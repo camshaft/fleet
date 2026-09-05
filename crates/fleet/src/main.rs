@@ -164,6 +164,15 @@ impl Fleet {
     fn registry_path(&self) -> PathBuf {
         self.root.join("registry.json")
     }
+    /// Where per-agent worktrees are checked out (`<hub>/.claude/worktrees/<name>`) — hub-managed, so a
+    /// worktree stays off the target repo's own tree. `root` is `<hub>/.claude/fleet`, so its parent is
+    /// `<hub>/.claude`.
+    fn worktrees_dir(&self) -> PathBuf {
+        self.root
+            .parent()
+            .map(|p| p.join("worktrees"))
+            .unwrap_or_else(|| self.root.join("worktrees"))
+    }
     fn inbox(&self, agent: &str) -> PathBuf {
         self.root.join("inbox").join(agent)
     }
@@ -590,6 +599,49 @@ fn send(
         "fleet send: {} → {} [{}] {}",
         msg.from, msg.to, msg.kind, msg.subject
     );
+}
+
+// ── worktree lifecycle (target-parameterized) ─────────────────────────────────────────────────────
+
+/// The topic branch an agent's worktree checks out: `fleet/<name>` (the standalone fleet has no single
+/// `trunk`-holder like cadenza's pr-sync — that's a cadenza-adapter concern, not core).
+fn agent_branch(name: &str) -> String {
+    format!("fleet/{name}")
+}
+
+/// Idempotently ensure agent `name`'s worktree exists, cut from `base` in the TARGET repo. Unlike
+/// cadenza's hub-anchored `ensure_worktree`, this is PARAMETERIZED by the target repo + base (the
+/// multi-repo generalization): `git -C <target_repo> worktree add -b fleet/<name> <hub>/.claude/
+/// worktrees/<name> <base>`. Returns the worktree path. A pre-existing worktree dir is a clean no-op.
+/// Errors are returned (not `exit`) so the caller (`fleet up`) can report per-agent + continue.
+fn ensure_worktree(
+    fleet: &Fleet,
+    target_repo: &Path,
+    base: &str,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let wt = fleet.worktrees_dir().join(name);
+    if wt.is_dir() {
+        return Ok(wt);
+    }
+    if let Some(parent) = wt.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let out = std::process::Command::new("git")
+        .current_dir(target_repo)
+        .args(["worktree", "add", "-b", &agent_branch(name)])
+        .arg(&wt)
+        .arg(base)
+        .output()
+        .map_err(|e| format!("failed to spawn git worktree add: {e}"))?;
+    if out.status.success() {
+        Ok(wt)
+    } else {
+        Err(format!(
+            "git worktree add for '{name}' (base {base}) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
 }
 
 // ── reconcile (decentralized roster: declared desired-state → running actual-state) ────────────────
@@ -1285,6 +1337,48 @@ mod tests {
             vec!["x".to_string()],
             "stopped y is not drift"
         );
+    }
+
+    #[test]
+    fn agent_branch_and_worktrees_dir_have_the_expected_shape() {
+        assert_eq!(agent_branch("v-x"), "fleet/v-x");
+        let fleet = Fleet {
+            root: PathBuf::from("/some/hub/.claude/fleet"),
+        };
+        assert_eq!(
+            fleet.worktrees_dir(),
+            PathBuf::from("/some/hub/.claude/worktrees")
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_cuts_a_linked_worktree_from_the_target_repo_and_is_idempotent() {
+        let (base_dir, fleet) = tmp_hub();
+        // A throwaway TARGET repo with one commit so there's a base ref.
+        let target = base_dir.join("target-repo");
+        std::fs::create_dir_all(&target).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(&target)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        let _ = git(&["config", "user.email", "t@t"]);
+        let _ = git(&["config", "user.name", "t"]);
+        std::fs::write(target.join("f"), "x").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-qm", "init"]).status.success());
+
+        let wt = ensure_worktree(&fleet, &target, "HEAD", "a1").expect("worktree cut");
+        assert!(wt.is_dir(), "worktree dir exists");
+        assert!(wt.join("f").exists(), "checked out the target repo's tree");
+        assert!(wt.ends_with("a1"));
+        // Idempotent: a second call is a clean no-op returning the same path (no error re-adding).
+        let wt2 = ensure_worktree(&fleet, &target, "HEAD", "a1").expect("idempotent");
+        assert_eq!(wt, wt2);
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]
