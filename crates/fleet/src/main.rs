@@ -53,6 +53,63 @@ fn default_true() -> bool {
 fn default_effort() -> String {
     "high".to_string()
 }
+fn default_interval() -> String {
+    "10m".to_string()
+}
+fn default_model() -> String {
+    "opus".to_string()
+}
+
+/// One declared agent in a target repo's checked-in `fleet.toml` roster — the DESIRED persistent set
+/// (decentralized rosters, operator direction 2026-09-05). Runtime-only fields (worktree, live status,
+/// window) are NOT here; `fleet up` derives them when it reconciles this declaration into a running agent.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct RosterEntry {
+    name: String,
+    role: String,
+    #[serde(default)]
+    vertical: String,
+    #[serde(default)]
+    area: String,
+    #[serde(default = "default_interval")]
+    interval: String,
+    #[serde(default = "default_model")]
+    model: String,
+    #[serde(default = "default_effort")]
+    effort: String,
+}
+
+/// A target repo's identity + adapter hooks, from its checked-in `fleet.toml` `[repo]` table. The gate/
+/// merge hooks are OPAQUE to core (core is messaging+windows+orchestration only — it never runs a gate);
+/// the per-repo adapter owns them. Empty `gate`/`merge` = none.
+#[derive(Clone, Debug, Deserialize)]
+struct RepoConfig {
+    /// Absolute path to the target repo checkout on this host.
+    path: String,
+    /// The branch to cut agent worktrees from (e.g. `origin/main`).
+    #[serde(default = "default_base")]
+    base: String,
+    /// Adapter hook: how to gate a change (a command, or "" = none). Core does NOT run this.
+    #[serde(default)]
+    gate: String,
+    /// Adapter hook: how to land (e.g. `pr-sync` | `gh-pr` | `direct` | ""). Core does NOT run this.
+    #[serde(default)]
+    merge: String,
+}
+
+fn default_base() -> String {
+    "origin/main".to_string()
+}
+
+/// A target repo's whole checked-in fleet config (`fleet.toml`): its identity/adapter + its declared
+/// roster. This is the decentralized desired-state that travels WITH the repo; the hub holds the actual
+/// runtime state, and `fleet up` reconciles declared → running.
+#[derive(Clone, Debug, Deserialize)]
+struct TargetConfig {
+    repo: RepoConfig,
+    #[serde(default, rename = "agent")]
+    agents: Vec<RosterEntry>,
+}
 
 /// Resolve a model alias to the full id `claude --model` receives (the fleet runs the 1M-context
 /// variants). The ONE place the long ids live, so registry/CLI stay readable. Unknown → passthrough.
@@ -535,6 +592,103 @@ fn send(
     );
 }
 
+// ── reconcile (decentralized roster: declared desired-state → running actual-state) ────────────────
+
+/// The reconcile plan for one target: which DECLARED agents need launching (absent from the runtime
+/// registry, or present-but-`stopped`), and which RUNNING agents are UNDECLARED drift (active in the
+/// registry but named by no declared roster — reported, never auto-killed). Pure so the reconciliation
+/// policy is unit-tested without touching the hub or minting worktrees.
+#[derive(Debug, PartialEq, Eq, Default)]
+struct ReconcilePlan {
+    /// Declared agents that should be launched (not currently active in the registry).
+    to_launch: Vec<String>,
+    /// Declared agents already active — nothing to do.
+    already_running: Vec<String>,
+    /// Active registry agents not named by the declared roster — drift to surface (NOT auto-removed).
+    undeclared_running: Vec<String>,
+}
+
+/// Compute the reconcile plan from a target's DECLARED roster + the hub's RUNNING agents. An agent
+/// "counts as running" only if its registry row is `status == "active"`; a `stopped` row (or no row)
+/// means the declared agent needs launching. Undeclared *active* agents are reported as drift.
+fn reconcile_plan(declared: &[RosterEntry], running: &[Agent]) -> ReconcilePlan {
+    let active_names: std::collections::HashSet<&str> = running
+        .iter()
+        .filter(|a| a.status == "active")
+        .map(|a| a.name.as_str())
+        .collect();
+    let declared_names: std::collections::HashSet<&str> =
+        declared.iter().map(|e| e.name.as_str()).collect();
+    let mut plan = ReconcilePlan::default();
+    for e in declared {
+        if active_names.contains(e.name.as_str()) {
+            plan.already_running.push(e.name.clone());
+        } else {
+            plan.to_launch.push(e.name.clone());
+        }
+    }
+    for a in running.iter().filter(|a| a.status == "active") {
+        if !declared_names.contains(a.name.as_str()) {
+            plan.undeclared_running.push(a.name.clone());
+        }
+    }
+    plan
+}
+
+/// `fleet up <config>`: parse a target repo's `fleet.toml`, load the hub's runtime registry, and REPORT
+/// the reconcile plan (declared → running). DRY-RUN / reporting only in this P1 slice — the actual
+/// worktree-mint + window-launch of `to_launch` agents lands with the window-management slice (it needs
+/// ensure_worktree(target repo+base) + the tmux launcher, deferred here). Reads the target repo path +
+/// adapter hooks but does NOT run the gate/merge hooks (those are the per-repo adapter's, not core's).
+fn up(fleet: &Fleet, config_path: &Path) {
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("fleet up: cannot read {} ({e})", config_path.display());
+            std::process::exit(2);
+        }
+    };
+    let cfg: TargetConfig = match toml::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "fleet up: {} is not valid fleet.toml ({e})",
+                config_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let reg = fleet.load();
+    let plan = reconcile_plan(&cfg.agents, &reg.agents);
+    println!(
+        "fleet up: target repo {} (base {}, gate {:?}, merge {:?}) — {} declared agent(s):",
+        cfg.repo.path,
+        cfg.repo.base,
+        cfg.repo.gate,
+        cfg.repo.merge,
+        cfg.agents.len()
+    );
+    if !plan.already_running.is_empty() {
+        println!("  ✓ already running: {}", plan.already_running.join(", "));
+    }
+    if !plan.to_launch.is_empty() {
+        println!(
+            "  ⟳ TO LAUNCH ({}): {}  [dry-run — worktree-mint + window-launch land with the window-mgmt slice]",
+            plan.to_launch.len(),
+            plan.to_launch.join(", ")
+        );
+    }
+    if !plan.undeclared_running.is_empty() {
+        println!(
+            "  ⚠ undeclared-but-running (drift, NOT auto-removed): {}",
+            plan.undeclared_running.join(", ")
+        );
+    }
+    if plan.to_launch.is_empty() && plan.undeclared_running.is_empty() {
+        println!("  ✓ reconciled — every declared agent is running, no drift.");
+    }
+}
+
 // ── describe (window.sh eval surface) ────────────────────────────────────────────────────────────
 
 /// Emit shell-safe `KEY=VALUE` lines for `window.sh` to `eval` at launch. The model alias is expanded to
@@ -792,6 +946,12 @@ enum Cmd {
         /// The agent name.
         name: String,
     },
+    /// Reconcile a target repo's checked-in `fleet.toml` declared roster against the running fleet
+    /// (reports the plan; the actual launch lands with the window-management slice).
+    Up {
+        /// Path to the target repo's `fleet.toml`.
+        config: PathBuf,
+    },
 }
 
 fn main() {
@@ -816,6 +976,7 @@ fn main() {
             None => inbox_list(&fleet, &name),
         },
         Cmd::Describe { name } => describe(&fleet, &name),
+        Cmd::Up { config } => up(&fleet, &config),
     }
 }
 
@@ -1069,5 +1230,92 @@ mod tests {
         assert!(!role_is_terminal_interactive("vertical"));
         assert!(!role_is_terminal_interactive("concierge"));
         assert!(!role_is_terminal_interactive("pr-sync"));
+    }
+
+    fn mk_agent(name: &str, status: &str) -> Agent {
+        Agent {
+            name: name.into(),
+            role: "vertical".into(),
+            vertical: String::new(),
+            area: String::new(),
+            worktree: format!("/wt/{name}"),
+            branch: format!("fleet/{name}"),
+            interval: "10m".into(),
+            model: "opus".into(),
+            effort: "high".into(),
+            status: status.into(),
+            disallow_ask: true,
+        }
+    }
+
+    fn mk_declared(name: &str) -> RosterEntry {
+        RosterEntry {
+            name: name.into(),
+            role: "vertical".into(),
+            vertical: String::new(),
+            area: String::new(),
+            interval: "10m".into(),
+            model: "opus".into(),
+            effort: "high".into(),
+        }
+    }
+
+    #[test]
+    fn reconcile_launches_absent_and_stopped_flags_undeclared_and_leaves_active() {
+        let declared = vec![mk_declared("a"), mk_declared("b"), mk_declared("c")];
+        let running = vec![
+            mk_agent("a", "active"),  // declared + active → already_running
+            mk_agent("b", "stopped"), // declared + stopped → to_launch
+            mk_agent("z", "active"),  // undeclared + active → drift
+                                      // "c" declared but has no registry row → to_launch
+        ];
+        let plan = reconcile_plan(&declared, &running);
+        assert_eq!(plan.already_running, vec!["a".to_string()]);
+        assert_eq!(plan.to_launch, vec!["b".to_string(), "c".to_string()]);
+        assert_eq!(plan.undeclared_running, vec!["z".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_empty_declared_reports_all_active_as_drift() {
+        let plan = reconcile_plan(&[], &[mk_agent("x", "active"), mk_agent("y", "stopped")]);
+        assert!(plan.to_launch.is_empty());
+        assert!(plan.already_running.is_empty());
+        assert_eq!(
+            plan.undeclared_running,
+            vec!["x".to_string()],
+            "stopped y is not drift"
+        );
+    }
+
+    #[test]
+    fn fleet_toml_parses_repo_and_declared_roster_with_defaults() {
+        let toml_src = r#"
+            [repo]
+            path = "/home/u/Projects/camshaft/cadenza"
+            base = "origin/main"
+            gate = "cargo xtask fleet gate-local"
+            merge = "pr-sync"
+
+            [[agent]]
+            name = "v-iterators"
+            role = "vertical"
+            vertical = "iterators"
+            area = "rcdzc"
+
+            [[agent]]
+            name = "breaker"
+            role = "breaker"
+            model = "fable"
+        "#;
+        let cfg: TargetConfig = toml::from_str(toml_src).expect("valid fleet.toml");
+        assert_eq!(cfg.repo.path, "/home/u/Projects/camshaft/cadenza");
+        assert_eq!(cfg.repo.merge, "pr-sync");
+        assert_eq!(cfg.agents.len(), 2);
+        assert_eq!(cfg.agents[0].name, "v-iterators");
+        // defaults applied where omitted
+        assert_eq!(cfg.agents[0].interval, "10m");
+        assert_eq!(cfg.agents[0].model, "opus");
+        assert_eq!(cfg.agents[1].model, "fable");
+        assert_eq!(cfg.agents[1].effort, "high", "default effort");
     }
 }
