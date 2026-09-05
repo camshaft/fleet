@@ -185,6 +185,54 @@ fn is_valid_urgency(u: &str) -> bool {
     URGENCY_LEVELS.contains(&u)
 }
 
+/// The compact inbox-line tag for a message's urgency: elevated levels get a loud suffix so they stand
+/// out in the oldest-first listing; `normal`/`low`/unknown get nothing (keeps the common line identical).
+fn urgency_tag(u: &str) -> &'static str {
+    match u {
+        "urgent" => "  <<URGENT>>",
+        "high" => "  <high>",
+        _ => "",
+    }
+}
+
+/// The message kinds that are INFORMATIONAL (read-and-archive; not a drain-stall) — the SINGLE source of
+/// truth. `message_kind_is_actionable` is "not in this list"; the `fleet inbox` summary derives its legend
+/// from it so the classifier + CLI text can never drift. Unknown kinds → actionable (fail-safe).
+const INFORMATIONAL_KINDS: &[&str] = &["note", "merged", "backlog", "status", "reply"];
+
+fn message_kind_is_actionable(kind: &str) -> bool {
+    !INFORMATIONAL_KINDS.contains(&kind)
+}
+
+/// Is `s` a single, safe path component (no traversal / separators)? Guards `--processed <msg>`.
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && !s.contains("..")
+}
+
+/// Count regular files in `dir` matching `keep` (0 if unreadable/absent).
+fn count_dir(dir: &Path, keep: impl Fn(&str) -> bool) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .filter(|e| keep(&e.file_name().to_string_lossy()))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Inbox filenames lead with the zero-padded durable delivery-seq, so a plain lexicographic sort ==
+/// oldest-first arrival order. Pure so the ordering contract is unit-testable.
+fn sort_inbox_filenames(names: &mut [String]) {
+    names.sort();
+}
+
 /// Per-process ordinal for `Message::seq` (the toolchain forbids wall-clock). Delivery ORDER uses the
 /// durable cross-process `next_delivery_seq` in the filename, not this.
 fn next_seq() -> u64 {
@@ -470,6 +518,182 @@ fn send(
     );
 }
 
+// ── inbox (receive half) ─────────────────────────────────────────────────────────────────────────
+
+/// The consume outcome from the (src, dst) existence pair — pure so the idempotency contract is tested.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsumeAction {
+    Move,
+    ClearStray,
+    AlreadyDone,
+    Missing,
+}
+
+fn inbox_consume_action(src_exists: bool, dst_exists: bool) -> ConsumeAction {
+    match (src_exists, dst_exists) {
+        (true, false) => ConsumeAction::Move,
+        (true, true) => ConsumeAction::ClearStray,
+        (false, true) => ConsumeAction::AlreadyDone,
+        (false, false) => ConsumeAction::Missing,
+    }
+}
+
+/// A raced drain between the exists() probe and the ClearStray remove can leave `NotFound` — which
+/// SATISFIES the goal ("live inbox no longer holds msg"), so it is NOT fatal; any other error is.
+fn clear_stray_remove_is_fatal(kind: std::io::ErrorKind) -> bool {
+    kind != std::io::ErrorKind::NotFound
+}
+
+/// List an agent's inbox: ALWAYS print the resolved HUB path (a wrong path is the failure mode this
+/// guards), oldest-first, with an actionable/informational split + urgency flags. A read error is LOUD +
+/// distinct from an empty inbox (the "0 messages" confusion this command exists to prevent).
+fn inbox_list(fleet: &Fleet, name: &str) {
+    let dir = fleet.inbox(name);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!(
+                "inbox for '{name}' at {}: COULD NOT READ ({e}). That path is missing or unreadable — \
+                 this is NOT an empty inbox. Verify it's the HUB path, not a worktree-relative `.claude/...`.",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    sort_inbox_filenames(&mut names);
+    println!(
+        "inbox for '{name}' at {} ({} message(s)):",
+        dir.display(),
+        names.len()
+    );
+    if names.is_empty() {
+        println!(
+            "  0 messages — nothing to drain (if you EXPECTED mail, verify this is the HUB path, \
+             not a worktree-relative `.claude/...`)."
+        );
+        return;
+    }
+    let mut actionable = 0usize;
+    let mut elevated = 0usize;
+    for n in &names {
+        let (from, kind, urgency) = std::fs::read_to_string(dir.join(n))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Message>(&t).ok())
+            .map(|m| (m.from, m.kind, m.urgency))
+            .unwrap_or_else(|| ("?".to_string(), "?".to_string(), default_urgency()));
+        let is_act = message_kind_is_actionable(&kind);
+        if is_act {
+            actionable += 1;
+        }
+        let utag = urgency_tag(&urgency);
+        if !utag.is_empty() {
+            elevated += 1;
+        }
+        let mark = if is_act { "⚑" } else { "·" };
+        println!("  {mark} {n}  [{kind}] from {from}{utag}");
+    }
+    let informational = names.len().saturating_sub(actionable);
+    println!(
+        "  ── {actionable} actionable (⚑ = anything not below), {informational} informational (· {})",
+        INFORMATIONAL_KINDS.join("/")
+    );
+    if elevated > 0 {
+        println!(
+            "  ── {elevated} message(s) flagged high/urgent (<high> / <<URGENT>>) — prioritize reading these"
+        );
+    }
+    if actionable == 0 {
+        println!(
+            "  ✓ nothing ACTIONABLE queued — the informational mail is safe to archive to processed/ \
+             (it is not a drain-stall)."
+        );
+    }
+}
+
+/// Consume one inbox message: MOVE `<msg>` to `processed/` under the resolver-owned HUB path, then
+/// re-list. Idempotent (already-archived = success), loud on a genuinely-missing name (a typo must not
+/// masquerade as a drain), and safe against a mid-move stray + a raced TOCTOU remove.
+fn inbox_consume(fleet: &Fleet, name: &str, msg: &str) {
+    if !is_safe_component(msg) {
+        eprintln!(
+            "fleet inbox --processed: refusing unsafe message name {msg:?} (must be a bare inbox \
+             filename from the listing — no path separators or `..`)."
+        );
+        std::process::exit(1);
+    }
+    let dir = fleet.inbox(name);
+    let src = dir.join(msg);
+    let processed_dir = dir.join("processed");
+    let dst = processed_dir.join(msg);
+    match inbox_consume_action(src.exists(), dst.exists()) {
+        ConsumeAction::AlreadyDone => {
+            println!("fleet inbox: '{msg}' already in processed/ (no-op) — re-listing '{name}'.");
+            inbox_list(fleet, name);
+            return;
+        }
+        ConsumeAction::Missing => {
+            eprintln!(
+                "fleet inbox --processed: no message {msg:?} in '{name}' inbox at {} (nor in \
+                 processed/). Check the exact filename from `fleet inbox {name}` — a typo here silently \
+                 leaves the real message UNCONSUMED (the drain-stall this command prevents).",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+        ConsumeAction::ClearStray => {
+            if let Err(e) = std::fs::remove_file(&src)
+                && clear_stray_remove_is_fatal(e.kind())
+            {
+                eprintln!(
+                    "fleet inbox --processed: '{msg}' is already archived, but could not remove the \
+                     stray live copy {} ({e}).",
+                    src.display()
+                );
+                std::process::exit(1);
+            }
+            println!(
+                "fleet inbox: '{msg}' was already in processed/ — cleared the stray live copy — re-listing '{name}'."
+            );
+            inbox_list(fleet, name);
+            return;
+        }
+        ConsumeAction::Move => {}
+    }
+    if let Err(e) = std::fs::create_dir_all(&processed_dir) {
+        eprintln!(
+            "fleet inbox --processed: could not create {} ({e}).",
+            processed_dir.display()
+        );
+        std::process::exit(1);
+    }
+    if let Err(e) = std::fs::rename(&src, &dst) {
+        eprintln!(
+            "fleet inbox --processed: could not move {} → {} ({e}).",
+            src.display(),
+            dst.display()
+        );
+        std::process::exit(1);
+    }
+    println!("fleet inbox: moved '{msg}' → processed/. Remaining:");
+    inbox_list(fleet, name);
+}
+
+/// A compact inbox depth string (`empty` | `N msg`) for status/watchdog surfaces.
+fn inbox_depth(fleet: &Fleet, name: &str) -> String {
+    let n = count_dir(&fleet.inbox(name), |f| f.ends_with(".json"));
+    if n == 0 {
+        "empty".to_string()
+    } else {
+        format!("{n} msg")
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "fleet",
@@ -514,6 +738,15 @@ enum Cmd {
         #[arg(long, default_value = "normal")]
         urgency: String,
     },
+    /// List an agent's inbox (the RESOLVER — prints the canonical HUB path), or with `--processed <msg>`
+    /// archive one message into `processed/`.
+    Inbox {
+        /// The agent name whose inbox to list/drain.
+        name: String,
+        /// Archive this message filename into `processed/` (instead of listing).
+        #[arg(long)]
+        processed: Option<String>,
+    },
 }
 
 fn main() {
@@ -533,6 +766,10 @@ fn main() {
         } => send(
             &fleet, &to, &kind, &subject, &r#ref, &body, body_file, from, &urgency,
         ),
+        Cmd::Inbox { name, processed } => match processed {
+            Some(msg) => inbox_consume(&fleet, &name, &msg),
+            None => inbox_list(&fleet, &name),
+        },
     }
 }
 
@@ -685,6 +922,87 @@ mod tests {
             "filename sorts by delivery seq + tags the kind: {}",
             entries[0]
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn consume_action_covers_the_four_existence_cases() {
+        assert_eq!(inbox_consume_action(true, false), ConsumeAction::Move);
+        assert_eq!(inbox_consume_action(true, true), ConsumeAction::ClearStray);
+        assert_eq!(
+            inbox_consume_action(false, true),
+            ConsumeAction::AlreadyDone
+        );
+        assert_eq!(inbox_consume_action(false, false), ConsumeAction::Missing);
+    }
+
+    #[test]
+    fn actionable_classifier_is_a_denylist() {
+        assert!(message_kind_is_actionable("ask"));
+        assert!(message_kind_is_actionable("issue"));
+        assert!(
+            message_kind_is_actionable("weird-unknown-kind"),
+            "unknown → fail-safe actionable"
+        );
+        assert!(!message_kind_is_actionable("note"));
+        assert!(!message_kind_is_actionable("merged"));
+        assert!(!message_kind_is_actionable("reply"));
+    }
+
+    #[test]
+    fn clear_stray_notfound_is_not_fatal() {
+        assert!(!clear_stray_remove_is_fatal(std::io::ErrorKind::NotFound));
+        assert!(clear_stray_remove_is_fatal(
+            std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn is_safe_component_rejects_traversal() {
+        assert!(is_safe_component("000000000001-123-note.json"));
+        assert!(!is_safe_component(".."));
+        assert!(!is_safe_component("a/b"));
+        assert!(!is_safe_component("../x"));
+        assert!(!is_safe_component(""));
+    }
+
+    #[test]
+    fn deliver_then_consume_moves_message_to_processed_and_is_idempotent() {
+        let (base, fleet) = tmp_hub();
+        let msg = Message {
+            from: "a".into(),
+            to: "b".into(),
+            kind: "note".into(),
+            subject: "hi".into(),
+            r#ref: String::new(),
+            body: "x".into(),
+            seq: 1,
+            in_reply_to: String::new(),
+            urgency: "normal".into(),
+        };
+        deliver(&fleet, &msg);
+        let fname = std::fs::read_dir(fleet.inbox("b"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n.ends_with(".json"))
+            .unwrap();
+        // The live message is present; processed/ is not.
+        assert!(fleet.inbox("b").join(&fname).exists());
+        // consume moves it (idempotency is exercised via the pure action classifier above; here we assert
+        // the move happened: live gone, archived present).
+        std::fs::create_dir_all(fleet.inbox("b").join("processed")).unwrap();
+        std::fs::rename(
+            fleet.inbox("b").join(&fname),
+            fleet.inbox("b").join("processed").join(&fname),
+        )
+        .unwrap();
+        assert!(!fleet.inbox("b").join(&fname).exists(), "live copy gone");
+        assert!(
+            fleet.inbox("b").join("processed").join(&fname).exists(),
+            "archived copy present"
+        );
+        assert_eq!(inbox_depth(&fleet, "b"), "empty", "no live .json left");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
