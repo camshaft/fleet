@@ -154,6 +154,322 @@ fn heartbeat(fleet: &Fleet, name: &str) {
     println!("ok");
 }
 
+// ── message bus ──────────────────────────────────────────────────────────────────────────────────
+
+/// A fleet message. Lifted verbatim from cadenza fleet.rs so the on-disk JSON is byte-identical.
+#[derive(Serialize, Deserialize)]
+struct Message {
+    from: String,
+    to: String,
+    kind: String,
+    subject: String,
+    #[serde(default)]
+    r#ref: String,
+    #[serde(default)]
+    body: String,
+    /// A per-process ordinal (metadata only — the inbox sorts by FILENAME, whose leading field is the
+    /// durable cross-process delivery sequence, NOT this). Kept for on-disk-format compatibility.
+    seq: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    in_reply_to: String,
+    #[serde(default = "default_urgency")]
+    urgency: String,
+}
+
+const URGENCY_LEVELS: [&str; 4] = ["low", "normal", "high", "urgent"];
+
+fn default_urgency() -> String {
+    "normal".to_string()
+}
+fn is_valid_urgency(u: &str) -> bool {
+    URGENCY_LEVELS.contains(&u)
+}
+
+/// Per-process ordinal for `Message::seq` (the toolchain forbids wall-clock). Delivery ORDER uses the
+/// durable cross-process `next_delivery_seq` in the filename, not this.
+fn next_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Durable hub-global delivery sequence (monotonic ACROSS processes) so message filenames sort in send
+/// order for the oldest-first drain. temp+rename with a UNIQUE temp per writer so concurrent sends never
+/// corrupt the counter. Lifted verbatim from cadenza fleet.rs.
+fn next_delivery_seq(fleet: &Fleet) -> u64 {
+    let path = fleet.root.join(".delivery-seq");
+    let cur = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let next = cur.saturating_add(1);
+    let tmp = fleet.root.join(format!(
+        ".delivery-seq.{}.{}.tmp",
+        std::process::id(),
+        next_seq()
+    ));
+    if std::fs::write(&tmp, format!("{next}\n")).is_ok() {
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    next
+}
+
+/// Validate an agent name that becomes a filesystem path component (`inbox/<name>`). `^[A-Za-z0-9]
+/// [A-Za-z0-9-]*$` — a leading ASCII alphanumeric, then alphanumerics/hyphens only: no path separator,
+/// no `.`/`..` traversal, no dotfile/flag lookalike. Lifted verbatim (matches the slack-bridge sink).
+fn validate_agent_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("empty");
+    }
+    if name.len() > 128 {
+        return Err("too long");
+    }
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        return Err("must start with an ASCII letter or digit");
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(
+            "only ASCII alphanumerics and `-` are allowed (no dots/underscores/separators)",
+        );
+    }
+    Ok(())
+}
+
+/// Rescue a reply addressed to `unknown`: find a `fleet/<agent>` token in the subject + route there.
+fn recipient_from_subject(subject: &str) -> Option<String> {
+    let idx = subject.find("fleet/")?;
+    let rest = &subject[idx + "fleet/".len()..];
+    let agent: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if agent.is_empty() || validate_agent_name(&agent).is_err() {
+        None
+    } else {
+        Some(agent)
+    }
+}
+
+/// Deliver a message: temp+rename into the recipient's inbox so a reader never sees a partial file. The
+/// filename `<delivery-seq>-<pid>-<kind>.json` sorts in send order. A `to == "unknown"` whose subject
+/// names a `fleet/<agent>` is rescued to that agent. Path-traversal-guarded at this single chokepoint.
+fn deliver(fleet: &Fleet, msg: &Message) {
+    let to: String = if msg.to == "unknown" {
+        match recipient_from_subject(&msg.subject) {
+            Some(real) => {
+                eprintln!("fleet deliver: rescued a `to=unknown` message → routing to '{real}'");
+                real
+            }
+            None => msg.to.clone(),
+        }
+    } else {
+        msg.to.clone()
+    };
+    if let Err(why) = validate_agent_name(&to) {
+        eprintln!("fleet: refusing to deliver to invalid agent name {to:?}: {why}");
+        std::process::exit(1);
+    }
+    let inbox = fleet.inbox(&to);
+    std::fs::create_dir_all(&inbox).expect("create recipient inbox");
+    let fname = format!(
+        "{:012}-{}-{}.json",
+        next_delivery_seq(fleet),
+        std::process::id(),
+        msg.kind
+    );
+    let json = serde_json::to_string_pretty(msg).expect("serialize message");
+    let tmp = inbox.join(format!(".{fname}.tmp"));
+    std::fs::write(&tmp, json).expect("write message tmp");
+    std::fs::rename(&tmp, inbox.join(&fname)).expect("rename message into inbox");
+}
+
+/// Conservative env-dump / secret-token scanner (belt-and-braces P0 leak guard, operator seq-198): flags
+/// only UNAMBIGUOUS leaks (a large KEY=VALUE block, a secret-named key with a real value, a live-looking
+/// credential token) so it never false-positives on the legion of prose bodies that document env vars.
+/// Lifted verbatim from cadenza fleet.rs. Repo-agnostic → core.
+fn message_secret_findings(title: &str, body: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+    let text = format!("{title}\n{body}");
+    let mut env_toks = 0usize;
+    for tok in text.split_whitespace() {
+        let Some(eq) = tok.find('=') else { continue };
+        let key = &tok[..eq];
+        let val = &tok[eq + 1..];
+        let key_shaped = !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            && key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase() || c == '_');
+        if !key_shaped || val.is_empty() {
+            continue;
+        }
+        env_toks += 1;
+        let ku = key.to_ascii_uppercase();
+        let secret_named = ku.starts_with("AWS_")
+            || ku.starts_with("ANTHROPIC_")
+            || [
+                "TOKEN",
+                "SECRET",
+                "PASSWORD",
+                "PASSWD",
+                "API_KEY",
+                "CREDENTIAL",
+                "SESSION_TOKEN",
+                "ACCESS_KEY",
+            ]
+            .iter()
+            .any(|p| ku.contains(p));
+        let trivial = matches!(val, "1" | "0" | "true" | "false" | "yes" | "no") || val.len() <= 4;
+        if secret_named && !trivial {
+            findings.push(format!("secret-named key with a real value — `{key}=…`"));
+        }
+        if val.contains("sk-ant-")
+            || val.starts_with("AKIA")
+            || val.starts_with("ghp_")
+            || val.starts_with("xoxb-")
+        {
+            findings.push(format!(
+                "assignment `{key}=…` value looks like a live credential token"
+            ));
+        }
+    }
+    if env_toks >= 8 {
+        findings.push(format!(
+            "{env_toks} KEY=VALUE env assignments — this looks like an ENV DUMP; a body must be prose"
+        ));
+    }
+    for (tok, min_run) in [
+        ("sk-ant-", 12usize),
+        ("ghp_", 20),
+        ("xoxb-", 10),
+        ("AKIA", 16),
+        ("ASIA", 16),
+    ] {
+        let mut hay = text.as_str();
+        while let Some(pos) = hay.find(tok) {
+            let after = &hay[pos + tok.len()..];
+            let run = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .count();
+            if run >= min_run {
+                findings.push(format!(
+                    "a live-looking credential token (`{tok}…`) appears in the text"
+                ));
+                break;
+            }
+            hay = &hay[pos + tok.len()..];
+        }
+    }
+    findings
+}
+
+/// Kinds whose sender EXPECTS a reply — refuse an unresolved (`unknown`) sender for these, or the reply
+/// dead-letters and the sender idles forever. (Cadenza's `merge-request` reply-expecting kind is adapter
+/// territory and not in this core list.)
+fn kind_expects_reply(kind: &str) -> bool {
+    matches!(kind, "ask" | "issue")
+}
+
+/// Core `send`: validate urgency, resolve the body (`--body-file` wins, leak-safe), leak-guard the
+/// subject/body, resolve the sender (`--from` → `$FLEET_AGENT` → `unknown`), then deliver. DEFERRED to
+/// later P1 slices (not yet lifted): the tmux "wake the recipient" nudge, the branch/worktree sender
+/// derivation, and the cadenza-adapter merge-request/pr-sync guards. Sender must be `--from`/`$FLEET_AGENT`
+/// until the derivation lands.
+#[allow(clippy::too_many_arguments)]
+fn send(
+    fleet: &Fleet,
+    to: &str,
+    kind: &str,
+    subject: &str,
+    r#ref: &str,
+    body: &str,
+    body_file: Option<PathBuf>,
+    from: Option<String>,
+    urgency: &str,
+) {
+    if !is_valid_urgency(urgency) {
+        eprintln!(
+            "fleet send: REFUSING — unknown --urgency `{urgency}`. Valid levels: {}.",
+            URGENCY_LEVELS.join(" | ")
+        );
+        std::process::exit(1);
+    }
+    let body: String = match &body_file {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fleet send: cannot read --body-file {}: {e}", p.display());
+                std::process::exit(2);
+            }
+        },
+        None => body.to_string(),
+    };
+    let leak = message_secret_findings(subject, &body);
+    if !leak.is_empty() {
+        eprintln!(
+            "fleet send: REFUSING — the --subject/--body looks like it carries env-dump or secret material:"
+        );
+        for f in &leak {
+            eprintln!("  ✗ {f}");
+        }
+        eprintln!(
+            "A message is PROSE — never env/set/command output/a credential. Use --body-file with a literal file."
+        );
+        std::process::exit(1);
+    }
+    let from = from
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("FLEET_AGENT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    if from != "unknown"
+        && let Err(why) = validate_agent_name(&from)
+    {
+        eprintln!(
+            "fleet send: REFUSING — resolved sender `{from}` is not a valid agent name ({why})."
+        );
+        std::process::exit(1);
+    }
+    if from == "unknown" && kind_expects_reply(kind) {
+        eprintln!(
+            "fleet send: REFUSING a `{kind}` from an UNRESOLVED sender (the reply would dead-letter). \
+             Pass `--from <your-agent-name>` (or set $FLEET_AGENT)."
+        );
+        std::process::exit(1);
+    }
+    let msg = Message {
+        from,
+        to: to.to_string(),
+        kind: kind.to_string(),
+        subject: subject.to_string(),
+        r#ref: r#ref.to_string(),
+        body,
+        seq: next_seq(),
+        in_reply_to: String::new(),
+        urgency: urgency.to_string(),
+    };
+    deliver(fleet, &msg);
+    eprintln!(
+        "fleet send: {} → {} [{}] {}",
+        msg.from, msg.to, msg.kind, msg.subject
+    );
+}
+
 #[derive(Parser)]
 #[command(
     name = "fleet",
@@ -171,6 +487,33 @@ enum Cmd {
         /// The agent name.
         name: String,
     },
+    /// Send a message to another agent's inbox.
+    Send {
+        /// Recipient agent name.
+        #[arg(long)]
+        to: String,
+        /// Message kind (e.g. `note`, `ask`, `reply`, `issue`).
+        #[arg(long)]
+        kind: String,
+        /// Subject line.
+        #[arg(long)]
+        subject: String,
+        /// Optional structured ref (e.g. a commit sha).
+        #[arg(long, default_value = "")]
+        r#ref: String,
+        /// Inline body (prefer --body-file for anything with special chars — leak-safe + literal).
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Read the body from a file (wins over --body).
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Explicit sender (else $FLEET_AGENT, else `unknown`).
+        #[arg(long)]
+        from: Option<String>,
+        /// Urgency: low | normal | high | urgent.
+        #[arg(long, default_value = "normal")]
+        urgency: String,
+    },
 }
 
 fn main() {
@@ -178,6 +521,18 @@ fn main() {
     let fleet = Fleet::resolve();
     match cli.cmd {
         Cmd::Heartbeat { name } => heartbeat(&fleet, &name),
+        Cmd::Send {
+            to,
+            kind,
+            subject,
+            r#ref,
+            body,
+            body_file,
+            from,
+            urgency,
+        } => send(
+            &fleet, &to, &kind, &subject, &r#ref, &body, body_file, from, &urgency,
+        ),
     }
 }
 
@@ -249,6 +604,86 @@ mod tests {
         assert!(
             fleet.inbox(&back.agents[0].name).ends_with("v-x"),
             "inbox path is <hub>/inbox/<name>"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delivery_seq_is_monotonic_and_durable() {
+        let (base, fleet) = tmp_hub();
+        std::fs::create_dir_all(&fleet.root).unwrap();
+        assert_eq!(next_delivery_seq(&fleet), 1);
+        assert_eq!(next_delivery_seq(&fleet), 2);
+        assert_eq!(
+            next_delivery_seq(&fleet),
+            3,
+            "durable across calls (reads the file)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_agent_name_accepts_real_names_and_rejects_traversal() {
+        assert!(validate_agent_name("v-fleet-tooling").is_ok());
+        assert!(validate_agent_name("pr-sync").is_ok());
+        assert!(validate_agent_name("").is_err());
+        assert!(validate_agent_name("..").is_err(), "no dot/traversal");
+        assert!(validate_agent_name("../../etc").is_err());
+        assert!(validate_agent_name("-flag").is_err(), "no leading hyphen");
+        assert!(validate_agent_name("a/b").is_err(), "no path separator");
+    }
+
+    #[test]
+    fn recipient_from_subject_rescues_a_fleet_token() {
+        assert_eq!(
+            recipient_from_subject("merged: fleet/v-x landed").as_deref(),
+            Some("v-x")
+        );
+        assert_eq!(recipient_from_subject("no token here"), None);
+    }
+
+    #[test]
+    fn secret_findings_flags_dumps_and_tokens_but_passes_prose() {
+        // Prose that merely mentions env vars must NOT trip (the false-positive bar).
+        assert!(
+            message_secret_findings("docs", "set CDZ_NO_CARGO_SHIM=1 and CDZ_CHECK_LEASE_MAX=2")
+                .is_empty()
+        );
+        // A secret-named key with a real value trips.
+        assert!(!message_secret_findings("x", "AWS_SESSION_TOKEN=FQoGiZ3longvalue").is_empty());
+        // A live-looking token pasted anywhere trips.
+        assert!(
+            !message_secret_findings("x", "here is ghp_0123456789abcdefghijklmnop token")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deliver_writes_a_sortable_json_into_the_recipient_inbox() {
+        let (base, fleet) = tmp_hub();
+        let msg = Message {
+            from: "a".into(),
+            to: "b".into(),
+            kind: "note".into(),
+            subject: "hi".into(),
+            r#ref: String::new(),
+            body: "body".into(),
+            seq: 1,
+            in_reply_to: String::new(),
+            urgency: "normal".into(),
+        };
+        deliver(&fleet, &msg);
+        let entries: Vec<_> = std::fs::read_dir(fleet.inbox("b"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].starts_with("000000000001-") && entries[0].ends_with("-note.json"),
+            "filename sorts by delivery seq + tags the kind: {}",
+            entries[0]
         );
         let _ = std::fs::remove_dir_all(&base);
     }
