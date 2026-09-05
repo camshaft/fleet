@@ -54,6 +54,23 @@ fn default_effort() -> String {
     "high".to_string()
 }
 
+/// Resolve a model alias to the full id `claude --model` receives (the fleet runs the 1M-context
+/// variants). The ONE place the long ids live, so registry/CLI stay readable. Unknown → passthrough.
+fn resolve_model(alias: &str) -> String {
+    match alias {
+        "opus" => "us.anthropic.claude-opus-4-8[1m]".to_string(),
+        "fable" => "us.anthropic.claude-fable-5[1m]".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Only a TERMINAL-INTERACTIVE role keeps AskUserQuestion; every other role runs unattended and routes
+/// human-shaped decisions to the concierge as an `ask`. `describe` DERIVES the launch policy from the
+/// role (not a persisted field) so a role→policy change takes effect on the next relaunch.
+fn role_is_terminal_interactive(role: &str) -> bool {
+    role == "design"
+}
+
 /// The on-disk runtime manifest: just the list of agents. Kept flat so it is easy to read + diff.
 #[derive(Default, Serialize, Deserialize)]
 struct Registry {
@@ -518,6 +535,29 @@ fn send(
     );
 }
 
+// ── describe (window.sh eval surface) ────────────────────────────────────────────────────────────
+
+/// Emit shell-safe `KEY=VALUE` lines for `window.sh` to `eval` at launch. The model alias is expanded to
+/// its full id here (the point window.sh hands it to `claude --model`); DISALLOW_ASK is DERIVED from the
+/// role so a role→policy change takes effect on the next relaunch without rewriting persisted rows.
+fn describe(fleet: &Fleet, name: &str) {
+    let reg = fleet.load();
+    let Some(a) = reg.agents.iter().find(|a| a.name == name) else {
+        eprintln!("fleet describe: no agent named '{name}'");
+        std::process::exit(1);
+    };
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    println!("WORKTREE={}", q(&a.worktree));
+    println!("ROLE={}", q(&a.role));
+    println!("MODEL={}", q(&resolve_model(&a.model)));
+    println!("EFFORT={}", q(&a.effort));
+    println!("INTERVAL={}", q(&a.interval));
+    println!("VERTICAL={}", q(&a.vertical));
+    println!("AREA={}", q(&a.area));
+    let disallow_ask = !role_is_terminal_interactive(&a.role);
+    println!("DISALLOW_ASK={}", if disallow_ask { 1 } else { 0 });
+}
+
 // ── inbox (receive half) ─────────────────────────────────────────────────────────────────────────
 
 /// The consume outcome from the (src, dst) existence pair — pure so the idempotency contract is tested.
@@ -747,6 +787,11 @@ enum Cmd {
         #[arg(long)]
         processed: Option<String>,
     },
+    /// Emit an agent's launch config as shell `KEY=VALUE` lines for the window launcher to `eval`.
+    Describe {
+        /// The agent name.
+        name: String,
+    },
 }
 
 fn main() {
@@ -770,6 +815,7 @@ fn main() {
             Some(msg) => inbox_consume(&fleet, &name, &msg),
             None => inbox_list(&fleet, &name),
         },
+        Cmd::Describe { name } => describe(&fleet, &name),
     }
 }
 
@@ -1004,5 +1050,24 @@ mod tests {
         );
         assert_eq!(inbox_depth(&fleet, "b"), "empty", "no live .json left");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_model_expands_aliases_and_passes_through_unknown() {
+        assert_eq!(resolve_model("opus"), "us.anthropic.claude-opus-4-8[1m]");
+        assert_eq!(resolve_model("fable"), "us.anthropic.claude-fable-5[1m]");
+        assert_eq!(
+            resolve_model("some.custom.model-id"),
+            "some.custom.model-id",
+            "unknown alias passes through unchanged"
+        );
+    }
+
+    #[test]
+    fn only_design_keeps_the_interactive_prompt() {
+        assert!(role_is_terminal_interactive("design"));
+        assert!(!role_is_terminal_interactive("vertical"));
+        assert!(!role_is_terminal_interactive("concierge"));
+        assert!(!role_is_terminal_interactive("pr-sync"));
     }
 }
