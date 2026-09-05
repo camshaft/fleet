@@ -1,0 +1,9 @@
+# The standalone multi-repo agent-fleet orchestrator (extracted from cadenza — see DESIGN.md).
+# Workspace root. Core lives in crates/fleet (the `fleet` binary on PATH that every agent uses for comms).
+[workspace]
+resolver = "2"
+members = ["crates/fleet"]
+
+[workspace.package]
+edition = "2024"
+publish = false
