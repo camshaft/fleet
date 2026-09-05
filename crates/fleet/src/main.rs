@@ -179,6 +179,10 @@ impl Fleet {
     fn stopfile(&self, agent: &str) -> PathBuf {
         self.root.join("stop").join(agent)
     }
+    /// Ensure the agent's inbox (+ its `processed/` archive) exists. Idempotent.
+    fn ensure_inbox(&self, agent: &str) {
+        std::fs::create_dir_all(self.inbox(agent).join("processed")).ok();
+    }
 
     /// Load the runtime registry; empty on absent/malformed (never a hard fail — the manifest is recreated).
     fn load(&self) -> Registry {
@@ -609,6 +613,25 @@ fn agent_branch(name: &str) -> String {
     format!("fleet/{name}")
 }
 
+/// Build a runtime [`Agent`] row from a declared [`RosterEntry`] + the worktree path, deriving the
+/// runtime-only fields (branch, worktree, status=active, disallow_ask-from-role) — the desired→actual
+/// projection `fleet up` uses when it provisions a declared agent.
+fn agent_from_roster(entry: &RosterEntry, worktree: &Path) -> Agent {
+    Agent {
+        name: entry.name.clone(),
+        role: entry.role.clone(),
+        vertical: entry.vertical.clone(),
+        area: entry.area.clone(),
+        worktree: worktree.to_string_lossy().to_string(),
+        branch: agent_branch(&entry.name),
+        interval: entry.interval.clone(),
+        model: entry.model.clone(),
+        effort: entry.effort.clone(),
+        status: "active".to_string(),
+        disallow_ask: !role_is_terminal_interactive(&entry.role),
+    }
+}
+
 /// Idempotently ensure agent `name`'s worktree exists, cut from `base` in the TARGET repo. Unlike
 /// cadenza's hub-anchored `ensure_worktree`, this is PARAMETERIZED by the target repo + base (the
 /// multi-repo generalization): `git -C <target_repo> worktree add -b fleet/<name> <hub>/.claude/
@@ -692,7 +715,15 @@ fn reconcile_plan(declared: &[RosterEntry], running: &[Agent]) -> ReconcilePlan 
 /// worktree-mint + window-launch of `to_launch` agents lands with the window-management slice (it needs
 /// ensure_worktree(target repo+base) + the tmux launcher, deferred here). Reads the target repo path +
 /// adapter hooks but does NOT run the gate/merge hooks (those are the per-repo adapter's, not core's).
-fn up(fleet: &Fleet, config_path: &Path) {
+/// Upsert an active registry row for `agent` (replace any existing same-name row so a `stopped`→`active`
+/// re-launch flips cleanly), returning the mutated registry. Pure so the upsert is unit-tested.
+fn upsert_agent(mut reg: Registry, agent: Agent) -> Registry {
+    reg.agents.retain(|a| a.name != agent.name);
+    reg.agents.push(agent);
+    reg
+}
+
+fn up(fleet: &Fleet, config_path: &Path, provision: bool) {
     let text = match std::fs::read_to_string(config_path) {
         Ok(t) => t,
         Err(e) => {
@@ -710,7 +741,7 @@ fn up(fleet: &Fleet, config_path: &Path) {
             std::process::exit(1);
         }
     };
-    let reg = fleet.load();
+    let mut reg = fleet.load();
     let plan = reconcile_plan(&cfg.agents, &reg.agents);
     println!(
         "fleet up: target repo {} (base {}, gate {:?}, merge {:?}) — {} declared agent(s):",
@@ -723,22 +754,57 @@ fn up(fleet: &Fleet, config_path: &Path) {
     if !plan.already_running.is_empty() {
         println!("  ✓ already running: {}", plan.already_running.join(", "));
     }
-    if !plan.to_launch.is_empty() {
-        println!(
-            "  ⟳ TO LAUNCH ({}): {}  [dry-run — worktree-mint + window-launch land with the window-mgmt slice]",
-            plan.to_launch.len(),
-            plan.to_launch.join(", ")
-        );
-    }
     if !plan.undeclared_running.is_empty() {
         println!(
             "  ⚠ undeclared-but-running (drift, NOT auto-removed): {}",
             plan.undeclared_running.join(", ")
         );
     }
-    if plan.to_launch.is_empty() && plan.undeclared_running.is_empty() {
-        println!("  ✓ reconciled — every declared agent is running, no drift.");
+    if plan.to_launch.is_empty() {
+        if plan.undeclared_running.is_empty() {
+            println!("  ✓ reconciled — every declared agent is running, no drift.");
+        }
+        return;
     }
+    if !provision {
+        println!(
+            "  ⟳ TO LAUNCH ({}): {}  [dry-run — pass --provision to create worktree+inbox+registry row; \
+             the tmux WINDOW launch lands with the window-mgmt slice]",
+            plan.to_launch.len(),
+            plan.to_launch.join(", ")
+        );
+        return;
+    }
+    // --provision: materialize each to_launch agent's DURABLE state (worktree + inbox + active registry
+    // row). The tmux window launch is still deferred (window-mgmt slice) — a provisioned-not-launched
+    // agent has its worktree + row + inbox ready, which is exactly the pre-launch state.
+    let target = Path::new(&cfg.repo.path);
+    let mut provisioned = 0usize;
+    for name in &plan.to_launch {
+        let Some(entry) = cfg.agents.iter().find(|e| &e.name == name) else {
+            continue;
+        };
+        match ensure_worktree(fleet, target, &cfg.repo.base, name) {
+            Ok(wt) => {
+                fleet.ensure_inbox(name);
+                let _ = std::fs::remove_file(fleet.stopfile(name));
+                reg = upsert_agent(reg, agent_from_roster(entry, &wt));
+                provisioned += 1;
+                println!(
+                    "  + provisioned '{name}' (worktree {} + inbox + active row)",
+                    wt.display()
+                );
+            }
+            Err(why) => eprintln!("  ! '{name}': {why} — skipped"),
+        }
+    }
+    if provisioned > 0 {
+        fleet.save(&reg);
+    }
+    println!(
+        "  ✓ provisioned {provisioned}/{} declared-to-launch agent(s) — window launch pending the window-mgmt slice.",
+        plan.to_launch.len()
+    );
 }
 
 // ── describe (window.sh eval surface) ────────────────────────────────────────────────────────────
@@ -998,11 +1064,15 @@ enum Cmd {
         /// The agent name.
         name: String,
     },
-    /// Reconcile a target repo's checked-in `fleet.toml` declared roster against the running fleet
-    /// (reports the plan; the actual launch lands with the window-management slice).
+    /// Reconcile a target repo's checked-in `fleet.toml` declared roster against the running fleet.
+    /// Reports the plan by default; `--provision` materializes to_launch agents' durable state (worktree
+    /// + inbox + active registry row). The tmux window launch lands with the window-management slice.
     Up {
         /// Path to the target repo's `fleet.toml`.
         config: PathBuf,
+        /// Actually provision to_launch agents (create worktree + inbox + registry row), not just report.
+        #[arg(long)]
+        provision: bool,
     },
 }
 
@@ -1028,7 +1098,7 @@ fn main() {
             None => inbox_list(&fleet, &name),
         },
         Cmd::Describe { name } => describe(&fleet, &name),
-        Cmd::Up { config } => up(&fleet, &config),
+        Cmd::Up { config, provision } => up(&fleet, &config, provision),
     }
 }
 
@@ -1349,6 +1419,32 @@ mod tests {
             fleet.worktrees_dir(),
             PathBuf::from("/some/hub/.claude/worktrees")
         );
+    }
+
+    #[test]
+    fn agent_from_roster_derives_runtime_fields() {
+        let e = mk_declared("v-x");
+        let a = agent_from_roster(&e, Path::new("/wt/v-x"));
+        assert_eq!(a.name, "v-x");
+        assert_eq!(a.branch, "fleet/v-x");
+        assert_eq!(a.worktree, "/wt/v-x");
+        assert_eq!(a.status, "active");
+        assert!(a.disallow_ask, "vertical role → AskUserQuestion denied");
+        // A design agent keeps the interactive prompt.
+        let mut d = mk_declared("des");
+        d.role = "design".into();
+        assert!(!agent_from_roster(&d, Path::new("/wt/des")).disallow_ask);
+    }
+
+    #[test]
+    fn upsert_agent_replaces_a_same_name_row_so_stopped_flips_to_active() {
+        let reg = Registry {
+            agents: vec![mk_agent("a", "stopped"), mk_agent("b", "active")],
+        };
+        let reg = upsert_agent(reg, mk_agent("a", "active"));
+        assert_eq!(reg.agents.len(), 2, "no duplicate row for 'a'");
+        let a = reg.agents.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(a.status, "active", "stopped row replaced by the active one");
     }
 
     #[test]
