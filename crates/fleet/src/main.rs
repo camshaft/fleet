@@ -667,6 +667,65 @@ fn ensure_worktree(
     }
 }
 
+// ── tmux window launch ─────────────────────────────────────────────────────────────────────────
+
+/// The tmux session the fleet's windows live in (`$FLEET_SESSION`, else `main`).
+fn fleet_session() -> String {
+    std::env::var("FLEET_SESSION").unwrap_or_else(|_| "main".to_string())
+}
+
+/// Where the launcher script lives (`$FLEET_WINDOW_SH`, else the hub copy `<hub>/.claude/fleet/window.sh`
+/// materialized at setup). window.sh resolves the agent's config via `fleet describe` + launches claude.
+fn window_sh_path(fleet: &Fleet) -> PathBuf {
+    std::env::var_os("FLEET_WINDOW_SH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fleet.root.join("window.sh"))
+}
+
+/// The `tmux new-window` argv to open agent `name`'s window (cwd = its worktree) running the launcher.
+/// Pure so the command construction is unit-tested without spawning tmux. `-c <worktree>` sets the
+/// window's start dir; the window runs `bash <window_sh> <name>`.
+fn new_window_argv(session: &str, name: &str, worktree: &str, window_sh: &str) -> Vec<String> {
+    vec![
+        "new-window".into(),
+        "-t".into(),
+        format!("{session}:"),
+        "-n".into(),
+        name.into(),
+        "-c".into(),
+        worktree.into(),
+        "bash".into(),
+        window_sh.into(),
+        name.into(),
+    ]
+}
+
+/// Launch agent `name`'s tmux window (ensure the session exists first). Side-effecting; a tmux hiccup is
+/// reported (not fatal) so one launch failure doesn't abort a batch. Returns whether the window launched.
+fn launch_window(session: &str, name: &str, worktree: &str, window_sh: &Path) -> bool {
+    let tmux = |args: &[&str]| {
+        std::process::Command::new("tmux")
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    // Ensure the session exists (detached) before adding a window.
+    if !tmux(&["has-session", "-t", session]) {
+        let _ = tmux(&["new-session", "-d", "-s", session]);
+    }
+    let ws = window_sh.to_string_lossy().to_string();
+    let argv = new_window_argv(session, name, worktree, &ws);
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let ok = tmux(&argv_ref);
+    if !ok {
+        eprintln!(
+            "  ! '{name}': tmux new-window failed (window not launched — worktree/row are provisioned)"
+        );
+    }
+    ok
+}
+
 // ── reconcile (decentralized roster: declared desired-state → running actual-state) ────────────────
 
 /// The reconcile plan for one target: which DECLARED agents need launching (absent from the runtime
@@ -723,7 +782,7 @@ fn upsert_agent(mut reg: Registry, agent: Agent) -> Registry {
     reg
 }
 
-fn up(fleet: &Fleet, config_path: &Path, provision: bool) {
+fn up(fleet: &Fleet, config_path: &Path, provision: bool, launch: bool) {
     let text = match std::fs::read_to_string(config_path) {
         Ok(t) => t,
         Err(e) => {
@@ -779,7 +838,10 @@ fn up(fleet: &Fleet, config_path: &Path, provision: bool) {
     // row). The tmux window launch is still deferred (window-mgmt slice) — a provisioned-not-launched
     // agent has its worktree + row + inbox ready, which is exactly the pre-launch state.
     let target = Path::new(&cfg.repo.path);
+    let session = fleet_session();
+    let window_sh = window_sh_path(fleet);
     let mut provisioned = 0usize;
+    let mut launched = 0usize;
     for name in &plan.to_launch {
         let Some(entry) = cfg.agents.iter().find(|e| &e.name == name) else {
             continue;
@@ -794,6 +856,10 @@ fn up(fleet: &Fleet, config_path: &Path, provision: bool) {
                     "  + provisioned '{name}' (worktree {} + inbox + active row)",
                     wt.display()
                 );
+                if launch && launch_window(&session, name, &wt.to_string_lossy(), &window_sh) {
+                    launched += 1;
+                    println!("  ▶ launched '{name}' in tmux session '{session}'");
+                }
             }
             Err(why) => eprintln!("  ! '{name}': {why} — skipped"),
         }
@@ -801,10 +867,17 @@ fn up(fleet: &Fleet, config_path: &Path, provision: bool) {
     if provisioned > 0 {
         fleet.save(&reg);
     }
-    println!(
-        "  ✓ provisioned {provisioned}/{} declared-to-launch agent(s) — window launch pending the window-mgmt slice.",
-        plan.to_launch.len()
-    );
+    if launch {
+        println!(
+            "  ✓ provisioned {provisioned}/{} + launched {launched} window(s) in '{session}'.",
+            plan.to_launch.len()
+        );
+    } else {
+        println!(
+            "  ✓ provisioned {provisioned}/{} declared-to-launch agent(s) — pass --launch to also open tmux windows.",
+            plan.to_launch.len()
+        );
+    }
 }
 
 // ── describe (window.sh eval surface) ────────────────────────────────────────────────────────────
@@ -1073,6 +1146,9 @@ enum Cmd {
         /// Actually provision to_launch agents (create worktree + inbox + registry row), not just report.
         #[arg(long)]
         provision: bool,
+        /// Also open a tmux window per provisioned agent (implies --provision). No-op without --provision.
+        #[arg(long)]
+        launch: bool,
     },
 }
 
@@ -1098,7 +1174,11 @@ fn main() {
             None => inbox_list(&fleet, &name),
         },
         Cmd::Describe { name } => describe(&fleet, &name),
-        Cmd::Up { config, provision } => up(&fleet, &config, provision),
+        Cmd::Up {
+            config,
+            provision,
+            launch,
+        } => up(&fleet, &config, provision || launch, launch),
     }
 }
 
@@ -1406,6 +1486,26 @@ mod tests {
             plan.undeclared_running,
             vec!["x".to_string()],
             "stopped y is not drift"
+        );
+    }
+
+    #[test]
+    fn new_window_argv_opens_the_launcher_in_the_worktree_cwd() {
+        let argv = new_window_argv("main", "v-x", "/wt/v-x", "/hub/window.sh");
+        assert_eq!(
+            argv,
+            vec![
+                "new-window",
+                "-t",
+                "main:",
+                "-n",
+                "v-x",
+                "-c",
+                "/wt/v-x",
+                "bash",
+                "/hub/window.sh",
+                "v-x",
+            ]
         );
     }
 
