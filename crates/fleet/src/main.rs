@@ -1079,6 +1079,86 @@ fn inbox_depth(fleet: &Fleet, name: &str) -> String {
     }
 }
 
+// ── watchdog decision core (pure — the tmux pane-capture + send-keys sweep wraps these later) ───────
+
+/// Context-% at/above which the watchdog surfaces a saturation warning (report-only) — below the 100%
+/// wall so an agent can still self-`/compact`. Lifted verbatim from cadenza fleet.rs.
+const CTX_SATURATION_THRESHOLD: u8 = 85;
+/// Context-% at which an agent is UNRECOVERABLY WEDGED — `/compact` can no longer submit, so only a
+/// restart clears it.
+const CTX_WEDGE_THRESHOLD: u8 = 100;
+/// PRE-WALL escalation threshold for a general agent — high enough that "hasn't self-compacted yet" is a
+/// real signal, but below the wall so a `/compact` can still submit.
+const CTX_PREWALL_THRESHOLD: u8 = 95;
+/// PRE-WALL threshold for the merge-integrator role (if any) — earlier, since its wedge stalls the whole
+/// queue. (In the standalone fleet this is a per-target-adapter role, e.g. cadenza's pr-sync.)
+const CTX_PREWALL_THRESHOLD_INTEGRATOR: u8 = 92;
+
+// Threshold ordering invariant, guarded at COMPILE time (a bad future edit fails the build, not a test).
+const _: () = assert!(
+    CTX_PREWALL_THRESHOLD_INTEGRATOR < CTX_PREWALL_THRESHOLD,
+    "the single-writer integrator must escalate earlier than a general agent"
+);
+const _: () = assert!(
+    CTX_PREWALL_THRESHOLD < CTX_WEDGE_THRESHOLD,
+    "the pre-wall bound must sit below the 100% wall so /compact can still submit"
+);
+
+/// The pre-wall escalation threshold for `role` — the earlier integrator bound for a single-writer
+/// integrator role, else the general bound. Pure. (Which role is the integrator is a per-target-adapter
+/// concern; the standalone core just knows the general-vs-earlier policy.)
+fn prewall_threshold_for(is_integrator: bool) -> u8 {
+    if is_integrator {
+        CTX_PREWALL_THRESHOLD_INTEGRATOR
+    } else {
+        CTX_PREWALL_THRESHOLD
+    }
+}
+
+/// A just-completed compaction banner — its visible `% context` is the PRE-compaction stale value, so
+/// `parse_context_pct` returns None (unknown, not saturated) when this is present.
+fn pane_shows_recent_compaction(pane_text: &str) -> bool {
+    let lower = pane_text.to_ascii_lowercase();
+    lower.contains("compacted") && lower.contains("see full summary")
+}
+
+/// Parse the "% context" indicator Claude Code renders in its status line out of a captured pane. Takes
+/// the LAST match (the live status line is at the bottom). `None` if absent, or if the pane shows a
+/// just-completed compaction (the visible % is then stale). Pure so the parse is unit-tested.
+fn parse_context_pct(pane_text: &str) -> Option<u8> {
+    if pane_shows_recent_compaction(pane_text) {
+        return None;
+    }
+    let bytes = pane_text.as_bytes();
+    let mut found: Option<u8> = None;
+    for (i, _) in pane_text.match_indices("% context") {
+        let mut start = i;
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        if start < i
+            && let Ok(pct) = pane_text[start..i].parse::<u16>()
+        {
+            found = Some(pct.min(100) as u8);
+        }
+    }
+    found
+}
+
+/// Should the watchdog send-keys `/compact` this sweep? Fires ONLY in the PRE-WALL band [saturation, wall)
+/// — agents can't self-invoke `/compact` (a built-in, not a tool) — and not recently sent (thrash-guard).
+/// Pure so the trigger is unit-tested without tmux.
+fn should_send_compact(ctx_pct: Option<u8>, sent_recently: bool) -> bool {
+    matches!(ctx_pct, Some(p) if (CTX_SATURATION_THRESHOLD..CTX_WEDGE_THRESHOLD).contains(&p))
+        && !sent_recently
+}
+
+/// Should the watchdog AUTO-RESTART a wedged agent (at/above the 100% wall, where `/compact` can't
+/// submit)? Not if restarted recently (thrash-guard). Pure.
+fn should_auto_restart_wedge(ctx_pct: Option<u8>, restarted_recently: bool) -> bool {
+    matches!(ctx_pct, Some(p) if p >= CTX_WEDGE_THRESHOLD) && !restarted_recently
+}
+
 #[derive(Parser)]
 #[command(
     name = "fleet",
@@ -1487,6 +1567,55 @@ mod tests {
             vec!["x".to_string()],
             "stopped y is not drift"
         );
+    }
+
+    #[test]
+    fn parse_context_pct_takes_last_match_clamps_and_skips_recent_compaction() {
+        assert_eq!(parse_context_pct("noise 85% context used"), Some(85));
+        // takes the LAST (bottom = live status line)
+        assert_eq!(
+            parse_context_pct("40% context used\n…\n97% context used"),
+            Some(97)
+        );
+        assert_eq!(parse_context_pct("120% context"), Some(100), "clamped");
+        assert_eq!(parse_context_pct("no marker here"), None);
+        // a just-compacted pane's % is stale → unknown, not saturated
+        assert_eq!(
+            parse_context_pct("Compacted. ctrl+o to see full summary. 99% context"),
+            None
+        );
+    }
+
+    #[test]
+    fn compact_and_wedge_decisions_respect_the_bands_and_thrash_guards() {
+        // pre-wall band [85,100) → compact (unless recently sent)
+        assert!(should_send_compact(Some(85), false));
+        assert!(should_send_compact(Some(99), false));
+        assert!(!should_send_compact(Some(99), true), "thrash-guard");
+        assert!(!should_send_compact(Some(84), false), "below saturation");
+        assert!(
+            !should_send_compact(Some(100), false),
+            "at wall → restart, not compact"
+        );
+        assert!(!should_send_compact(None, false));
+        // at/above the wall → restart (unless recently restarted)
+        assert!(should_auto_restart_wedge(Some(100), false));
+        assert!(!should_auto_restart_wedge(Some(100), true), "thrash-guard");
+        assert!(
+            !should_auto_restart_wedge(Some(99), false),
+            "still pre-wall"
+        );
+        assert!(!should_auto_restart_wedge(None, false));
+    }
+
+    #[test]
+    fn prewall_threshold_is_earlier_for_the_integrator() {
+        assert_eq!(
+            prewall_threshold_for(true),
+            CTX_PREWALL_THRESHOLD_INTEGRATOR
+        );
+        assert_eq!(prewall_threshold_for(false), CTX_PREWALL_THRESHOLD);
+        assert!(prewall_threshold_for(true) < prewall_threshold_for(false));
     }
 
     #[test]
