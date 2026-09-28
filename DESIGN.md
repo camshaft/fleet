@@ -1,8 +1,65 @@
 # DESIGN: extract the fleet into a standalone multi-repo orchestrator
 
-Status: **greenlit to design-doc stage** (operator, 2026-09-05); actual repo-creation / migration is
-**gated on operator approval of THIS doc + a repo name**. Owner: `v-fleet-tooling`. Nothing is created or
-moved until approval.
+Status: **greenlit to design-doc stage** (operator, 2026-09-05). Repo created. **REARCHITECTED
+2026-09-28** — see the board-offload section immediately below; the 2026-09-05 architecture beneath it is
+partly SUPERSEDED. Owner: `v-fleet-tooling`. Operator direction (2026-09-28): make `camshaft/fleet` the
+real fleet, get it in shape, then **deprecate the cadenza-embedded fleet functionality entirely**; prefer
+a real language (Rust) over bash for everything.
+
+---
+
+## 2026-09-28 REARCHITECTURE — the task board offloads the fleet "core"
+
+Since 2026-09-05 a standalone **task board** (an MCP + REST server with a live agent roster) shipped and
+became the fleet's coordination substrate. It already provides, as durable server features, most of what
+the 2026-09-05 plan was going to REIMPLEMENT in the fleet core:
+
+- **Agent roster / registry** — `register_agent` / `update_agent` / `get_agent` / `list_agents`, each agent
+  carrying `charter` + an arbitrary `metadata` bag (role/model/effort/interval/**repos**/…). This REPLACES
+  `registry.json` and the decentralized per-repo `fleet.toml` rosters. **The board is the registry.**
+- **Messaging bus** — `send_message` / `get_messages` / `check_notifications` / `get_events` /
+  `subscribe`. This REPLACES the file inbox (`inbox/`, `.delivery-seq`, `processed/`). **Agents coordinate
+  through the board.**
+- **Charters** — the `charter` field is the source of an agent's role prompt. This REPLACES
+  `loops/<role>.md` as the authored source (a checked-in seed remains a bootstrap fallback).
+- **Task tracking** — projects/tasks/comments/status replace the ad-hoc backlog.
+
+**Consequence: the fleet crate does NOT reimplement any of that.** The in-progress "lift `registry.json` +
+inbox byte-identical from cadenza `fleet.rs`" in `crates/fleet/src/main.rs` is therefore SUPERSEDED — that
+state lives on the board now. What remains for `fleet` to own is exactly the set of things the board can't:
+
+1. **Workspace materialization** — a per-agent workspace directory holding one git **worktree per repo**
+   off a shared **bare-mirror store** (`~/.fleet/mirrors/<repo>.git` + `~/.fleet/agents/<agent>/<repo>`),
+   so an agent works across many repos with N agents sharing a repo's objects. (Reference logic prototyped
+   in cadenza `fleet/agent-workspace.sh` + `fleet/board-reconcile-workspaces.py` — to be ported to Rust
+   here; see cadenza `fleet/DESIGN-fleet-per-agent-workspaces.md`.)
+2. **Spin-up / launch** — launch an agent process (tmux window) in its workspace with the board MCP
+   available and a **board-sourced charter** kickoff, at the agent's declared model/effort/interval.
+   (Reference: cadenza `window.sh`; port to Rust, board-driven, no cadenza framing.)
+3. **Liveness / orchestration** — the watchdog, keyed off the board's `last_seen`/`status` (not file
+   heartbeats): detect wedged/idle/dead agents, re-arm/reissue, escalate. Host-health crons (tmp/disk/cpu)
+   stay host-level and board-independent.
+4. **Per-repo ADAPTER** — how to gate/build/merge in a given repo (the one thing the board doesn't know).
+   Stays per-repo; cadenza plugs in its nix gate; a plain repo declares none.
+
+**Revised, board-offloaded scope for the `fleet` crate (Rust — not bash):**
+- a small **board client** (roster read, charter fetch, messaging, presence) over the board MCP/REST;
+- the **workspace materializer** (mirrors + worktrees);
+- **spin-up** (launch a board-declared agent into its workspace with a board charter);
+- **liveness/watchdog** off the board;
+- host-health;
+- the per-repo adapter interface.
+
+**Revised plan:** (P1) board client + workspace materializer + spin-up, proven END-TO-END on a single
+pilot (`v-task-board`, off-tree, small repo) — an agent that materializes its workspace, boots with a
+board charter, and coordinates via the board; (P2) liveness/watchdog off the board + host-health + the
+adapter interface, migrate more agents; (P3) deprecate the cadenza-embedded fleet once parity is proven.
+The pilot's workspace already materializes (cadenza-prototyped) at `~/.fleet/agents/v-task-board/task-board`.
+
+The 2026-09-05 architecture below is retained for history; treat the board-offloaded scope above as the
+current plan wherever the two conflict (registry/inbox/messaging/roster → the board, not the fleet crate).
+
+---
 
 ## Motivation
 
