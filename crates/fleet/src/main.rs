@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 mod board;
 mod config;
 mod notify;
+mod transcripts;
 mod workspace;
+
+use transcripts::Harness as _; // bring the harness-seam methods (`.id()`) into scope for rendering
 
 /// The tmux session board-native agents run in (their windows are opened here by `launch_board_agent`, and
 /// the notifier injects wakes here). From `config.session`, else `main`.
@@ -1320,6 +1323,24 @@ enum Cmd {
         #[arg(long, default_value_t = 8899)]
         port: u16,
     },
+    /// Print a FAITHFUL, LOSSLESS rendering of an agent's harness session transcript (every turn, tool call,
+    /// tool result, and error — no digest/summary), with secrets scrubbed. `--since <session:offset>` emits
+    /// only content past a prior watermark, plus `--overlap` lines of prior context; the new watermark is
+    /// printed at the end so the next observation can advance. This is the reader the fleet-self-improve
+    /// observers (#176/#187) read from.
+    Transcripts {
+        /// The agent id whose transcript to render.
+        agent: String,
+        /// Render exactly this session JSONL file instead of locating the agent's newest session.
+        #[arg(long)]
+        session: Option<PathBuf>,
+        /// Only emit content past this `<session-id>:<line-offset>` watermark (from a prior run's footer).
+        #[arg(long)]
+        since: Option<String>,
+        /// Lines of prior context to re-include before the `--since` offset, so no boundary is lost.
+        #[arg(long, default_value_t = 40)]
+        overlap: usize,
+    },
 }
 
 fn main() {
@@ -1367,6 +1388,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Cmd::Transcripts {
+            agent,
+            session,
+            since,
+            overlap,
+        } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap),
     }
 }
 
@@ -2212,6 +2239,53 @@ fn set_interval(fleet: &Fleet, agent: &str, interval: &str) {
         fleet.save(&reg);
         println!("  also updated the file-hub registry row (kept in sync during migration)");
     }
+}
+
+/// Render an agent's session transcript faithfully (see [`transcripts`]). Resolves the session file
+/// (`--session`, else the watermark's session, else the agent's newest), parses it, windows it by the
+/// `--since` record offset backed up by `--overlap`, renders + scrubs, and prints the advancing watermark.
+/// The watermark offset is a RECORD index (parsed JSONL records already observed), printed as
+/// `<session-id>:<record-count>` in the footer.
+fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, overlap: usize) {
+    let (path, want_offset) = match session {
+        Some(p) => (
+            p.to_path_buf(),
+            since.map(|s| transcripts::parse_watermark(s).1).unwrap_or(0),
+        ),
+        None => {
+            let sessions = transcripts::locate_sessions(agent);
+            if sessions.is_empty() {
+                eprintln!("fleet transcripts: no session files found for '{agent}' (try --session <file>)");
+                std::process::exit(1);
+            }
+            match since.map(transcripts::parse_watermark) {
+                // Watermark names a session: render THAT one from its offset if we can find it, else the
+                // newest from the start (the named session rotated away).
+                Some((sid, off)) => match sessions.iter().find(|p| transcripts::session_id_of(p) == sid) {
+                    Some(p) => (p.clone(), off),
+                    None => (sessions.into_iter().next().unwrap(), 0),
+                },
+                None => (sessions.into_iter().next().unwrap(), 0),
+            }
+        }
+    };
+
+    let (records, _lines) = transcripts::parse_jsonl(&path).unwrap_or_else(|e| {
+        eprintln!("fleet transcripts: {e}");
+        std::process::exit(1);
+    });
+    let start = transcripts::window_start(want_offset, overlap).min(records.len());
+    let windowed = &records[start..];
+    let sid = transcripts::session_id_of(&path);
+
+    println!(
+        "=== transcript: {agent} · session {sid} · records {start}..{} (overlap {overlap}) · harness {} ===",
+        records.len(),
+        transcripts::ClaudeCode.id()
+    );
+    print!("{}", transcripts::render(windowed, &transcripts::ClaudeCode));
+    // The advancing watermark: feed back as `--since <this>` next observation.
+    println!("=== watermark: {sid}:{} ===", records.len());
 }
 
 #[cfg(test)]
