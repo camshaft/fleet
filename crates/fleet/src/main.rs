@@ -1770,6 +1770,49 @@ fn watchdog_verdict(age_secs: i64, interval_secs: u64) -> &'static str {
     }
 }
 
+/// Capture an agent's visible tmux pane text (no scrollback), or `None` if tmux errors / the window is gone.
+fn capture_pane(session: &str, agent: &str) -> Option<String> {
+    let target = format!("{session}:{agent}");
+    std::process::Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", &target])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+/// Does the pane show Claude Code's IDLE input prompt — a line that is just the `❯` glyph with an empty
+/// input? While a turn is generating, the input line is replaced by the live status, so a bare `❯` line is
+/// a reliable IDLE signal (a line with typed text after `❯` does NOT match). Pure — unit-tested.
+fn pane_shows_idle_prompt(pane_text: &str) -> bool {
+    pane_text.lines().any(|l| l.trim() == "❯")
+}
+
+/// Does the pane show Claude actively working (a turn in flight)? Mirrors the cadenza watchdog heuristic so
+/// the auto-wake NEVER injects into a heads-down pane (operator ban 2026-09-10 + the seq-1387 wake-only
+/// fence). An idle `❯` prompt overrides the lingering footer ("esc to interrupt" in the persistent hint)
+/// and a completed turn's token remnant; otherwise the working affordances (live meter, API-retry,
+/// backgrounding hint) mean a turn is generating. Tracks Claude Code's status-line vocabulary. Pure.
+fn pane_shows_working(pane_text: &str) -> bool {
+    if pane_shows_idle_prompt(pane_text) {
+        return false;
+    }
+    pane_text.contains("esc to interrupt")
+        || pane_text.contains("Retrying in ")
+        || pane_text.contains("Retrying…")
+        || pane_text.contains("to run in background")
+        || ((pane_text.contains("↓") || pane_text.contains("↑")) && pane_text.contains("tokens"))
+}
+
+/// Is the agent's pane actively working right now? Captures the visible pane and classifies it. A capture
+/// failure (no window / tmux error) returns false — the caller then treats "not working" per its own
+/// window-existence handling (the wake inject itself no-ops on a missing window).
+fn window_is_working(session: &str, agent: &str) -> bool {
+    capture_pane(session, agent)
+        .map(|s| pane_shows_working(&s))
+        .unwrap_or(false)
+}
+
 /// The wake injected into a re-arm candidate's window by `fleet watchdog --rearm`. It never reaps or
 /// restarts (the operator banned auto-reap) — it nudges the agent to run a tick, which is exactly what a
 /// human was doing by hand for stalled loops. A benign prompt: worst case the agent no-ops one tick.
@@ -1835,12 +1878,19 @@ fn watchdog(stale_only: bool, rearm: bool) {
         let action = if retighten {
             flagged += 1;
             if rearm {
-                match notify::tmux_inject(&session, id, WATCHDOG_REARM_WAKE) {
-                    Ok(()) => {
-                        rearmed += 1;
-                        "re-armed"
+                // HARD FENCE (operator ban 2026-09-10 + seq-1387 wake-only): NEVER inject into a pane that
+                // is actively working — that would interrupt a heads-down turn. Only wake a genuinely idle
+                // (or gone) pane. A working candidate is left alone this sweep; the next sweep re-checks.
+                if window_is_working(&session, id) {
+                    "working-skip"
+                } else {
+                    match notify::tmux_inject(&session, id, WATCHDOG_REARM_WAKE) {
+                        Ok(()) => {
+                            rearmed += 1;
+                            "re-armed"
+                        }
+                        Err(_) => "no-window",
                     }
-                    Err(_) => "no-window",
                 }
             } else {
                 "candidate"
@@ -2012,6 +2062,22 @@ mod tests {
         assert!(is_retighten_candidate("ok", 1, 6 * 3600));
         // Open work on a SHORT interval is fine — it's already cycling fast.
         assert!(!is_retighten_candidate("ok", 3, 600), "10m with tasks is already tight");
+    }
+
+    #[test]
+    fn pane_working_detection_fences_heads_down_agents() {
+        // A bare idle prompt is NOT working — even with the lingering footer + a completed turn's token
+        // remnant (the exact false-positive the idle-prompt override guards against).
+        let idle = "some earlier output\n↓ 4.2k tokens\n⏵⏵ bypass permissions · esc to interrupt · ← for agents\n❯";
+        assert!(pane_shows_idle_prompt(idle));
+        assert!(!pane_shows_working(idle), "idle ❯ overrides lingering footer/token remnant");
+        // A turn in flight → working (no bare ❯ prompt while generating).
+        assert!(pane_shows_working("Percolating… (2m 3s · ↓ 12.0k tokens)"));
+        assert!(pane_shows_working("doing a thing  esc to interrupt"));
+        assert!(pane_shows_working("Retrying in 4s… (attempt 2/10)"));
+        assert!(pane_shows_working("(ctrl+b to run in background)"));
+        // No prompt and no working affordance → not working (e.g. a dead/shell pane) — safe to wake.
+        assert!(!pane_shows_working("bash-5.2$ "));
     }
 
     #[test]
