@@ -50,11 +50,17 @@ state lives on the board now. What remains for `fleet` to own is exactly the set
 - host-health;
 - the per-repo adapter interface.
 
-**Revised plan:** (P1) board client + workspace materializer + spin-up, proven END-TO-END on a single
-pilot (`v-task-board`, off-tree, small repo) — an agent that materializes its workspace, boots with a
-board charter, and coordinates via the board; (P2) liveness/watchdog off the board + host-health + the
-adapter interface, migrate more agents; (P3) deprecate the cadenza-embedded fleet once parity is proven.
-The pilot's workspace already materializes (cadenza-prototyped) at `~/.fleet/agents/v-task-board/task-board`.
+**Revised plan:**
+- **P1 — board client + workspace materializer + spin-up — DONE + PROVEN LIVE.** PR #1 (this
+  rearchitecture) · #2 (read-only REST board client + `fleet spin-up` dry-run) · #3 (`spin-up --apply`:
+  materialize a worktree off a shared bare mirror + launch a board-native window with a self-discovery
+  kickoff) · #4 (pre-trust the fleet root so launch is fully unattended). `fleet spin-up v-task-board
+  --apply` spun the pilot up end-to-end: it materialized `~/.fleet/agents/v-task-board/task-board` off the
+  shared mirror, read its OWN charter via `get_agent`, and now coordinates entirely via the board — it has
+  autonomously shipped real PRs in its target repo since. Cadenza-nonspecific, board-native, unattended.
+- **P2 (next)** — liveness/watchdog off the board `last_seen` + host-health + the per-repo adapter
+  interface; migrate more agents onto the `fleet spin-up` path.
+- **P3** — retire `registry.json` and deprecate the cadenza-embedded fleet once parity is proven.
 
 The 2026-09-05 architecture below is retained for history; treat the board-offloaded scope above as the
 current plan wherever the two conflict (registry/inbox/messaging/roster → the board, not the fleet crate).
