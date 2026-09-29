@@ -1359,6 +1359,13 @@ enum Cmd {
         /// `""` to clear the pin (unpinned = run-anywhere).
         #[arg(long)]
         host: Option<String>,
+        /// Set the board-native roster marker: `--native true` marks the agent board-native (the board
+        /// watchdog then judges its liveness by board `last_seen`, and the file-hub watchdog stops scanning
+        /// it); `--native false` clears it back to a file-hub row. Omitted = leave `native` untouched. This
+        /// is the migration flip for an agent that has BECOME board-active (its tick now polls the board)
+        /// but was launched outside `spin-up` (which sets `native:true` by construction).
+        #[arg(long)]
+        native: Option<bool>,
         /// Perform the write (default: just print the metadata patch that would be sent).
         #[arg(long)]
         apply: bool,
@@ -1448,8 +1455,9 @@ fn main() {
             repos,
             interval,
             host,
+            native,
             apply,
-        } => set_meta(&agent, &repos, interval.as_deref(), host.as_deref(), apply),
+        } => set_meta(&agent, &repos, interval.as_deref(), host.as_deref(), native, apply),
         Cmd::SetInterval { agent, interval } => set_interval(&fleet, &agent, &interval),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
@@ -2265,6 +2273,7 @@ fn build_meta_patch(
     repos: &[String],
     interval: Option<&str>,
     host: Option<&str>,
+    native: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let mut patch = serde_json::Map::new();
     if !repos.is_empty() {
@@ -2283,17 +2292,28 @@ fn build_meta_patch(
         };
         patch.insert("host".to_string(), val);
     }
+    if let Some(n) = native {
+        // The board-native roster marker the watchdog splits on (native → board-watchdog; else file-hub).
+        patch.insert("native".to_string(), serde_json::Value::Bool(n));
+    }
     if patch.is_empty() {
-        return Err("nothing to set — pass at least one --repo, --interval, or --host".to_string());
+        return Err("nothing to set — pass at least one --repo, --interval, --host, or --native".to_string());
     }
     Ok(serde_json::Value::Object(patch))
 }
 
-/// Write launch-shaping metadata (`repos` / `interval`) onto an agent's board record — the migration
-/// primitive. Reports the patch by default; `--apply` PATCHes it (key-level merge, so untouched keys are
-/// preserved) and reads the record back to confirm.
-fn set_meta(agent: &str, repos: &[String], interval: Option<&str>, host: Option<&str>, apply: bool) {
-    let patch = build_meta_patch(repos, interval, host).unwrap_or_else(|e| {
+/// Write launch-shaping metadata (`repos` / `interval` / `host` / `native`) onto an agent's board record —
+/// the migration primitive. Reports the patch by default; `--apply` PATCHes it (key-level merge, so
+/// untouched keys are preserved) and reads the record back to confirm.
+fn set_meta(
+    agent: &str,
+    repos: &[String],
+    interval: Option<&str>,
+    host: Option<&str>,
+    native: Option<bool>,
+    apply: bool,
+) {
+    let patch = build_meta_patch(repos, interval, host, native).unwrap_or_else(|e| {
         eprintln!("fleet set-meta: {e}");
         std::process::exit(2);
     });
@@ -2628,24 +2648,31 @@ mod tests {
 
     #[test]
     fn build_meta_patch_includes_only_requested_keys_and_errors_when_empty() {
-        let p = build_meta_patch(&["o/r@b".to_string()], Some("2m"), None).unwrap();
+        let p = build_meta_patch(&["o/r@b".to_string()], Some("2m"), None, None).unwrap();
         assert_eq!(p["repos"], serde_json::json!([{"repo":"o/r","branch":"b"}]));
         assert_eq!(p["interval"], "2m");
-        // repos only — no interval/host key
-        let p = build_meta_patch(&["o/r".to_string()], None, None).unwrap();
-        assert!(p.get("interval").is_none() && p.get("host").is_none());
+        // repos only — no interval/host/native key
+        let p = build_meta_patch(&["o/r".to_string()], None, None, None).unwrap();
+        assert!(p.get("interval").is_none() && p.get("host").is_none() && p.get("native").is_none());
         assert!(p.get("repos").is_some());
         // interval only — no repos key
-        let p = build_meta_patch(&[], Some("30m"), None).unwrap();
+        let p = build_meta_patch(&[], Some("30m"), None, None).unwrap();
         assert!(p.get("repos").is_none());
         assert_eq!(p["interval"], "30m");
         // host set, and "" clears the pin (JSON null)
-        let p = build_meta_patch(&[], None, Some("green-machine")).unwrap();
+        let p = build_meta_patch(&[], None, Some("green-machine"), None).unwrap();
         assert_eq!(p["host"], "green-machine");
-        let p = build_meta_patch(&[], None, Some("")).unwrap();
+        let p = build_meta_patch(&[], None, Some(""), None).unwrap();
         assert_eq!(p["host"], serde_json::Value::Null, "empty host clears the pin");
+        // native: tri-state — Some(true)/Some(false) emit the bool; None omits the key entirely
+        let p = build_meta_patch(&[], None, None, Some(true)).unwrap();
+        assert_eq!(p["native"], serde_json::Value::Bool(true), "--native true → the board-native marker");
+        let p = build_meta_patch(&[], None, None, Some(false)).unwrap();
+        assert_eq!(p["native"], serde_json::Value::Bool(false), "--native false → clear back to file-hub");
+        assert!(build_meta_patch(&["o/r".to_string()], None, None, None).unwrap().get("native").is_none(),
+            "native untouched when not requested");
         // nothing requested → error (guards a no-op PATCH)
-        assert!(build_meta_patch(&[], None, None).is_err());
+        assert!(build_meta_patch(&[], None, None, None).is_err());
     }
 
     #[test]
