@@ -44,6 +44,12 @@ pub fn workspace_dir(fleet_root: &str, agent: &str, repo: &str) -> String {
     format!("{fleet_root}/agents/{agent}/{}", repo_name(repo))
 }
 
+/// The base workspace directory for `<agent>` (no repo subdir) — where a repo-less agent (e.g. a board
+/// orchestrator that works via the board MCP rather than a code checkout) is run.
+pub fn agent_root_dir(fleet_root: &str, agent: &str) -> String {
+    format!("{fleet_root}/agents/{agent}")
+}
+
 /// The shared bare-mirror directory for `<repo>` under the fleet root. This is the git *common dir* of
 /// every agent's worktree of the repo, and therefore the path claude resolves a worktree to for its
 /// folder-trust check — so it is what must be pre-trusted for an unattended launch.
@@ -125,5 +131,12 @@ mod tests {
             workspace_dir("/root/.fleet", "v-x", "camshaft/task-board"),
             "/root/.fleet/agents/v-x/task-board"
         );
+    }
+
+    #[test]
+    fn mirror_dir_and_agent_root_dir() {
+        assert_eq!(mirror_dir("/root/.fleet", "camshaft/task-board"), "/root/.fleet/mirrors/task-board.git");
+        assert_eq!(mirror_dir("/root/.fleet", "camshaft/bolero.git"), "/root/.fleet/mirrors/bolero.git");
+        assert_eq!(agent_root_dir("/root/.fleet", "board-pm"), "/root/.fleet/agents/board-pm");
     }
 }
