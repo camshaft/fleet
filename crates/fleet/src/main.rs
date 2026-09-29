@@ -726,6 +726,208 @@ fn launch_window(session: &str, name: &str, worktree: &str, window_sh: &Path) ->
     ok
 }
 
+/// Whether a tmux window named `name` currently exists in `session` (the agent's loop is running there).
+/// Side-effecting (shells out to tmux); returns false on any tmux error so a wake degrades to "accepted".
+fn window_exists(session: &str, name: &str) -> bool {
+    let out = std::process::Command::new("tmux")
+        .args(["list-windows", "-t", session, "-F", "#{window_name}"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|w| w == name),
+        _ => false,
+    }
+}
+
+/// Inject a one-line wake into agent `name`'s tmux window: send the literal text, then Enter (so a
+/// Claude REPL submits it as a prompt). Side-effecting; returns whether the send-keys succeeded.
+fn send_wake(session: &str, name: &str, line: &str) -> bool {
+    let target = format!("{session}:{name}");
+    std::process::Command::new("tmux")
+        .args(["send-keys", "-t", &target, line, "Enter"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// ── notify (event-wake HTTP listener: the board's webhook POST → a tmux send-keys wake) ──────────────
+
+/// Where the notifier listens (`$FLEET_NOTIFY_ADDR`, else the reverse-tunnel default `127.0.0.1:8899`).
+/// Loopback-only by default: the board reaches it only through the reverse tunnel's local forward, so the
+/// listener never needs a public bind.
+fn notify_addr(cli_addr: Option<String>) -> String {
+    cli_addr
+        .or_else(|| std::env::var("FLEET_NOTIFY_ADDR").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:8899".to_string())
+}
+
+/// Sanitize an event `type` for safe interpolation into the injected wake line: keep only ascii
+/// alphanumerics, `.`, `_`, `-`; cap the length. Untrusted board input reaches a tmux pane as keystrokes,
+/// so we build the wake line ourselves and only ever interpolate this sanitized token + integer ids.
+fn sanitize_type(typ: &str) -> String {
+    let s: String = typ
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(48)
+        .collect();
+    if s.is_empty() { "event".to_string() } else { s }
+}
+
+/// Build the one-line wake text from the (sanitized) event type and the stable ids on the event. Prefers
+/// the task id (task events), then the monotonic event seq (messages/other), so the recipient sees a
+/// concrete pointer and knows to drain via `check_notifications`.
+fn wake_line(typ: &str, task_id: Option<i64>, event_seq: Option<i64>) -> String {
+    let typ = sanitize_type(typ);
+    match (task_id, event_seq) {
+        (Some(t), _) => format!("[notification] task #{t} ({typ}) — check_notifications"),
+        (None, Some(s)) => format!("[notification] message #{s} ({typ}) — check_notifications"),
+        (None, None) => format!("[notification] {typ} — check_notifications"),
+    }
+}
+
+/// Parse the HTTP request head from a byte buffer: returns `(method, path, content_length)` once the
+/// blank-line header terminator (`\r\n\r\n`) is present, else `None` (need more bytes). Pure so the
+/// framing is unit-tested without a socket. Content-Length defaults to 0 when absent/unparseable.
+fn parse_request_head(buf: &[u8]) -> Option<(String, String, usize)> {
+    let s = String::from_utf8_lossy(buf);
+    let head_end = s.find("\r\n\r\n")?;
+    let head = &s[..head_end];
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = v.trim().parse().unwrap_or(0);
+        }
+    }
+    Some((method, path, content_length))
+}
+
+/// Byte offset just past the `\r\n\r\n` header terminator in `buf`, if present.
+fn body_start(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Render a minimal HTTP/1.1 response with a JSON body and `Connection: close`.
+fn http_response(status_line: &str, json_body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json_body}",
+        json_body.len()
+    )
+    .into_bytes()
+}
+
+/// Handle one accepted notifier connection: read the request, parse the board webhook payload, and inject
+/// a wake into the recipient's tmux window. Best-effort — a malformed/oversized request gets a 4xx and the
+/// connection closes; a missing window is a 202 (the agent picks the event up on its next `/loop` poll).
+fn handle_notify_conn(mut stream: std::net::TcpStream, session: &str) {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
+    // Read until we have the full head + declared body (cap total to guard against a runaway sender).
+    const MAX: usize = 64 * 1024;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut head: Option<(String, String, usize)> = None;
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if head.is_none() {
+                    head = parse_request_head(&buf);
+                }
+                if let (Some((_, _, clen)), Some(bs)) = (head.as_ref(), body_start(&buf))
+                    && buf.len() >= bs + clen
+                {
+                    break;
+                }
+                if buf.len() > MAX {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let Some((method, _path, _clen)) = head else {
+        let _ = stream.write_all(&http_response("400 Bad Request", "{\"error\":\"malformed request\"}"));
+        return;
+    };
+    if !method.eq_ignore_ascii_case("POST") {
+        let _ = stream.write_all(&http_response(
+            "405 Method Not Allowed",
+            "{\"error\":\"POST only\"}",
+        ));
+        return;
+    }
+    let body = body_start(&buf).map(|bs| &buf[bs..]).unwrap_or(&[]);
+    let json: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = stream.write_all(&http_response("400 Bad Request", "{\"error\":\"invalid json\"}"));
+            return;
+        }
+    };
+    let recipient = json.get("recipient").and_then(|v| v.as_str()).unwrap_or("");
+    if recipient.is_empty() || validate_agent_name(recipient).is_err() {
+        let _ = stream.write_all(&http_response(
+            "400 Bad Request",
+            "{\"error\":\"missing or invalid recipient\"}",
+        ));
+        return;
+    }
+    let typ = json.get("type").and_then(|v| v.as_str()).unwrap_or("event");
+    let task_id = json.get("task_id").and_then(|v| v.as_i64());
+    let event_seq = json.get("event_seq").and_then(|v| v.as_i64());
+    let line = wake_line(typ, task_id, event_seq);
+
+    if window_exists(session, recipient) {
+        send_wake(session, recipient, &line);
+        let _ = stream.write_all(&http_response(
+            "200 OK",
+            &format!("{{\"status\":\"woken\",\"agent\":\"{recipient}\"}}"),
+        ));
+    } else {
+        // No live window — the agent will drain the event on its next poll. Not an error.
+        let _ = stream.write_all(&http_response(
+            "202 Accepted",
+            &format!("{{\"status\":\"accepted\",\"agent\":\"{recipient}\"}}"),
+        ));
+    }
+}
+
+/// Run the event-wake notifier: bind the listener and serve each connection on its own thread (so one slow
+/// client never stalls a wake). Blocks until killed — supervised as a tmux window on the fleet host.
+fn notify(cli_addr: Option<String>) {
+    let addr = notify_addr(cli_addr);
+    let session = fleet_session();
+    let listener = match std::net::TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("fleet notify: cannot bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("fleet notify: listening on {addr} (session '{session}') — POST board webhook events to wake agents");
+    for conn in listener.incoming() {
+        match conn {
+            Ok(stream) => {
+                let session = session.clone();
+                std::thread::spawn(move || handle_notify_conn(stream, &session));
+            }
+            Err(e) => eprintln!("fleet notify: accept error: {e}"),
+        }
+    }
+}
+
 // ── reconcile (decentralized roster: declared desired-state → running actual-state) ────────────────
 
 /// The reconcile plan for one target: which DECLARED agents need launching (absent from the runtime
@@ -1230,6 +1432,14 @@ enum Cmd {
         #[arg(long)]
         launch: bool,
     },
+    /// Run the event-wake notifier: an HTTP listener that receives the board's inbox-event webhook POSTs
+    /// (forwarded by the reverse tunnel) and injects a one-line wake into the recipient agent's tmux
+    /// window via send-keys. Blocks until killed; supervised as a tmux window on the fleet host.
+    Notify {
+        /// Listen address (else $FLEET_NOTIFY_ADDR, else 127.0.0.1:8899).
+        #[arg(long)]
+        addr: Option<String>,
+    },
 }
 
 fn main() {
@@ -1259,6 +1469,7 @@ fn main() {
             provision,
             launch,
         } => up(&fleet, &config, provision || launch, launch),
+        Cmd::Notify { addr } => notify(addr),
     }
 }
 
@@ -1357,6 +1568,76 @@ mod tests {
         assert!(validate_agent_name("../../etc").is_err());
         assert!(validate_agent_name("-flag").is_err(), "no leading hyphen");
         assert!(validate_agent_name("a/b").is_err(), "no path separator");
+    }
+
+    #[test]
+    fn notify_addr_prefers_cli_then_env_then_default() {
+        assert_eq!(notify_addr(Some("0.0.0.0:9000".into())), "0.0.0.0:9000");
+        // Env is only consulted when the CLI arg is absent; default is the loopback tunnel port.
+        assert_eq!(notify_addr(None), "127.0.0.1:8899");
+        assert_eq!(notify_addr(Some(String::new())), "127.0.0.1:8899");
+    }
+
+    #[test]
+    fn sanitize_type_strips_unsafe_chars_and_never_empties() {
+        assert_eq!(sanitize_type("task.commented"), "task.commented");
+        assert_eq!(sanitize_type("message.direct"), "message.direct");
+        assert_eq!(sanitize_type("evil; rm -rf /\nEnter"), "evilrm-rfEnter");
+        assert_eq!(sanitize_type(""), "event", "empty falls back to a safe token");
+        assert_eq!(sanitize_type("   "), "event", "whitespace-only → safe token");
+    }
+
+    #[test]
+    fn wake_line_prefers_task_then_seq_then_type() {
+        assert_eq!(
+            wake_line("task.assigned", Some(110), Some(570)),
+            "[notification] task #110 (task.assigned) — check_notifications"
+        );
+        assert_eq!(
+            wake_line("message.direct", None, Some(438)),
+            "[notification] message #438 (message.direct) — check_notifications"
+        );
+        assert_eq!(
+            wake_line("presence", None, None),
+            "[notification] presence — check_notifications"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_extracts_method_path_and_content_length() {
+        let req = b"POST /wake HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\n\r\n{...}";
+        let (m, p, clen) = parse_request_head(req).expect("head complete");
+        assert_eq!(m, "POST");
+        assert_eq!(p, "/wake");
+        assert_eq!(clen, 42);
+        // Header name match is case-insensitive.
+        let req2 = b"GET / HTTP/1.1\r\ncontent-length: 7\r\n\r\n";
+        assert_eq!(parse_request_head(req2).unwrap().2, 7);
+    }
+
+    #[test]
+    fn parse_request_head_needs_the_blank_line_terminator() {
+        // No `\r\n\r\n` yet → need more bytes.
+        assert!(parse_request_head(b"POST /wake HTTP/1.1\r\nHost: x").is_none());
+        // Absent Content-Length defaults to 0.
+        assert_eq!(parse_request_head(b"POST / HTTP/1.1\r\n\r\n").unwrap().2, 0);
+    }
+
+    #[test]
+    fn body_start_locates_the_byte_after_the_terminator() {
+        let req = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi";
+        let bs = body_start(req).expect("terminator present");
+        assert_eq!(&req[bs..], b"hi");
+        assert!(body_start(b"no terminator here").is_none());
+    }
+
+    #[test]
+    fn http_response_sets_a_matching_content_length() {
+        let resp = http_response("200 OK", "{\"status\":\"woken\"}");
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Length: 18\r\n"), "18 = body byte len");
+        assert!(text.ends_with("\r\n\r\n{\"status\":\"woken\"}"));
     }
 
     #[test]
