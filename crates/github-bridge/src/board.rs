@@ -254,6 +254,35 @@ pub fn parse_issue_links(body: &str) -> Result<Vec<IssueTaskLink>, String> {
     Ok(links)
 }
 
+/// Parse the JSON body of `GET /external-links?...&board_kind=comment` into the set of synced comment refs
+/// (the `external_id`s). Accepts the same array / envelope shapes as [`parse_issue_links`]. Only
+/// `source == "github"` + `board_kind == "comment"` rows contribute.
+pub fn parse_comment_refs(body: &str) -> Result<std::collections::HashSet<String>, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("board /external-links: response was not JSON: {e}"))?;
+    let arr = match v {
+        Value::Array(a) => a,
+        Value::Object(ref o) => match o.get("external_links").or_else(|| o.get("links")) {
+            Some(Value::Array(a)) => a.clone(),
+            _ => return Err(format!("board /external-links: object without a links array: {v}")),
+        },
+        other => {
+            return Err(format!(
+                "board /external-links: expected an array or {{external_links:[…]}}, got {other}"
+            ));
+        }
+    };
+    let mut refs = std::collections::HashSet::new();
+    for row in arr {
+        let link: ExternalLink =
+            serde_json::from_value(row).map_err(|e| format!("board /external-links: bad row: {e}"))?;
+        if link.source == LINK_SOURCE && link.board_kind == LINK_KIND_COMMENT {
+            refs.insert(link.external_id);
+        }
+    }
+    Ok(refs)
+}
+
 /// A handle to the board's token-less localhost REST API (stateless — each call is one request). The firehose
 /// cursor (`since_seq`) is owned by the caller (the poll loop), not this client.
 pub struct BoardClient {
@@ -304,15 +333,45 @@ impl BoardClient {
     /// slice 2). Called by ingest right after it creates the mirrored task, so a later poll finds the link
     /// and doesn't re-create.
     pub fn register_issue_link(&self, board_task_id: i64, issue_ref: &str) -> Result<(), String> {
+        self.register_link(LINK_KIND_TASK, issue_ref, board_task_id)
+    }
+
+    /// Register (idempotent) a synced-comment link so a re-poll doesn't re-post the comment. `board_id` is
+    /// the task the comment lives on; `comment_ref` is [`comment_ref`]'s `owner/repo#c<id>`.
+    pub fn register_comment_link(&self, board_task_id: i64, comment_ref: &str) -> Result<(), String> {
+        self.register_link(LINK_KIND_COMMENT, comment_ref, board_task_id)
+    }
+
+    /// Register a `source="github"` external link of the given `board_kind` (shared by issue + comment
+    /// links). Idempotent on `(source, external_id)` server-side.
+    fn register_link(&self, board_kind: &str, external_id: &str, board_id: i64) -> Result<(), String> {
         let url = format!("{}/external-links", self.base);
         let body = json!({
             "source": LINK_SOURCE,
-            "external_id": issue_ref,
-            "board_kind": LINK_KIND_TASK,
-            "board_id": board_task_id,
+            "external_id": external_id,
+            "board_kind": board_kind,
+            "board_id": board_id,
         })
         .to_string();
         self.post_json(&url, &body, "POST /external-links")
+    }
+
+    /// Read the set of already-synced GitHub comment refs (`board_kind="comment"`) — the dedup set the
+    /// attributed-comment sync passes to `sync::plan_comment_ingest` so a re-poll never double-posts.
+    pub fn list_comment_refs(&self) -> Result<std::collections::HashSet<String>, String> {
+        let url =
+            format!("{}/external-links?source={LINK_SOURCE}&board_kind={LINK_KIND_COMMENT}", self.base);
+        let resp = self
+            .agent
+            .get(&url)
+            .set("accept", "application/json")
+            .set("user-agent", BOARD_UA)
+            .call()
+            .map_err(|e| format!("board GET /external-links (comments) failed: {e}"))?;
+        let raw = resp
+            .into_string()
+            .map_err(|e| format!("board GET /external-links (comments) read failed: {e}"))?;
+        parse_comment_refs(&raw)
     }
 
     /// Create a mirrored board task from an ingested issue (`POST /tasks`), returning its numeric `id`. The
@@ -528,6 +587,26 @@ mod tests {
     fn parse_issue_links_rejects_non_array() {
         assert!(parse_issue_links(r#"{"nope": 1}"#).is_err());
         assert!(parse_issue_links("not json").is_err());
+    }
+
+    #[test]
+    fn parse_comment_refs_collects_only_github_comment_rows() {
+        let body = r#"[
+            {"source": "github", "external_id": "o/r#c1", "board_kind": "comment", "board_id": 7},
+            {"source": "github", "external_id": "o/r#c2", "board_kind": "comment", "board_id": 7},
+            {"source": "github", "external_id": "o/r#5",  "board_kind": "task",    "board_id": 7},
+            {"source": "slack",  "external_id": "x",      "board_kind": "comment", "board_id": 7}
+        ]"#;
+        let refs = parse_comment_refs(body).unwrap();
+        assert_eq!(refs.len(), 2, "only github/comment rows");
+        assert!(refs.contains("o/r#c1") && refs.contains("o/r#c2"));
+        assert!(!refs.contains("o/r#5"), "task row excluded");
+    }
+
+    #[test]
+    fn parse_comment_refs_empty_and_error() {
+        assert!(parse_comment_refs("[]").unwrap().is_empty());
+        assert!(parse_comment_refs("not json").is_err());
     }
 
     #[test]

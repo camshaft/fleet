@@ -17,10 +17,11 @@ behind a feature — GitHub is plain REST polling, so there is no heavy async tr
 | module        | role |
 |---------------|------|
 | `config`      | Fail-soft config from a **single TOML file** (no env vars — operator mandate #159): GitHub token + `owner/repo` + board `project_id`, board REST base, GitHub API base. |
-| `board`       | Token-less localhost board REST client: firehose poll (`GET /events`, board-core #150), create/comment mirrored tasks with GitHub-author attribution (`POST /tasks`, `POST /tasks/:id/comments`, board-core #149), and durable issue↔task link read/register (`/external-links`, board-core #149 slice 2 / #151). |
-
-Later slices add: the GitHub REST transport (issue + comment polling), issue→task ingest, attributed comment
-sync, OUT-reflect-under-policy, and the daemon binary that wires the poll loop.
+| `board`       | Token-less localhost board REST client: firehose poll (`GET /events`, board-core #150/#264), create/comment mirrored tasks with GitHub-author attribution (`POST /tasks`, `POST /tasks/:id/comments`, board-core #149), and durable issue↔task + comment link read/register (`/external-links`, board-core #149 slice 2 / #151). |
+| `github`      | GitHub REST transport: `Issue`/`IssueComment` model, null/ghost-tolerant PR-flagging parsers, and a thin no-`Debug` authenticated client (issues + comments poll, `viewer_login`, `post_issue_comment`). |
+| `sync`        | Pure bidirectional planning. IN: issues → idempotent task creates + comments → attributed board comments (loop-safe, dedup'd). OUT: `task.outbound_reflect` (board-core #264) → GitHub issue comments (source-filtered, attribution-rendered). |
+| `state`       | The daemon's persisted cursors (firehose seq for OUT, GitHub `?since=` for IN), fail-soft load. |
+| `main`/`runner` | The daemon (feature `daemon`): a blocking poll loop — IN (GitHub → board) + OUT (board firehose → GitHub) each tick, fail-soft dormant with no token. Not unit-tested (live network); the gate is the lib's `cargo test`. |
 
 Data flow (target):
 
@@ -35,12 +36,27 @@ board firehose (authorized reflect, #150)                 GitHub REST (issues + 
 ## Build
 
 ```sh
-# Pure core + tests (fast):
+# Pure core + tests (fast — no daemon tree):
 cargo test -p github-bridge
+
+# The daemon binary (pulls clap/tracing — REQUIRED to build the bin):
+cargo build -p github-bridge --features daemon --release
+# → target/release/github-bridge
 ```
 
-The daemon binary + its GitHub REST transport arrive in a later slice; the default `cargo test --workspace`
-/ `nix flake check` gate this crate's pure core today.
+The `daemon` feature is `required-features` on the `[[bin]]`, so the default `cargo test --workspace` /
+`nix flake check` never compile the CLI/logging tree.
+
+## Run
+
+```sh
+github-bridge --config /path/to/github-bridge.toml
+```
+
+`--config` is the **only** input — there is no env-var configuration (mandate #159). With no token in the
+config the daemon stays alive but **idle** (fail-soft), so it is safe to deploy before the token is minted.
+Each tick runs IN (GitHub → board) then OUT (board firehose → GitHub); logging is `RUST_LOG`-controlled
+(default `info`).
 
 ## Config (TOML)
 
