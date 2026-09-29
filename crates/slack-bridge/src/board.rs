@@ -21,11 +21,18 @@
 //! network. The board channel_id → Slack channel MAP is board-core #149 slice 2 (not landed yet); until
 //! it does, an [`OutboundReflect`] carries the board `channel_id` and the transport layer resolves it.
 
+use crate::resolver::ChannelLink;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// The firehose event type the bridge reflects OUT to Slack (board-core #150).
 pub const OUTBOUND_REFLECT: &str = "channel.outbound_reflect";
+
+/// The external-link `source` this adapter owns (board-core #149 slice 2's generic external_link table,
+/// shared with the GitHub adapter #136 which uses its own source).
+pub const LINK_SOURCE: &str = "slack";
+/// The external-link `board_kind` for a channel↔channel link (vs `task` for #136/#151 links).
+pub const LINK_KIND_CHANNEL: &str = "channel";
 
 /// One event from the board-wide firehose (`GET /events`): append-only, ascending `seq`, ALL types.
 ///
@@ -123,6 +130,51 @@ pub fn build_post_body(
     m
 }
 
+/// One row of the board's generic `external_link` table (board-core #149 slice 2). Only the fields the
+/// channel map needs are modeled; `external_parent_id`/`metadata` and any future columns are ignored.
+#[derive(Debug, Clone, Deserialize)]
+struct ExternalLink {
+    source: String,
+    /// The external side of the link — for a Slack channel link, the Slack channel id (e.g. `C123`).
+    external_id: String,
+    board_kind: String,
+    /// The board side — for a channel link, the board `channel_id`.
+    board_id: i64,
+}
+
+/// Parse the JSON body of `GET /external-links` into the board↔Slack CHANNEL links. Accepts a bare array
+/// or an `{ "external_links": [...] }` / `{ "links": [...] }` envelope. Only `source == "slack"` +
+/// `board_kind == "channel"` rows become [`ChannelLink`]s (defense-in-depth even though we filter in the
+/// query); other rows (e.g. `board_kind == "task"`) are skipped.
+pub fn parse_channel_links(body: &str) -> Result<Vec<ChannelLink>, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("board /external-links: response was not JSON: {e}"))?;
+    let arr = match v {
+        Value::Array(a) => a,
+        Value::Object(ref o) => match o.get("external_links").or_else(|| o.get("links")) {
+            Some(Value::Array(a)) => a.clone(),
+            _ => return Err(format!("board /external-links: object without a links array: {v}")),
+        },
+        other => {
+            return Err(format!(
+                "board /external-links: expected an array or {{external_links:[…]}}, got {other}"
+            ));
+        }
+    };
+    let mut links = Vec::new();
+    for row in arr {
+        let link: ExternalLink = serde_json::from_value(row)
+            .map_err(|e| format!("board /external-links: bad row: {e}"))?;
+        if link.source == LINK_SOURCE && link.board_kind == LINK_KIND_CHANNEL {
+            links.push(ChannelLink {
+                board_channel_id: link.board_id,
+                slack_channel: link.external_id,
+            });
+        }
+    }
+    Ok(links)
+}
+
 /// A handle to the board's token-less localhost REST API (stateless — each call is one request). The
 /// firehose cursor (`since_seq`) is owned by the caller (the transport loop), not this client.
 pub struct BoardClient {
@@ -179,6 +231,46 @@ impl BoardClient {
             .set("content-type", "application/json")
             .send_string(&body.to_string())
             .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Read the board-registered Slack channel links (board-core #149 slice 2). The transport merges these
+    /// with the static config `[[channel_map]]` to build the live [`crate::resolver::ChannelMap`], so the
+    /// operator-DM channel and any board-registered mapping resolve without a config edit.
+    pub fn list_channel_links(&self) -> Result<Vec<ChannelLink>, String> {
+        let url = format!(
+            "{}/external-links?source={LINK_SOURCE}&board_kind={LINK_KIND_CHANNEL}",
+            self.base
+        );
+        let resp = self
+            .agent
+            .get(&url)
+            .set("accept", "application/json")
+            .call()
+            .map_err(|e| format!("board GET /external-links failed: {e}"))?;
+        let raw = resp
+            .into_string()
+            .map_err(|e| format!("board GET /external-links read failed: {e}"))?;
+        parse_channel_links(&raw)
+    }
+
+    /// Register (idempotent on `(source, external_id)`) a board channel ↔ Slack channel link (board-core
+    /// #149 slice 2). Used by the cutover (#154) to wire the operator-DM board channel to the operator's
+    /// Slack DM without a static config entry.
+    pub fn register_channel_link(&self, board_channel_id: i64, slack_channel: &str) -> Result<(), String> {
+        let url = format!("{}/external-links", self.base);
+        let body = json!({
+            "source": LINK_SOURCE,
+            "external_id": slack_channel,
+            "board_kind": LINK_KIND_CHANNEL,
+            "board_id": board_channel_id,
+        })
+        .to_string();
+        self.agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .send_string(&body)
+            .map_err(|e| format!("board POST /external-links failed: {e}"))?;
         Ok(())
     }
 }
@@ -281,5 +373,59 @@ mod tests {
     fn client_new_trims_trailing_slash() {
         let c = BoardClient::new("http://x/board/api/");
         assert_eq!(c.base, "http://x/board/api");
+    }
+
+    // ── external-links / channel map (board-core #149 slice 2) ──────────────────────────────────────
+
+    #[test]
+    fn parse_channel_links_bare_array() {
+        let body = r#"[
+            {"source": "slack", "external_id": "C7", "board_kind": "channel", "board_id": 7},
+            {"source": "slack", "external_id": "C8", "board_kind": "channel", "board_id": 8,
+             "external_parent_id": null, "metadata": {"note": "ignored"}}
+        ]"#;
+        let links = parse_channel_links(body).unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].board_channel_id, 7);
+        assert_eq!(links[0].slack_channel, "C7");
+        assert_eq!(links[1].board_channel_id, 8);
+    }
+
+    #[test]
+    fn parse_channel_links_envelope_forms() {
+        let a = parse_channel_links(
+            r#"{"external_links": [{"source":"slack","external_id":"C1","board_kind":"channel","board_id":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(a.len(), 1);
+        let b = parse_channel_links(
+            r#"{"links": [{"source":"slack","external_id":"C2","board_kind":"channel","board_id":2}]}"#,
+        )
+        .unwrap();
+        assert_eq!(b[0].board_channel_id, 2);
+    }
+
+    #[test]
+    fn parse_channel_links_skips_non_channel_and_non_slack_rows() {
+        // A task link and a different-source row must be filtered out — only slack/channel rows map.
+        let body = r#"[
+            {"source": "slack",  "external_id": "C7",   "board_kind": "channel", "board_id": 7},
+            {"source": "slack",  "external_id": "T99",  "board_kind": "task",    "board_id": 99},
+            {"source": "github", "external_id": "org/r#5", "board_kind": "task", "board_id": 5}
+        ]"#;
+        let links = parse_channel_links(body).unwrap();
+        assert_eq!(links.len(), 1, "only the slack/channel row survives");
+        assert_eq!(links[0].slack_channel, "C7");
+    }
+
+    #[test]
+    fn parse_channel_links_rejects_non_array() {
+        assert!(parse_channel_links(r#"{"nope": 1}"#).is_err());
+        assert!(parse_channel_links("not json").is_err());
+    }
+
+    #[test]
+    fn parse_channel_links_empty_is_ok() {
+        assert!(parse_channel_links("[]").unwrap().is_empty());
     }
 }
