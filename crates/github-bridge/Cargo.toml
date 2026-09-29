@@ -1,0 +1,35 @@
+# `github-bridge` — the fleet's GitHub↔board bridge adapter daemon (design #141, task #136).
+#
+# This is the SECOND adapter over the shared external-bridge core (Slack is the first, `crates/slack-bridge`):
+# GitHub issues mirror IN to board tasks, GitHub issue comments sync in attributed to their GitHub authors,
+# and an authorized board task comment reflects OUT onto the GitHub issue under policy. The board owns the
+# bridge CORE (external-identity, external-links, outbound-reflect authz — board tasks #149/#150/#151); this
+# crate is TRANSPORT + SYNC only and CONSUMES those primitives, never reimplements them. GitHub-specifics
+# stay in this crate so the shared concerns live once on the board (see `crates/slack-bridge` for the sibling).
+#
+# The crate is a workspace member so `cargo test` at the workspace root gates its pure core (config
+# resolution, firehose parsing, issue↔task link mapping, attributed-post/identity body building). The live
+# daemon binary (the GitHub REST poller + board firehose loop) is added in a later slice behind a feature so
+# it never enters the default `cargo test` / `nix flake check`.
+[package]
+name = "github-bridge"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "github_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# The daemon's config format: a single TOML file (operator mandate #159 — no env-var config). Holds the
+# GitHub token + wiring; delivered at deploy time as the agenix-decrypted secret, gitignored in dev.
+toml = "0.8"
+# Minimal blocking HTTP client for the board's token-less localhost REST firehose (`GET /events` poll +
+# task/comment writes) — the same client the `fleet` orchestrator uses for its board REST access. In a
+# later slice this same client (its TLS feature) also reaches the GitHub REST API; light + blocking, so the
+# whole bridge stays a plain poll loop with no heavy async tree (unlike Slack's Socket Mode transport).
+ureq = "2"

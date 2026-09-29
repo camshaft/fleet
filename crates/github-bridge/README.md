@@ -1,0 +1,93 @@
+# github-bridge
+
+The fleet's **GitHub ↔ board bridge adapter** — the transport + sync end of approved design #141 (task
+#136). A GitHub repo's issues mirror IN to coordination-board tasks; GitHub issue comments sync in
+attributed to their GitHub authors; an authorized board task comment reflects OUT onto the GitHub issue
+under policy. The board owns the bridge **core** (external-identity, external-links, outbound-reflect authz
+— board tasks #149/#150/#151); this crate is **transport + sync only**.
+
+It is the **second adapter** over that shared core — Slack is the first (`crates/slack-bridge`). Concerns
+shared by both adapters live once on the board; only GitHub-specifics live here.
+
+## Architecture
+
+Pure, unit-tested core (always compiled) + a thin blocking poll-loop daemon binary (added in a later slice
+behind a feature — GitHub is plain REST polling, so there is no heavy async tree like Slack's Socket Mode):
+
+| module        | role |
+|---------------|------|
+| `config`      | Fail-soft config from a **single TOML file** (no env vars — operator mandate #159): GitHub token + `owner/repo` + board `project_id`, board REST base, GitHub API base. |
+| `board`       | Token-less localhost board REST client: firehose poll (`GET /events`, board-core #150), create/comment mirrored tasks with GitHub-author attribution (`POST /tasks`, `POST /tasks/:id/comments`, board-core #149), and durable issue↔task link read/register (`/external-links`, board-core #149 slice 2 / #151). |
+
+Later slices add: the GitHub REST transport (issue + comment polling), issue→task ingest, attributed comment
+sync, OUT-reflect-under-policy, and the daemon binary that wires the poll loop.
+
+Data flow (target):
+
+```
+board firehose (authorized reflect, #150)                 GitHub REST (issues + comments)
+        │  poll_events                                            │  list_issues / list_comments
+        ▼                                                         ▼
+   reflect task comment ──► GitHub issue comment           ingest ──► board::create_task / comment_task
+   (issue↔task link resolves task → issue)                 (attributed external_author = github:<login>)
+```
+
+## Build
+
+```sh
+# Pure core + tests (fast):
+cargo test -p github-bridge
+```
+
+The daemon binary + its GitHub REST transport arrive in a later slice; the default `cargo test --workspace`
+/ `nix flake check` gate this crate's pure core today.
+
+## Config (TOML)
+
+```toml
+github_token = "ghp_..."          # GitHub PAT or App installation token (issues:read/write, etc.)
+repo         = "camshaft/fleet"    # owner/name of the repo whose issues are ingested
+project_id   = 16                  # board project ingested issues become tasks in
+board_api    = "http://127.0.0.1:8880/board/api"  # optional; default shown (local board front-door)
+api_base     = "https://api.github.com"           # optional; override for GitHub Enterprise Server
+default_to   = "concierge"        # optional; default
+bridge_agent = "github-bridge"    # optional; the board agent id this bridge writes as
+state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file's dir. Holds the firehose
+                                         # cursor — MUST be writable + durable across restarts.
+```
+
+- Token present ⇒ live; missing ⇒ dormant (valid — deploy before the token is minted).
+- `repo` + `project_id` both present ⇒ ingest active; either missing ⇒ up-but-idle (valid).
+- Unknown keys are rejected (`deny_unknown_fields`) — a typo surfaces as a "malformed config" (fail-soft
+  dormant), not a silent drop.
+- `Debug` on the config **redacts** the token — it never prints into logs.
+
+## Deploy (camshaft/dotfiles, fleet-tunnel/green-machine-ops)
+
+- systemd role runs `github-bridge --config <path>`; `Restart=always` (fail-soft startup makes this safe).
+- The config is delivered as the **agenix-decrypted TOML secret** `github-bridge.toml.age` (mode 0400) —
+  **not** an env file / `EnvironmentFile=` (mandate #159).
+- `StateDirectory=github-bridge` (or any persistent writable dir) for the firehose cursor.
+- Needs localhost reach to the board front-door (`board_api`) + outbound HTTPS to `api_base`.
+
+## Issue ↔ task links
+
+- The durable map lives in the board's generic `external_link` table (board-core #149 slice 2 / #151):
+  `source="github"`, `board_kind="task"`, `external_id="owner/repo#<number>"`, `board_id=<task id>`.
+- Ingest reads `GET /external-links?source=github&board_kind=task` to stay **idempotent** — an issue already
+  linked to a task is updated, never re-created — and registers the link right after creating the task.
+
+## Operational notes
+
+- **Firehose cursor** (`<state_dir>/github-bridge.cursor`): advanced only past terminally-handled events; a
+  restart resumes without gap. First run initializes at the firehose head (skips backlog).
+- **No echo loop:** the bridge writes board tasks/comments as its own `bridge_agent`, which is not an
+  authorized OUT reflector, so its own writes never reflect back OUT to GitHub.
+- **Attribution:** ingested GitHub authors are attributed via `external_author = github:<login>` +
+  `upsert_external_identity` (board-core #149), so board readers see the GitHub author, not the bridge.
+
+## Follow-ons (coordinate with v-task-board)
+
+- **OUT-reflect contract for task comments:** #150 shipped the reflect event for channel posts; the GitHub
+  OUT direction reflects a *task comment* onto a GitHub issue. The exact firehose event kind + payload for a
+  task-comment reflect is being confirmed with v-task-board before the OUT-reflect slice decodes it.

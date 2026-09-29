@@ -1453,6 +1453,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "github-bridge"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+ "ureq",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
