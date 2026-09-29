@@ -61,7 +61,10 @@ Each tick runs IN (GitHub → board) then OUT (board firehose → GitHub); loggi
 ## Config (TOML)
 
 ```toml
-github_token = "ghp_..."          # GitHub PAT or App installation token (issues:read/write, across ALL repos below)
+github_token      = "ghp_..."     # GitHub PAT or App installation token (issues:read/write, across ALL repos below)
+# github_token_file = "/run/agenix/github-bridge-token"  # OR: read the bare token from this file (agenix
+                                  # secret), keeping the rest of this config non-secret. Overrides inline; a
+                                  # relative path resolves against this file's dir. Missing/empty ⇒ dormant.
 repos        = ["camshaft/fleet", "camshaft/dotfiles"]  # owner/name list — ingested into project_id
 # repo       = "camshaft/fleet"   # singular sugar for a one-repo config (folds into `repos`)
 project_id   = 16                  # board project all ingested issues become tasks in

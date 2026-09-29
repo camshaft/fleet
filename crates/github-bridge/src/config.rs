@@ -103,6 +103,11 @@ impl fmt::Debug for Config {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     github_token: Option<String>,
+    /// Path to a file holding ONLY the GitHub token (an agenix secret). When set, [`Config::load`] reads the
+    /// token from it (trimmed) — so the deploy keeps just the bare PAT encrypted while the rest of the config
+    /// stays non-secret (secret-surface minimization, board-core #272). Overrides inline `github_token`; a
+    /// relative path resolves against the config file's dir. Missing/empty ⇒ fail-soft dormant.
+    github_token_file: Option<String>,
     /// Singular sugar for a one-repo config; folded into [`Config::repos`].
     repo: Option<String>,
     /// The multi-repo list; each `owner/name`. Folded together with `repo`.
@@ -167,9 +172,31 @@ impl Config {
         Ok(Self::from_file_config(toml::from_str(text)?, base_dir))
     }
 
+    /// Resolve `github_token_file` (IO — kept out of the pure [`Self::from_toml_str`]): when set, read the
+    /// bare token from that file (trimmed) and use it as `github_token`, overriding any inline value. A
+    /// relative path resolves against `base_dir` (an absolute path is used as-is). A missing/empty/unreadable
+    /// file is logged and leaves the token as-is (usually `None` in the split model ⇒ fail-soft dormant).
+    fn resolve_token_file(mut file: FileConfig, base_dir: &Path) -> FileConfig {
+        if let Some(rel) = file.github_token_file.as_deref().filter(|s| !s.is_empty()) {
+            let path = base_dir.join(rel); // PathBuf::join: an absolute `rel` replaces base_dir
+            match std::fs::read_to_string(&path) {
+                Ok(s) if !s.trim().is_empty() => file.github_token = Some(s.trim().to_string()),
+                Ok(_) => {
+                    eprintln!("github-bridge: token file {} is empty — running dormant", path.display())
+                }
+                Err(e) => eprintln!(
+                    "github-bridge: cannot read token file {}: {e} — running dormant",
+                    path.display()
+                ),
+            }
+        }
+        file
+    }
+
     /// Load config from the TOML file at `path`, **fail-soft**: a missing OR malformed file yields a dormant
     /// [`Config`] (defaults, no token) — a malformed file is logged via `eprintln!` (no structured logger at
-    /// config-load time) — rather than an error or crash. `state_dir` defaults to the config file's own dir.
+    /// config-load time) — rather than an error or crash. When the file sets `github_token_file`, the bare
+    /// token is read from that path. `state_dir` defaults to the config file's own dir.
     pub fn load(path: &Path) -> Config {
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let text = match std::fs::read_to_string(path) {
@@ -177,7 +204,7 @@ impl Config {
             Err(_) => return Self::from_file_config(FileConfig::default(), base_dir), // absent = dormant
         };
         match toml::from_str::<FileConfig>(&text) {
-            Ok(fc) => Self::from_file_config(fc, base_dir),
+            Ok(fc) => Self::from_file_config(Self::resolve_token_file(fc, base_dir), base_dir),
             Err(e) => {
                 eprintln!("github-bridge: ignoring malformed {}: {e}", path.display());
                 Self::from_file_config(FileConfig::default(), base_dir)
@@ -343,6 +370,45 @@ mod tests {
         let cfg = Config::load(&path);
         assert!(cfg.token().is_none(), "malformed → dormant, no crash");
         assert_eq!(cfg.default_to, "concierge");
+    }
+
+    // ── github_token_file (bare-token split, board-core #272) ────────────────────────────────────
+
+    #[test]
+    fn load_reads_token_from_token_file() {
+        let dir = tmp_dir("tokfile");
+        std::fs::write(dir.join("gh.token"), "  ghp_FROMFILE\n").unwrap(); // whitespace trimmed
+        let path = dir.join("github-bridge.toml");
+        std::fs::write(
+            &path,
+            "github_token_file = \"gh.token\"\nrepo = \"o/r\"\nproject_id = 3\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path);
+        assert_eq!(cfg.token(), Some("ghp_FROMFILE"), "token read + trimmed from the referenced file");
+        assert_eq!(cfg.ingest_targets(), vec![("o/r", 3)], "non-secret settings still apply");
+    }
+
+    #[test]
+    fn token_file_overrides_inline_token() {
+        let dir = tmp_dir("tokoverride");
+        std::fs::write(dir.join("gh.token"), "ghp_FILEWINS").unwrap();
+        let path = dir.join("github-bridge.toml");
+        std::fs::write(&path, "github_token = \"ghp_inline\"\ngithub_token_file = \"gh.token\"\n")
+            .unwrap();
+        assert_eq!(Config::load(&path).token(), Some("ghp_FILEWINS"), "the secret file wins over inline");
+    }
+
+    #[test]
+    fn missing_or_empty_token_file_is_dormant_not_fatal() {
+        let dir = tmp_dir("toknofile");
+        let path = dir.join("github-bridge.toml");
+        std::fs::write(&path, "github_token_file = \"absent.token\"\n").unwrap();
+        assert!(Config::load(&path).token().is_none(), "missing token file → dormant, no crash");
+
+        std::fs::write(dir.join("empty.token"), "   \n").unwrap();
+        std::fs::write(&path, "github_token_file = \"empty.token\"\n").unwrap();
+        assert!(Config::load(&path).token().is_none(), "empty token file → dormant");
     }
 
     // ── SECURITY: redacting Debug ────────────────────────────────────────────────────────────────
