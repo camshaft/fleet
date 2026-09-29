@@ -1460,10 +1460,32 @@ enum Cmd {
         rearm: bool,
         /// Also detect per-agent transcript-growth OBSERVATION candidates (#187): agents whose newest session
         /// grew past the threshold (CDZ_OBSERVE_LINES, default 2000 lines) since last observed, plus stood-down
-        /// agents with a closing tail. Report-only — the ephemeral observer spawn lands with the observer role
-        /// (#188). Opt-in so the always-on re-arm sweep pays no transcript-read cost until the spawn is wired.
+        /// agents with a closing tail. Opt-in so the always-on re-arm sweep pays no transcript-read cost.
         #[arg(long)]
         observe: bool,
+        /// With --observe, SPAWN an ephemeral observer per highest-growth candidate (#188): bounded by a
+        /// per-sweep cap (CDZ_OBSERVE_SPAWN_CAP, default 3) + a per-target cooldown
+        /// (CDZ_OBSERVE_SPAWN_COOLDOWN_SECS, default 1800). The watermark advances only when the observer
+        /// confirms via `fleet observe-record`. Without this, --observe is detect/report-only.
+        #[arg(long)]
+        spawn: bool,
+        /// With --observe --spawn, PREVIEW the spawn plan (which observers would launch) without launching.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
+    /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
+    /// or incomplete observation never advances the watermark and the span re-fires next sweep (the design's
+    /// confirmed-observation guardrail). This is the ONLY writer of the watermark.
+    ObserveRecord {
+        /// The OBSERVED agent (the watermark is keyed by the target, not by the `observer` identity).
+        agent: String,
+        /// The session id observed.
+        #[arg(long)]
+        session: String,
+        /// The line offset read through (the new watermark).
+        #[arg(long)]
+        offset: usize,
     },
     /// Write launch-shaping metadata onto an agent's board record — the migration primitive that makes an
     /// agent spin-up-ready. Merges (only the given keys change). Reports the patch by default; `--apply`
@@ -1576,7 +1598,14 @@ fn main() {
             stale_only,
             rearm,
             observe,
-        } => watchdog(stale_only, rearm, observe),
+            spawn,
+            dry_run,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run),
+        Cmd::ObserveRecord {
+            agent,
+            session,
+            offset,
+        } => observe_record(&fleet, &agent, &session, offset),
         Cmd::SetMeta {
             agent,
             repos,
@@ -2228,11 +2257,22 @@ fn session_line_count(path: &Path) -> usize {
     }
 }
 
-/// Report-only observation check for one agent (#187 detection half): measure its newest session's growth
-/// against its watermark and return a candidate description when an observation should fire (size threshold
-/// crossed, or a stood-down agent has a closing tail). Does NOT spawn or advance the watermark — that lands
-/// with the observer role (BUILD 3, #188). `None` when the agent has no session or is below threshold.
-fn observe_candidate(fleet: &Fleet, agent: &str, stood_down: bool, threshold: usize) -> Option<String> {
+/// Advance an agent's observation watermark to `<session>:<offset>` — the CONFIRMED-observation write. Only
+/// [`observe_record`] calls this (never detection or spawn), so a crashed/timed-out observer leaves the span
+/// unobserved and it re-fires next sweep (design guardrail, #188 comment 494). Best-effort.
+fn write_observe_watermark(fleet: &Fleet, name: &str, session: &str, offset: usize) {
+    let p = observe_watermark_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, format!("{session}:{offset}"));
+}
+
+/// Observation check for one agent (#187 detection): measure its newest session's growth against its
+/// watermark and return the observation DECISION when one should fire (size threshold crossed, or a
+/// stood-down agent has a closing tail). `None` when the agent has no session or is below threshold. The
+/// caller formats the report line and (with `--spawn`) launches an observer scoped to `d.session:since_offset`.
+fn observe_candidate(fleet: &Fleet, agent: &str, stood_down: bool, threshold: usize) -> Option<ObserveDecision> {
     let sessions = transcripts::locate_sessions(agent);
     let newest = sessions.first()?;
     let session = transcripts::session_id_of(newest);
@@ -2244,14 +2284,129 @@ fn observe_candidate(fleet: &Fleet, agent: &str, stood_down: bool, threshold: us
         threshold,
         stood_down,
     );
-    if !d.fire {
-        return None;
+    d.fire.then_some(d)
+}
+
+// ── observer spawn (#188 BUILD 3/5) ────────────────────────────────────────────────────────────────
+// `fleet watchdog --observe --spawn` launches an EPHEMERAL observer session per fired candidate (bounded by
+// a per-agent spawn cooldown + a per-sweep cap), scoped to the unobserved window. The session acts as the
+// single stable board id `observer` (design author + board-pm, #188 comments 500/501): session lifetime is
+// decoupled from board identity, so proposals/reports/kb entries are one queryable author and the roster
+// never fragments. The watermark advances ONLY when the observer confirms via `fleet observe-record`.
+
+/// Max observers launched in one watchdog sweep — an anti-firehose bound on top of the observer's own
+/// FLOOR/CAP. Highest-growth candidates first. `CDZ_OBSERVE_SPAWN_CAP` overrides.
+const OBSERVE_SPAWN_CAP_DEFAULT: usize = 3;
+
+/// Don't re-spawn an observer for the SAME target within this window — an observation takes minutes and the
+/// watermark only advances on confirmation, so without a cooldown a still-running (or crashed) observer's
+/// target would re-spawn every 60s sweep. `CDZ_OBSERVE_SPAWN_COOLDOWN_SECS` overrides.
+const OBSERVE_SPAWN_COOLDOWN_SECS: u64 = 1800; // 30 min
+
+/// The per-target observer spawn stamp: `<hub>/.claude/fleet/observer/<name>.spawned` (unix secs of the last
+/// spawn). Sibling of the watermark + re-arm stamps.
+fn observe_spawn_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("observer").join(format!("{name}.spawned"))
+}
+
+fn read_observe_spawn_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(observe_spawn_stamp_path(fleet, name))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn write_observe_spawn_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = observe_spawn_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
-    let why = if stood_down { "spin-down" } else { "size" };
-    Some(format!(
-        "{agent}[{}:{}+{} {why}]",
-        d.session, d.since_offset, d.increment
-    ))
+    let _ = std::fs::write(p, now.to_string());
+}
+
+/// Whether a fresh observer spawn for this target is still on cooldown. Pure — unit-tested.
+fn observe_on_spawn_cooldown(last_spawn: Option<u64>, now: u64, cooldown: u64) -> bool {
+    last_spawn.is_some_and(|last| now.saturating_sub(last) < cooldown)
+}
+
+/// The kickoff for an EPHEMERAL observer session: it acts as the stable board id `observer`, reads exactly
+/// the target window, files curated proposals into project #28, CONFIRMS via `fleet observe-record` as its
+/// last step, then exits (no loop). Pure so the prompt is unit-tested. `role_path` points at the full role
+/// body (the authoritative method); the kickoff carries the parameters + the identity + the completion
+/// command so the observation is well-formed even before reading the role.
+fn build_observer_kickoff(target: &str, session: &str, since_offset: usize, role_path: &str) -> String {
+    format!(
+        "You are an EPHEMERAL fleet `observer`. Board IDENTITY: you act as the single stable board agent id \
+         `observer` — ensure it is registered (register_agent 'observer', idempotent) and author EVERYTHING \
+         (tasks, comments, kb entries) as `observer`. This session makes exactly ONE observation and EXITS — \
+         do NOT start a /loop. Read your full role and method at {role_path} and follow it exactly. YOUR \
+         TARGET WINDOW: agent '{target}', session '{session}', from line offset {since_offset}. Read it IN \
+         FULL with: fleet transcripts {target} --session {session} --since {session}:{since_offset} \
+         --overlap 40 . Lean HARD on kb_search; dedup against OPEN proposals by author `observer` in board \
+         project #28 (fleet-self-improve); file only above-floor, evidence-cited, deduped proposals per that \
+         project's template (the Target field + agent·session·turn evidence say WHICH agent it is about). \
+         As your VERY LAST step — after emitting your report/proposal(s) or an explicit no-op report — \
+         CONFIRM the observation so the watermark advances and this span is not re-observed: run \
+         `fleet observe-record {target} --session {session} --offset <final-line-count-you-read-through>`. \
+         Then exit. If you crash or stop before observe-record, the span stays unobserved and re-fires — \
+         which is correct; never observe-record without having emitted."
+    )
+}
+
+/// Launch (or, with `dry_run`, preview) an ephemeral observer session for one target window. Runs in a
+/// repo-less workspace under the fleet root; the board identity is `observer` (the session registers/authors
+/// as it per [`build_observer_kickoff`]). Returns a short action label for the sweep report. Best-effort:
+/// a launch error is reported, never fatal (one target failing must not abort the sweep).
+fn spawn_observer(
+    fleet: &Fleet,
+    board_session: &str,
+    target: &str,
+    obs_session: &str,
+    since_offset: usize,
+    dry_run: bool,
+) -> String {
+    let fleet_root = config::get()
+        .root
+        .clone()
+        .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
+    let workdir = workspace::agent_root_dir(&fleet_root, "observer");
+    let role_path = fleet.root.join("loops").join("observer.md");
+    let kickoff = build_observer_kickoff(target, obs_session, since_offset, &role_path.to_string_lossy());
+    // A per-target tmux window (local only — the BOARD identity stays `observer`), so several observations
+    // can run at once without a name clash.
+    let window = format!("obs-{}", target.replace(['/', ':', '.'], "-"));
+    if dry_run {
+        return format!("would-spawn({window}←{obs_session}:{since_offset})");
+    }
+    if let Err(e) = std::fs::create_dir_all(&workdir) {
+        return format!("spawn-FAILED(mkdir {workdir}: {e})");
+    }
+    let _ = pre_trust_dirs(&[fleet_root.clone(), workdir.clone()]);
+    let cmd = match build_launch_cmd("claude", &resolve_model("opus"), "high") {
+        Ok(c) => c,
+        Err(e) => return format!("spawn-FAILED({e})"),
+    };
+    match std::process::Command::new("tmux")
+        .args([
+            "new-window", "-d", "-t", board_session, "-n", &window, "-c", &workdir,
+            "-e", &format!("CDZ_KICKOFF={kickoff}"), &cmd,
+        ])
+        .status()
+    {
+        Ok(s) if s.success() => format!("spawned({window})"),
+        Ok(_) => "spawn-FAILED(tmux new-window)".to_string(),
+        Err(e) => format!("spawn-FAILED(tmux: {e})"),
+    }
+}
+
+/// `fleet observe-record <agent> --session <sid> --offset <n>`: the CONFIRMED-observation watermark advance
+/// (#188), called by the observer as its LAST step after emitting. This is the only writer of the watermark,
+/// so an observer that crashed before this leaves the span unobserved to re-fire. Also clears the spawn
+/// stamp: the observation completed, so a fresh growth past the new watermark may spawn immediately (the
+/// cooldown only exists to avoid re-spawning an in-flight/crashed observer, not a completed one).
+fn observe_record(fleet: &Fleet, agent: &str, session: &str, offset: usize) {
+    write_observe_watermark(fleet, agent, session, offset);
+    let _ = std::fs::remove_file(observe_spawn_stamp_path(fleet, agent));
+    println!("observe-record: {agent} watermark → {session}:{offset} (observation confirmed)");
 }
 
 /// The fenced, cooldown-limited re-arm of ONE candidate window, shared by the board and file-hub scans:
@@ -2292,14 +2447,14 @@ fn rearm_candidate(
 /// A board that is unreachable does NOT abort the watchdog: the board dimension is skipped with a warning
 /// and the FILE-HUB scan still runs. That resilience is the point — a flaky board is exactly when file-hub
 /// agents (which have NO board delivery) most need the poll, so their liveness must not hinge on it.
-fn watchdog(stale_only: bool, rearm: bool, observe: bool) {
+fn watchdog(stale_only: bool, rearm: bool, observe: bool, spawn: bool, spawn_dry_run: bool) {
     // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
     // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
     // is unreachable — the file-hub scan then covers everything as a best-effort outage fallback.
     let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm, observe);
+            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run);
             native_ids
         }
         Err(e) => {
@@ -2375,6 +2530,8 @@ fn watchdog_board(
     stale_only: bool,
     rearm: bool,
     observe: bool,
+    spawn: bool,
+    spawn_dry_run: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
@@ -2386,7 +2543,9 @@ fn watchdog_board(
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(OBSERVE_LINES_DEFAULT);
-    let mut obs_candidates: Vec<String> = Vec::new();
+    // Collected observation candidates: (target agent, stood_down, decision). Displayed after the table, and
+    // — with --spawn (#188) — the highest-growth few are launched as ephemeral observers (cap + cooldown).
+    let mut obs: Vec<(String, bool, ObserveDecision)> = Vec::new();
     println!(
         "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
         "agent", "interval", "age", "open", "verdict", "action"
@@ -2437,8 +2596,8 @@ fn watchdog_board(
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
-        if observe && let Some(cand) = observe_candidate(&fleet, id, stood_down, observe_threshold) {
-            obs_candidates.push(cand);
+        if observe && let Some(d) = observe_candidate(&fleet, id, stood_down, observe_threshold) {
+            obs.push((id.to_string(), stood_down, d));
         }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs, idle_presence);
         if stale_only && !retighten {
@@ -2475,18 +2634,69 @@ fn watchdog_board(
         );
     }
     if observe {
-        if obs_candidates.is_empty() {
+        if obs.is_empty() {
             println!(
-                "-- observation: no agent over the {observe_threshold}-line growth threshold (report-only)"
+                "-- observation: no agent over the {observe_threshold}-line growth threshold"
             );
         } else {
-            println!(
-                "-- observation candidates ({}, report-only — ephemeral spawn lands with the observer role #188): {}",
-                obs_candidates.len(),
-                obs_candidates.join(", ")
-            );
+            let display: Vec<String> = obs
+                .iter()
+                .map(|(id, sd, d)| {
+                    let why = if *sd { "spin-down" } else { "size" };
+                    format!("{id}[{}:{}+{} {why}]", d.session, d.since_offset, d.increment)
+                })
+                .collect();
+            let tail = if spawn { "" } else { " (report-only; pass --spawn to launch observers)" };
+            println!("-- observation candidates ({}){}: {}", obs.len(), tail, display.join(", "));
+        }
+        if spawn {
+            observe_spawn_pass(&fleet, &session, &mut obs, now_unix, spawn_dry_run);
         }
     }
+}
+
+/// The --spawn half (#188): launch ephemeral observers for the highest-growth candidates, bounded by a
+/// per-sweep CAP and a per-target COOLDOWN (an in-flight/crashed observer's target must not re-spawn every
+/// 60s sweep — the watermark only advances on confirmation). `dry_run` previews without launching. Splitting
+/// this out keeps the sweep loop readable; sorting by increment puts the most-grown windows first.
+fn observe_spawn_pass(
+    fleet: &Fleet,
+    session: &str,
+    obs: &mut [(String, bool, ObserveDecision)],
+    now_unix: u64,
+    dry_run: bool,
+) {
+    let cap = std::env::var("CDZ_OBSERVE_SPAWN_CAP")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(OBSERVE_SPAWN_CAP_DEFAULT);
+    let cooldown = std::env::var("CDZ_OBSERVE_SPAWN_COOLDOWN_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(OBSERVE_SPAWN_COOLDOWN_SECS);
+    obs.sort_by_key(|a| std::cmp::Reverse(a.2.increment)); // most-grown first
+    let mut launched = 0usize;
+    let mut actions: Vec<String> = Vec::new();
+    for (id, _sd, d) in obs.iter() {
+        if launched >= cap {
+            actions.push(format!("{id}=cap-deferred"));
+            continue;
+        }
+        if observe_on_spawn_cooldown(read_observe_spawn_stamp(fleet, id), now_unix, cooldown) {
+            actions.push(format!("{id}=cooldown"));
+            continue;
+        }
+        let act = spawn_observer(fleet, session, id, &d.session, d.since_offset, dry_run);
+        if !dry_run && act.starts_with("spawned") {
+            write_observe_spawn_stamp(fleet, id, now_unix);
+        }
+        if act.starts_with("spawned") || act.starts_with("would-spawn") {
+            launched += 1;
+        }
+        actions.push(format!("{id}={act}"));
+    }
+    let mode = if dry_run { "DRY-RUN " } else { "" };
+    println!("-- observer {mode}spawn (cap {cap}): {}", actions.join(", "));
 }
 
 /// Watchdog scan of the FILE-HUB registry (the agents not yet migrated board-native). Same signals adapted
@@ -3454,6 +3664,42 @@ mod tests {
         let done = observe_trigger(("s1", 950), ("s1", 950), 2000, true);
         assert!(!done.fire);
         assert_eq!(done.increment, 0);
+    }
+
+    #[test]
+    fn observe_spawn_cooldown_holds_within_window_and_lapses_after() {
+        assert!(!observe_on_spawn_cooldown(None, 10_000, 1800), "never spawned → not on cooldown");
+        assert!(observe_on_spawn_cooldown(Some(9_000), 10_000, 1800), "1000s < 1800 → on cooldown");
+        assert!(!observe_on_spawn_cooldown(Some(8_000), 10_000, 1800), "2000s ≥ 1800 → lapsed");
+        // saturating: a future stamp (clock skew) is treated as just-spawned → on cooldown, never underflows.
+        assert!(observe_on_spawn_cooldown(Some(11_000), 10_000, 1800));
+    }
+
+    #[test]
+    fn observe_watermark_round_trips_and_defaults_when_absent() {
+        let (base, fleet) = tmp_hub();
+        assert_eq!(read_observe_watermark(&fleet, "a"), (String::new(), 0), "absent → empty/0");
+        write_observe_watermark(&fleet, "a", "sess-1", 4200);
+        assert_eq!(read_observe_watermark(&fleet, "a"), ("sess-1".to_string(), 4200));
+        // observe-record advances it (and a later read sees the new offset).
+        write_observe_watermark(&fleet, "a", "sess-1", 5000);
+        assert_eq!(read_observe_watermark(&fleet, "a"), ("sess-1".to_string(), 5000));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_observer_kickoff_carries_identity_window_and_completion_command() {
+        let k = build_observer_kickoff("v-x", "sess-9", 1200, "/hub/loops/observer.md");
+        // Ephemeral + single stable board identity (one-shot; author as `observer`).
+        assert!(k.contains("EPHEMERAL"));
+        assert!(k.contains("ONE observation") && k.contains("do NOT start a /loop"), "one-shot, not looping");
+        assert!(k.contains("`observer`") && k.contains("register_agent"));
+        // The exact target window it must read (agent, session, offset) + the transcripts invocation.
+        assert!(k.contains("fleet transcripts v-x --session sess-9 --since sess-9:1200"));
+        // The completion contract: observe-record is the LAST step, keyed by the TARGET agent.
+        assert!(k.contains("fleet observe-record v-x --session sess-9 --offset"));
+        assert!(k.contains("/hub/loops/observer.md"), "points at the full role body");
+        assert!(k.contains("project #28"), "files into the fleet-self-improve lane");
     }
 
     #[test]
