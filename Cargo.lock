@@ -493,6 +493,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-tunnel"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

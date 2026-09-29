@@ -1,0 +1,62 @@
+# `fleet-tunnel` — the reverse HTTP-over-websocket bridge daemon (fleet-host side).
+#
+# A fleet host has no inbound path, so this daemon dials OUT to the board's websocket endpoint
+# (/tunnel/ws) and lets the board ride HTTP requests back down the socket; each request is
+# forwarded to a single local upstream (the `fleet notify` notifier on 127.0.0.1:8899) and the
+# response returned over the same socket. Mirror image of a cloudflared tunnel. Ported 1:1 from
+# the original Python daemon (operator seq-1392: fleet tooling is Rust).
+#
+# Same layout as `slack-bridge`: the pure core (config parse/validate, frame ser/de, base64 body)
+# is a lib the workspace `cargo test` gates, and the heavy async transport tree
+# (tokio/tokio-tungstenite/rustls) is deferred behind a `transport` feature so it never enters the
+# default `cargo test` / `nix flake check`. Build/run the daemon with `--features transport`.
+[package]
+name = "fleet-tunnel"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "fleet_tunnel"
+path = "src/lib.rs"
+
+# The daemon binary — the async transport shell. `required-features = ["transport"]`-gated so the
+# default `cargo test --workspace` / `nix flake check` never builds its heavy async tree.
+[[bin]]
+name = "fleet-tunnel"
+path = "src/main.rs"
+required-features = ["transport"]
+
+[features]
+# The live reverse-tunnel transport. Off by default; pulls the async tree only when enabled.
+transport = [
+  "dep:tokio",
+  "dep:tokio-tungstenite",
+  "dep:futures-util",
+  "dep:ureq",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+  "dep:clap",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# The daemon's config format: a single TOML file (operator mandate #159 — no env-var config).
+toml = "0.8"
+# Frame bodies are base64 (JSON text frames carry binary HTTP bodies).
+base64 = "0.22"
+
+# ── The async transport tree — OPTIONAL, pulled only by the `transport` feature (see above). ──
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"], optional = true }
+# WebSocket client; rustls-tls-native-roots for the wss:// public-gateway dial (matches the TLS
+# stack slack-bridge already pulls, so no new lockfile entries).
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"], optional = true }
+futures-util = { version = "0.3", optional = true }
+# Minimal blocking HTTP client for the localhost forward to the notifier (run in spawn_blocking).
+ureq = { version = "2", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate #159).
+clap = { version = "4", features = ["derive"], optional = true }
