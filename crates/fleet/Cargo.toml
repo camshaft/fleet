@@ -24,3 +24,5 @@ toml = "0.8"
 ureq = "2"
 # RFC3339 parse (+ format, for tests) of the board's last_seen for liveness — no macros.
 time = { version = "0.3", features = ["parsing", "formatting"] }
+# Tiny blocking HTTP server for the notifier that receives the board's per-agent webhook POSTs.
+tiny_http = "0.12"

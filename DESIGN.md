@@ -91,8 +91,12 @@ state lives on the board now. What remains for `fleet` to own is exactly the set
   `list_tasks(assignee=X)` in a non-terminal status + `check_notifications(mark_read=false)` unread count
   ("owns a project" is charter-convention, not a board field, so it is NOT a signal). `v-task-board` already
   re-armed to 60s-busy / 120s-idle as the reference. The fleet seeds the short base + the self-pacing rule
-  in the spin-up kickoff. Still to land: the notifier daemon + the adaptive-base kickoff, trialled on
-  `v-task-board` first.
+  in the spin-up kickoff. **Notifier landed** (PR #9): `fleet notify [--port]` runs the single HTTP
+  endpoint — it receives a board webhook POST, maps `task.assigned`→`[notification] task #<task_id>` /
+  `message.direct`→`[notification] message #<event_seq>` (other events ignored), and `tmux send-keys`
+  injects the prompt into the recipient's window in the board session; verified end-to-end against a
+  throwaway session. Still to land: register the endpoint as each board-backed agent's `webhook_url` + the
+  adaptive-base spin-up kickoff, trialled on `v-task-board` first.
 - **P3** — retire `registry.json` and deprecate the cadenza-embedded fleet once parity is proven.
 
 The 2026-09-05 architecture below is retained for history; treat the board-offloaded scope above as the
