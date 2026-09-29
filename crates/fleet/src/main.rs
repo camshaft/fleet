@@ -1510,6 +1510,12 @@ enum Cmd {
         /// but was launched outside `spin-up` (which sets `native:true` by construction).
         #[arg(long)]
         native: Option<bool>,
+        /// Opt-in launch inside the workdir's flake devShell: `--devshell true` makes `spin-up` launch the
+        /// agent via `nix develop` so the flake-pinned toolchain (node/cargo/…) is on PATH instead of the
+        /// host's (#214); `--devshell false` clears it. Omitted = leave untouched. Set only for an agent
+        /// whose workdir is a flake with a devShell.
+        #[arg(long)]
+        devshell: Option<bool>,
         /// Perform the write (default: just print the metadata patch that would be sent).
         #[arg(long)]
         apply: bool,
@@ -1612,8 +1618,9 @@ fn main() {
             interval,
             host,
             native,
+            devshell,
             apply,
-        } => set_meta(&agent, &repos, interval.as_deref(), host.as_deref(), native, apply),
+        } => set_meta(&agent, &repos, interval.as_deref(), host.as_deref(), native, devshell, apply),
         Cmd::SetInterval { agent, interval } => set_interval(&fleet, &agent, &interval),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
@@ -1656,6 +1663,9 @@ fn spin_up(agent: &str, apply: bool) {
     let interval = field("interval").unwrap_or_else(|| "30m".into());
     // The agent runtime to launch (metadata.harness); defaults to claude so existing records are unchanged.
     let harness = field("harness").unwrap_or_else(|| "claude".into());
+    // Opt-in: launch inside the workdir's flake devShell so the pinned toolchain is on PATH (#214). Off by
+    // default — set only for an agent whose workdir is a flake with a devShell.
+    let devshell = md.get("devshell").and_then(|v| v.as_bool()).unwrap_or(false);
     let repos = md
         .get("repos")
         .and_then(|v| v.as_array())
@@ -1720,9 +1730,10 @@ fn spin_up(agent: &str, apply: bool) {
         }
     };
     if !apply {
-        match build_launch_cmd(&harness, &model, &effort) {
+        match build_launch_cmd(&harness, &model, &effort, devshell.then_some(workdir.as_str())) {
             Ok(_) => println!(
-                "  would launch: {harness} in {workdir} (board MCP in-session) with a self-discovery kickoff, then a work-conserving dynamic /loop (idle cadence ~{interval})"
+                "  would launch: {harness} in {workdir}{} (board MCP in-session) with a self-discovery kickoff, then a work-conserving dynamic /loop (idle cadence ~{interval})",
+                if devshell { " [inside nix develop]" } else { "" }
             ),
             Err(e) => println!("  would NOT launch: {e}"),
         }
@@ -1752,7 +1763,7 @@ fn spin_up(agent: &str, apply: bool) {
         Ok(false) => {}
         Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
-    match launch_board_agent(agent, &workdir, &harness, &model, &effort, &interval) {
+    match launch_board_agent(agent, &workdir, &harness, &model, &effort, &interval, devshell) {
         Ok(win) => {
             println!(
                 "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then run a work-conserving dynamic /loop (idle cadence ~{interval})"
@@ -1815,15 +1826,32 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
 /// unattended-approval / initial-prompt) AND its own kickoff/loop/wake semantics — the Claude `/loop` +
 /// in-session-MCP self-discovery model is Claude-specific and does not carry over unchanged. An unknown
 /// harness is rejected so a typo'd `metadata.harness` fails loudly at spin-up instead of launching nothing.
-fn build_launch_cmd(harness: &str, model: &str, effort: &str) -> Result<String, String> {
+/// `devshell` (opt-in, `metadata.devshell = true`): when `Some(workdir)`, launch INSIDE that workdir's flake
+/// devShell (`nix develop "path:<workdir>" --command …`) so the flake-pinned toolchain (node/cargo/python/…)
+/// is on PATH instead of the host's — the host PATH drifts (e.g. host node v18 breaks a flake-pinned build,
+/// bare `curl`/`python3` intermittently miss in a compound shell call), and each agent otherwise re-derives
+/// per-charter workarounds (#214). Default `None` = launch on the host PATH exactly as before. The caller
+/// only sets it for an agent whose workdir is a flake with a devShell.
+fn build_launch_cmd(
+    harness: &str,
+    model: &str,
+    effort: &str,
+    devshell: Option<&str>,
+) -> Result<String, String> {
     match harness {
-        "claude" => Ok(format!(
+        "claude" => {
             // effort/model are single-quoted (no single-quotes in them) so `[1m]` can't glob; the kickoff
             // rides in $CDZ_KICKOFF (set literally via `-e`, expanded double-quoted) so its spaces/quotes
             // are safe.
-            "exec claude --disallowedTools AskUserQuestion --effort '{effort}' --model '{model}' \
-             --autocompact 600000 --dangerously-skip-permissions \"$CDZ_KICKOFF\""
-        )),
+            let claude = format!(
+                "claude --disallowedTools AskUserQuestion --effort '{effort}' --model '{model}' \
+                 --autocompact 600000 --dangerously-skip-permissions \"$CDZ_KICKOFF\""
+            );
+            Ok(match devshell {
+                Some(dir) => format!("exec nix develop \"path:{dir}\" --command {claude}"),
+                None => format!("exec {claude}"),
+            })
+        }
         "codex" => Err(
             "harness 'codex' is recognized but its launch is not wired yet — fill in the codex arm of \
              build_launch_cmd (the codex CLI's model flag + unattended/no-approval flags + initial-prompt \
@@ -1841,7 +1869,7 @@ fn build_launch_cmd(harness: &str, model: &str, effort: &str) -> Result<String, 
 /// fetches its own charter from the board via its in-session MCP — nothing is injected). The launch command
 /// is harness-specific (see [`build_launch_cmd`]); refuses to double-launch an existing same-named window.
 /// The kickoff is passed via a tmux env var so no shell quoting can mangle it.
-fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, effort: &str, interval: &str) -> Result<String, String> {
+fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, effort: &str, interval: &str, devshell: bool) -> Result<String, String> {
     let session = board_session();
     if let Ok(out) = std::process::Command::new("tmux")
         .args(["list-windows", "-t", &session, "-F", "#W"])
@@ -1851,7 +1879,7 @@ fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, ef
         return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
     }
     let kickoff = build_kickoff(agent, workdir, interval);
-    let cmd = build_launch_cmd(harness, model, effort)?;
+    let cmd = build_launch_cmd(harness, model, effort, devshell.then_some(workdir))?;
     let status = std::process::Command::new("tmux")
         .args([
             "new-window", "-d",
@@ -2411,7 +2439,7 @@ fn spawn_observer(
         return format!("spawn-FAILED(mkdir {workdir}: {e})");
     }
     let _ = pre_trust_dirs(&[fleet_root.clone(), workdir.clone()]);
-    let cmd = match build_launch_cmd("claude", &resolve_model("opus"), "high") {
+    let cmd = match build_launch_cmd("claude", &resolve_model("opus"), "high", None) {
         Ok(c) => c,
         Err(e) => return format!("spawn-FAILED({e})"),
     };
@@ -2831,6 +2859,7 @@ fn build_meta_patch(
     interval: Option<&str>,
     host: Option<&str>,
     native: Option<bool>,
+    devshell: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let mut patch = serde_json::Map::new();
     if !repos.is_empty() {
@@ -2853,8 +2882,14 @@ fn build_meta_patch(
         // The board-native roster marker the watchdog splits on (native → board-watchdog; else file-hub).
         patch.insert("native".to_string(), serde_json::Value::Bool(n));
     }
+    if let Some(d) = devshell {
+        // Opt-in: launch the agent inside its workdir's flake devShell (pinned toolchain on PATH; #214).
+        patch.insert("devshell".to_string(), serde_json::Value::Bool(d));
+    }
     if patch.is_empty() {
-        return Err("nothing to set — pass at least one --repo, --interval, --host, or --native".to_string());
+        return Err(
+            "nothing to set — pass at least one --repo, --interval, --host, --native, or --devshell".to_string(),
+        );
     }
     Ok(serde_json::Value::Object(patch))
 }
@@ -2868,9 +2903,10 @@ fn set_meta(
     interval: Option<&str>,
     host: Option<&str>,
     native: Option<bool>,
+    devshell: Option<bool>,
     apply: bool,
 ) {
-    let patch = build_meta_patch(repos, interval, host, native).unwrap_or_else(|e| {
+    let patch = build_meta_patch(repos, interval, host, native, devshell).unwrap_or_else(|e| {
         eprintln!("fleet set-meta: {e}");
         std::process::exit(2);
     });
@@ -3075,15 +3111,19 @@ mod tests {
     #[test]
     fn build_launch_cmd_wires_claude_and_stages_codex_and_rejects_unknown() {
         // claude is fully wired: the exec line carries the model/effort and reads the kickoff from the env.
-        let c = build_launch_cmd("claude", "claude-x", "high").expect("claude wired");
+        let c = build_launch_cmd("claude", "claude-x", "high", None).expect("claude wired");
         assert!(c.starts_with("exec claude "));
         assert!(c.contains("--model 'claude-x'") && c.contains("--effort 'high'"));
         assert!(c.contains("\"$CDZ_KICKOFF\""), "kickoff rides in the env var, not interpolated");
+        // devshell (#214): opt-in launch inside the workdir's flake devShell so the pinned toolchain is on PATH.
+        let d = build_launch_cmd("claude", "claude-x", "high", Some("/wt/v-x")).expect("claude wired");
+        assert!(d.starts_with("exec nix develop \"path:/wt/v-x\" --command claude "), "wrapped in nix develop");
+        assert!(d.contains("--model 'claude-x'") && d.contains("\"$CDZ_KICKOFF\""), "same claude args inside the devShell");
         // codex is recognized but not yet wired — an actionable error, never a guessed command.
-        let e = build_launch_cmd("codex", "m", "high").unwrap_err();
+        let e = build_launch_cmd("codex", "m", "high", None).unwrap_err();
         assert!(e.contains("codex") && e.contains("not wired"));
         // an unknown/typo'd harness fails loudly.
-        let u = build_launch_cmd("gpt5", "m", "high").unwrap_err();
+        let u = build_launch_cmd("gpt5", "m", "high", None).unwrap_err();
         assert!(u.contains("unknown harness 'gpt5'"));
     }
 
@@ -3215,31 +3255,36 @@ mod tests {
 
     #[test]
     fn build_meta_patch_includes_only_requested_keys_and_errors_when_empty() {
-        let p = build_meta_patch(&["o/r@b".to_string()], Some("2m"), None, None).unwrap();
+        let p = build_meta_patch(&["o/r@b".to_string()], Some("2m"), None, None, None).unwrap();
         assert_eq!(p["repos"], serde_json::json!([{"repo":"o/r","branch":"b"}]));
         assert_eq!(p["interval"], "2m");
-        // repos only — no interval/host/native key
-        let p = build_meta_patch(&["o/r".to_string()], None, None, None).unwrap();
-        assert!(p.get("interval").is_none() && p.get("host").is_none() && p.get("native").is_none());
+        // repos only — no interval/host/native/devshell key
+        let p = build_meta_patch(&["o/r".to_string()], None, None, None, None).unwrap();
+        assert!(p.get("interval").is_none() && p.get("host").is_none() && p.get("native").is_none() && p.get("devshell").is_none());
         assert!(p.get("repos").is_some());
         // interval only — no repos key
-        let p = build_meta_patch(&[], Some("30m"), None, None).unwrap();
+        let p = build_meta_patch(&[], Some("30m"), None, None, None).unwrap();
         assert!(p.get("repos").is_none());
         assert_eq!(p["interval"], "30m");
         // host set, and "" clears the pin (JSON null)
-        let p = build_meta_patch(&[], None, Some("green-machine"), None).unwrap();
+        let p = build_meta_patch(&[], None, Some("green-machine"), None, None).unwrap();
         assert_eq!(p["host"], "green-machine");
-        let p = build_meta_patch(&[], None, Some(""), None).unwrap();
+        let p = build_meta_patch(&[], None, Some(""), None, None).unwrap();
         assert_eq!(p["host"], serde_json::Value::Null, "empty host clears the pin");
         // native: tri-state — Some(true)/Some(false) emit the bool; None omits the key entirely
-        let p = build_meta_patch(&[], None, None, Some(true)).unwrap();
+        let p = build_meta_patch(&[], None, None, Some(true), None).unwrap();
         assert_eq!(p["native"], serde_json::Value::Bool(true), "--native true → the board-native marker");
-        let p = build_meta_patch(&[], None, None, Some(false)).unwrap();
+        let p = build_meta_patch(&[], None, None, Some(false), None).unwrap();
         assert_eq!(p["native"], serde_json::Value::Bool(false), "--native false → clear back to file-hub");
-        assert!(build_meta_patch(&["o/r".to_string()], None, None, None).unwrap().get("native").is_none(),
+        assert!(build_meta_patch(&["o/r".to_string()], None, None, None, None).unwrap().get("native").is_none(),
             "native untouched when not requested");
+        // devshell: tri-state, same shape (#214 opt-in launch-in-nix-develop marker)
+        let p = build_meta_patch(&[], None, None, None, Some(true)).unwrap();
+        assert_eq!(p["devshell"], serde_json::Value::Bool(true), "--devshell true → launch inside the flake devShell");
+        assert!(build_meta_patch(&["o/r".to_string()], None, None, None, None).unwrap().get("devshell").is_none(),
+            "devshell untouched when not requested");
         // nothing requested → error (guards a no-op PATCH)
-        assert!(build_meta_patch(&[], None, None, None).is_err());
+        assert!(build_meta_patch(&[], None, None, None, None).is_err());
     }
 
     #[test]
