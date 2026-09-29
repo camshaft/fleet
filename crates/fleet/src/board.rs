@@ -64,6 +64,23 @@ impl Board {
         self.get_json(&format!("/agents/{agent}"))
     }
 
+    /// Count an agent's OPEN (non-terminal) assigned tasks — the `/tasks?assignee=<id>` list minus anything
+    /// `done`/`cancelled`. The watchdog uses this to spot an agent sitting on assigned work while idling on a
+    /// long loop interval. (Agent ids are kebab-case with no URL-special chars, so no query-encoding needed.)
+    pub fn open_task_count(&self, assignee: &str) -> Result<usize, String> {
+        let tasks = match self.get_json(&format!("/tasks?assignee={assignee}"))? {
+            Value::Array(a) => a,
+            other => return Err(format!("board /tasks: expected an array, got {other}")),
+        };
+        Ok(tasks
+            .iter()
+            .filter(|t| {
+                let s = t.get("status").and_then(Value::as_str).unwrap_or("");
+                s != "done" && s != "cancelled"
+            })
+            .count())
+    }
+
     /// Merge `metadata` into an agent's board record via `PATCH /agents/<id>`. The board merges at the KEY
     /// level, so only the keys present in `metadata` change — every other metadata key is preserved. `Err`
     /// on a non-2xx response (e.g. an unknown agent).
