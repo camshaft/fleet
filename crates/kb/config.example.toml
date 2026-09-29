@@ -31,6 +31,13 @@ rerank_model = "BAAI/bge-reranker-base"
 # How many vector candidates to pull + rerank before blending. (was KB_RERANK_CANDIDATES)
 rerank_candidates = 40
 
+# Where fastembed caches downloaded model files (bge-large + reranker). Empty = fastembed's own default
+# (FASTEMBED_CACHE_DIR env, else .fastembed_cache in the process CWD). fastembed 4.9 uses two different cache
+# mechanisms (the embedder honors HF_HOME, the reranker only reads FASTEMBED_CACHE_DIR/CWD), so a hardened
+# service with a read-only CWD must set ONE explicit writable dir here — it's passed to both. The deployed
+# role points this at its systemd StateDirectory.
+cache_dir = ""
+
 # --- MCP server ---
 # Bind address for `kb serve`. (was KB_MCP_HOST / KB_MCP_PORT)
 mcp_host = "0.0.0.0"

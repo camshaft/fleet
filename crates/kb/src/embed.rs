@@ -64,9 +64,14 @@ fn model() -> Result<&'static Mutex<TextEmbedding>, String> {
     }
     let cfg = config::get();
     let kind = model_kind(&cfg.embed_model)?;
-    let opts = InitOptions::new(kind)
+    let mut opts = InitOptions::new(kind)
         .with_execution_providers(providers(cfg))
         .with_show_download_progress(true);
+    // Pin the model cache to the same explicit dir the reranker uses (see rerank.rs) so both land in one
+    // deterministic, writable location under the hardened service — independent of CWD/HF_HOME.
+    if !cfg.cache_dir.is_empty() {
+        opts = opts.with_cache_dir(std::path::PathBuf::from(&cfg.cache_dir));
+    }
     let te = TextEmbedding::try_new(opts).map_err(|e| format!("embedder init failed: {e}"))?;
     // Racing initializers: whoever wins `set` provides the model; the loser's is dropped.
     let _ = MODEL.set(Mutex::new(te));

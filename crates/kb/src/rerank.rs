@@ -28,9 +28,14 @@ fn model() -> Result<&'static Mutex<TextRerank>, String> {
     }
     let cfg = config::get();
     let kind = model_kind(&cfg.rerank_model)?;
-    let opts = RerankInitOptions::new(kind)
+    let mut opts = RerankInitOptions::new(kind)
         .with_execution_providers(vec![CPUExecutionProvider::default().build()])
         .with_show_download_progress(true);
+    // fastembed's reranker only reads `FASTEMBED_CACHE_DIR`/CWD for its cache (it does NOT honor HF_HOME),
+    // so under a hardened service (read-only CWD) the download fails unless we point it at a writable dir.
+    if !cfg.cache_dir.is_empty() {
+        opts = opts.with_cache_dir(std::path::PathBuf::from(&cfg.cache_dir));
+    }
     let tr = TextRerank::try_new(opts).map_err(|e| format!("reranker init failed: {e}"))?;
     let _ = MODEL.set(Mutex::new(tr));
     Ok(MODEL.get().expect("just set"))
