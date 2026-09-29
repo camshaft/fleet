@@ -1355,6 +1355,14 @@ fn spin_up(agent: &str, apply: bool) {
         eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
         std::process::exit(1);
     }
+    // Pre-trust the fleet root so claude does not stall on the one-time folder-trust prompt (an interactive
+    // agent can't answer it, and --dangerously-skip-permissions does NOT bypass it). Trust inherits down
+    // the tree, so trusting the root once covers every agent workspace under it. Non-fatal on error.
+    match pre_trust_fleet_root(&fleet_root) {
+        Ok(true) => println!("  pre-trusted fleet root {fleet_root} (workspaces under it inherit trust)"),
+        Ok(false) => {}
+        Err(e) => eprintln!("  WARN: could not pre-trust {fleet_root}: {e} (agent may hit a one-time trust prompt)"),
+    }
     match launch_board_agent(agent, &workdir, &model, &effort, &interval) {
         Ok(win) => println!(
             "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then /loop {interval}"
@@ -1410,6 +1418,53 @@ fn launch_board_agent(agent: &str, workdir: &str, model: &str, effort: &str, int
     Ok(format!("{session}:{agent}"))
 }
 
+/// Add a trusted-project entry for `dir` to a parsed `~/.claude.json` value. Returns whether it changed
+/// the value (false = already trusted → no write needed). Only touches `projects.<dir>`; leaves every
+/// other key untouched (preserve_order keeps the rest of the config byte-stable). Pure — unit-tested.
+fn ensure_trusted(config: &mut serde_json::Value, dir: &str) -> bool {
+    let already = config
+        .get("projects")
+        .and_then(|p| p.get(dir))
+        .and_then(|e| e.get("hasTrustDialogAccepted"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if already {
+        return false;
+    }
+    let Some(obj) = config.as_object_mut() else { return false };
+    let projects = obj
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(projects) = projects.as_object_mut() else { return false };
+    let entry = projects
+        .entry(dir.to_string())
+        .or_insert_with(|| serde_json::json!({ "allowedTools": [] }));
+    entry["hasTrustDialogAccepted"] = serde_json::Value::Bool(true);
+    true
+}
+
+/// Idempotently mark the fleet root trusted in `~/.claude.json` (workspaces under it inherit trust, so a
+/// spun-up agent never stalls on the folder-trust prompt). Returns true if it wrote a change. Reads the
+/// resolved (symlink-canonical) path — that is the key claude stores. Writes atomically (temp + rename)
+/// only when a change is needed, so it can't tear the shared config and rarely races a concurrent writer.
+fn pre_trust_fleet_root(fleet_root: &str) -> Result<bool, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let cfg = format!("{home}/.claude.json");
+    let canon = std::fs::canonicalize(fleet_root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| fleet_root.to_string());
+    let raw = std::fs::read_to_string(&cfg).map_err(|e| format!("read {cfg}: {e}"))?;
+    let mut v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("parse {cfg}: {e}"))?;
+    if !ensure_trusted(&mut v, &canon) {
+        return Ok(false);
+    }
+    let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    let tmp = format!("{cfg}.fleet-tmp-{}", std::process::id());
+    std::fs::write(&tmp, body).map_err(|e| format!("write {tmp}: {e}"))?;
+    std::fs::rename(&tmp, &cfg).map_err(|e| format!("rename {tmp} -> {cfg}: {e}"))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,6 +1480,19 @@ mod tests {
             root: base.join(".claude/fleet"),
         };
         (base, fleet)
+    }
+
+    #[test]
+    fn ensure_trusted_adds_missing_is_idempotent_and_creates_projects() {
+        let mut v = serde_json::json!({"projects": {"/x": {"hasTrustDialogAccepted": true}}});
+        assert!(ensure_trusted(&mut v, "/root/.fleet")); // new dir -> changed
+        assert_eq!(v["projects"]["/root/.fleet"]["hasTrustDialogAccepted"], true);
+        assert!(!ensure_trusted(&mut v, "/root/.fleet")); // now trusted -> no change
+        assert!(!ensure_trusted(&mut v, "/x")); // already trusted -> no change
+        let mut empty = serde_json::json!({"other": 1});
+        assert!(ensure_trusted(&mut empty, "/d")); // creates the projects map
+        assert_eq!(empty["projects"]["/d"]["hasTrustDialogAccepted"], true);
+        assert_eq!(empty["other"], 1, "other keys are preserved");
     }
 
     #[test]
