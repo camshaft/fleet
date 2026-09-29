@@ -1352,6 +1352,8 @@ fn spin_up(agent: &str, apply: bool) {
     let model = resolve_model(&field("model").unwrap_or_else(|| "opus".into()));
     let effort = field("effort").unwrap_or_else(|| "high".into());
     let interval = field("interval").unwrap_or_else(|| "30m".into());
+    // The agent runtime to launch (metadata.harness); defaults to claude so existing records are unchanged.
+    let harness = field("harness").unwrap_or_else(|| "claude".into());
     let repos = md
         .get("repos")
         .and_then(|v| v.as_array())
@@ -1365,7 +1367,7 @@ fn spin_up(agent: &str, apply: bool) {
         "  charter on board: {}",
         if has_charter { "yes — the agent fetches it in-session at boot" } else { "NO — declare a charter first" }
     );
-    println!("  model={model}  effort={effort}  interval={interval}");
+    println!("  harness={harness}  model={model}  effort={effort}  interval={interval}");
     if repos.is_empty() {
         println!("  repos: NONE declared — no workspace to materialize (declare `repos` on the board record)");
     }
@@ -1414,7 +1416,12 @@ fn spin_up(agent: &str, apply: bool) {
         }
     };
     if !apply {
-        println!("  would launch: claude in {workdir} (board MCP in-session) with a self-discovery kickoff, then /loop {interval}");
+        match build_launch_cmd(&harness, &model, &effort) {
+            Ok(_) => println!(
+                "  would launch: {harness} in {workdir} (board MCP in-session) with a self-discovery kickoff, then a work-conserving dynamic /loop (idle cadence ~{interval})"
+            ),
+            Err(e) => println!("  would NOT launch: {e}"),
+        }
         println!("  (dry-run — re-run with --apply to materialize + launch)");
         return;
     }
@@ -1441,7 +1448,7 @@ fn spin_up(agent: &str, apply: bool) {
         Ok(false) => {}
         Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
-    match launch_board_agent(agent, &workdir, &model, &effort, &interval) {
+    match launch_board_agent(agent, &workdir, &harness, &model, &effort, &interval) {
         Ok(win) => {
             println!(
                 "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then /loop {interval}"
@@ -1490,10 +1497,43 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
     )
 }
 
-/// Open a tmux window running `claude` in `workdir` with a SELF-DISCOVERY kickoff (the agent fetches its
-/// own charter from the board via its in-session MCP — nothing is injected). Refuses to double-launch an
-/// existing same-named window. The kickoff is passed via a tmux env var so no shell quoting can mangle it.
-fn launch_board_agent(agent: &str, workdir: &str, model: &str, effort: &str, interval: &str) -> Result<String, String> {
+/// Build the shell command that launches the agent's harness (agent runtime) in its tmux window, per the
+/// selected `harness`. This is the one seam every harness plugs into: the window launch, trust, and kickoff
+/// are harness-agnostic, only this command differs. The kickoff rides in `$CDZ_KICKOFF` (set on the window),
+/// so the command references that env var rather than interpolating the prompt. Pure so it is unit-tested.
+///
+/// `claude` is fully wired. `codex` is a recognized-but-not-yet-wired harness: it returns an actionable
+/// error rather than a guessed command, because Codex needs both its own CLI launch flags (model /
+/// unattended-approval / initial-prompt) AND its own kickoff/loop/wake semantics — the Claude `/loop` +
+/// in-session-MCP self-discovery model is Claude-specific and does not carry over unchanged. An unknown
+/// harness is rejected so a typo'd `metadata.harness` fails loudly at spin-up instead of launching nothing.
+fn build_launch_cmd(harness: &str, model: &str, effort: &str) -> Result<String, String> {
+    match harness {
+        "claude" => Ok(format!(
+            // effort/model are single-quoted (no single-quotes in them) so `[1m]` can't glob; the kickoff
+            // rides in $CDZ_KICKOFF (set literally via `-e`, expanded double-quoted) so its spaces/quotes
+            // are safe.
+            "exec claude --disallowedTools AskUserQuestion --effort '{effort}' --model '{model}' \
+             --autocompact 600000 --dangerously-skip-permissions \"$CDZ_KICKOFF\""
+        )),
+        "codex" => Err(
+            "harness 'codex' is recognized but its launch is not wired yet — fill in the codex arm of \
+             build_launch_cmd (the codex CLI's model flag + unattended/no-approval flags + initial-prompt \
+             from $CDZ_KICKOFF) AND give codex its own kickoff/loop/wake semantics (the Claude /loop + \
+             in-session-MCP self-discovery model does not carry over). Validate against a live codex install."
+                .to_string(),
+        ),
+        other => Err(format!(
+            "unknown harness '{other}' (known: claude, codex) — set metadata.harness on the agent's board record"
+        )),
+    }
+}
+
+/// Open a tmux window running the agent's harness in `workdir` with a SELF-DISCOVERY kickoff (the agent
+/// fetches its own charter from the board via its in-session MCP — nothing is injected). The launch command
+/// is harness-specific (see [`build_launch_cmd`]); refuses to double-launch an existing same-named window.
+/// The kickoff is passed via a tmux env var so no shell quoting can mangle it.
+fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, effort: &str, interval: &str) -> Result<String, String> {
     let session = board_session();
     if let Ok(out) = std::process::Command::new("tmux")
         .args(["list-windows", "-t", &session, "-F", "#W"])
@@ -1503,12 +1543,7 @@ fn launch_board_agent(agent: &str, workdir: &str, model: &str, effort: &str, int
         return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
     }
     let kickoff = build_kickoff(agent, workdir, interval);
-    // effort/model are single-quoted (no single-quotes in them) so `[1m]` can't glob; the kickoff rides in
-    // $CDZ_KICKOFF (set literally via `-e`, expanded double-quoted) so its spaces/quotes are safe.
-    let cmd = format!(
-        "exec claude --disallowedTools AskUserQuestion --effort '{effort}' --model '{model}' \
-         --autocompact 600000 --dangerously-skip-permissions \"$CDZ_KICKOFF\""
-    );
+    let cmd = build_launch_cmd(harness, model, effort)?;
     let status = std::process::Command::new("tmux")
         .args([
             "new-window", "-d",
@@ -1747,6 +1782,21 @@ mod tests {
         assert!(k.contains("list_tasks with assignee 'v-x'"));
         assert!(k.contains("NEVER idle-sleep"));
         assert!(k.contains("about 30m"), "the interval is the idle-fallback ceiling");
+    }
+
+    #[test]
+    fn build_launch_cmd_wires_claude_and_stages_codex_and_rejects_unknown() {
+        // claude is fully wired: the exec line carries the model/effort and reads the kickoff from the env.
+        let c = build_launch_cmd("claude", "claude-x", "high").expect("claude wired");
+        assert!(c.starts_with("exec claude "));
+        assert!(c.contains("--model 'claude-x'") && c.contains("--effort 'high'"));
+        assert!(c.contains("\"$CDZ_KICKOFF\""), "kickoff rides in the env var, not interpolated");
+        // codex is recognized but not yet wired — an actionable error, never a guessed command.
+        let e = build_launch_cmd("codex", "m", "high").unwrap_err();
+        assert!(e.contains("codex") && e.contains("not wired"));
+        // an unknown/typo'd harness fails loudly.
+        let u = build_launch_cmd("gpt5", "m", "high").unwrap_err();
+        assert!(u.contains("unknown harness 'gpt5'"));
     }
 
     #[test]
