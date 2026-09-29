@@ -25,6 +25,21 @@ const DEFAULT_BASE: &str = "http://127.0.0.1:8880/board/api";
 /// ("browser_signature_banned", #209) — so send a browser-ish UA defensively; harmless on loopback.
 const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) fleet-orchestrator";
 
+/// Whether a task is ACTIONABLE pending work for the work-conserving loop (board-pm refinement): only a
+/// `todo`/`in_progress` task that is NOT blocked/parked. A `blocked_on` link (waiting on a blocker, or on a
+/// prereq that does not exist yet) means the task is parked, not actionable — counting it kept an agent's
+/// loop hot on a parked item (the v-runtime #230 false-fire). Pure — unit-tested.
+fn task_is_actionable(task: &Value) -> bool {
+    let status = task.get("status").and_then(Value::as_str).unwrap_or("");
+    let actionable_status = status == "todo" || status == "in_progress";
+    // The list endpoint carries the blocker as `blocked_on_kind`; the full task object as `blocked_on`.
+    // Either present-and-non-null means parked.
+    let blocked = ["blocked_on_kind", "blocked_on"]
+        .iter()
+        .any(|k| task.get(*k).is_some_and(|v| !v.is_null()));
+    actionable_status && !blocked
+}
+
 /// The board query path for an OPEN observation task tagged `observes=<target>` in a project — the #290
 /// idempotency check. Both `meta_key` and `meta_value` must be present for the board to filter on metadata
 /// (either alone is inert). Agent ids are kebab-case with no URL-special characters, so no encoding is
@@ -81,21 +96,16 @@ impl Board {
         self.get_json(&format!("/agents/{agent}"))
     }
 
-    /// Count an agent's OPEN (non-terminal) assigned tasks — the `/tasks?assignee=<id>` list minus anything
-    /// `done`/`cancelled`. The watchdog uses this to spot an agent sitting on assigned work while idling on a
-    /// long loop interval. (Agent ids are kebab-case with no URL-special chars, so no query-encoding needed.)
+    /// Count an agent's ACTIONABLE assigned tasks — the `/tasks?assignee=<id>` list kept to `todo`/`in_progress`
+    /// tasks that are NOT blocked/parked (see [`task_is_actionable`]). The watchdog uses this to spot an agent
+    /// sitting on actionable work while idling on a long loop interval; a blocked/parked task must NOT keep the
+    /// loop hot. (Agent ids are kebab-case with no URL-special chars, so no query-encoding needed.)
     pub fn open_task_count(&self, assignee: &str) -> Result<usize, String> {
         let tasks = match self.get_json(&format!("/tasks?assignee={assignee}"))? {
             Value::Array(a) => a,
             other => return Err(format!("board /tasks: expected an array, got {other}")),
         };
-        Ok(tasks
-            .iter()
-            .filter(|t| {
-                let s = t.get("status").and_then(Value::as_str).unwrap_or("");
-                s != "done" && s != "cancelled"
-            })
-            .count())
+        Ok(tasks.iter().filter(|t| task_is_actionable(t)).count())
     }
 
     /// Fetch a custom workspace-kind resource (`GET /api/workspace-kinds/{kind}`) → `Some(record)`, or `None`
@@ -257,6 +267,29 @@ mod tests {
         // The default is the front-door /board/api proxy, not the board's own unreachable port.
         assert!(DEFAULT_BASE.ends_with("/board/api"));
         assert!(DEFAULT_BASE.starts_with("http://"));
+    }
+
+    #[test]
+    fn task_is_actionable_only_for_unblocked_todo_or_in_progress() {
+        let mk = |s: &str| serde_json::json!({ "status": s });
+        assert!(task_is_actionable(&mk("todo")));
+        assert!(task_is_actionable(&mk("in_progress")));
+        // Terminal or non-actionable statuses never count.
+        assert!(!task_is_actionable(&mk("done")));
+        assert!(!task_is_actionable(&mk("cancelled")));
+        assert!(!task_is_actionable(&mk("blocked")));
+        assert!(!task_is_actionable(&serde_json::json!({})), "missing status is not actionable");
+        // A todo/in_progress task PARKED on a blocker is NOT actionable — either blocked_on shape.
+        assert!(
+            !task_is_actionable(&serde_json::json!({ "status": "todo", "blocked_on_kind": "operator" })),
+            "parked via blocked_on_kind (list shape) is not actionable"
+        );
+        assert!(
+            !task_is_actionable(&serde_json::json!({ "status": "in_progress", "blocked_on": {"kind": "task"} })),
+            "parked via blocked_on (full-object shape) is not actionable"
+        );
+        // A null blocked_on does NOT mean parked.
+        assert!(task_is_actionable(&serde_json::json!({ "status": "todo", "blocked_on": null })));
     }
 
     #[test]
