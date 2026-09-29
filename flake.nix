@@ -80,12 +80,60 @@
             mainProgram = "fleet-tunnel";
           };
         };
+
+      # The voice-assistant daemon (crates/voice-assistant): a local voice loop (custom wake phrase → STT →
+      # Claude+MCP → TTS). Its audio+ML shell is `required-features = ["runtime"]`-gated, so the `runtime`
+      # feature is REQUIRED to produce the binary (it pulls sherpa-onnx for STT/TTS/wake + cpal for audio).
+      # The dotfiles voice-assistant role consumes this as inputs.fleet.packages.${system}.voice-assistant.
+      #
+      # Unlike the other crates, this one links NATIVE libraries at build time:
+      #   • sherpa-onnx-sys — with the crate's `shared` feature it links a prebuilt libsherpa-onnx. The
+      #     build script normally DOWNLOADS a CPU archive, which the hermetic nix sandbox forbids, so the
+      #     build must be pointed at a lib via SHERPA_ONNX_LIB_DIR. On green-machine that's the CUDA 11.8
+      #     GPU build (runs on the Pascal 1080 Ti); CUDA itself is exposed at RUNTIME via LD_LIBRARY_PATH
+      #     from the dotfiles role (the knowledge-base.nix pattern), not linked here.
+      #   • cpal — needs ALSA headers/libs (alsa-lib) to build.
+      # `sherpaOnnxLib` is the derivation providing $out/lib/libsherpa-onnx-c-api.so; on green-machine it is
+      # overridden to the GPU archive. Left as null here so a non-green host still evaluates (the package
+      # only builds where the lib is supplied) — this is why voice-assistant is NOT in `checks` below: the
+      # native/GPU build is not hermetic on arbitrary CI.
+      voiceAssistantPackage =
+        pkgs:
+        { sherpaOnnxLib ? null }:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "voice-assistant";
+          version = "0.0.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildAndTestSubdir = "crates/voice-assistant";
+          buildFeatures = [ "runtime" ];
+          nativeBuildInputs = [
+            pkgs.cmake
+            pkgs.pkg-config
+          ];
+          buildInputs = [
+            pkgs.alsa-lib
+          ] ++ pkgs.lib.optional (sherpaOnnxLib != null) sherpaOnnxLib;
+          # Point sherpa-onnx-sys at the prebuilt lib instead of letting it fetch (no network in sandbox).
+          SHERPA_ONNX_LIB_DIR = pkgs.lib.optionalString (sherpaOnnxLib != null) "${sherpaOnnxLib}/lib";
+          # The daemon shells no build-time deps beyond the native libs; its tests are the pure lib's
+          # `cargo test` gate (the default-features build), not run under the sandbox.
+          doCheck = false;
+          meta = {
+            description = "Local voice assistant daemon (wake → STT → Claude → TTS)";
+            mainProgram = "voice-assistant";
+          };
+        };
     in
     {
       packages = forAllSystems (pkgs: rec {
         fleet = fleetPackage pkgs;
         slack-bridge = slackBridgePackage pkgs;
         fleet-tunnel = fleetTunnelPackage pkgs;
+        # Built with no sherpaOnnxLib by default: the derivation evaluates everywhere but only *builds*
+        # where the native sherpa lib is supplied (green-machine overrides `sherpaOnnxLib` to the CUDA
+        # archive). See voiceAssistantPackage above.
+        voice-assistant = voiceAssistantPackage pkgs { };
         default = fleet;
       });
 
@@ -95,6 +143,7 @@
           fleet = fleetPackage pkgs;
           slackBridge = slackBridgePackage pkgs;
           fleetTunnel = fleetTunnelPackage pkgs;
+          voiceAssistant = voiceAssistantPackage pkgs { };
         in
         {
           fleet = {
@@ -108,6 +157,10 @@
           fleet-tunnel = {
             type = "app";
             program = "${fleetTunnel}/bin/fleet-tunnel";
+          };
+          voice-assistant = {
+            type = "app";
+            program = "${voiceAssistant}/bin/voice-assistant";
           };
           default = {
             type = "app";
@@ -135,6 +188,10 @@
             pkgs.rustfmt
             pkgs.git
             pkgs.tmux
+            # For building crates/voice-assistant --features runtime (sherpa-onnx-sys + cpal):
+            pkgs.cmake
+            pkgs.pkg-config
+            pkgs.alsa-lib
           ];
         };
       });

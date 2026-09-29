@@ -2,7 +2,7 @@
 # Workspace root. Core lives in crates/fleet (the `fleet` binary on PATH that every agent uses for comms).
 [workspace]
 resolver = "2"
-members = ["crates/fleet", "crates/slack-bridge", "crates/fleet-tunnel"]
+members = ["crates/fleet", "crates/slack-bridge", "crates/fleet-tunnel", "crates/voice-assistant"]
 
 [workspace.package]
 edition = "2024"

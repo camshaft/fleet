@@ -1,0 +1,52 @@
+# `voice-assistant` — a local voice loop: custom wake phrase → STT → Claude (+ MCP knowledge base /
+# task board / surfaces) → TTS, spoken through the host's audio. Ported to Rust from the Python
+# `shop-assistant` (operator seq-1375/1376: push it into a repo + flake, and it must be Rust).
+#
+# Same layout as `fleet-tunnel` / `slack-bridge`: the pure, synchronously-testable core (config parse,
+# chime tone math, event/webhook parsing, the brain's stream-json decoding) is a lib the workspace
+# `cargo test` / `nix flake check` always gates. The heavy ML + audio tree (sherpa-onnx for STT/TTS/
+# wake, cpal for capture/playback) is deferred behind a `runtime` feature so the default build stays
+# light and the binary that needs the native/GPU libs is opt-in (`--features runtime`).
+[package]
+name = "voice-assistant"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "voice_assistant"
+path = "src/lib.rs"
+
+# The daemon binary — the audio+ML shell. `required-features = ["runtime"]`-gated so the default
+# `cargo test --workspace` / `nix flake check` never builds sherpa-onnx or cpal.
+[[bin]]
+name = "voice-assistant"
+path = "src/main.rs"
+required-features = ["runtime"]
+
+[features]
+# The live voice loop: pulls the ONNX backend (sherpa-onnx: STT/TTS/wake) + audio I/O (cpal). Off by
+# default; enable to build/run the daemon.
+runtime = ["dep:sherpa-onnx", "dep:cpal", "dep:clap"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order: the brain forwards MCP tool arguments straight through; don't reorder object keys.
+serde_json = { version = "1", features = ["preserve_order"] }
+# The config format: a single TOML file (operator mandate seq-1377 — no env-var config).
+toml = "0.8"
+# Minimal blocking HTTP: the board register/webhook client (same stack fleet + fleet-tunnel use).
+ureq = "2"
+# The webhook receiver that turns board events into proactive prompts (same dep as fleet's notifier).
+tiny_http = "0.12"
+
+# ── The runtime tree — OPTIONAL, pulled only by the `runtime` feature (see above). ──
+# The single ONNX backend: STT (Whisper, CUDA), TTS (Kokoro), wake (KWS). Official k2-fsa bindings
+# (the `shared` feature links a prebuilt libsherpa-onnx — a CUDA 11.8 GPU build on green-machine, which
+# runs on the Pascal 1080 Ti; the default `static` links the bundled CPU archive).
+sherpa-onnx = { version = "1.13", optional = true, default-features = false, features = ["shared"] }
+# Microphone capture + speaker playback (ALSA/PipeWire on Linux).
+cpal = { version = "0.15", optional = true }
+# `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate seq-1377).
+clap = { version = "4", features = ["derive"], optional = true }
