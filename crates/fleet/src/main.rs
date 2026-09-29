@@ -1442,9 +1442,20 @@ fn spin_up(agent: &str, apply: bool) {
         Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
     match launch_board_agent(agent, &workdir, &model, &effort, &interval) {
-        Ok(win) => println!(
-            "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then /loop {interval}"
-        ),
+        Ok(win) => {
+            println!(
+                "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then /loop {interval}"
+            );
+            // Mark the agent board-native. `spin-up` IS the board-native launch path, so whatever it
+            // launches is board-native by construction; stamping `native: true` gives orchestrators a
+            // deterministic roster discriminator (metadata.native == true) instead of guessing from a
+            // non-empty charter (which the file-hub registry rows mirrored onto the board also lack).
+            // Idempotent key-level merge; non-fatal — the agent is already running.
+            match board.patch_metadata(agent, serde_json::json!({ "native": true })) {
+                Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
+                Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
+            }
+        }
         Err(e) => {
             eprintln!("  launch FAILED: {e}");
             std::process::exit(1);
