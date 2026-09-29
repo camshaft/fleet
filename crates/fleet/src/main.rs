@@ -2700,7 +2700,10 @@ fn observe_spawn_pass(
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(OBSERVE_SPAWN_COOLDOWN_SECS);
-    obs.sort_by_key(|a| std::cmp::Reverse(a.2.increment)); // most-grown first
+    // SPIN-DOWN candidates first (their closing read is mandatory + unrepeatable — a retiring agent's
+    // context is about to be gone), then most-grown first. So a small spin-down window is never crowded out
+    // of the per-sweep cap by large size candidates.
+    obs.sort_by_key(|(_, stood_down, d)| (std::cmp::Reverse(*stood_down), std::cmp::Reverse(d.increment)));
     let mut launched = 0usize;
     let mut actions: Vec<String> = Vec::new();
     for (id, _sd, d) in obs.iter() {
