@@ -28,3 +28,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # The daemon's config format: a single TOML file (operator mandate #159 — no env-var config). Holds
 # credentials + wiring; delivered at deploy time as the agenix-decrypted secret, gitignored in dev.
 toml = "0.8"
+# Minimal blocking HTTP client for the board's token-less localhost REST firehose (`GET /events` poll +
+# `POST /channels/:id/posts`). Same client the `fleet` orchestrator uses for its board REST access; light
+# and blocking — the sync core, NOT the heavy async Slack transport (that's the `transport` feature).
+ureq = "2"
