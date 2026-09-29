@@ -51,7 +51,9 @@ pub fn run(cfg: Config, scope_guard_command: String) -> Result<(), String> {
         &cfg.board.effective_webhook_url(),
     );
 
-    let cap = Capture::open(&cfg.audio)?;
+    // Open capture with retry-until-present rather than a fatal `?`: the daemon must stay up and wait for
+    // the mic (operator requirement #239), never crash-loop when it's absent at startup.
+    let cap = Capture::open_with_retry(&cfg.audio);
     let wake = WakeSpotter::new(&cfg.wake, cfg.audio.sample_rate)?;
     let stt = Transcriber::new(&cfg.stt, cfg.audio.sample_rate)?;
     let tts = Synthesizer::new(&cfg.tts)?;
@@ -218,6 +220,16 @@ impl Assistant {
     fn wait_for_wake_or_event(&mut self) -> Woke {
         let per_frame = Duration::from_millis(500);
         loop {
+            // If the capture device faulted (e.g. the mic was unplugged mid-run), don't spin on a dead
+            // stream — rebuild it, blocking until the device returns, then carry on (operator req #239:
+            // survive hot-unplug, never crash). Reset the wake stream so stale pre-unplug state can't
+            // linger into the reconnected stream.
+            if !self.cap.healthy() {
+                eprintln!("[audio] capture device lost; reconnecting…");
+                self.cap = Capture::open_with_retry(&self.cfg.audio);
+                self.wake.reset();
+                eprintln!("[audio] capture device reconnected");
+            }
             // A queued board event wakes the loop even without the wake phrase. The channel is
             // consume-on-read, so buffer what we drain for `drain_proactive` to handle.
             if let Some(w) = self.webhook.as_ref() {
