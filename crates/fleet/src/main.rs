@@ -1722,6 +1722,167 @@ fn main() {
     }
 }
 
+/// The launch plan derived from a board workspace-kind resource: the `setup_script` that materializes the
+/// workspace and the free-form `config` hints (`cwd`, `pre_trust`, `env`) the launcher reads. Parsing is
+/// pure so it is unit-tested without the board.
+struct WorkspaceKindPlan {
+    name: String,
+    description: Option<String>,
+    setup_script: Option<String>,
+    cwd: String,
+    pre_trust: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// Parse a board workspace-kind record into a launch plan. `config.cwd` is the launch directory (an
+/// absolute path is used as-is; a relative one is taken under `fleet_root`); when absent the agent's own
+/// root dir is the default. `config.pre_trust` is an optional list of extra paths to trust (the launch cwd
+/// and the fleet root are always trusted), and `config.env` an optional string map of environment variables
+/// the setup_script receives. Pure — unit-tested.
+fn parse_workspace_kind(agent: &str, fleet_root: &str, rec: &serde_json::Value) -> WorkspaceKindPlan {
+    let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    let description = rec.get("description").and_then(|v| v.as_str()).map(str::to_string);
+    let setup_script = rec
+        .get("setup_script")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let config = rec.get("config").cloned().unwrap_or(serde_json::Value::Null);
+    let cwd = match config.get("cwd").and_then(|v| v.as_str()) {
+        Some(c) if c.starts_with('/') => c.to_string(),
+        Some(c) => format!("{fleet_root}/{c}"),
+        None => workspace::agent_root_dir(fleet_root, agent),
+    };
+    let mut pre_trust: Vec<String> = vec![fleet_root.to_string(), cwd.clone()];
+    if let Some(arr) = config.get("pre_trust").and_then(|v| v.as_array()) {
+        pre_trust.extend(arr.iter().filter_map(|p| p.as_str().map(str::to_string)));
+    }
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(obj) = config.get("env").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                env.push((k.clone(), s.to_string()));
+            }
+        }
+    }
+    WorkspaceKindPlan { name, description, setup_script, cwd, pre_trust, env }
+}
+
+/// Spin up an agent whose workspace is defined by a board workspace-kind resource rather than by `repos`.
+/// Fetches the kind, reports the plan, and on `--apply` runs its setup_script (with `FLEET_AGENT` /
+/// `FLEET_ROOT` and any `config.env` in the environment) to materialize the workspace, pre-trusts the
+/// launch paths, and launches the agent in the kind's `config.cwd`. (#287)
+#[allow(clippy::too_many_arguments)]
+fn spin_up_workspace_kind(
+    board: &board::Board,
+    agent: &str,
+    kind: &str,
+    fleet_root: &str,
+    has_charter: bool,
+    harness: &str,
+    model: &str,
+    effort: &str,
+    interval: &str,
+    devshell: bool,
+    apply: bool,
+) {
+    let rec = match board.get_workspace_kind(kind) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            eprintln!(
+                "fleet spin-up: agent '{agent}' declares workspace_kind '{kind}', but no such kind is defined on the board (define it with POST /api/workspace-kinds)"
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("fleet spin-up: {e}");
+            std::process::exit(1);
+        }
+    };
+    let plan = parse_workspace_kind(agent, fleet_root, &rec);
+
+    println!("spin-up '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    println!(
+        "  charter on board: {}",
+        if has_charter { "yes — the agent fetches it in-session at boot" } else { "NO — declare a charter first" }
+    );
+    println!("  harness={harness}  model={model}  effort={effort}  interval={interval}");
+    println!(
+        "  workspace kind: {}{}",
+        plan.name,
+        plan.description.as_deref().map(|d| format!(" — {d}")).unwrap_or_default()
+    );
+    println!("  launch cwd: {}", plan.cwd);
+    match &plan.setup_script {
+        Some(s) => println!(
+            "  setup_script: {} line(s) — runs with FLEET_AGENT/FLEET_ROOT{} in the environment",
+            s.lines().count(),
+            if plan.env.is_empty() { String::new() } else { format!(" + {} config env var(s)", plan.env.len()) }
+        ),
+        None => println!("  setup_script: NONE — the launch cwd is expected to exist already"),
+    }
+
+    if !apply {
+        println!("  (dry-run — re-run with --apply to run the setup_script + launch)");
+        return;
+    }
+    if !has_charter {
+        eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
+        std::process::exit(1);
+    }
+
+    if let Some(script) = &plan.setup_script {
+        // Run the setup_script from the fleet root so it has a stable base, with the agent identity and root
+        // in the environment; the script is what materializes the launch cwd (and anything else the kind needs).
+        if let Err(e) = std::fs::create_dir_all(fleet_root) {
+            eprintln!("  setup FAILED: mkdir {fleet_root}: {e}");
+            std::process::exit(1);
+        }
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(script)
+            .current_dir(fleet_root)
+            .env("FLEET_AGENT", agent)
+            .env("FLEET_ROOT", fleet_root);
+        for (k, v) in &plan.env {
+            cmd.env(k, v);
+        }
+        match cmd.status() {
+            Ok(st) if st.success() => println!("  setup_script OK"),
+            Ok(st) => {
+                eprintln!("  setup_script FAILED (exit {})", st.code().unwrap_or(-1));
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("  setup_script FAILED to run: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    match pre_trust_dirs(&plan.pre_trust) {
+        Ok(true) => println!("  pre-trusted {} path(s) (launch cwd + fleet root + config pre_trust)", plan.pre_trust.len()),
+        Ok(false) => {}
+        Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
+    }
+    match launch_board_agent(agent, &plan.cwd, harness, model, effort, interval, devshell) {
+        Ok(win) => {
+            println!(
+                "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {}) — it will get_agent itself for its charter, then run a work-conserving dynamic /loop (idle cadence ~{interval})",
+                plan.cwd
+            );
+            match board.patch_metadata(agent, serde_json::json!({ "native": true })) {
+                Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
+                Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
+            }
+        }
+        Err(e) => {
+            eprintln!("  launch FAILED: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Spin up one board-declared agent into its `~/.fleet` workspace. Reads the board record (orchestrator
 /// read — agents coordinate via their own MCP), then reports the materialize + launch plan; `--apply`
 /// materializes each repo's worktree off a shared bare mirror and launches a tmux window running `claude`
@@ -1759,6 +1920,17 @@ fn spin_up(agent: &str, apply: bool) {
         .root
         .clone()
         .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
+
+    // A board-defined custom workspace kind (metadata.workspace_kind) takes precedence over `repos`: the
+    // board resource named by the kind carries a setup_script that materializes the workspace and a
+    // free-form config with the launch hints (cwd/pre_trust/env). This lets an environment the fleet does
+    // not model natively be defined in a board resource and driven from there. (#287)
+    if let Some(kind) = field("workspace_kind") {
+        return spin_up_workspace_kind(
+            &board, agent, &kind, &fleet_root, has_charter, &harness, &model, &effort, &interval,
+            devshell, apply,
+        );
+    }
 
     println!("spin-up '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
     println!(
@@ -3536,6 +3708,51 @@ mod tests {
             assert!(o.status.success(), "hook bash syntax error:\n{}", String::from_utf8_lossy(&o.stderr));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_workspace_kind_reads_setup_script_and_config_hints() {
+        let rec = serde_json::json!({
+            "name": "example-env",
+            "description": "a board-defined environment",
+            "setup_script": "echo materialize\n",
+            "config": {
+                "cwd": "/work/example",
+                "pre_trust": ["/work/example/sub", "/opt/toolchain"],
+                "env": { "FOO": "bar", "IGNORED_NUM": 7 }
+            }
+        });
+        let p = parse_workspace_kind("v-example", "/home/u/.fleet", &rec);
+        assert_eq!(p.name, "example-env");
+        assert_eq!(p.description.as_deref(), Some("a board-defined environment"));
+        assert_eq!(p.setup_script.as_deref(), Some("echo materialize\n"));
+        assert_eq!(p.cwd, "/work/example", "absolute config.cwd is used as-is");
+        // The launch cwd + the fleet root are always trusted, then the config pre_trust entries.
+        assert_eq!(
+            p.pre_trust,
+            vec![
+                "/home/u/.fleet".to_string(),
+                "/work/example".to_string(),
+                "/work/example/sub".to_string(),
+                "/opt/toolchain".to_string(),
+            ]
+        );
+        // Only string-valued env keys survive; a non-string value is dropped.
+        assert_eq!(p.env, vec![("FOO".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn parse_workspace_kind_defaults_cwd_and_treats_blank_setup_as_none() {
+        // No config at all: cwd falls back to the agent's own root dir under the fleet root, no extra trust.
+        let rec = serde_json::json!({ "name": "bare", "setup_script": "   \n" });
+        let p = parse_workspace_kind("v-bare", "/home/u/.fleet", &rec);
+        assert_eq!(p.cwd, workspace::agent_root_dir("/home/u/.fleet", "v-bare"));
+        assert_eq!(p.pre_trust, vec!["/home/u/.fleet".to_string(), p.cwd.clone()]);
+        assert!(p.setup_script.is_none(), "whitespace-only setup_script is treated as absent");
+        // A relative config.cwd is taken under the fleet root.
+        let rec2 = serde_json::json!({ "name": "rel", "config": { "cwd": "checkout/here" } });
+        let p2 = parse_workspace_kind("v-rel", "/home/u/.fleet", &rec2);
+        assert_eq!(p2.cwd, "/home/u/.fleet/checkout/here");
     }
 
     #[test]

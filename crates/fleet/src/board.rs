@@ -90,6 +90,32 @@ impl Board {
             .count())
     }
 
+    /// Fetch a custom workspace-kind resource (`GET /api/workspace-kinds/{kind}`) → `Some(record)`, or `None`
+    /// when the kind is not defined (a 404). `spin-up` consumes this for an agent whose `metadata.workspace_kind`
+    /// names a board-defined environment: the record's `setup_script` materializes the workspace and its
+    /// free-form `config` object carries the launch hints (cwd/pre_trust/env) the consumer reads.
+    pub fn get_workspace_kind(&self, kind: &str) -> Result<Option<Value>, String> {
+        let url = format!("{}/workspace-kinds/{}", self.base, kind);
+        match self
+            .agent
+            .get(&url)
+            .set("accept", "application/json")
+            .set("user-agent", BOARD_UA)
+            .call()
+        {
+            Ok(resp) => {
+                let raw = resp
+                    .into_string()
+                    .map_err(|e| format!("board GET /workspace-kinds/{kind} read failed: {e}"))?;
+                serde_json::from_str(&raw)
+                    .map(Some)
+                    .map_err(|e| format!("board GET /workspace-kinds/{kind}: response was not JSON: {e}"))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(format!("board GET /workspace-kinds/{kind} failed: {e}")),
+        }
+    }
+
     /// Merge `metadata` into an agent's board record via `PATCH /agents/<id>`. The board merges at the KEY
     /// level, so only the keys present in `metadata` change — every other metadata key is preserved. `Err`
     /// on a non-2xx response (e.g. an unknown agent).
