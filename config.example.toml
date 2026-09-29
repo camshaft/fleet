@@ -1,0 +1,26 @@
+# fleet — example configuration (operator mandate seq-1377: the fleet binary is TOML-configured, not
+# FLEET_* env vars). Copy to $XDG_CONFIG_HOME/fleet/config.toml (else $HOME/.config/fleet/config.toml), or
+# pass `fleet --config <path> …`. Every key is OPTIONAL — an absent file, or an absent key, uses the
+# built-in default shown, so a host with no config behaves exactly as before. (HOME/XDG_CONFIG_HOME are the
+# only environment still read, and only to LOCATE this file + default the workspace root — not fleet knobs.)
+
+# tmux session the fleet's windows (agents + daemons) live in.
+# default: "main"
+# session = "main"
+
+# File-hub root for legacy runtime state (heartbeat/inbox/registry). Absent → git-common-dir of the cwd.
+# hub = "/home/you/Projects/camshaft/cadenza"
+
+# Per-agent workspace root for the ~/.fleet model (worktrees off a shared bare mirror).
+# default: "$HOME/.fleet"
+# root = "/home/you/.fleet"
+
+# Board REST base URL the fleet client talks to.
+# default: "http://127.0.0.1:8880/board/api" (the local front-door proxy)
+# board_api = "http://127.0.0.1:8880/board/api"
+
+# Path to the window launcher script. Absent → "<hub>/.claude/fleet/window.sh".
+# window_sh = "/home/you/.fleet/window.sh"
+
+# This process's agent id — the `fleet send` sender identity when --from is not given.
+# agent = "v-fleet-tooling"

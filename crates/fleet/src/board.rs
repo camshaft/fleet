@@ -27,9 +27,12 @@ pub struct Board {
 }
 
 impl Board {
-    /// The board REST base URL (`$FLEET_BOARD_API`, else the local front-door proxy).
+    /// The board REST base URL (`config.board_api`, else the local front-door proxy).
     pub fn base_url() -> String {
-        std::env::var("FLEET_BOARD_API").unwrap_or_else(|_| DEFAULT_BASE.to_string())
+        crate::config::get()
+            .board_api
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BASE.to_string())
     }
 
     /// Build a client. No network round-trip — the REST API is sessionless, so there is no handshake.
