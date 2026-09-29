@@ -16,6 +16,9 @@
 //! - [`format`] — board ↔ Slack message shaping: render an outbound-reflect as Slack mrkdwn (with
 //!   external-author attribution, HTML-escaping, length-capping + a degraded plain variant / relay-plan
 //!   resilience), and parse an operator's Slack line into a routed [`format::Intent`].
+//! - [`sync`] — the pure bidirectional-sync planning (firehose events → Slack posts + cursor advance;
+//!   inbound Slack → attributed board post), with the board↔Slack channel MAP injected as a resolver so
+//!   the adapter stays decoupled from board-core #149 slice-2 and generic across external sources.
 //!
 //! Later slices add the async transport binary (Socket Mode) that wires these together, behind the
 //! `transport` feature.
@@ -26,6 +29,7 @@
 pub mod board;
 pub mod config;
 pub mod format;
+pub mod sync;
 
 pub use board::{BoardClient, Event, OutboundReflect, OUTBOUND_REFLECT};
 pub use config::{Config, SlackTokens};
@@ -33,3 +37,4 @@ pub use format::{
     help_text, is_valid_agent_name, parse_operator_message, relay_plan, render_outbound_reflect,
     render_outbound_reflect_plain, Intent, RelayPlan, RELAY_QUEUE_WARN,
 };
+pub use sync::{plan_inbound, plan_outbound, slack_external_author, InboundPost, OutboundPost};
