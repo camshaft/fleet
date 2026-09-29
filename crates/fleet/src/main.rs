@@ -1252,6 +1252,22 @@ enum Cmd {
         #[arg(long)]
         stale_only: bool,
     },
+    /// Write launch-shaping metadata onto an agent's board record — the migration primitive that makes an
+    /// agent spin-up-ready. Merges (only the given keys change). Reports the patch by default; `--apply`
+    /// writes it. Use this instead of hand-editing the board when pushing an agent to be board-backed.
+    SetMeta {
+        /// The board agent id to update.
+        agent: String,
+        /// A repo the agent works in, as `owner/name@branch` (branch defaults to `main`). Repeatable.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Set the agent's loop interval (e.g. `2m`, `30m`, `2h`).
+        #[arg(long)]
+        interval: Option<String>,
+        /// Perform the write (default: just print the metadata patch that would be sent).
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn main() {
@@ -1283,6 +1299,12 @@ fn main() {
         } => up(&fleet, &config, provision || launch, launch),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::Status { stale_only } => status(stale_only),
+        Cmd::SetMeta {
+            agent,
+            repos,
+            interval,
+            apply,
+        } => set_meta(&agent, &repos, interval.as_deref(), apply),
     }
 }
 
@@ -1542,6 +1564,68 @@ fn status(stale_only: bool) {
     }
 }
 
+/// Parse a `owner/name@branch` repo spec into a board `repos` entry `{repo, branch}` (branch defaults to
+/// `main` when the `@branch` suffix is absent or empty). Pure — unit-tested.
+fn parse_repo_spec(spec: &str) -> serde_json::Value {
+    let (repo, branch) = match spec.split_once('@') {
+        Some((r, b)) if !b.is_empty() => (r, b),
+        _ => (spec.trim_end_matches('@'), "main"),
+    };
+    serde_json::json!({ "repo": repo, "branch": branch })
+}
+
+/// Build the metadata patch (the subset of keys to merge) from the requested `repos` + `interval`, or an
+/// error string if nothing was requested. Pure — unit-tested.
+fn build_meta_patch(repos: &[String], interval: Option<&str>) -> Result<serde_json::Value, String> {
+    let mut patch = serde_json::Map::new();
+    if !repos.is_empty() {
+        let entries: Vec<serde_json::Value> = repos.iter().map(|s| parse_repo_spec(s)).collect();
+        patch.insert("repos".to_string(), serde_json::Value::Array(entries));
+    }
+    if let Some(iv) = interval {
+        patch.insert("interval".to_string(), serde_json::Value::String(iv.to_string()));
+    }
+    if patch.is_empty() {
+        return Err("nothing to set — pass at least one --repo or --interval".to_string());
+    }
+    Ok(serde_json::Value::Object(patch))
+}
+
+/// Write launch-shaping metadata (`repos` / `interval`) onto an agent's board record — the migration
+/// primitive. Reports the patch by default; `--apply` PATCHes it (key-level merge, so untouched keys are
+/// preserved) and reads the record back to confirm.
+fn set_meta(agent: &str, repos: &[String], interval: Option<&str>, apply: bool) {
+    let patch = build_meta_patch(repos, interval).unwrap_or_else(|e| {
+        eprintln!("fleet set-meta: {e}");
+        std::process::exit(2);
+    });
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet set-meta: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "set-meta '{agent}' ({}): merge {}",
+        if apply { "APPLY" } else { "dry-run" },
+        serde_json::to_string(&patch).unwrap_or_default()
+    );
+    if !apply {
+        println!("  (dry-run — re-run with --apply to write; merge preserves every other metadata key)");
+        return;
+    }
+    if let Err(e) = board.patch_metadata(agent, patch) {
+        eprintln!("  write FAILED: {e}");
+        std::process::exit(1);
+    }
+    match board.get_agent(agent).ok().and_then(|r| r.get("metadata").cloned()) {
+        Some(md) => println!(
+            "  written. metadata now: repos={} interval={}",
+            md.get("repos").map(|v| v.to_string()).unwrap_or_else(|| "<none>".into()),
+            md.get("interval").and_then(|v| v.as_str()).unwrap_or("<none>")
+        ),
+        None => println!("  written (could not read back the record to confirm)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,6 +1641,30 @@ mod tests {
             root: base.join(".claude/fleet"),
         };
         (base, fleet)
+    }
+
+    #[test]
+    fn parse_repo_spec_splits_branch_and_defaults_to_main() {
+        assert_eq!(parse_repo_spec("camshaft/bolero@master"), serde_json::json!({"repo":"camshaft/bolero","branch":"master"}));
+        assert_eq!(parse_repo_spec("camshaft/backbeat"), serde_json::json!({"repo":"camshaft/backbeat","branch":"main"}));
+        assert_eq!(parse_repo_spec("camshaft/x@"), serde_json::json!({"repo":"camshaft/x","branch":"main"}), "empty branch → main");
+    }
+
+    #[test]
+    fn build_meta_patch_includes_only_requested_keys_and_errors_when_empty() {
+        let p = build_meta_patch(&["o/r@b".to_string()], Some("2m")).unwrap();
+        assert_eq!(p["repos"], serde_json::json!([{"repo":"o/r","branch":"b"}]));
+        assert_eq!(p["interval"], "2m");
+        // repos only — no interval key
+        let p = build_meta_patch(&["o/r".to_string()], None).unwrap();
+        assert!(p.get("interval").is_none());
+        assert!(p.get("repos").is_some());
+        // interval only — no repos key
+        let p = build_meta_patch(&[], Some("30m")).unwrap();
+        assert!(p.get("repos").is_none());
+        assert_eq!(p["interval"], "30m");
+        // nothing requested → error (guards a no-op PATCH)
+        assert!(build_meta_patch(&[], None).is_err());
     }
 
     #[test]

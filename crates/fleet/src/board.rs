@@ -5,11 +5,16 @@
 //! wrap those. The ONLY board access outside a Claude session is the `fleet` orchestrator itself
 //! (spin-up / reconcile / watchdog), and only to READ the roster + a charter so it knows what to launch.
 //!
-//! Transport is the board's **REST API** (a plain `GET` returning JSON), not MCP: for a non-session
-//! process a REST call is far simpler than the MCP SSE handshake (initialize → session-id →
+//! Transport is the board's **REST API** (a plain `GET`/`PATCH` returning JSON), not MCP: for a
+//! non-session process a REST call is far simpler than the MCP SSE handshake (initialize → session-id →
 //! notifications/initialized → tools/call → parse `data:` frames). Base URL: `$FLEET_BOARD_API` (default
-//! the local front-door proxy `…/board/api`). This client is deliberately read-only (`list_agents` +
-//! `get_agent`); it is not an agent-facing wrapper.
+//! the local front-door proxy `…/board/api`).
+//!
+//! The client reads the roster (`list_agents` / `get_agent`) and writes ONE thing: an agent's metadata bag
+//! (`patch_metadata`), the orchestrator's migration primitive for making an agent spin-up-ready (declaring
+//! its `repos`, its loop `interval`). That write is an ORCHESTRATOR act, not an agent-facing wrapper — an
+//! agent still coordinates through its own in-session board MCP; the fleet only sets the launch-shaping
+//! metadata the board can't infer.
 
 use serde_json::Value;
 
@@ -57,6 +62,20 @@ impl Board {
     /// One agent's full board record (charter + metadata), or an error if absent (a 404 GET).
     pub fn get_agent(&self, agent: &str) -> Result<Value, String> {
         self.get_json(&format!("/agents/{agent}"))
+    }
+
+    /// Merge `metadata` into an agent's board record via `PATCH /agents/<id>`. The board merges at the KEY
+    /// level, so only the keys present in `metadata` change — every other metadata key is preserved. `Err`
+    /// on a non-2xx response (e.g. an unknown agent).
+    pub fn patch_metadata(&self, agent: &str, metadata: Value) -> Result<(), String> {
+        let url = format!("{}/agents/{}", self.base, agent);
+        let body = serde_json::json!({ "metadata": metadata }).to_string();
+        self.agent
+            .request("PATCH", &url)
+            .set("content-type", "application/json")
+            .send_string(&body)
+            .map_err(|e| format!("board PATCH /agents/{agent} failed: {e}"))?;
+        Ok(())
     }
 }
 
