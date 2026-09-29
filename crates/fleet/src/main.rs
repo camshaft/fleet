@@ -1948,11 +1948,20 @@ fn file_mtime_unix(path: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// Count an agent's UNDRAINED file-hub inbox messages: the file entries under `<hub>/inbox/<name>` (the
-/// `processed/` archive subdir is a directory, so it's excluded). 0 when the inbox is absent.
+/// Count an agent's UNDRAINED file-hub inbox MESSAGES under `<hub>/inbox/<name>`. A message is a `.json`
+/// file (the delivery format `<seq>-<pid>-<kind>.json`) — the SAME predicate `inbox_list`/`inbox_depth`
+/// use, so this counts exactly what a drain would. Non-message files (a `*_seed.txt`/`seed-*.md` kickoff
+/// seed) and the `processed/` archive dir are excluded — otherwise a lingering seed file reads as a
+/// perpetual "pending message" and the watchdog false-nudges the agent every sweep. 0 when the inbox is
+/// absent.
 fn inbox_pending_count(fleet: &Fleet, name: &str) -> usize {
     std::fs::read_dir(fleet.inbox(name))
-        .map(|rd| rd.flatten().filter(|e| e.path().is_file()).count())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_file())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                .count()
+        })
         .unwrap_or(0)
 }
 
@@ -2601,6 +2610,11 @@ mod tests {
         std::fs::write(fleet.inbox("a1").join("0001-msg.json"), "{}").unwrap();
         std::fs::write(fleet.inbox("a1").join("0002-msg.json"), "{}").unwrap();
         assert_eq!(inbox_pending_count(&fleet, "a1"), 2, "two undrained messages; processed/ not counted");
+        // A non-message kickoff SEED file (not `.json`) must NOT count — else a lingering seed reads as a
+        // perpetual pending message and the watchdog false-nudges the agent every sweep (v-s2n-quic/v-etude).
+        std::fs::write(fleet.inbox("a1").join("s2n_seed.txt"), "seed").unwrap();
+        std::fs::write(fleet.inbox("a1").join("seed-a1.md"), "seed").unwrap();
+        assert_eq!(inbox_pending_count(&fleet, "a1"), 2, "seed files excluded; only .json messages count");
         assert_eq!(inbox_pending_count(&fleet, "nobody"), 0, "absent inbox → 0");
         let _ = std::fs::remove_dir_all(&base);
     }
