@@ -60,3 +60,11 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 # `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate #159).
 clap = { version = "4", features = ["derive"], optional = true }
+
+# For the tests/roundtrip.rs e2e (a stub board + stub upstream); gated to `--features transport`
+# runs (the daemon binary it drives is transport-gated too). Versions match the transport tree.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+base64 = "0.22"
