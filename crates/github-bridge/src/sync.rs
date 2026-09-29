@@ -17,7 +17,7 @@
 //! Everything here is pure + unit-tested; the daemon feeds it what it read and executes what it returns
 //! (`board::create_task` + `register_issue_link`, `board::comment_task` + a `board_kind="comment"` link).
 
-use crate::board::{comment_ref, issue_ref, IssueTaskLink};
+use crate::board::{comment_ref, issue_ref, Event, IssueTaskLink, TaskReflect, LINK_SOURCE};
 use crate::github::{github_external_author, Issue, IssueComment};
 use std::collections::HashSet;
 
@@ -148,6 +148,65 @@ pub fn plan_comment_ingest(
         });
     }
     CommentIngestPlan { posts }
+}
+
+// ── OUT direction (board → GitHub): reflect an authorized task comment onto its linked issue ──────────
+
+/// A resolved OUT action: post [`body`](OutboundComment::body) as a comment on the GitHub issue identified
+/// by [`external_id`](OutboundComment::external_id). Produced from a `task.outbound_reflect` firehose event
+/// (board-core #264) that the board already authorized — the bridge posts it, no re-checking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundComment {
+    /// The board comment id this came from (dedup / idempotency on the OUT side).
+    pub comment_id: i64,
+    /// The GitHub issue ref to comment on (`owner/repo#number`; `board::parse_issue_ref` splits it).
+    pub external_id: String,
+    /// The external parent, when the target is nested (often absent).
+    pub external_parent_id: Option<String>,
+    /// The rendered GitHub comment body (original comment + a fleet-board attribution line).
+    pub body: String,
+    /// The firehose event `seq` — the daemon advances its persisted cursor to this after the post lands.
+    pub event_seq: i64,
+}
+
+/// Render the GitHub comment body for a reflected board comment. The GitHub comment is posted by the
+/// bridge's own bot account, so the ORIGINAL board author is attributed inline (else every reflected comment
+/// would look like it came from the bot). Prefers the human external-author name when the board comment was
+/// itself attributed to one; falls back to the board agent id. Pure.
+pub fn render_outbound_github_comment(reflect: &TaskReflect) -> String {
+    let who = reflect.external_author.as_deref().unwrap_or(reflect.author.as_str());
+    format!("_↩ reflected from the fleet board — {who}_\n\n{}", reflect.body)
+}
+
+/// Plan the GitHub comments to post from a batch of firehose events.
+///
+/// - Only `task.outbound_reflect` events (board-core #264) whose `source` is ours ([`LINK_SOURCE`]) become
+///   actions; everything else is skipped. Per #264 the event's existence IS the authorization (the board
+///   already applied the per-link `{direction, outbound_authors}` policy), so no re-checking here.
+/// - The new cursor is the max `seq` across ALL events in the batch (even skipped ones), never below
+///   `cursor`, so a skipped/unrelated event is not reprocessed on the next poll.
+///
+/// Pure — the daemon posts each action via the GitHub client and records a link so a re-emit is idempotent.
+pub fn plan_outbound(events: &[Event], cursor: i64) -> (Vec<OutboundComment>, i64) {
+    let mut out = Vec::new();
+    let mut new_cursor = cursor;
+    for ev in events {
+        if ev.seq > new_cursor {
+            new_cursor = ev.seq;
+        }
+        if let Some(r) = ev.as_task_reflect()
+            && r.source == LINK_SOURCE
+        {
+            out.push(OutboundComment {
+                comment_id: r.comment_id,
+                external_id: r.external_id.clone(),
+                external_parent_id: r.external_parent_id.clone(),
+                body: render_outbound_github_comment(&r),
+                event_seq: ev.seq,
+            });
+        }
+    }
+    (out, new_cursor)
 }
 
 #[cfg(test)]
@@ -291,5 +350,91 @@ mod tests {
         let plan = plan_comment_ingest(&comments, "o/r", 100, Some(""), &HashSet::new());
         assert_eq!(plan.posts.len(), 1, "empty author != self even when self_login is empty");
         assert_eq!(plan.posts[0].external_author, None);
+    }
+
+    // ── plan_outbound (board → GitHub) ─────────────────────────────────────────────────────────────
+
+    fn reflect_event(seq: i64, source: &str, external_id: &str, comment_id: i64, author: &str, body: &str) -> Event {
+        Event {
+            seq,
+            kind: crate::board::TASK_OUTBOUND_REFLECT.to_string(),
+            actor: Some(author.to_string()),
+            task_id: Some(1),
+            channel_id: None,
+            created_at: None,
+            data: serde_json::json!({
+                "task_id": 1, "comment_id": comment_id, "author": author, "body": body,
+                "source": source, "external_id": external_id,
+            }),
+        }
+    }
+
+    fn plain_event(seq: i64) -> Event {
+        Event {
+            seq,
+            kind: "task.commented".to_string(),
+            actor: None,
+            task_id: Some(1),
+            channel_id: None,
+            created_at: None,
+            data: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn outbound_maps_github_reflects_to_comments() {
+        let events = [reflect_event(10, "github", "o/r#3", 42, "concierge", "ship it")];
+        let (out, cursor) = plan_outbound(&events, 5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].external_id, "o/r#3");
+        assert_eq!(out[0].comment_id, 42);
+        assert_eq!(out[0].event_seq, 10);
+        assert!(out[0].body.contains("ship it"), "original body carried");
+        assert!(out[0].body.contains("concierge"), "board author attributed inline");
+        assert_eq!(cursor, 10, "cursor advances to the max seq");
+    }
+
+    #[test]
+    fn outbound_skips_non_github_sources_but_advances_cursor() {
+        // A reflect for a different source (e.g. a slack link) must be ignored — not our adapter.
+        let events = [reflect_event(20, "slack", "C7", 1, "concierge", "x")];
+        let (out, cursor) = plan_outbound(&events, 0);
+        assert!(out.is_empty(), "non-github source skipped");
+        assert_eq!(cursor, 20, "cursor still advances past the skipped event");
+    }
+
+    #[test]
+    fn outbound_skips_non_reflect_events_but_advances_cursor() {
+        let events = [plain_event(30), reflect_event(31, "github", "o/r#1", 5, "a", "hi")];
+        let (out, cursor) = plan_outbound(&events, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(cursor, 31, "cursor advances past the skipped non-reflect event too");
+    }
+
+    #[test]
+    fn outbound_cursor_is_monotonic_and_empty_batch_keeps_it() {
+        // A stale/lower seq must never regress the cursor; an empty batch keeps it.
+        let (_out, c1) = plan_outbound(&[reflect_event(3, "github", "o/r#1", 1, "a", "old")], 100);
+        assert_eq!(c1, 100, "lower seq doesn't regress the cursor");
+        let (out, c2) = plan_outbound(&[], 42);
+        assert!(out.is_empty());
+        assert_eq!(c2, 42);
+    }
+
+    #[test]
+    fn outbound_render_prefers_external_author_name() {
+        let mut r = TaskReflect {
+            task_id: 1,
+            comment_id: 1,
+            body: "hello".to_string(),
+            author: "concierge".to_string(),
+            external_author: Some("github:octocat".to_string()),
+            source: "github".to_string(),
+            external_id: "o/r#1".to_string(),
+            external_parent_id: None,
+        };
+        assert!(render_outbound_github_comment(&r).contains("github:octocat"));
+        r.external_author = None;
+        assert!(render_outbound_github_comment(&r).contains("concierge"), "falls back to board author");
     }
 }

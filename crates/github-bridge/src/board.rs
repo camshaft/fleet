@@ -30,9 +30,12 @@ use serde_json::{Value, json};
 /// (Matches the `fleet` orchestrator's board client.)
 const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) github-bridge";
 
-/// The firehose event type the bridge reflects OUT (board-core #150). Kept as a constant so the OUT-reflect
-/// slice matches on it once the task-comment reflect contract is confirmed with v-task-board.
-pub const OUTBOUND_REFLECT: &str = "channel.outbound_reflect";
+/// The firehose event type the bridge reflects OUT to GitHub (board-core #264): an authorized board TASK
+/// COMMENT to mirror onto the linked GitHub issue. The board has ALREADY applied the per-link authz
+/// (`external_links.metadata` `{direction, outbound_authors}`) — the mere existence of the event IS the
+/// authorization, one event per authorized link, so the bridge reflects every one whose `source` is ours and
+/// never re-checks direction/authors. (Distinct from Slack's channel-scoped `channel.outbound_reflect`.)
+pub const TASK_OUTBOUND_REFLECT: &str = "task.outbound_reflect";
 
 /// The external-link `source` this adapter owns in the board's generic `external_link` table (board-core
 /// #149 slice 2). Distinct from the Slack adapter's `"slack"` so the two adapters' links never collide.
@@ -54,6 +57,18 @@ pub fn issue_ref(repo: &str, number: i64) -> String {
 /// `external_id` for a `board_kind="comment"` row — the dedup key for attributed-comment sync.
 pub fn comment_ref(repo: &str, comment_id: i64) -> String {
     format!("{repo}#c{comment_id}")
+}
+
+/// Parse an issue-link `external_id` back into `(repo, issue_number)` — the inverse of [`issue_ref`]. Used by
+/// the OUT path to turn a `task.outbound_reflect`'s `external_id` into the repo + issue number to post to.
+/// Splits on the LAST `#` (a repo name never contains `#`, the number always follows the final one) and
+/// requires a valid trailing integer; returns `None` on any other shape (a comment ref `…#c<id>`, garbage).
+pub fn parse_issue_ref(external_id: &str) -> Option<(String, i64)> {
+    let (repo, num) = external_id.rsplit_once('#')?;
+    if repo.is_empty() {
+        return None;
+    }
+    num.parse::<i64>().ok().map(|n| (repo.to_string(), n))
 }
 
 /// One event from the board-wide firehose (`GET /events`): append-only, ascending `seq`, ALL types.
@@ -83,6 +98,43 @@ pub struct Event {
     /// The per-type payload, decoded on demand.
     #[serde(default)]
     pub data: Value,
+}
+
+impl Event {
+    /// Decode this event as a [`TaskReflect`] iff it's a `task.outbound_reflect` — else `None` (a different
+    /// type, or a payload that doesn't match the expected shape). Never panics.
+    pub fn as_task_reflect(&self) -> Option<TaskReflect> {
+        if self.kind != TASK_OUTBOUND_REFLECT {
+            return None;
+        }
+        serde_json::from_value(self.data.clone()).ok()
+    }
+}
+
+/// The payload of a `task.outbound_reflect` event (board-core #264): a board task comment the board
+/// authorized to reflect OUT, one event per authorized `external_link`. The bridge filters on
+/// [`source`](TaskReflect::source) == [`LINK_SOURCE`] and posts [`body`](TaskReflect::body) to the GitHub
+/// issue at [`external_id`](TaskReflect::external_id).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TaskReflect {
+    /// The board task the comment lives on.
+    pub task_id: i64,
+    /// The board comment's own id (for dedup / idempotency on the OUT side).
+    pub comment_id: i64,
+    /// The comment body to reflect.
+    pub body: String,
+    /// The board author of the comment (an agent id, e.g. `concierge`).
+    pub author: String,
+    /// The external-identity id when the comment was itself attributed to an external human (board-core #149).
+    #[serde(default)]
+    pub external_author: Option<String>,
+    /// The external-link `source` this reflect is for — the bridge acts only on its own ([`LINK_SOURCE`]).
+    pub source: String,
+    /// The external side of the link — for GitHub, the issue ref `owner/repo#number` (see [`parse_issue_ref`]).
+    pub external_id: String,
+    /// The external parent, when the target is nested (e.g. an issue-vs-comment parenting); often absent.
+    #[serde(default)]
+    pub external_parent_id: Option<String>,
 }
 
 /// Parse the JSON body of `GET /events` into the event list. The board returns either a bare array or an
@@ -336,14 +388,56 @@ mod tests {
     fn parse_events_accepts_a_bare_array() {
         let body = r#"[
             {"seq": 1, "type": "task.commented", "actor": "concierge", "task_id": 7, "data": {}},
-            {"seq": 2, "type": "channel.outbound_reflect", "task_id": 7,
-             "data": {"post_seq": 42, "author": "concierge", "body": "hi"}}
+            {"seq": 2, "type": "task.outbound_reflect", "task_id": 7,
+             "data": {"task_id": 7, "comment_id": 42, "author": "concierge", "body": "hi",
+                      "source": "github", "external_id": "camshaft/fleet#3"}}
         ]"#;
         let evs = parse_events(body).unwrap();
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].seq, 1);
         assert_eq!(evs[0].task_id, Some(7));
-        assert_eq!(evs[1].kind, OUTBOUND_REFLECT);
+        assert_eq!(evs[1].kind, TASK_OUTBOUND_REFLECT);
+    }
+
+    #[test]
+    fn as_task_reflect_decodes_the_payload() {
+        let body = r#"[{"seq": 5, "type": "task.outbound_reflect", "task_id": 7,
+            "data": {"task_id": 7, "comment_id": 42, "author": "concierge", "body": "ship it",
+                     "external_author": "github:octocat", "source": "github",
+                     "external_id": "camshaft/fleet#3", "external_parent_id": null}}]"#;
+        let r = parse_events(body).unwrap()[0].as_task_reflect().expect("decodes");
+        assert_eq!(r.task_id, 7);
+        assert_eq!(r.comment_id, 42);
+        assert_eq!(r.author, "concierge");
+        assert_eq!(r.body, "ship it");
+        assert_eq!(r.external_author.as_deref(), Some("github:octocat"));
+        assert_eq!(r.source, "github");
+        assert_eq!(r.external_id, "camshaft/fleet#3");
+        assert_eq!(r.external_parent_id, None);
+    }
+
+    #[test]
+    fn as_task_reflect_none_for_other_types_and_bad_payload() {
+        // Wrong type → None.
+        let other = r#"[{"seq": 1, "type": "task.commented", "data": {"body": "x"}}]"#;
+        assert!(parse_events(other).unwrap()[0].as_task_reflect().is_none());
+        // Right type, missing required fields → None, never a panic.
+        let bad = r#"[{"seq": 1, "type": "task.outbound_reflect", "data": {"body": "x"}}]"#;
+        assert!(parse_events(bad).unwrap()[0].as_task_reflect().is_none());
+    }
+
+    #[test]
+    fn parse_issue_ref_round_trips_issue_ref() {
+        assert_eq!(parse_issue_ref("camshaft/fleet#42"), Some(("camshaft/fleet".to_string(), 42)));
+        assert_eq!(parse_issue_ref(&issue_ref("o/r", 7)), Some(("o/r".to_string(), 7)));
+    }
+
+    #[test]
+    fn parse_issue_ref_rejects_non_issue_shapes() {
+        assert!(parse_issue_ref("camshaft/fleet#c555").is_none(), "a comment ref is not an issue ref");
+        assert!(parse_issue_ref("no-hash").is_none());
+        assert!(parse_issue_ref("#5").is_none(), "empty repo");
+        assert!(parse_issue_ref("o/r#").is_none(), "no number");
     }
 
     #[test]
