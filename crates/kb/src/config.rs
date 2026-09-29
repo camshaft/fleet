@@ -36,6 +36,14 @@ pub struct Config {
     /// How many vector candidates to rerank (was `KB_RERANK_CANDIDATES`).
     pub rerank_candidates: usize,
 
+    /// Where fastembed caches downloaded model files (bge-large + reranker). Empty = fastembed's own
+    /// default (`FASTEMBED_CACHE_DIR` env, else `.fastembed_cache` in the process CWD). This exists because
+    /// fastembed 4.9 uses TWO different cache mechanisms — the embedder honors `HF_HOME`, but the reranker
+    /// only reads `FASTEMBED_CACHE_DIR`/CWD — so under a hardened service (read-only CWD) the reranker
+    /// download fails. Setting one explicit dir here (passed to BOTH via `with_cache_dir`) makes the cache
+    /// location deterministic and env-independent. The deployed role points this at a writable StateDirectory.
+    pub cache_dir: String,
+
     /// MCP server bind host (was `KB_MCP_HOST`).
     pub mcp_host: String,
     /// MCP server bind port (was `KB_MCP_PORT`).
@@ -79,6 +87,7 @@ impl Default for Config {
             rerank_enabled: true,
             rerank_model: "BAAI/bge-reranker-base".to_string(),
             rerank_candidates: 40,
+            cache_dir: String::new(),
             mcp_host: "0.0.0.0".to_string(),
             mcp_port: 8077,
             mcp_allowed_hosts: vec!["*".to_string()],
