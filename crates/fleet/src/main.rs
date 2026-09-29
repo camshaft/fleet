@@ -1463,6 +1463,33 @@ fn spin_up(agent: &str, apply: bool) {
     }
 }
 
+/// Build the SELF-DISCOVERY kickoff prompt for a board-native agent: it fetches its own charter from the
+/// board (nothing is injected) and starts a WORK-CONSERVING loop. Pure so the prompt is unit-tested.
+///
+/// The loop is dynamic (`/loop` with NO fixed interval) so the agent self-paces via its own next-wake
+/// decision instead of sleeping a fixed period regardless of pending work. Each tick the agent drains its
+/// inbox, does one unit, then gates the next wake on work-present: it keeps looping soon while it holds
+/// open assigned tasks or unread messages, and only falls back to the long `interval` idle cadence once its
+/// assigned queue is drained AND its inbox is empty — so an agent with assigned work never idle-sleeps.
+fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
+    let tick = format!(
+        "run one tick of your charter: drain your board notifications (check_notifications), do ONE unit \
+         of work per your charter, then update your presence (set_status). WORK-CONSERVING PACING: after \
+         the unit, check your OPEN assigned tasks (list_tasks with assignee '{agent}', counting any not \
+         done/cancelled) and your unread notifications. If you hold open assigned work OR unread messages, \
+         keep going — schedule your next tick SOON (60-120s). Only when your assigned queue is empty AND \
+         your inbox is drained may you fall back to the long idle cadence (about {interval}). NEVER \
+         idle-sleep on the long cadence while you still hold open assigned tasks."
+    );
+    format!(
+        "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
+         this session. FIRST call get_agent with agent_id '{agent}' to read your OWN charter + metadata \
+         from the board, and follow that charter as your role. Coordinate through the board (send_message \
+         / check_notifications / comment_task / set_status) — there is no file inbox. You work in \
+         {workdir}. Start your recurring loop now: /loop {tick}"
+    )
+}
+
 /// Open a tmux window running `claude` in `workdir` with a SELF-DISCOVERY kickoff (the agent fetches its
 /// own charter from the board via its in-session MCP — nothing is injected). Refuses to double-launch an
 /// existing same-named window. The kickoff is passed via a tmux env var so no shell quoting can mangle it.
@@ -1475,15 +1502,7 @@ fn launch_board_agent(agent: &str, workdir: &str, model: &str, effort: &str, int
     {
         return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
     }
-    let tick = "run one tick of your charter: drain your board notifications (check_notifications), \
-                do ONE unit of work per your charter, then update your presence (set_status)";
-    let kickoff = format!(
-        "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
-         this session. FIRST call get_agent with agent_id '{agent}' to read your OWN charter + metadata \
-         from the board, and follow that charter as your role. Coordinate through the board (send_message \
-         / check_notifications / comment_task / set_status) — there is no file inbox. You work in \
-         {workdir}. Start your recurring loop now: /loop {interval} {tick}"
-    );
+    let kickoff = build_kickoff(agent, workdir, interval);
     // effort/model are single-quoted (no single-quotes in them) so `[1m]` can't glob; the kickoff rides in
     // $CDZ_KICKOFF (set literally via `-e`, expanded double-quoted) so its spaces/quotes are safe.
     let cmd = format!(
@@ -1712,6 +1731,22 @@ mod tests {
             root: base.join(".claude/fleet"),
         };
         (base, fleet)
+    }
+
+    #[test]
+    fn build_kickoff_is_work_conserving_and_self_discovering() {
+        let k = build_kickoff("v-x", "/wt/v-x", "30m");
+        // Self-discovery: the agent fetches its own charter, nothing is injected.
+        assert!(k.contains("get_agent"), "self-discovers its charter");
+        assert!(k.contains("'v-x'") && k.contains("/wt/v-x"));
+        // Dynamic loop (no fixed interval arg after /loop) — the agent self-paces.
+        assert!(k.contains("/loop run one tick"), "dynamic /loop, not `/loop 30m`");
+        assert!(!k.contains("/loop 30m"), "must NOT pin a fixed interval on the loop");
+        // Work-conserving: gate the next wake on open assigned work + unread, long idle only when drained.
+        assert!(k.contains("WORK-CONSERVING PACING"));
+        assert!(k.contains("list_tasks with assignee 'v-x'"));
+        assert!(k.contains("NEVER idle-sleep"));
+        assert!(k.contains("about 30m"), "the interval is the idle-fallback ceiling");
     }
 
     #[test]
