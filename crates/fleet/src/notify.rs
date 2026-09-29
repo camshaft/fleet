@@ -13,18 +13,27 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// Map a board webhook event to the wake prompt to inject, or `None` to ignore the event. An assignment, a
-/// direct message, or a COMMENT on a task the agent subscribes to wakes it (routing the loop to the task /
-/// message); presence churn and the agent's own actions do not. Comments are safe to wake on because the
-/// board only delivers `task.commented` to a task's subscribers/assignee/creator (minus the actor), so the
-/// subscription IS the filter — this satisfies #145 ("notify a subscribed agent when its task is commented on
-/// + drive the loop wake"). Pure — unit-tested.
+/// Map a board webhook event to the wake prompt to inject, or `None` to ignore the event. Only ACTIONABLE
+/// events inject a live-session loop-wake: a `task.assigned` (new work for the recipient) and a
+/// `message.direct` (someone is asking). INFORMATIONAL events — `task.commented`, `task.status_changed`, and
+/// the like — do NOT wake: the board still delivers them to the recipient's durable inbox, where they accrue
+/// for the agent's next poll (poll is the primary channel). Presence churn and the agent's own actions never
+/// wake either. Pure — unit-tested.
+///
+/// This gates on event TYPE (#215). The board delivers `task.commented` to a task's subscribers/assignee/
+/// CREATOR (minus the actor), and a creator can't leave that fan-out — so waking on every comment meant a
+/// stood-down/idle agent was loop-woken by pure FYI comments on tasks it merely opened (an observed drain of
+/// opus ticks). Superseding the earlier #145 "wake a subscriber on any comment" behavior: a comment now
+/// accrues for the next poll, and a genuinely actionable ask arrives as a `message.direct` (which still
+/// wakes) or via the per-task mute opt-out (board `mute_task`, #90). A per-recipient "this comment is a
+/// question/mention" wake would need a board-side actionability hint on the event — a DEFERRED enhancement,
+/// not needed for the type-based gate.
 pub fn notification_prompt(event_type: &str, task_id: Option<i64>, event_seq: Option<i64>) -> Option<String> {
     match event_type {
         "task.assigned" => task_id.map(|id| format!("[notification] task #{id}")),
-        // A comment on a subscribed task → wake and point the loop at the task (where the new comment is).
-        "task.commented" => task_id.map(|id| format!("[notification] task #{id}")),
         "message.direct" => event_seq.map(|seq| format!("[notification] message #{seq}")),
+        // task.commented / task.status_changed / task.updated / presence.updated and every other type are
+        // INFORMATIONAL — they accrue for the next poll and never inject a wake.
         _ => None,
     }
 }
@@ -92,14 +101,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_wakes_on_assignment_comment_and_dm() {
+    fn prompt_wakes_only_on_actionable_assignment_and_dm_not_informational() {
+        // ACTIONABLE → wake: a new assignment, and a direct message.
         assert_eq!(notification_prompt("task.assigned", Some(42), None).as_deref(), Some("[notification] task #42"));
-        // a comment on a subscribed task wakes and points the loop at the task (#145)
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9)).as_deref(), Some("[notification] task #42"));
         assert_eq!(notification_prompt("message.direct", None, Some(438)).as_deref(), Some("[notification] message #438"));
-        // an assignment/comment without a task_id, or a DM without a seq, can't form a prompt
+        // INFORMATIONAL → NO wake (accrues for the next poll): a comment or a status change on a task the
+        // agent merely created/subscribes to must not loop-wake a stood-down/idle session (#215).
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9)), None, "a comment accrues for poll, never wakes");
+        assert_eq!(notification_prompt("task.status_changed", Some(42), Some(9)), None);
+        // an assignment without a task_id, or a DM without a seq, can't form a prompt
         assert_eq!(notification_prompt("task.assigned", None, Some(1)), None);
-        assert_eq!(notification_prompt("task.commented", None, Some(2)), None);
         assert_eq!(notification_prompt("message.direct", Some(1), None), None);
         // presence churn and other non-actionable event types are ignored
         assert_eq!(notification_prompt("presence.updated", None, Some(3)), None);
@@ -112,8 +123,10 @@ mod tests {
         assert_eq!(payload_to_wake(&assign), Some(("v-bolero".into(), "[notification] task #7".into())));
         let dm = serde_json::json!({"recipient":"v-capmeshd","type":"message.direct","channel_id":1,"event_seq":438});
         assert_eq!(payload_to_wake(&dm), Some(("v-capmeshd".into(), "[notification] message #438".into())));
-        // missing recipient / non-actionable type / missing ids -> None
+        // missing recipient / informational type / missing ids -> None (no wake)
         assert_eq!(payload_to_wake(&serde_json::json!({"type":"task.assigned","task_id":7})), None);
         assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"presence.updated"})), None);
+        // an FYI comment delivered to a subscriber/creator does NOT wake (it accrues for poll) — #215
+        assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"task.commented","task_id":7,"event_seq":9})), None);
     }
 }
