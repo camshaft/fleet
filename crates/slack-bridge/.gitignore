@@ -1,0 +1,3 @@
+# Local/dev credentials — NEVER commit. Deploy provides tokens via the agenix slack-bridge.env.age
+# secret (systemd EnvironmentFile), not from a checked-in file.
+/slack.toml
