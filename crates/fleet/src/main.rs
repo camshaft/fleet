@@ -1844,15 +1844,24 @@ const WATCHDOG_REARM_WAKE: &str = "[watchdog] you have pending work (an overdue 
 /// default; with `rearm` it ACTS on each candidate by injecting a wake into its tmux window (automating the
 /// manual loop-reissue) — it still never reaps or restarts. File-hub mirror rows (no `native` flag) are
 /// skipped: they don't run a board-native loop, so their `last_seen` is meaningless here.
+///
+/// A board that is unreachable does NOT abort the watchdog: the board dimension is skipped with a warning
+/// and the FILE-HUB scan still runs. That resilience is the point — a flaky board is exactly when file-hub
+/// agents (which have NO board delivery) most need the poll, so their liveness must not hinge on it.
 fn watchdog(stale_only: bool, rearm: bool) {
-    let board = board::Board::connect().unwrap_or_else(|e| {
-        eprintln!("fleet watchdog: {e}");
-        std::process::exit(1);
-    });
-    let agents = board.list_agents().unwrap_or_else(|e| {
-        eprintln!("fleet watchdog: {e}");
-        std::process::exit(1);
-    });
+    match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
+        Ok((board, agents)) => watchdog_board(&board, &agents, stale_only, rearm),
+        Err(e) => eprintln!("fleet watchdog: board unavailable ({e}); scanning the file-hub only"),
+    }
+    // FILE-HUB agents are not on the board (no board event delivery), so the event-wake path never reaches
+    // them — the poll watchdog is their only liveness. Scan the file-hub registry too (no-op when no hub is
+    // configured / no active file-hub agents, i.e. a board-only host). Runs regardless of board health above.
+    watchdog_file_hub(stale_only, rearm);
+}
+
+/// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
+/// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
+fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only: bool, rearm: bool) {
     let now = time::OffsetDateTime::now_utc();
     let session = board_session();
     println!(
@@ -1862,7 +1871,7 @@ fn watchdog(stale_only: bool, rearm: bool) {
     let mut flagged = 0usize;
     let mut rearmed = 0usize;
     let mut native = 0usize;
-    for a in &agents {
+    for a in agents {
         let md = a.get("metadata");
         let is_native = md
             .and_then(|m| m.get("native"))
@@ -1932,11 +1941,6 @@ fn watchdog(stale_only: bool, rearm: bool) {
             "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval); pass --rearm to wake them"
         );
     }
-
-    // FILE-HUB agents are not on the board (no board event delivery), so the event-wake path never reaches
-    // them — the poll watchdog is their only liveness. Scan the file-hub registry too (no-op when no hub is
-    // configured / no active file-hub agents, i.e. a board-only host).
-    watchdog_file_hub(stale_only, rearm);
 }
 
 /// Watchdog scan of the FILE-HUB registry (the agents not yet migrated board-native). Same signals adapted
