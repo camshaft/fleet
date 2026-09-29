@@ -1777,6 +1777,12 @@ fn spin_up(agent: &str, apply: bool) {
             match workspace::ensure(&fleet_root, agent, repo, branch) {
                 Ok(wd) => {
                     println!("  workspace ready: {wd}  (worktree of {repo}@{branch} off a shared mirror)");
+                    // Install the generic fail-open fmt pre-commit into the repo's shared MIRROR hooks dir
+                    // (a linked worktree runs hooks from the common/mirror dir), so a board-native agent gets
+                    // a commit-time rustfmt nudge — the safety net a ~/.fleet worktree otherwise lacks (#283).
+                    let hooks =
+                        std::path::Path::new(&workspace::mirror_dir(&fleet_root, repo)).join("hooks");
+                    install_fmt_hook(&hooks);
                     wd
                 }
                 Err(e) => {
@@ -2064,6 +2070,89 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
         }
     }
     println!("  spun down '{agent}' — stood down + resumable.");
+}
+
+/// A recognizable marker in the fleet-installed fmt pre-commit hook, so a re-install tells OUR hook (safe to
+/// refresh) from a foreign one (never clobber).
+const FMT_HOOK_MARKER: &str = "# fleet:fmt-warn";
+
+/// The generic, repo-agnostic pre-commit hook `spin-up` installs into a materialized worktree's shared mirror
+/// hooks dir: a FAIL-OPEN rustfmt nudge so a board-native agent gets a commit-time warning when its staged
+/// Rust is not `cargo fmt`-clean (the required `checks/rustfmt` CI job / `cargo xtask check` reds otherwise —
+/// the class that bit #10139). NEVER blocks a commit (exit 0), never mutates files, no-ops without staged .rs
+/// or without cargo. Silence with FLEET_SKIP_FMT_HOOK=1. Kept generic (no cadenza-specific checks) so it is
+/// correct for every repo an agent's worktree may be.
+fn fmt_precommit_hook_body() -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         {FMT_HOOK_MARKER} (installed by `fleet spin-up`; fail-open rustfmt nudge for board-native worktrees)\n\
+         [ \"${{FLEET_SKIP_FMT_HOOK:-}}\" = \"1\" ] && exit 0\n\
+         staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' 2>/dev/null)\n\
+         [ -z \"$staged\" ] && exit 0\n\
+         command -v cargo >/dev/null 2>&1 || exit 0\n\
+         if ! cargo fmt --all --check >/dev/null 2>&1; then\n\
+         \x20 echo \"warn pre-commit: staged Rust is not rustfmt-clean — run 'cargo fmt' before landing (the\" >&2\n\
+         \x20 echo \"  required checks/rustfmt CI job / 'cargo xtask check' reds otherwise). Silence: FLEET_SKIP_FMT_HOOK=1.\" >&2\n\
+         fi\n\
+         exit 0\n"
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FmtHookAction {
+    /// No pre-commit present — install ours.
+    Install,
+    /// Our hook is already there — refresh it (idempotent; picks up body changes).
+    Refresh,
+    /// A FOREIGN pre-commit exists — never clobber it; skip.
+    SkipForeign,
+}
+
+/// Decide what to do about installing the fmt hook given the existing `pre-commit` content (None = absent).
+/// Pure so the never-clobber-a-foreign-hook policy is unit-tested. Ours is recognized by [`FMT_HOOK_MARKER`].
+fn fmt_hook_install_action(existing: Option<&str>) -> FmtHookAction {
+    match existing {
+        None => FmtHookAction::Install,
+        Some(body) if body.contains(FMT_HOOK_MARKER) => FmtHookAction::Refresh,
+        Some(_) => FmtHookAction::SkipForeign,
+    }
+}
+
+/// Install the generic fmt pre-commit hook into `hooks_dir` (a repo's shared MIRROR hooks dir, so it covers
+/// every worktree cut from that mirror). Idempotent (silent no-op when already current), never clobbers a
+/// foreign hook. Best-effort — a failure only forfeits the commit-time nudge (the gate still covers fmt), so
+/// it warns rather than aborting spin-up.
+fn install_fmt_hook(hooks_dir: &std::path::Path) {
+    let hook = hooks_dir.join("pre-commit");
+    let existing = std::fs::read_to_string(&hook).ok();
+    let body = fmt_precommit_hook_body();
+    match fmt_hook_install_action(existing.as_deref()) {
+        FmtHookAction::SkipForeign => {
+            println!("  fmt hook: foreign pre-commit at {} left untouched", hook.display());
+            return;
+        }
+        // Already exactly our current hook — nothing to do, stay quiet (the common case after first install).
+        FmtHookAction::Refresh if existing.as_deref() == Some(body.as_str()) => return,
+        FmtHookAction::Install | FmtHookAction::Refresh => {}
+    }
+    if let Err(e) = std::fs::create_dir_all(hooks_dir) {
+        eprintln!("  WARN: fmt hook not installed (mkdir {}: {e})", hooks_dir.display());
+        return;
+    }
+    if let Err(e) = std::fs::write(&hook, &body) {
+        eprintln!("  WARN: fmt hook not installed (write {}: {e})", hook.display());
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755));
+    }
+    println!(
+        "  fmt hook: {} the fail-open rustfmt pre-commit at {}",
+        if existing.is_some() { "refreshed" } else { "installed" },
+        hook.display()
+    );
 }
 
 /// Open a tmux window running the agent's harness in `workdir` with a SELF-DISCOVERY kickoff (the agent
@@ -3416,6 +3505,37 @@ mod tests {
         // Native + no window → offline ONLY (still mark offline so up-board leaves it stood down); force moot.
         assert_eq!(spin_down_action(true, false, false, false), OfflineOnly);
         assert_eq!(spin_down_action(true, false, true, true), OfflineOnly);
+    }
+
+    #[test]
+    fn fmt_hook_install_action_never_clobbers_a_foreign_hook() {
+        use FmtHookAction::*;
+        // Absent → install ours.
+        assert_eq!(fmt_hook_install_action(None), Install);
+        // Our own hook (marker present) → refresh (idempotent).
+        assert_eq!(fmt_hook_install_action(Some(&fmt_precommit_hook_body())), Refresh);
+        // A foreign hook → NEVER clobber.
+        assert_eq!(fmt_hook_install_action(Some("#!/bin/sh\n# someone else's pre-commit\n")), SkipForeign);
+    }
+
+    #[test]
+    fn fmt_precommit_hook_is_fail_open_valid_bash() {
+        let b = fmt_precommit_hook_body();
+        assert!(b.contains(FMT_HOOK_MARKER), "carries the ownership marker");
+        assert!(b.contains("FLEET_SKIP_FMT_HOOK"), "has the silencer");
+        assert!(b.contains("cargo fmt --all --check"), "checks fmt (read-only)");
+        assert!(b.trim_end().ends_with("exit 0"), "FAIL-OPEN: the hook never blocks a commit");
+        // Syntax-check with `bash -n` (a broken hook would fail every commit in the shared mirror); skip if absent.
+        let dir = std::env::temp_dir().join(format!("fleet-fmthook-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("pre-commit");
+        if std::fs::write(&f, &b).is_err() {
+            return; // can't stage the file — skip the syntax check rather than false-fail
+        }
+        if let Ok(o) = std::process::Command::new("bash").arg("-n").arg(&f).output() {
+            assert!(o.status.success(), "hook bash syntax error:\n{}", String::from_utf8_lossy(&o.stderr));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
