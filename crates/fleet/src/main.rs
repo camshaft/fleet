@@ -2329,24 +2329,34 @@ fn observe_on_spawn_cooldown(last_spawn: Option<u64>, now: u64, cooldown: u64) -
 }
 
 /// The kickoff for an EPHEMERAL observer session: it acts as the stable board id `observer`, reads exactly
-/// the target window, files curated proposals into project #28, CONFIRMS via `fleet observe-record` as its
-/// last step, then exits (no loop). Pure so the prompt is unit-tested. `role_path` points at the full role
-/// body (the authoritative method); the kickoff carries the parameters + the identity + the completion
-/// command so the observation is well-formed even before reading the role.
-fn build_observer_kickoff(target: &str, session: &str, since_offset: usize, role_path: &str) -> String {
+/// the target window, files curated proposals into project #28, CONFIRMS via `observe-record` as its last
+/// step, then exits (no loop). Pure so the prompt is unit-tested. `fleet_bin` is the ABSOLUTE path to THIS
+/// standalone fleet binary — used for every `fleet` subcommand, because the `fleet` on PATH may be a
+/// different build (during the migration it is the cadenza embedded fleet, which lacks `transcripts` /
+/// `observe-record`). `role_path` points at the full role body (the authoritative method); the kickoff
+/// carries the parameters + identity + completion command so the observation is well-formed regardless.
+fn build_observer_kickoff(
+    target: &str,
+    session: &str,
+    since_offset: usize,
+    role_path: &str,
+    fleet_bin: &str,
+) -> String {
     format!(
         "You are an EPHEMERAL fleet `observer`. Board IDENTITY: you act as the single stable board agent id \
          `observer` — ensure it is registered (register_agent 'observer', idempotent) and author EVERYTHING \
          (tasks, comments, kb entries) as `observer`. This session makes exactly ONE observation and EXITS — \
-         do NOT start a /loop. Read your full role and method at {role_path} and follow it exactly. YOUR \
-         TARGET WINDOW: agent '{target}', session '{session}', from line offset {since_offset}. Read it IN \
-         FULL with: fleet transcripts {target} --session {session} --since {session}:{since_offset} \
+         do NOT start a /loop. IMPORTANT: for every `fleet` command use THIS binary by its absolute path — \
+         `{fleet_bin}` — NOT the `fleet` on PATH (which may be a different build lacking `transcripts` / \
+         `observe-record`). Read your full role and method at {role_path} and follow it exactly. YOUR TARGET \
+         WINDOW: agent '{target}', session '{session}', from line offset {since_offset}. Read it IN FULL \
+         with: {fleet_bin} transcripts {target} --session {session} --since {session}:{since_offset} \
          --overlap 40 . Lean HARD on kb_search; dedup against OPEN proposals by author `observer` in board \
          project #28 (fleet-self-improve); file only above-floor, evidence-cited, deduped proposals per that \
          project's template (the Target field + agent·session·turn evidence say WHICH agent it is about). \
          As your VERY LAST step — after emitting your report/proposal(s) or an explicit no-op report — \
          CONFIRM the observation so the watermark advances and this span is not re-observed: run \
-         `fleet observe-record {target} --session {session} --offset <final-line-count-you-read-through>`. \
+         `{fleet_bin} observe-record {target} --session {session} --offset <final-line-count-you-read-through>`. \
          Then exit. If you crash or stop before observe-record, the span stays unobserved and re-fires — \
          which is correct; never observe-record without having emitted."
     )
@@ -2357,7 +2367,6 @@ fn build_observer_kickoff(target: &str, session: &str, since_offset: usize, role
 /// as it per [`build_observer_kickoff`]). Returns a short action label for the sweep report. Best-effort:
 /// a launch error is reported, never fatal (one target failing must not abort the sweep).
 fn spawn_observer(
-    fleet: &Fleet,
     board_session: &str,
     target: &str,
     obs_session: &str,
@@ -2369,8 +2378,21 @@ fn spawn_observer(
         .clone()
         .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
     let workdir = workspace::agent_root_dir(&fleet_root, "observer");
-    let role_path = fleet.root.join("loops").join("observer.md");
-    let kickoff = build_observer_kickoff(target, obs_session, since_offset, &role_path.to_string_lossy());
+    // Use THIS standalone binary (its absolute path) for the observer's `fleet` commands — the `fleet` on
+    // PATH may be the cadenza embedded fleet, which lacks `transcripts`/`observe-record`. The role body ships
+    // beside the binary at <repo>/loops/observer.md (binary = <repo>/target/<profile>/fleet → up 3).
+    let exe = std::env::current_exe().ok();
+    let fleet_bin = exe
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .unwrap_or("fleet")
+        .to_string();
+    let role_path = exe
+        .as_ref()
+        .and_then(|p| p.ancestors().nth(3))
+        .map(|repo| repo.join("loops/observer.md").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "loops/observer.md".to_string());
+    let kickoff = build_observer_kickoff(target, obs_session, since_offset, &role_path, &fleet_bin);
     // A per-target tmux window (local only — the BOARD identity stays `observer`), so several observations
     // can run at once without a name clash.
     let window = format!("obs-{}", target.replace(['/', ':', '.'], "-"));
@@ -2686,7 +2708,7 @@ fn observe_spawn_pass(
             actions.push(format!("{id}=cooldown"));
             continue;
         }
-        let act = spawn_observer(fleet, session, id, &d.session, d.since_offset, dry_run);
+        let act = spawn_observer(session, id, &d.session, d.since_offset, dry_run);
         if !dry_run && act.starts_with("spawned") {
             write_observe_spawn_stamp(fleet, id, now_unix);
         }
@@ -3689,16 +3711,16 @@ mod tests {
 
     #[test]
     fn build_observer_kickoff_carries_identity_window_and_completion_command() {
-        let k = build_observer_kickoff("v-x", "sess-9", 1200, "/hub/loops/observer.md");
+        let k = build_observer_kickoff("v-x", "sess-9", 1200, "/repo/loops/observer.md", "/repo/target/release/fleet");
         // Ephemeral + single stable board identity (one-shot; author as `observer`).
         assert!(k.contains("EPHEMERAL"));
         assert!(k.contains("ONE observation") && k.contains("do NOT start a /loop"), "one-shot, not looping");
         assert!(k.contains("`observer`") && k.contains("register_agent"));
-        // The exact target window it must read (agent, session, offset) + the transcripts invocation.
-        assert!(k.contains("fleet transcripts v-x --session sess-9 --since sess-9:1200"));
-        // The completion contract: observe-record is the LAST step, keyed by the TARGET agent.
-        assert!(k.contains("fleet observe-record v-x --session sess-9 --offset"));
-        assert!(k.contains("/hub/loops/observer.md"), "points at the full role body");
+        // Uses the ABSOLUTE standalone binary (not PATH `fleet`) for transcripts + observe-record, with the
+        // exact target window (agent, session, offset).
+        assert!(k.contains("/repo/target/release/fleet transcripts v-x --session sess-9 --since sess-9:1200"));
+        assert!(k.contains("/repo/target/release/fleet observe-record v-x --session sess-9 --offset"));
+        assert!(k.contains("/repo/loops/observer.md"), "points at the full role body");
         assert!(k.contains("project #28"), "files into the fleet-self-improve lane");
     }
 
