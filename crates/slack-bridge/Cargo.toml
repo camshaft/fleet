@@ -1,0 +1,29 @@
+# `slack-bridge` — the fleet's Slack↔board bridge adapter daemon (design #141, tasks #152/#154).
+#
+# This adapter is TRANSPORT + SYNC only: it subscribes to the board-wide event firehose and runs the
+# board↔Slack sync over the Slack Socket Mode transport. The board owns the bridge CORE (channel-map,
+# external-identity, outbound-authz) — those are board-side primitives this crate consumes, not
+# reimplements. It is one instance of a generic external-source bridge (Slack today; a GitHub adapter
+# reuses the same board core via #136), so Slack-specifics stay in this crate and shared concerns live
+# on the board.
+#
+# The crate is a workspace member so `cargo test` at the workspace root gates its pure core (config
+# resolution, attribution formatting, mapping, dedup). The heavy async Slack transport tree
+# (slack-morphism/tokio/hyper/rustls) is deferred behind a `transport` feature (added with the daemon
+# binary in a later slice) so it never enters the shared lockfile or the default `cargo test`.
+[package]
+name = "slack-bridge"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "slack_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# The optional gitignored TOML config (slack.toml) for local/dev credential + wiring overrides.
+toml = "0.8"
