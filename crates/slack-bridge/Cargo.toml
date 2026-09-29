@@ -25,5 +25,6 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-# The optional gitignored TOML config (slack.toml) for local/dev credential + wiring overrides.
+# The daemon's config format: a single TOML file (operator mandate #159 — no env-var config). Holds
+# credentials + wiring; delivered at deploy time as the agenix-decrypted secret, gitignored in dev.
 toml = "0.8"

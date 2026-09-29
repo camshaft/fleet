@@ -1,27 +1,31 @@
-//! Bridge configuration — Slack credentials + board wiring, loaded fail-soft.
+//! Bridge configuration — loaded from a single **TOML config file**. NO environment variables.
 //!
-//! The bridge must **fail soft when tokens are absent** (log + carry on, never crash), so it can be
-//! built, land, and run before the operator has created the Slack app. This module resolves config
-//! from, in priority order:
-//!   1. environment variables (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, …) — the deploy sets these via a
-//!      systemd `EnvironmentFile` sourced from the agenix `slack-bridge.env.age` secret (task #153),
-//!   2. `~/.slack-bridge-env` (override with `$SLACK_BRIDGE_ENV`) — a home-dir, out-of-repo dotenv file
-//!      the operator can drop tokens in for local/dev runs,
-//!   3. a gitignored TOML file (`slack.toml` under the state dir by default, or `$SLACK_BRIDGE_CONFIG`),
-//!   4. built-in defaults for the non-secret fields.
+//! Operator mandate seq-1377 / task #159 (fleet-wide): every daemon is configured via a TOML file, never
+//! env vars ("no env var BS — a pain to maintain"). So ALL config *values* — Slack credentials, the
+//! channel, the board REST base, wiring — live in one TOML file. Only the file *path* is chosen outside
+//! the file: the daemon takes a `--config <path>` CLI flag (that is not env-var config), defaulting to
+//! [`DEFAULT_CONFIG_FILENAME`]. The deploy (task #153) delivers this file as the agenix-decrypted secret
+//! (mode 0400, out of the repo); the dev file is gitignored.
 //!
-//! Credentials are NEVER hardcoded or committed — `slack.toml` / the env file are gitignored. A
-//! [`Config`] whose [`Config::tokens`] returns `None` is valid: the caller logs "tokens absent, idle"
-//! and the transport loop stays dormant, retrying, rather than panicking.
+//! The bridge must **fail soft**: a missing OR malformed config file yields a valid *dormant* [`Config`]
+//! (defaults, no tokens) — logged, never a crash — so it can be built, land, and run before the operator
+//! has written the config / created the Slack app. A [`Config`] whose [`Config::tokens`] returns `None`
+//! is valid: the caller logs "tokens absent, idle" and the transport loop stays dormant, retrying.
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The localhost board REST base the firehose subscriber reads (mirrors the orchestrator's `Board`
-/// client). Overridable via `$FLEET_BOARD_API`; defaults to the local front-door proxy.
+/// client), used when the config file omits it.
 const DEFAULT_BOARD_API: &str = "http://127.0.0.1:8880/board/api";
+const DEFAULT_DEFAULT_TO: &str = "concierge";
+const DEFAULT_BRIDGE_AGENT: &str = "slack-bridge";
+
+/// The config filename the daemon reads by default; override with the `--config <path>` CLI flag. This
+/// is NOT discovered via any environment variable (mandate #159) — it's a fixed filename the deploy
+/// points `--config` at (the agenix-decrypted secret) and dev runs pass explicitly.
+pub const DEFAULT_CONFIG_FILENAME: &str = "slack-bridge.toml";
 
 /// Redact a secret for `Debug`: keep only the `xoxb-`/`xapp-` style prefix so logs stay diagnosable
 /// without ever printing the token body. SECURITY: these structs hold live Slack credentials; a stray
@@ -62,26 +66,26 @@ impl fmt::Debug for SlackTokens {
     }
 }
 
-/// Fully-resolved bridge configuration.
+/// Fully-resolved bridge configuration (from the TOML file, with defaults applied).
 ///
 /// NOTE: `Debug` is REDACTING (no derive) so the token fields never print raw.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
-    /// Bot token, if provided (env or file). `None` = fail-soft dormant mode.
+    /// Bot token, if set in the file. `None` = fail-soft dormant mode.
     pub bot_token: Option<String>,
-    /// App-level token, if provided.
+    /// App-level token, if set.
     pub app_token: Option<String>,
     /// The Slack channel ID the bridge posts board→operator messages into (e.g. `C0123ABCD`). Optional:
     /// without it the bridge is inbound-only (DMs) and can't mirror to a default channel.
     pub channel: Option<String>,
-    /// The bridge's local state dir (holds `slack.toml` + any persisted thread-map state).
-    pub state_dir: PathBuf,
     /// The board REST base URL the firehose subscriber reads (localhost front-door proxy by default).
     pub board_api: String,
     /// Default recipient when the operator gives no `@agent` (the concierge).
     pub default_to: String,
     /// This bridge's own board agent name.
     pub bridge_agent: String,
+    /// The bridge's local state dir (persisted thread-map etc.). Defaults to the config file's dir.
+    pub state_dir: PathBuf,
 }
 
 impl fmt::Debug for Config {
@@ -90,28 +94,28 @@ impl fmt::Debug for Config {
             .field("bot_token", &redact_opt(&self.bot_token))
             .field("app_token", &redact_opt(&self.app_token))
             .field("channel", &self.channel)
-            .field("state_dir", &self.state_dir)
             .field("board_api", &self.board_api)
             .field("default_to", &self.default_to)
             .field("bridge_agent", &self.bridge_agent)
+            .field("state_dir", &self.state_dir)
             .finish()
     }
 }
 
-/// The subset read from the optional TOML file. Every field optional; env overrides any of these.
+/// The raw TOML shape. Every field optional: secrets absent → dormant; non-secret fields fall back to
+/// built-in defaults. `#[serde(deny_unknown_fields)]` so a typo'd key is surfaced (fail-soft: it makes
+/// the file "malformed", which [`Config::load`] logs and treats as dormant rather than silently ignoring).
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     bot_token: Option<String>,
     app_token: Option<String>,
     channel: Option<String>,
-    state_dir: Option<String>,
     board_api: Option<String>,
     default_to: Option<String>,
     bridge_agent: Option<String>,
+    state_dir: Option<String>,
 }
-
-const DEFAULT_DEFAULT_TO: &str = "concierge";
-const DEFAULT_BRIDGE_AGENT: &str = "slack-bridge";
 
 impl Config {
     /// The tokens if and only if BOTH are present — the precondition for starting the transport.
@@ -125,133 +129,48 @@ impl Config {
         }
     }
 
-    /// Resolve config from the process environment plus an optional TOML file (no dotenv layer). Pure
-    /// w.r.t. its inputs: `env` is a lookup closure (tests pass a fixed map). Kept for tests + as the
-    /// thin base; [`Config::resolve_layered`] adds the dotenv layer. Fail-soft: missing file/tokens is fine.
-    pub fn resolve<F>(env: F, default_state_dir: &Path) -> Self
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        Self::resolve_layered(env, &BTreeMap::new(), default_state_dir)
-    }
-
-    /// Resolve config with a THREE-layer precedence: process env > `dotenv` map (`~/.slack-bridge-env`) >
-    /// `slack.toml`. The operator can drop tokens in the home-dir dotenv (an out-of-repo secret file), so
-    /// it slots between explicit env vars and the repo-local toml. Pure w.r.t. inputs: both `env` and
-    /// `dotenv` are supplied by the caller ([`Config::from_env`] reads the real ones). Fail-soft.
-    pub fn resolve_layered<F>(
-        env: F,
-        dotenv: &BTreeMap<String, String>,
-        default_state_dir: &Path,
-    ) -> Self
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        // Locate the toml config: $SLACK_BRIDGE_CONFIG, else <state_dir guess>/slack.toml.
-        let state_dir_guess = env("SLACK_BRIDGE_STATE_DIR")
-            .or_else(|| dotenv.get("SLACK_BRIDGE_STATE_DIR").cloned())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_state_dir.to_path_buf());
-        let file_path = env("SLACK_BRIDGE_CONFIG")
-            .or_else(|| dotenv.get("SLACK_BRIDGE_CONFIG").cloned())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| state_dir_guess.join("slack.toml"));
-        let file = read_file_config(&file_path);
-
-        // env > dotenv > file > default.
-        let pick = |key: &str, file_val: Option<String>| {
-            env(key).or_else(|| dotenv.get(key).cloned()).or(file_val)
-        };
-
-        let state_dir = pick("SLACK_BRIDGE_STATE_DIR", file.state_dir)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_state_dir.to_path_buf());
-
+    /// Apply defaults to a parsed [`FileConfig`]. `base_dir` (the config file's directory) is the default
+    /// `state_dir` when the file doesn't set one. Pure.
+    fn from_file_config(file: FileConfig, base_dir: &Path) -> Config {
+        let nonempty = |o: Option<String>| o.filter(|s| !s.is_empty());
         Config {
-            bot_token: pick("SLACK_BOT_TOKEN", file.bot_token).filter(|s| !s.is_empty()),
-            app_token: pick("SLACK_APP_TOKEN", file.app_token).filter(|s| !s.is_empty()),
-            // Accept SLACK_BRIDGE_CHANNEL or the shorter SLACK_CHANNEL alias (the dotenv file may use either).
-            channel: pick("SLACK_BRIDGE_CHANNEL", file.channel)
-                .or_else(|| env("SLACK_CHANNEL").or_else(|| dotenv.get("SLACK_CHANNEL").cloned()))
-                .filter(|s| !s.is_empty()),
-            state_dir,
-            board_api: pick("FLEET_BOARD_API", file.board_api)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_BOARD_API.to_string()),
-            default_to: pick("FLEET_DEFAULT_TO", file.default_to)
-                .filter(|s| !s.is_empty())
+            bot_token: nonempty(file.bot_token),
+            app_token: nonempty(file.app_token),
+            channel: nonempty(file.channel),
+            board_api: nonempty(file.board_api).unwrap_or_else(|| DEFAULT_BOARD_API.to_string()),
+            default_to: nonempty(file.default_to)
                 .unwrap_or_else(|| DEFAULT_DEFAULT_TO.to_string()),
-            bridge_agent: pick("SLACK_BRIDGE_AGENT", file.bridge_agent)
-                .filter(|s| !s.is_empty())
+            bridge_agent: nonempty(file.bridge_agent)
                 .unwrap_or_else(|| DEFAULT_BRIDGE_AGENT.to_string()),
+            state_dir: nonempty(file.state_dir)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| base_dir.to_path_buf()),
         }
     }
 
-    /// Convenience: resolve from the REAL process environment + `~/.slack-bridge-env` (dotenv) if present.
-    pub fn from_env(default_state_dir: &Path) -> Self {
-        let dotenv = home_dotenv();
-        Self::resolve_layered(|k| std::env::var(k).ok(), &dotenv, default_state_dir)
+    /// Parse config from a TOML string, applying defaults. `base_dir` is the dir the config file lives in
+    /// (the default `state_dir`). Pure — the unit-test entry point. Returns the parse error on malformed
+    /// TOML (the fail-soft handling lives in [`Config::load`]).
+    pub fn from_toml_str(text: &str, base_dir: &Path) -> Result<Config, toml::de::Error> {
+        Ok(Self::from_file_config(toml::from_str(text)?, base_dir))
     }
-}
 
-/// Parse dotenv-style `KEY=VALUE` lines: ignores blank lines and `#` comments, trims whitespace, strips
-/// one layer of surrounding quotes from the value, and honors a leading `export`. Pure — unit-tested.
-/// Unknown keys are kept (the caller only reads the ones it knows).
-pub fn parse_dotenv(text: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
+    /// Load config from the TOML file at `path`, **fail-soft**: a missing OR malformed file yields a
+    /// dormant [`Config`] (defaults, no tokens) — a malformed file is logged via `eprintln!` (no
+    /// structured logger at config-load time) — rather than an error or crash. `state_dir` defaults to
+    /// the config file's own directory.
+    pub fn load(path: &Path) -> Config {
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return Self::from_file_config(FileConfig::default(), base_dir), // absent = dormant
         };
-        let key = k.trim().to_string();
-        let mut val = v.trim();
-        // Strip one layer of matching quotes.
-        if (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
-            || (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
-        {
-            val = &val[1..val.len() - 1];
-        }
-        if !key.is_empty() {
-            out.insert(key, val.to_string());
-        }
-    }
-    out
-}
-
-/// Read the home-dir dotenv (`$SLACK_BRIDGE_ENV`, else `~/.slack-bridge-env`) into a map, or empty if
-/// absent/unreadable (fail-soft). `$HOME` missing and no override → empty.
-fn home_dotenv() -> BTreeMap<String, String> {
-    let path = match std::env::var_os("SLACK_BRIDGE_ENV") {
-        Some(p) => PathBuf::from(p),
-        None => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(".slack-bridge-env"),
-            None => return BTreeMap::new(),
-        },
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_dotenv(&text),
-        Err(_) => BTreeMap::new(),
-    }
-}
-
-/// Read + parse the TOML config file. A missing file, or one that fails to parse, yields defaults (empty)
-/// rather than an error — fail-soft. A parse error is worth surfacing, so it logs via `eprintln!` (the
-/// bridge has no structured logger at config-load time) and returns an empty config.
-fn read_file_config(path: &Path) -> FileConfig {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return FileConfig::default(), // absent = fine
-    };
-    match toml::from_str::<FileConfig>(&text) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("slack-bridge: ignoring malformed {}: {e}", path.display());
-            FileConfig::default()
+        match toml::from_str::<FileConfig>(&text) {
+            Ok(fc) => Self::from_file_config(fc, base_dir),
+            Err(e) => {
+                eprintln!("slack-bridge: ignoring malformed {}: {e}", path.display());
+                Self::from_file_config(FileConfig::default(), base_dir)
+            }
         }
     }
 }
@@ -259,34 +178,27 @@ fn read_file_config(path: &Path) -> FileConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn env_map(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let m: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |k: &str| m.get(k).cloned()
+    fn base() -> PathBuf {
+        PathBuf::from("/etc/slack-bridge")
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let d =
-            std::env::temp_dir().join(format!("slack-cfg-{}-{}-{}", tag, std::process::id(), n));
+        let d = std::env::temp_dir().join(format!("slack-cfg-{}-{}-{}", tag, std::process::id(), n));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
     #[test]
-    fn absent_everything_is_dormant_but_valid() {
-        let dir = tmp_dir("empty");
-        let cfg = Config::resolve(env_map(&[]), &dir);
+    fn empty_toml_is_dormant_but_valid() {
+        let cfg = Config::from_toml_str("", &base()).unwrap();
         assert!(cfg.tokens().is_none(), "no tokens → dormant");
         assert_eq!(cfg.default_to, "concierge");
         assert_eq!(cfg.bridge_agent, "slack-bridge");
-        assert_eq!(cfg.state_dir, dir);
+        assert_eq!(cfg.state_dir, base(), "state_dir defaults to the config file's dir");
         assert!(
             cfg.board_api.ends_with("/board/api"),
             "board_api defaults to the local front-door proxy: {}",
@@ -296,158 +208,86 @@ mod tests {
 
     #[test]
     fn only_one_token_is_still_dormant() {
-        let dir = tmp_dir("onetok");
-        let cfg = Config::resolve(env_map(&[("SLACK_BOT_TOKEN", "xoxb-1")]), &dir);
+        let cfg = Config::from_toml_str("bot_token = \"xoxb-1\"\n", &base()).unwrap();
         assert!(cfg.tokens().is_none(), "one token is not enough to run");
         assert_eq!(cfg.bot_token.as_deref(), Some("xoxb-1"));
     }
 
     #[test]
-    fn both_tokens_from_env_yield_tokens() {
-        let dir = tmp_dir("bothtok");
-        let cfg = Config::resolve(
-            env_map(&[("SLACK_BOT_TOKEN", "xoxb-1"), ("SLACK_APP_TOKEN", "xapp-2")]),
-            &dir,
-        );
+    fn both_tokens_yield_tokens() {
+        let cfg =
+            Config::from_toml_str("bot_token = \"xoxb-1\"\napp_token = \"xapp-2\"\n", &base())
+                .unwrap();
         let t = cfg.tokens().expect("both present");
         assert_eq!(t.bot_token, "xoxb-1");
         assert_eq!(t.app_token, "xapp-2");
     }
 
     #[test]
-    fn env_overrides_and_defaults_apply() {
-        let dir = tmp_dir("over");
-        let cfg = Config::resolve(
-            env_map(&[
-                ("SLACK_BRIDGE_CHANNEL", "C123"),
-                ("FLEET_DEFAULT_TO", "pr-sync"),
-                ("SLACK_BRIDGE_AGENT", "sb2"),
-                ("FLEET_BOARD_API", "http://board.local/api"),
-            ]),
-            &dir,
-        );
+    fn full_toml_sets_every_field() {
+        let toml = r#"
+            bot_token = "xoxb-b"
+            app_token = "xapp-a"
+            channel = "C123"
+            board_api = "http://board.local/api"
+            default_to = "pr-sync"
+            bridge_agent = "sb2"
+            state_dir = "/var/lib/slack-bridge"
+        "#;
+        let cfg = Config::from_toml_str(toml, &base()).unwrap();
+        assert!(cfg.tokens().is_some());
         assert_eq!(cfg.channel.as_deref(), Some("C123"));
+        assert_eq!(cfg.board_api, "http://board.local/api");
         assert_eq!(cfg.default_to, "pr-sync");
         assert_eq!(cfg.bridge_agent, "sb2");
-        assert_eq!(cfg.board_api, "http://board.local/api");
+        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/slack-bridge"));
     }
 
     #[test]
-    fn reads_toml_file_and_env_wins() {
-        let dir = tmp_dir("file");
-        let cfg_path = dir.join("slack.toml");
-        std::fs::write(
-            &cfg_path,
-            "bot_token = \"xoxb-file\"\napp_token = \"xapp-file\"\nchannel = \"Cfile\"\ndefault_to = \"design\"\n",
-        )
-        .unwrap();
-        // SLACK_BRIDGE_STATE_DIR points at `dir` so the file is found at dir/slack.toml; env overrides bot_token.
-        let cfg = Config::resolve(
-            env_map(&[
-                ("SLACK_BRIDGE_STATE_DIR", dir.to_str().unwrap()),
-                ("SLACK_BOT_TOKEN", "xoxb-env"),
-            ]),
-            &dir,
-        );
-        assert_eq!(
-            cfg.bot_token.as_deref(),
-            Some("xoxb-env"),
-            "env wins over file"
-        );
-        assert_eq!(
-            cfg.app_token.as_deref(),
-            Some("xapp-file"),
-            "file fills the rest"
-        );
-        assert_eq!(cfg.channel.as_deref(), Some("Cfile"));
-        assert_eq!(cfg.default_to, "design");
+    fn empty_string_values_fall_back_to_defaults() {
+        // An explicitly-empty non-secret string must not blank out the default (treated as unset).
+        let cfg = Config::from_toml_str("default_to = \"\"\nbot_token = \"\"\n", &base()).unwrap();
+        assert_eq!(cfg.default_to, "concierge");
+        assert!(cfg.bot_token.is_none(), "empty token string is not a token");
+    }
+
+    #[test]
+    fn unknown_key_is_a_parse_error() {
+        // deny_unknown_fields: a typo'd key is surfaced, not silently dropped. (load() turns this into
+        // a fail-soft dormant config; the pure parser returns the error.)
+        assert!(Config::from_toml_str("bot_tokn = \"xoxb-typo\"\n", &base()).is_err());
+    }
+
+    // ── load(): fail-soft file handling ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_reads_a_real_file_and_defaults_state_dir_to_its_parent() {
+        let dir = tmp_dir("load");
+        let path = dir.join("slack-bridge.toml");
+        std::fs::write(&path, "bot_token = \"xoxb-f\"\napp_token = \"xapp-f\"\nchannel = \"Cfile\"\n")
+            .unwrap();
+        let cfg = Config::load(&path);
         assert!(cfg.tokens().is_some());
+        assert_eq!(cfg.channel.as_deref(), Some("Cfile"));
+        assert_eq!(cfg.state_dir, dir, "state_dir defaults to the config file's dir");
     }
 
     #[test]
-    fn malformed_toml_is_ignored_not_fatal() {
-        let dir = tmp_dir("bad");
-        std::fs::write(dir.join("slack.toml"), "this is not = = valid toml [[[").unwrap();
-        let cfg = Config::resolve(
-            env_map(&[("SLACK_BRIDGE_STATE_DIR", dir.to_str().unwrap())]),
-            &dir,
-        );
-        // Falls back to dormant defaults rather than crashing.
+    fn load_missing_file_is_dormant_not_fatal() {
+        let dir = tmp_dir("missing");
+        let cfg = Config::load(&dir.join("nope.toml"));
         assert!(cfg.tokens().is_none());
         assert_eq!(cfg.default_to, "concierge");
     }
 
     #[test]
-    fn explicit_config_path_env_is_honored() {
-        let dir = tmp_dir("explicit");
-        let cfg_path = dir.join("custom.toml");
-        std::fs::write(&cfg_path, "app_token = \"xapp-c\"\nbot_token = \"xoxb-c\"\n").unwrap();
-        let cfg = Config::resolve(
-            env_map(&[("SLACK_BRIDGE_CONFIG", cfg_path.to_str().unwrap())]),
-            &dir,
-        );
-        assert!(cfg.tokens().is_some(), "tokens loaded from the explicit path");
-    }
-
-    // ── ~/.slack-bridge-env dotenv layer + precedence ────────────────────────────────────────────
-
-    #[test]
-    fn parse_dotenv_handles_comments_export_quotes() {
-        let text = "# comment\n\nexport SLACK_BOT_TOKEN=xoxb-1\nSLACK_APP_TOKEN=\"xapp-2\"\nSLACK_CHANNEL='D0X'\nbad line no equals\n";
-        let m = parse_dotenv(text);
-        assert_eq!(m.get("SLACK_BOT_TOKEN").unwrap(), "xoxb-1");
-        assert_eq!(
-            m.get("SLACK_APP_TOKEN").unwrap(),
-            "xapp-2",
-            "double quotes stripped"
-        );
-        assert_eq!(
-            m.get("SLACK_CHANNEL").unwrap(),
-            "D0X",
-            "single quotes stripped"
-        );
-        assert!(!m.contains_key("bad line no equals"));
-    }
-
-    #[test]
-    fn dotenv_supplies_tokens_when_env_absent() {
-        let dir = tmp_dir("dotenv");
-        let dotenv =
-            parse_dotenv("SLACK_BOT_TOKEN=xoxb-d\nSLACK_APP_TOKEN=xapp-d\nSLACK_CHANNEL=D0DM\n");
-        let cfg = Config::resolve_layered(env_map(&[]), &dotenv, &dir);
-        let t = cfg.tokens().expect("tokens from dotenv");
-        assert_eq!(t.bot_token, "xoxb-d");
-        assert_eq!(t.app_token, "xapp-d");
-        assert_eq!(
-            cfg.channel.as_deref(),
-            Some("D0DM"),
-            "SLACK_CHANNEL alias honored"
-        );
-    }
-
-    #[test]
-    fn precedence_env_over_dotenv_over_file() {
-        let dir = tmp_dir("prec");
-        std::fs::write(
-            dir.join("slack.toml"),
-            "bot_token = \"xoxb-file\"\napp_token = \"xapp-file\"\n",
-        )
-        .unwrap();
-        let dotenv = parse_dotenv("SLACK_BOT_TOKEN=xoxb-dotenv\n");
-        let cfg = Config::resolve_layered(
-            env_map(&[
-                ("SLACK_BRIDGE_STATE_DIR", dir.to_str().unwrap()),
-                ("SLACK_APP_TOKEN", "xapp-env"),
-            ]),
-            &dotenv,
-            &dir,
-        );
-        assert_eq!(cfg.app_token.as_deref(), Some("xapp-env"), "env wins");
-        assert_eq!(
-            cfg.bot_token.as_deref(),
-            Some("xoxb-dotenv"),
-            "dotenv beats file"
-        );
+    fn load_malformed_file_is_dormant_not_fatal() {
+        let dir = tmp_dir("bad");
+        let path = dir.join("slack-bridge.toml");
+        std::fs::write(&path, "this is not = = valid toml [[[").unwrap();
+        let cfg = Config::load(&path);
+        assert!(cfg.tokens().is_none(), "malformed → dormant, no crash");
+        assert_eq!(cfg.default_to, "concierge");
     }
 
     // ── SECURITY: redacting Debug ────────────────────────────────────────────────────────────────
@@ -459,10 +299,7 @@ mod tests {
             app_token: "xapp-SECRETBODY".into(),
         };
         let dbg = format!("{t:?}");
-        assert!(
-            !dbg.contains("SECRETBODY"),
-            "token body must not appear: {dbg}"
-        );
+        assert!(!dbg.contains("SECRETBODY"), "token body must not appear: {dbg}");
         assert!(
             dbg.contains("xoxb-***") && dbg.contains("xapp-***"),
             "prefix kept: {dbg}"
@@ -472,41 +309,34 @@ mod tests {
             bot_token: Some("xoxb-SECRETBODY".into()),
             app_token: Some("xapp-SECRETBODY".into()),
             channel: Some("D0X".into()),
-            state_dir: PathBuf::from("/tmp/f"),
             board_api: "http://127.0.0.1:8880/board/api".into(),
             default_to: "concierge".into(),
             bridge_agent: "slack-bridge".into(),
+            state_dir: PathBuf::from("/tmp/f"),
         };
         let dbg = format!("{cfg:?}");
-        assert!(
-            !dbg.contains("SECRETBODY"),
-            "config Debug must not leak tokens: {dbg}"
-        );
+        assert!(!dbg.contains("SECRETBODY"), "config Debug must not leak tokens: {dbg}");
         assert!(dbg.contains("D0X"), "non-secret fields still shown");
     }
 
     #[test]
     fn redact_never_leaks_a_malformed_secret_body() {
-        // The invariant is that ANY secret shape is redacted, not just a well-formed `xoxb-…`. The
-        // fallback arms (no hyphen, empty prefix) are the security-critical ones — a refactor that
-        // regressed them would leak a body-with-no-prefix. Pin that the body NEVER appears for every
-        // degenerate shape (only a well-formed prefix is ever kept).
+        // The invariant: ANY secret shape is redacted, not just a well-formed `xoxb-…`. The fallback
+        // arms (no hyphen, empty prefix) are the security-critical ones — a refactor that regressed them
+        // would leak a body-with-no-prefix. Pin that the body NEVER appears for every degenerate shape.
         let t = SlackTokens {
-            bot_token: "xoxbNOHYPHENSECRET".into(),   // no '-' → whole thing is the "body"
-            app_token: "-LEADINGHYPHENSECRET".into(),  // empty prefix → not kept
+            bot_token: "xoxbNOHYPHENSECRET".into(),  // no '-' → whole thing is the "body"
+            app_token: "-LEADINGHYPHENSECRET".into(), // empty prefix → not kept
         };
         let dbg = format!("{t:?}");
         assert!(
             !dbg.contains("NOHYPHENSECRET") && !dbg.contains("LEADINGHYPHENSECRET"),
             "no malformed-token body may leak: {dbg}"
         );
-        assert!(
-            dbg.contains("***"),
-            "a malformed secret still redacts to ***: {dbg}"
-        );
+        assert!(dbg.contains("***"), "a malformed secret still redacts to ***: {dbg}");
 
-        // An EMPTY secret is distinguishable as `<unset>` (not a leak — there's nothing to hide) so an
-        // operator can tell "not configured" from "configured but redacted".
+        // An EMPTY secret is distinguishable as `<unset>` (not a leak — nothing to hide) so an operator
+        // can tell "not configured" from "configured but redacted".
         let empty = SlackTokens {
             bot_token: String::new(),
             app_token: String::new(),

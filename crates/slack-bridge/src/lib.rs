@@ -7,8 +7,9 @@
 //!
 //! The pure, transport-agnostic core (unit-tested here, wired to the live Slack async transport by the
 //! daemon binary in a later slice behind the `transport` feature):
-//! - [`config`] — fail-soft credential/wiring resolution (env > gitignored `slack.toml` > defaults),
-//!   plus the localhost board REST base the firehose subscriber reads.
+//! - [`config`] — fail-soft config from a single **TOML file** (operator mandate #159: no env vars;
+//!   only the file path is a `--config` CLI flag), including the localhost board REST base the firehose
+//!   subscriber reads.
 //!
 //! Later slices add: `board` (firehose subscribe + post/read over the board's localhost REST/MCP),
 //! `format` (board-event ↔ Slack mrkdwn shaping with external-author attribution), and the async
