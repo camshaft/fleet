@@ -1482,6 +1482,23 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Gracefully spin DOWN one board-native agent (the inverse of `spin-up`): mark its board `status`
+    /// `offline` then stop its loop by killing its tmux window. RESUMABLE, not a retire — the board record
+    /// (charter + metadata) is left intact, so `spin-up` revives it later, and `up-board` treats it as stood
+    /// down (offline + no window → never auto-launched). Refuses if the agent is NOT board-native (a file-hub
+    /// agent uses `cargo xtask fleet remove`) or if its pane shows a turn in flight (unless `--force`). Reports
+    /// the plan by default; `--apply` performs it. Sets `offline` BEFORE the kill so an interleaved `up-board`
+    /// cannot see it online-but-windowless and relaunch it.
+    SpinDown {
+        /// The board agent id to spin down.
+        agent: String,
+        /// Perform the offline+kill (default: just report the plan).
+        #[arg(long)]
+        apply: bool,
+        /// Spin down even if the pane shows an in-flight turn (default: refuse a busy agent).
+        #[arg(long)]
+        force: bool,
+    },
     /// Report every board-declared agent's liveness off its board `last_seen` (the watchdog's read side).
     /// Reads the roster from the board (orchestrator read — agents coordinate via their own MCP) and
     /// classifies each by how stale its heartbeat is: live / quiet / STALE.
@@ -1659,6 +1676,7 @@ fn main() {
         } => up(&fleet, &config, provision || launch, launch),
         Cmd::UpBoard { launch, pinned_only } => up_board(launch, pinned_only),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
+        Cmd::SpinDown { agent, apply, force } => spin_down(&agent, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
         Cmd::Watchdog {
             stale_only,
@@ -1934,6 +1952,118 @@ fn build_launch_cmd(
             "unknown harness '{other}' (known: claude, codex) — set metadata.harness on the agent's board record"
         )),
     }
+}
+
+/// The graceful spin-down decision for a board-native agent, given whether its board record is `native`,
+/// whether a live tmux window exists, whether the pane shows an in-flight turn, and `--force`. Pure so the
+/// stand-down policy is unit-tested without the board or tmux.
+#[derive(Debug, PartialEq, Eq)]
+enum SpinDownAction {
+    /// Not a board-native agent — refuse (a file-hub agent stands down via `cargo xtask fleet remove`).
+    NotBoardNative,
+    /// A turn is in flight and `--force` was not given — refuse so a working agent is never killed.
+    RefuseBusy,
+    /// Set the board status offline, then kill the live window (stops the loop).
+    OfflineAndKill,
+    /// Already windowless — set the board status offline only, so up-board leaves it stood down.
+    OfflineOnly,
+}
+
+fn spin_down_action(is_native: bool, has_window: bool, is_working: bool, force: bool) -> SpinDownAction {
+    if !is_native {
+        return SpinDownAction::NotBoardNative;
+    }
+    if has_window && is_working && !force {
+        return SpinDownAction::RefuseBusy;
+    }
+    if has_window {
+        SpinDownAction::OfflineAndKill
+    } else {
+        SpinDownAction::OfflineOnly
+    }
+}
+
+/// `fleet spin-down`: gracefully stand down ONE board-native agent — the inverse of [`spin_up`]. Marks its
+/// board `status` `offline` (so `up-board` treats it as stood down: offline + no window → never auto-launched)
+/// then kills its tmux window to stop the loop. RESUMABLE, not a retire — the board record (charter +
+/// metadata) is untouched, so `spin-up` revives it. Refuses a non-board-native agent (a file-hub agent uses
+/// `cargo xtask fleet remove`) and a busy pane (unless `--force`). Sets offline BEFORE the kill so an
+/// interleaved `up-board` cannot see it online-but-windowless and relaunch it.
+fn spin_down(agent: &str, apply: bool, force: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet spin-down: {e}");
+        std::process::exit(1);
+    });
+    let rec = board.get_agent(agent).unwrap_or_else(|e| {
+        eprintln!("fleet spin-down: {e}");
+        std::process::exit(1);
+    });
+    let is_native = rec
+        .get("metadata")
+        .and_then(|m| m.get("native"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let session = board_session();
+    let has_window = tmux_window_names(&session).iter().any(|w| w == agent);
+    let is_working = has_window && window_is_working(&session, agent);
+    let action = spin_down_action(is_native, has_window, is_working, force);
+
+    println!("spin-down '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    match action {
+        SpinDownAction::NotBoardNative => {
+            eprintln!(
+                "  ✗ '{agent}' is NOT board-native (metadata.native != true) — spin-down manages board-native \
+                 agents only. A file-hub agent stands down via `cargo xtask fleet remove {agent}`."
+            );
+            std::process::exit(1);
+        }
+        SpinDownAction::RefuseBusy => {
+            eprintln!(
+                "  ✗ '{agent}' has a turn IN FLIGHT (its pane is working) — refusing so a running agent is not \
+                 killed mid-work. Re-run when it's idle, or pass --force to stand it down anyway."
+            );
+            std::process::exit(1);
+        }
+        SpinDownAction::OfflineAndKill => println!(
+            "  plan: set board status=offline, then kill tmux window {session}:{agent} (stops the loop)"
+        ),
+        SpinDownAction::OfflineOnly => println!(
+            "  plan: no live window — set board status=offline only (up-board then leaves it stood down)"
+        ),
+    }
+    println!(
+        "  RESUMABLE: board record (charter + metadata) left intact — `fleet spin-up {agent} --apply` revives it."
+    );
+    if !apply {
+        println!("  (dry-run — re-run with --apply to perform it)");
+        return;
+    }
+    // Offline FIRST, then kill: `up-board` only leaves an agent down when it is offline + windowless, so
+    // setting offline before removing the window closes the relaunch race.
+    let msg = format!(
+        "Spun down via `fleet spin-down` (resumable). Board record intact; `fleet spin-up {agent} --apply` revives it."
+    );
+    if let Err(e) = board.set_status(agent, "offline", &msg) {
+        eprintln!("  ✗ failed to set board status offline: {e}");
+        std::process::exit(1);
+    }
+    println!("  ✓ board status set offline");
+    if matches!(action, SpinDownAction::OfflineAndKill) {
+        let target = format!("{session}:{agent}");
+        let killed = std::process::Command::new("tmux")
+            .args(["kill-window", "-t", &target])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if killed {
+            println!("  ✓ killed window {target} (loop stopped)");
+        } else {
+            println!(
+                "  ! tmux kill-window {target} failed (status is offline; remove the window manually if it lingers)"
+            );
+        }
+    }
+    println!("  spun down '{agent}' — stood down + resumable.");
 }
 
 /// Open a tmux window running the agent's harness in `workdir` with a SELF-DISCOVERY kickoff (the agent
@@ -3269,6 +3399,23 @@ mod tests {
         // an unknown/typo'd harness fails loudly.
         let u = build_launch_cmd("gpt5", "m", "high", None).unwrap_err();
         assert!(u.contains("unknown harness 'gpt5'"));
+    }
+
+    #[test]
+    fn spin_down_action_covers_native_busy_window_and_windowless() {
+        use SpinDownAction::*;
+        // Not board-native → refuse regardless of window/force (a file-hub agent uses cargo xtask fleet remove).
+        assert_eq!(spin_down_action(false, true, false, false), NotBoardNative);
+        assert_eq!(spin_down_action(false, false, false, true), NotBoardNative);
+        // Native + a working pane + no --force → refuse so a running agent is never killed mid-turn.
+        assert_eq!(spin_down_action(true, true, true, false), RefuseBusy);
+        // --force overrides the busy refusal → offline + kill.
+        assert_eq!(spin_down_action(true, true, true, true), OfflineAndKill);
+        // Native + an IDLE live window → offline then kill (stops the loop).
+        assert_eq!(spin_down_action(true, true, false, false), OfflineAndKill);
+        // Native + no window → offline ONLY (still mark offline so up-board leaves it stood down); force moot.
+        assert_eq!(spin_down_action(true, false, false, false), OfflineOnly);
+        assert_eq!(spin_down_action(true, false, true, true), OfflineOnly);
     }
 
     #[test]

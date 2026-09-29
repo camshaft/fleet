@@ -105,6 +105,23 @@ impl Board {
         Ok(())
     }
 
+    /// Set an agent's board `status` + `status_message` via `PATCH /agents/{id}` (the same endpoint
+    /// `patch_metadata` uses; verified to accept a `status` field). Used by `fleet spin-down` to mark a
+    /// board-native agent `offline` so `up-board` leaves it stood down (offline + no window → never
+    /// auto-launched) while its record stays intact for a later `spin-up`. `Err` on a non-2xx response.
+    pub fn set_status(&self, agent: &str, status: &str, status_message: &str) -> Result<(), String> {
+        let url = format!("{}/agents/{}", self.base, agent);
+        let body =
+            serde_json::json!({ "status": status, "status_message": status_message }).to_string();
+        self.agent
+            .request("PATCH", &url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&body)
+            .map_err(|e| format!("board PATCH /agents/{agent} (status) failed: {e}"))?;
+        Ok(())
+    }
+
     /// Create-or-get a channel by name (`POST /channels`, idempotent — posting an existing name returns it),
     /// returning its numeric `id`. `created_by` attributes the creation. Used to resolve a channel name → id
     /// before posting (the board posts by id, not name).
