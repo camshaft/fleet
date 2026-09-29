@@ -1394,9 +1394,24 @@ fn spin_up(agent: &str, apply: bool) {
         }
     }
 
-    let Some(workdir) = primary_workdir else {
-        println!("  launch: skipped — no primary repo to run in");
-        return;
+    // A repo-less agent (e.g. a board orchestrator that works via the board MCP, not a checkout) has no
+    // primary worktree: run it in a plain agent directory instead of bailing.
+    let repo_less = primary_workdir.is_none();
+    let workdir = match primary_workdir {
+        Some(wd) => wd,
+        None => {
+            let dir = workspace::agent_root_dir(&fleet_root, agent);
+            if apply {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    eprintln!("  workspace FAILED: mkdir {dir}: {e}");
+                    std::process::exit(1);
+                }
+                println!("  repo-less workspace ready: {dir}  (no repo declared — runs via the board)");
+            } else {
+                println!("  would create repo-less workspace: {dir}  (no repo declared — runs via the board)");
+            }
+            dir
+        }
     };
     if !apply {
         println!("  would launch: claude in {workdir} (board MCP in-session) with a self-discovery kickoff, then /loop {interval}");
@@ -1410,12 +1425,16 @@ fn spin_up(agent: &str, apply: bool) {
     // Pre-trust so claude does not stall on the one-time folder-trust prompt (an interactive agent can't
     // answer it, and --dangerously-skip-permissions does NOT bypass it). A worktree workspace is trusted by
     // its git common dir (the shared MIRROR), which claude does not inherit from the fleet root — so trust
-    // each repo's mirror, plus the fleet root (for a repo-less workspace). Non-fatal on error.
+    // each repo's mirror; a repo-less workspace (a plain dir) is trusted by the dir itself. Plus the fleet
+    // root. Non-fatal on error.
     let mut trust: Vec<String> = vec![fleet_root.clone()];
     for r in &repos {
         if let Some(repo) = r.get("repo").and_then(|v| v.as_str()) {
             trust.push(workspace::mirror_dir(&fleet_root, repo));
         }
+    }
+    if repo_less {
+        trust.push(workdir.clone());
     }
     match pre_trust_dirs(&trust) {
         Ok(true) => println!("  pre-trusted {} path(s) (fleet root + repo mirror(s))", trust.len()),
