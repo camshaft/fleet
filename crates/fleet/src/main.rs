@@ -16,7 +16,14 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod board;
+mod notify;
 mod workspace;
+
+/// The tmux session board-native agents run in (their windows are opened here by `launch_board_agent`, and
+/// the notifier injects wakes here). `$CDZ_FLEET_SESSION`, else `main`.
+fn board_session() -> String {
+    std::env::var("CDZ_FLEET_SESSION").unwrap_or_else(|_| "main".to_string())
+}
 
 /// One agent's durable row in the runtime registry (the machine-local manifest that survives a reboot).
 /// Lifted verbatim from cadenza fleet.rs so the registry.json format is byte-identical across the cutover.
@@ -1268,6 +1275,14 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Run the event-driven wake notifier: a local HTTP endpoint that receives the board's per-agent
+    /// webhook POSTs and `tmux send-keys` injects `[notification] task #<id>` / `message #<seq>` into the
+    /// recipient agent's window (register this endpoint as each board-backed agent's `webhook_url`). Blocks.
+    Notify {
+        /// Port to listen on (127.0.0.1 only).
+        #[arg(long, default_value_t = 8899)]
+        port: u16,
+    },
 }
 
 fn main() {
@@ -1305,6 +1320,12 @@ fn main() {
             interval,
             apply,
         } => set_meta(&agent, &repos, interval.as_deref(), apply),
+        Cmd::Notify { port } => {
+            if let Err(e) = notify::serve(port, &board_session()) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -1409,7 +1430,7 @@ fn spin_up(agent: &str, apply: bool) {
 /// own charter from the board via its in-session MCP — nothing is injected). Refuses to double-launch an
 /// existing same-named window. The kickoff is passed via a tmux env var so no shell quoting can mangle it.
 fn launch_board_agent(agent: &str, workdir: &str, model: &str, effort: &str, interval: &str) -> Result<String, String> {
-    let session = std::env::var("CDZ_FLEET_SESSION").unwrap_or_else(|_| "main".to_string());
+    let session = board_session();
     if let Ok(out) = std::process::Command::new("tmux")
         .args(["list-windows", "-t", &session, "-F", "#W"])
         .output()
