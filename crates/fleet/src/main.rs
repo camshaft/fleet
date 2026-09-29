@@ -1259,6 +1259,14 @@ enum Cmd {
         #[arg(long)]
         stale_only: bool,
     },
+    /// Board-native liveness watchdog: for each board-native agent (metadata.native == true), compare its
+    /// heartbeat age to its OWN loop interval and flag re-arm candidates — an agent heartbeats ~once per
+    /// interval, so an age beyond several intervals means missed ticks. Report-only (non-destructive).
+    Watchdog {
+        /// Only print agents that are not `ok` (late/STALE) — the re-arm candidates.
+        #[arg(long)]
+        stale_only: bool,
+    },
     /// Write launch-shaping metadata onto an agent's board record — the migration primitive that makes an
     /// agent spin-up-ready. Merges (only the given keys change). Reports the patch by default; `--apply`
     /// writes it. Use this instead of hand-editing the board when pushing an agent to be board-backed.
@@ -1314,6 +1322,7 @@ fn main() {
         } => up(&fleet, &config, provision || launch, launch),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::Status { stale_only } => status(stale_only),
+        Cmd::Watchdog { stale_only } => watchdog(stale_only),
         Cmd::SetMeta {
             agent,
             repos,
@@ -1451,7 +1460,7 @@ fn spin_up(agent: &str, apply: bool) {
     match launch_board_agent(agent, &workdir, &harness, &model, &effort, &interval) {
         Ok(win) => {
             println!(
-                "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then /loop {interval}"
+                "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then run a work-conserving dynamic /loop (idle cadence ~{interval})"
             );
             // Mark the agent board-native. `spin-up` IS the board-native launch path, so whatever it
             // launches is board-native by construction; stamping `native: true` gives orchestrators a
@@ -1689,6 +1698,99 @@ fn status(stale_only: bool) {
     }
 }
 
+/// How many of an agent's own loop intervals a heartbeat may lapse before the watchdog calls it a re-arm
+/// candidate: one missed tick is jitter, but several missed intervals means the loop isn't cycling.
+const WATCHDOG_OVERDUE_INTERVALS: u64 = 3;
+
+/// Parse a fleet loop interval into seconds: a bare number is seconds; a trailing `s`/`m`/`h`/`d` scales.
+/// Returns `None` for an empty or unrecognized value. Pure — unit-tested.
+fn parse_interval_secs(spec: &str) -> Option<u64> {
+    let s = spec.trim();
+    let last = s.chars().last()?;
+    let (num, mult) = match last {
+        's' => (&s[..s.len() - 1], 1u64),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3600),
+        'd' => (&s[..s.len() - 1], 86400),
+        c if c.is_ascii_digit() => (s, 1),
+        _ => return None,
+    };
+    num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+}
+
+/// Watchdog verdict for a board-native agent: compare heartbeat `age_secs` to its OWN loop `interval_secs`.
+/// `ok` within one interval (steady heartbeat), `late` within the overdue window, `STALE` (a re-arm
+/// candidate) beyond it. Negative age (clock skew — a future `last_seen`) is treated as `ok`. Pure.
+fn watchdog_verdict(age_secs: i64, interval_secs: u64) -> &'static str {
+    if age_secs < 0 || interval_secs == 0 {
+        return "ok";
+    }
+    let age = age_secs as u64;
+    if age < interval_secs {
+        "ok"
+    } else if age < interval_secs.saturating_mul(WATCHDOG_OVERDUE_INTERVALS) {
+        "late"
+    } else {
+        "STALE"
+    }
+}
+
+/// Board-native liveness watchdog (read side): for each BOARD-NATIVE agent (metadata.native == true),
+/// compare its heartbeat age to its own declared loop interval and flag re-arm candidates. Report-only —
+/// it never touches an agent (the operator banned auto-reap); a follow-on slice adds the opt-in re-arm and
+/// the "open assigned tasks on a long interval" dimension (needs a board list_tasks read). File-hub mirror
+/// rows (no `native` flag) are skipped: they don't run a board-native loop, so their `last_seen` is
+/// meaningless here.
+fn watchdog(stale_only: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet watchdog: {e}");
+        std::process::exit(1);
+    });
+    let agents = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet watchdog: {e}");
+        std::process::exit(1);
+    });
+    let now = time::OffsetDateTime::now_utc();
+    println!("{:<28} {:<8} {:<8} {:<8} last_seen", "agent", "interval", "age", "verdict");
+    let mut flagged = 0usize;
+    let mut native = 0usize;
+    for a in &agents {
+        let md = a.get("metadata");
+        let is_native = md
+            .and_then(|m| m.get("native"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !is_native {
+            continue;
+        }
+        native += 1;
+        let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let interval_str = md
+            .and_then(|m| m.get("interval"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let ls = a.get("last_seen").and_then(|v| v.as_str()).unwrap_or("");
+        let interval_secs = parse_interval_secs(interval_str).unwrap_or(0);
+        let (verdict, age_str) = match last_seen_age_secs(ls, now) {
+            Some(age) => (watchdog_verdict(age, interval_secs), format!("{}m", age / 60)),
+            None => ("?", "?".to_string()),
+        };
+        if stale_only && verdict == "ok" {
+            continue;
+        }
+        if verdict == "late" || verdict == "STALE" {
+            flagged += 1;
+        }
+        let iv = if interval_str.is_empty() { "?" } else { interval_str };
+        println!("{id:<28} {iv:<8} {age_str:<8} {verdict:<8} {ls}");
+    }
+    if stale_only && flagged == 0 {
+        println!("(all {native} board-native agents ok)");
+    } else {
+        println!("-- {native} board-native agent(s); {flagged} re-arm candidate(s) (late/STALE)");
+    }
+}
+
 /// Parse a `owner/name@branch` repo spec into a board `repos` entry `{repo, branch}` (branch defaults to
 /// `main` when the `@branch` suffix is absent or empty). Pure — unit-tested.
 fn parse_repo_spec(spec: &str) -> serde_json::Value {
@@ -1797,6 +1899,32 @@ mod tests {
         // an unknown/typo'd harness fails loudly.
         let u = build_launch_cmd("gpt5", "m", "high").unwrap_err();
         assert!(u.contains("unknown harness 'gpt5'"));
+    }
+
+    #[test]
+    fn parse_interval_secs_handles_units_and_bare_numbers() {
+        assert_eq!(parse_interval_secs("90s"), Some(90));
+        assert_eq!(parse_interval_secs("30m"), Some(1800));
+        assert_eq!(parse_interval_secs("2h"), Some(7200));
+        assert_eq!(parse_interval_secs("1d"), Some(86400));
+        assert_eq!(parse_interval_secs("45"), Some(45), "bare number → seconds");
+        assert_eq!(parse_interval_secs(" 6h "), Some(21600), "trimmed");
+        assert_eq!(parse_interval_secs(""), None);
+        assert_eq!(parse_interval_secs("5x"), None, "unknown unit");
+        assert_eq!(parse_interval_secs("h"), None, "no number");
+    }
+
+    #[test]
+    fn watchdog_verdict_buckets_by_the_agents_own_interval() {
+        let iv: u64 = 1800; // 30m
+        let ivi = iv as i64;
+        assert_eq!(watchdog_verdict(0, iv), "ok");
+        assert_eq!(watchdog_verdict(ivi - 1, iv), "ok", "within one interval");
+        assert_eq!(watchdog_verdict(ivi, iv), "late", "at one interval → late");
+        assert_eq!(watchdog_verdict(ivi * 3 - 1, iv), "late");
+        assert_eq!(watchdog_verdict(ivi * 3, iv), "STALE", "beyond the overdue window → re-arm candidate");
+        assert_eq!(watchdog_verdict(-120, iv), "ok", "clock skew (future last_seen) is ok");
+        assert_eq!(watchdog_verdict(999999, 0), "ok", "unknown interval → never flagged");
     }
 
     #[test]
