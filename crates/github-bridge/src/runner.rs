@@ -1,6 +1,17 @@
 //! The blocking poll-loop transport — the thin layer between the pure lib and the live GitHub + board REST
 //! I/O. Kept out of `main.rs` so `main` reads as a wiring diagram. Not unit-tested (live network); every
 //! DECISION it calls into (`sync::*`, `state::*`, the parsers) IS tested in the lib.
+//!
+//! ## Delivery semantics — AT-LEAST-ONCE (with a narrow, inherent duplicate window)
+//! Both directions dedup on the board's durable `external_links` (issue↔task, synced-comment refs) plus a
+//! persisted cursor, so the STEADY state is exactly-once: a re-poll of a known issue/comment is a no-op, and
+//! the firehose cursor advances per terminally-handled event. The one residual window is a write that
+//! SUCCEEDS on the remote but whose RESPONSE we fail to read (a network blip after GitHub/board committed):
+//! we then retry and duplicate — a second GitHub comment (OUT), or a second board task/comment (IN, worse).
+//! This cannot be closed adapter-side: GitHub issue comments have no idempotency key, and `create_task`
+//! records its issue↔task link only AFTER it returns, so a create-succeeded-read-failed re-creates. The
+//! real fix is a board-core idempotent "create/comment keyed on the external link" primitive (routed to
+//! v-task-board); until then the bridge is at-least-once and this window is accepted as rare + non-fatal.
 
 use github_bridge::board::{parse_issue_ref, BoardClient, LINK_SOURCE};
 use github_bridge::config::Config;
