@@ -39,11 +39,21 @@ pub const OUTBOUND_REFLECT: &str = "channel.outbound_reflect";
 pub const LINK_SOURCE: &str = "github";
 /// The external-link `board_kind` for an issue↔task link (an issue mirrors to a board TASK, not a channel).
 pub const LINK_KIND_TASK: &str = "task";
+/// The external-link `board_kind` for a synced GitHub comment. Recorded so a re-poll doesn't re-post an
+/// already-mirrored comment (idempotent attributed-comment sync); `board_id` is the task the comment lives on.
+pub const LINK_KIND_COMMENT: &str = "comment";
 
 /// The canonical external id for a GitHub issue link: `owner/repo#number` (e.g. `camshaft/fleet#42`). Stable
 /// and human-legible; the board's `external_link.external_id` for the issue↔task row.
 pub fn issue_ref(repo: &str, number: i64) -> String {
     format!("{repo}#{number}")
+}
+
+/// The canonical external id for a synced GitHub comment: `owner/repo#c<comment_id>` (the comment id is
+/// globally unique within GitHub, so the issue number isn't needed to disambiguate). The `external_link`
+/// `external_id` for a `board_kind="comment"` row — the dedup key for attributed-comment sync.
+pub fn comment_ref(repo: &str, comment_id: i64) -> String {
+    format!("{repo}#c{comment_id}")
 }
 
 /// One event from the board-wide firehose (`GET /events`): append-only, ascending `seq`, ALL types.
@@ -370,6 +380,13 @@ mod tests {
     #[test]
     fn issue_ref_is_owner_repo_hash_number() {
         assert_eq!(issue_ref("camshaft/fleet", 42), "camshaft/fleet#42");
+    }
+
+    #[test]
+    fn comment_ref_is_owner_repo_hash_c_id() {
+        assert_eq!(comment_ref("camshaft/fleet", 555), "camshaft/fleet#c555");
+        // Distinct from an issue ref so the two link kinds never collide on external_id.
+        assert_ne!(comment_ref("o/r", 5), issue_ref("o/r", 5));
     }
 
     #[test]
