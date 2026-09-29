@@ -2,24 +2,23 @@
 //! I/O. Kept out of `main.rs` so `main` reads as a wiring diagram. Not unit-tested (live network); every
 //! DECISION it calls into (`sync::*`, `state::*`, the parsers) IS tested in the lib.
 //!
-//! ## Delivery semantics — AT-LEAST-ONCE (with a narrow, inherent duplicate window)
-//! Both directions dedup on the board's durable `external_links` (issue↔task, synced-comment refs) plus a
-//! persisted cursor, so the STEADY state is exactly-once: a re-poll of a known issue/comment is a no-op, and
-//! the firehose cursor advances per terminally-handled event. The one residual window is a write that
-//! SUCCEEDS on the remote but whose RESPONSE we fail to read (a network blip after GitHub/board committed):
-//! we then retry and duplicate — a second GitHub comment (OUT), or a second board task/comment (IN, worse).
-//! This cannot be closed adapter-side: GitHub issue comments have no idempotency key, and `create_task`
-//! records its issue↔task link only AFTER it returns, so a create-succeeded-read-failed re-creates. The
-//! real fix is a board-core idempotent "create/comment keyed on the external link" primitive (routed to
-//! v-task-board); until then the bridge is at-least-once and this window is accepted as rare + non-fatal.
+//! ## Delivery semantics
+//! - **IN (GitHub → board) is EXACTLY-ONCE.** `create_task`/`comment_task` carry the `external_link` and the
+//!   board de-duplicates atomically on `(source, external_id)` (board-core #270), returning `created:false`
+//!   for an already-mirrored issue/comment. So a response-read-failed retry re-posts the same ref and the
+//!   board returns the existing row instead of duplicating — no create→link race.
+//! - **OUT (board → GitHub) is AT-LEAST-ONCE.** GitHub issue comments have no idempotency key, so a comment
+//!   POST that succeeds while its response fails to read duplicates one comment when the reflect retries
+//!   next tick. Inherent to the GitHub API; rare + non-fatal. The firehose cursor advances per
+//!   terminally-handled event so nothing before the last success re-posts.
 
 use github_bridge::board::{parse_issue_ref, BoardClient, LINK_SOURCE};
 use github_bridge::config::Config;
 use github_bridge::{
-    github_external_author, issue_ref, plan_comment_ingest, plan_issue_ingest, plan_outbound, GithubClient,
-    Issue, State, PER_PAGE,
+    github_external_author, plan_comment_ingest, plan_issue_ingest, plan_outbound, GithubClient, Issue,
+    State, PER_PAGE,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 
@@ -134,6 +133,11 @@ fn newest_timestamp(issues: &[Issue]) -> Option<String> {
     issues.iter().map(|i| i.updated_at.clone()).filter(|s| !s.is_empty()).max()
 }
 
+/// The bare GitHub login from a `github:<login>` external-author id (empty when absent — a ghost author).
+fn author_login(external_author: Option<&str>) -> &str {
+    external_author.and_then(|a| a.strip_prefix("github:")).unwrap_or("")
+}
+
 /// Best-effort: attach a GitHub author's login as their board external-identity display name (so readers see
 /// a clean name alongside the stable `github:<login>` key). Register-once per tick via `seen`.
 fn register_author(board: &BoardClient, login: &str, seen: &mut HashSet<String>) {
@@ -163,48 +167,41 @@ fn in_tick_repo(
         return Ok(());
     }
 
-    // Create tasks for new (non-PR, unlinked) issues.
-    let plan = plan_issue_ingest(&issues, repo, &board.list_issue_links()?);
-    for tc in &plan.creates {
-        let task_id = board.create_task(
+    // One create per non-PR issue; the board de-duplicates on the issue link (#270) and returns the existing
+    // task with created=false, so re-polling a known issue is a cheap no-op with no duplicate. The returned
+    // task id is what its comments attach to — no separate link lookup.
+    let mut seen_authors = HashSet::new();
+    for tc in &plan_issue_ingest(&issues, repo).creates {
+        let (task_id, created) = board.create_task(
             project_id,
             &tc.title,
             &tc.description,
             &cfg.bridge_agent,
             tc.external_author.as_deref(),
+            &tc.issue_ref,
         )?;
-        board.register_issue_link(task_id, &tc.issue_ref)?;
-        tracing::info!(issue = %tc.issue_ref, task_id, "ingested GitHub issue → board task");
-    }
+        if created {
+            tracing::info!(issue = %tc.issue_ref, task_id, "ingested GitHub issue → board task");
+        }
+        register_author(board, author_login(tc.external_author.as_deref()), &mut seen_authors);
 
-    // Sync comments on the polled issues (links now include any task just created).
-    let task_of: HashMap<String, i64> =
-        board.list_issue_links()?.into_iter().map(|l| (l.issue_ref, l.board_task_id)).collect();
-    let mut synced = board.list_comment_refs()?;
-    let mut seen_authors = HashSet::new();
-    for issue in &issues {
-        if issue.is_pull_request {
-            continue;
-        }
-        register_author(board, &issue.author, &mut seen_authors);
-        let iref = issue_ref(repo, issue.number);
-        let Some(&task_id) = task_of.get(&iref) else {
-            tracing::warn!(issue = %iref, "issue has no linked task yet — syncing its comments next tick");
-            continue;
-        };
-        let comments = collect_pages(|page| gh.list_issue_comments(repo, issue.number, since.as_deref(), page))?;
-        if comments.is_empty() {
-            continue;
-        }
+        // Sync this issue's comments (the board de-dupes each on its comment link, #270).
+        let comments =
+            collect_pages(|page| gh.list_issue_comments(repo, tc.issue_number, since.as_deref(), page))?;
         for c in &comments {
             register_author(board, &c.author, &mut seen_authors);
         }
-        let cplan = plan_comment_ingest(&comments, repo, task_id, self_login, &synced);
-        for post in &cplan.posts {
-            board.comment_task(task_id, &cfg.bridge_agent, &post.body, post.external_author.as_deref())?;
-            board.register_comment_link(task_id, &post.comment_ref)?;
-            synced.insert(post.comment_ref.clone()); // dedup within this same tick too
-            tracing::info!(comment = %post.comment_ref, task_id, "ingested GitHub comment → board comment");
+        for post in &plan_comment_ingest(&comments, repo, task_id, self_login).posts {
+            let created_c = board.comment_task(
+                task_id,
+                &cfg.bridge_agent,
+                &post.body,
+                post.external_author.as_deref(),
+                &post.comment_ref,
+            )?;
+            if created_c {
+                tracing::info!(comment = %post.comment_ref, task_id, "ingested GitHub comment → board comment");
+            }
         }
     }
 

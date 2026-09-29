@@ -90,12 +90,14 @@ state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file
 - `StateDirectory=github-bridge` (or any persistent writable dir) for the firehose cursor.
 - Needs localhost reach to the board front-door (`board_api`) + outbound HTTPS to `api_base`.
 
-## Issue ↔ task links
+## Issue ↔ task links (idempotent, board-side — #270)
 
-- The durable map lives in the board's generic `external_link` table (board-core #149 slice 2 / #151):
-  `source="github"`, `board_kind="task"`, `external_id="owner/repo#<number>"`, `board_id=<task id>`.
-- Ingest reads `GET /external-links?source=github&board_kind=task` to stay **idempotent** — an issue already
-  linked to a task is updated, never re-created — and registers the link right after creating the task.
+- `create_task` / `comment_task` carry an `external_link {source:"github", external_id}` (the issue ref
+  `owner/repo#<number>` or comment ref `owner/repo#c<id>`). The board **atomically** creates-or-returns-
+  existing keyed on `(source, external_id)` and reports `created` in the response (board-core #270).
+- So ingest is **exactly-once with no create→link race**: the adapter just posts every polled issue/comment
+  and relies on `created:false` (+ the returned id) to know it was already mirrored. No separate
+  link-register call and no pre-fetch of existing links.
 
 ## Operational notes
 
@@ -108,14 +110,8 @@ state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file
   comments authored by the bridge's own GitHub account (`viewer_login`).
 - **Attribution:** ingested GitHub authors are attributed via `external_author = github:<login>` +
   `upsert_external_identity` (board-core #149), so board readers see the GitHub author, not the bridge.
-- **Delivery is at-least-once.** Steady state is exactly-once (external-link dedup + persisted cursor); the
-  one residual window is a remote write that succeeds but whose response we fail to read — a rare network
-  blip then duplicates one GitHub comment / board task on retry. Inherent (no GitHub comment idempotency
-  key; `create_task` links only after it returns). See the `runner` module doc + the follow-on below.
-
-## Follow-ons (coordinate with v-task-board)
-
-- **Idempotent create-keyed-on-external-link (board core):** to make IN ingest exactly-once, `create_task`
-  (and `comment_task`) should accept the intended `external_link` and atomically create-or-return-existing
-  keyed on `(source, external_id)`. Removes the duplicate-task/comment risk on a create-succeeded-response-
-  -failed retry. Proposed to v-task-board.
+- **Delivery.** **IN (ingest) is exactly-once** — the board de-duplicates create/comment on the external link
+  atomically (#270), so a response-read-failed retry returns `created:false` rather than duplicating.
+  **OUT (GitHub comment post) remains at-least-once**: GitHub issue comments have no idempotency key, so a
+  write that succeeds while its response fails to read duplicates one comment on retry — rare + non-fatal,
+  and inherent to the GitHub API. See the `runner` module doc.

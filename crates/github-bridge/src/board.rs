@@ -18,8 +18,8 @@
 //!   #151) so a restart is idempotent and never double-creates.
 //!
 //! The HTTP methods are thin wrappers over ureq; all PARSING/SHAPING is factored into pure functions
-//! ([`parse_events`], [`parse_issue_links`], [`build_task_body`], [`build_comment_body`],
-//! [`build_identity_body`]) that are unit-tested without a network.
+//! ([`parse_events`], [`build_task_body`], [`build_comment_body`], [`build_identity_body`]) that are
+//! unit-tested without a network.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,13 +38,10 @@ const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) github-bridge";
 pub const TASK_OUTBOUND_REFLECT: &str = "task.outbound_reflect";
 
 /// The external-link `source` this adapter owns in the board's generic `external_link` table (board-core
-/// #149 slice 2). Distinct from the Slack adapter's `"slack"` so the two adapters' links never collide.
+/// #149 slice 2 / #270). Distinct from the Slack adapter's `"slack"` so the two adapters' links never
+/// collide. Sent as `external_link.source` on the idempotent create/comment calls; the board keys dedup on
+/// `(source, external_id)` and assigns the `board_kind` (task vs comment) itself.
 pub const LINK_SOURCE: &str = "github";
-/// The external-link `board_kind` for an issue↔task link (an issue mirrors to a board TASK, not a channel).
-pub const LINK_KIND_TASK: &str = "task";
-/// The external-link `board_kind` for a synced GitHub comment. Recorded so a re-poll doesn't re-post an
-/// already-mirrored comment (idempotent attributed-comment sync); `board_id` is the task the comment lives on.
-pub const LINK_KIND_COMMENT: &str = "comment";
 
 /// The canonical external id for a GitHub issue link: `owner/repo#number` (e.g. `camshaft/fleet#42`). Stable
 /// and human-legible; the board's `external_link.external_id` for the issue↔task row.
@@ -159,20 +156,25 @@ pub fn parse_events(body: &str) -> Result<Vec<Event>, String> {
 
 /// Build the JSON body for creating a mirrored board task from an ingested GitHub issue (`POST /tasks`).
 /// `project_id` selects the board project; `created_by` is the bridge's own agent id; `external_author`
-/// attributes the originating GitHub user (e.g. `github:octocat`). Pure — unit-tested. Omits the optional key
-/// when absent (rather than sending an explicit null) so the board applies its own defaults.
+/// attributes the originating GitHub user (e.g. `github:octocat`); `external_id` is the issue ref
+/// (`owner/repo#number`) that makes the create IDEMPOTENT (board-core #270): the board atomically
+/// creates-or-returns-existing keyed on `(source, external_id)` and reports `created` in the response, so the
+/// adapter never double-creates on a retry (no separate link-register call). Pure — unit-tested. Omits the
+/// optional `external_author` when absent so the board applies its own default.
 pub fn build_task_body(
     project_id: i64,
     title: &str,
     description: &str,
     created_by: &str,
     external_author: Option<&str>,
+    external_id: &str,
 ) -> Value {
     let mut m = json!({
         "project_id": project_id,
         "title": title,
         "description": description,
         "created_by": created_by,
+        "external_link": { "source": LINK_SOURCE, "external_id": external_id },
     });
     if let Some(ea) = external_author {
         m["external_author"] = json!(ea);
@@ -181,10 +183,15 @@ pub fn build_task_body(
 }
 
 /// Build the JSON body for an attributed task comment (`POST /tasks/:id/comments`). `author` is the bridge's
-/// own board agent id; `external_author` attributes the originating GitHub user. Pure — unit-tested. Omits
-/// the optional key when absent so the board applies its own defaults.
-pub fn build_comment_body(author: &str, body: &str, external_author: Option<&str>) -> Value {
-    let mut m = json!({ "author": author, "body": body });
+/// own board agent id; `external_author` attributes the originating GitHub user; `external_id` is the comment
+/// ref (`owner/repo#c<id>`) that makes the comment IDEMPOTENT (board-core #270, dedup keyed on
+/// `(source, external_id)`). Pure — unit-tested. Omits the optional `external_author` when absent.
+pub fn build_comment_body(author: &str, body: &str, external_author: Option<&str>, external_id: &str) -> Value {
+    let mut m = json!({
+        "author": author,
+        "body": body,
+        "external_link": { "source": LINK_SOURCE, "external_id": external_id },
+    });
     if let Some(ea) = external_author {
         m["external_author"] = json!(ea);
     }
@@ -197,90 +204,6 @@ pub fn build_comment_body(author: &str, body: &str, external_author: Option<&str
 /// see WHO posted rather than a bare id. Pure — unit-tested. Idempotent server-side.
 pub fn build_identity_body(id: &str, source: &str, display_name: &str) -> Value {
     json!({ "id": id, "source": source, "display_name": display_name })
-}
-
-/// One row of the board's generic `external_link` table (board-core #149 slice 2). Only the fields the
-/// issue↔task map needs are modeled; any future columns are ignored.
-#[derive(Debug, Clone, Deserialize)]
-struct ExternalLink {
-    source: String,
-    /// The external side — for an issue link, the GitHub issue ref (`owner/repo#number`).
-    external_id: String,
-    board_kind: String,
-    /// The board side — for an issue link, the board task id.
-    board_id: i64,
-}
-
-/// A resolved GitHub-issue ↔ board-task link (board-core #149 slice 2 / #151). Lets ingest be idempotent: an
-/// issue already linked to a task is updated in place rather than re-created.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IssueTaskLink {
-    /// The board task id.
-    pub board_task_id: i64,
-    /// The GitHub issue ref (`owner/repo#number`).
-    pub issue_ref: String,
-}
-
-/// Parse the JSON body of `GET /external-links` into the GitHub issue↔task links. Accepts a bare array or an
-/// `{ "external_links": [...] }` / `{ "links": [...] }` envelope. Only `source == "github"` +
-/// `board_kind == "task"` rows become [`IssueTaskLink`]s (defense-in-depth even though we filter in the
-/// query); other rows (e.g. the Slack adapter's channel links) are skipped.
-pub fn parse_issue_links(body: &str) -> Result<Vec<IssueTaskLink>, String> {
-    let v: Value = serde_json::from_str(body)
-        .map_err(|e| format!("board /external-links: response was not JSON: {e}"))?;
-    let arr = match v {
-        Value::Array(a) => a,
-        Value::Object(ref o) => match o.get("external_links").or_else(|| o.get("links")) {
-            Some(Value::Array(a)) => a.clone(),
-            _ => return Err(format!("board /external-links: object without a links array: {v}")),
-        },
-        other => {
-            return Err(format!(
-                "board /external-links: expected an array or {{external_links:[…]}}, got {other}"
-            ));
-        }
-    };
-    let mut links = Vec::new();
-    for row in arr {
-        let link: ExternalLink =
-            serde_json::from_value(row).map_err(|e| format!("board /external-links: bad row: {e}"))?;
-        if link.source == LINK_SOURCE && link.board_kind == LINK_KIND_TASK {
-            links.push(IssueTaskLink {
-                board_task_id: link.board_id,
-                issue_ref: link.external_id,
-            });
-        }
-    }
-    Ok(links)
-}
-
-/// Parse the JSON body of `GET /external-links?...&board_kind=comment` into the set of synced comment refs
-/// (the `external_id`s). Accepts the same array / envelope shapes as [`parse_issue_links`]. Only
-/// `source == "github"` + `board_kind == "comment"` rows contribute.
-pub fn parse_comment_refs(body: &str) -> Result<std::collections::HashSet<String>, String> {
-    let v: Value = serde_json::from_str(body)
-        .map_err(|e| format!("board /external-links: response was not JSON: {e}"))?;
-    let arr = match v {
-        Value::Array(a) => a,
-        Value::Object(ref o) => match o.get("external_links").or_else(|| o.get("links")) {
-            Some(Value::Array(a)) => a.clone(),
-            _ => return Err(format!("board /external-links: object without a links array: {v}")),
-        },
-        other => {
-            return Err(format!(
-                "board /external-links: expected an array or {{external_links:[…]}}, got {other}"
-            ));
-        }
-    };
-    let mut refs = std::collections::HashSet::new();
-    for row in arr {
-        let link: ExternalLink =
-            serde_json::from_value(row).map_err(|e| format!("board /external-links: bad row: {e}"))?;
-        if link.source == LINK_SOURCE && link.board_kind == LINK_KIND_COMMENT {
-            refs.insert(link.external_id);
-        }
-    }
-    Ok(refs)
 }
 
 /// A handle to the board's token-less localhost REST API (stateless — each call is one request). The firehose
@@ -313,69 +236,11 @@ impl BoardClient {
         parse_events(&raw)
     }
 
-    /// Read the board-registered GitHub issue↔task links (board-core #149 slice 2). Ingest reads these to
-    /// stay idempotent — an issue already linked to a task is updated, not re-created.
-    pub fn list_issue_links(&self) -> Result<Vec<IssueTaskLink>, String> {
-        let url = format!("{}/external-links?source={LINK_SOURCE}&board_kind={LINK_KIND_TASK}", self.base);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("accept", "application/json")
-            .set("user-agent", BOARD_UA)
-            .call()
-            .map_err(|e| format!("board GET /external-links failed: {e}"))?;
-        let raw =
-            resp.into_string().map_err(|e| format!("board GET /external-links read failed: {e}"))?;
-        parse_issue_links(&raw)
-    }
-
-    /// Register (idempotent on `(source, external_id)`) a GitHub issue ↔ board task link (board-core #149
-    /// slice 2). Called by ingest right after it creates the mirrored task, so a later poll finds the link
-    /// and doesn't re-create.
-    pub fn register_issue_link(&self, board_task_id: i64, issue_ref: &str) -> Result<(), String> {
-        self.register_link(LINK_KIND_TASK, issue_ref, board_task_id)
-    }
-
-    /// Register (idempotent) a synced-comment link so a re-poll doesn't re-post the comment. `board_id` is
-    /// the task the comment lives on; `comment_ref` is [`comment_ref`]'s `owner/repo#c<id>`.
-    pub fn register_comment_link(&self, board_task_id: i64, comment_ref: &str) -> Result<(), String> {
-        self.register_link(LINK_KIND_COMMENT, comment_ref, board_task_id)
-    }
-
-    /// Register a `source="github"` external link of the given `board_kind` (shared by issue + comment
-    /// links). Idempotent on `(source, external_id)` server-side.
-    fn register_link(&self, board_kind: &str, external_id: &str, board_id: i64) -> Result<(), String> {
-        let url = format!("{}/external-links", self.base);
-        let body = json!({
-            "source": LINK_SOURCE,
-            "external_id": external_id,
-            "board_kind": board_kind,
-            "board_id": board_id,
-        })
-        .to_string();
-        self.post_json(&url, &body, "POST /external-links")
-    }
-
-    /// Read the set of already-synced GitHub comment refs (`board_kind="comment"`) — the dedup set the
-    /// attributed-comment sync passes to `sync::plan_comment_ingest` so a re-poll never double-posts.
-    pub fn list_comment_refs(&self) -> Result<std::collections::HashSet<String>, String> {
-        let url =
-            format!("{}/external-links?source={LINK_SOURCE}&board_kind={LINK_KIND_COMMENT}", self.base);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("accept", "application/json")
-            .set("user-agent", BOARD_UA)
-            .call()
-            .map_err(|e| format!("board GET /external-links (comments) failed: {e}"))?;
-        let raw = resp
-            .into_string()
-            .map_err(|e| format!("board GET /external-links (comments) read failed: {e}"))?;
-        parse_comment_refs(&raw)
-    }
-
-    /// Create a mirrored board task from an ingested issue (`POST /tasks`), returning its numeric `id`. The
-    /// caller then records the issue↔task link via [`Self::register_issue_link`].
+    /// Create a mirrored board task from an ingested issue (`POST /tasks`), IDEMPOTENT on the issue link
+    /// (board-core #270): passing `external_id` (the issue ref) makes the board create-or-return-existing in
+    /// one transaction. Returns `(task_id, created)` — `created == false` means the issue was already ingested
+    /// and the returned id is the existing task, so the caller short-circuits with no duplicate and no
+    /// separate link-register call.
     pub fn create_task(
         &self,
         project_id: i64,
@@ -383,36 +248,58 @@ impl BoardClient {
         description: &str,
         created_by: &str,
         external_author: Option<&str>,
-    ) -> Result<i64, String> {
+        external_id: &str,
+    ) -> Result<(i64, bool), String> {
         let url = format!("{}/tasks", self.base);
-        let body = build_task_body(project_id, title, description, created_by, external_author).to_string();
-        let resp = self
+        let body =
+            build_task_body(project_id, title, description, created_by, external_author, external_id)
+                .to_string();
+        let raw = self
             .agent
             .post(&url)
             .set("content-type", "application/json")
             .set("user-agent", BOARD_UA)
             .send_string(&body)
-            .map_err(|e| format!("board POST /tasks failed: {e}"))?;
-        let raw = resp.into_string().map_err(|e| format!("board POST /tasks read failed: {e}"))?;
+            .map_err(|e| format!("board POST /tasks failed: {e}"))?
+            .into_string()
+            .map_err(|e| format!("board POST /tasks read failed: {e}"))?;
         let v: Value =
             serde_json::from_str(&raw).map_err(|e| format!("board POST /tasks: response was not JSON: {e}"))?;
-        v.get("id")
+        let id = v
+            .get("id")
             .and_then(Value::as_i64)
-            .ok_or_else(|| format!("board POST /tasks: no numeric id in response {v}"))
+            .ok_or_else(|| format!("board POST /tasks: no numeric id in response {v}"))?;
+        // `created` is #270-only; default true if a pre-#270 board omits it (then link-idempotency is off,
+        // but the daemon documents at-least-once for that case).
+        let created = v.get("created").and_then(Value::as_bool).unwrap_or(true);
+        Ok((id, created))
     }
 
-    /// Add an attributed comment to a board task (`POST /tasks/:id/comments`): `author` = the bridge agent,
-    /// `external_author` = the GitHub user (`github:<login>`).
+    /// Add an attributed comment to a board task (`POST /tasks/:id/comments`), IDEMPOTENT on the comment link
+    /// (board-core #270): `external_id` (the comment ref) dedups server-side. `author` = the bridge agent,
+    /// `external_author` = the GitHub user (`github:<login>`). Returns `created` (false = already synced).
     pub fn comment_task(
         &self,
         task_id: i64,
         author: &str,
         body: &str,
         external_author: Option<&str>,
-    ) -> Result<(), String> {
+        external_id: &str,
+    ) -> Result<bool, String> {
         let url = format!("{}/tasks/{}/comments", self.base, task_id);
-        let payload = build_comment_body(author, body, external_author).to_string();
-        self.post_json(&url, &payload, "POST /tasks/:id/comments")
+        let payload = build_comment_body(author, body, external_author, external_id).to_string();
+        let raw = self
+            .agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&payload)
+            .map_err(|e| format!("board POST /tasks/{task_id}/comments failed: {e}"))?
+            .into_string()
+            .map_err(|e| format!("board POST /tasks/{task_id}/comments read failed: {e}"))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST /tasks/{task_id}/comments: response was not JSON: {e}"))?;
+        Ok(v.get("created").and_then(Value::as_bool).unwrap_or(true))
     }
 
     /// Upsert (idempotent on `id`) an external identity's display name (board-core #149; live independent of
@@ -542,108 +429,45 @@ mod tests {
         assert_ne!(comment_ref("o/r", 5), issue_ref("o/r", 5));
     }
 
-    #[test]
-    fn parse_issue_links_bare_array() {
-        let body = r#"[
-            {"source": "github", "external_id": "camshaft/fleet#7", "board_kind": "task", "board_id": 7},
-            {"source": "github", "external_id": "camshaft/fleet#8", "board_kind": "task", "board_id": 8,
-             "metadata": {"note": "ignored"}}
-        ]"#;
-        let links = parse_issue_links(body).unwrap();
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0].board_task_id, 7);
-        assert_eq!(links[0].issue_ref, "camshaft/fleet#7");
-        assert_eq!(links[1].board_task_id, 8);
-    }
+    // ── pure body builders (idempotent create/comment, board-core #270) ─────────────────────────────
 
     #[test]
-    fn parse_issue_links_envelope_forms() {
-        let a = parse_issue_links(
-            r#"{"external_links": [{"source":"github","external_id":"o/r#1","board_kind":"task","board_id":1}]}"#,
-        )
-        .unwrap();
-        assert_eq!(a.len(), 1);
-        let b = parse_issue_links(
-            r#"{"links": [{"source":"github","external_id":"o/r#2","board_kind":"task","board_id":2}]}"#,
-        )
-        .unwrap();
-        assert_eq!(b[0].board_task_id, 2);
-    }
-
-    #[test]
-    fn parse_issue_links_skips_non_github_and_non_task_rows() {
-        // A Slack channel link and a github non-task row must be filtered out — only github/task rows map.
-        let body = r#"[
-            {"source": "github", "external_id": "o/r#7", "board_kind": "task",    "board_id": 7},
-            {"source": "github", "external_id": "o/r#9", "board_kind": "channel", "board_id": 9},
-            {"source": "slack",  "external_id": "C7",    "board_kind": "channel", "board_id": 7}
-        ]"#;
-        let links = parse_issue_links(body).unwrap();
-        assert_eq!(links.len(), 1, "only the github/task row survives");
-        assert_eq!(links[0].issue_ref, "o/r#7");
-    }
-
-    #[test]
-    fn parse_issue_links_rejects_non_array() {
-        assert!(parse_issue_links(r#"{"nope": 1}"#).is_err());
-        assert!(parse_issue_links("not json").is_err());
-    }
-
-    #[test]
-    fn parse_comment_refs_collects_only_github_comment_rows() {
-        let body = r#"[
-            {"source": "github", "external_id": "o/r#c1", "board_kind": "comment", "board_id": 7},
-            {"source": "github", "external_id": "o/r#c2", "board_kind": "comment", "board_id": 7},
-            {"source": "github", "external_id": "o/r#5",  "board_kind": "task",    "board_id": 7},
-            {"source": "slack",  "external_id": "x",      "board_kind": "comment", "board_id": 7}
-        ]"#;
-        let refs = parse_comment_refs(body).unwrap();
-        assert_eq!(refs.len(), 2, "only github/comment rows");
-        assert!(refs.contains("o/r#c1") && refs.contains("o/r#c2"));
-        assert!(!refs.contains("o/r#5"), "task row excluded");
-    }
-
-    #[test]
-    fn parse_comment_refs_empty_and_error() {
-        assert!(parse_comment_refs("[]").unwrap().is_empty());
-        assert!(parse_comment_refs("not json").is_err());
-    }
-
-    #[test]
-    fn parse_issue_links_empty_is_ok() {
-        assert!(parse_issue_links("[]").unwrap().is_empty());
-    }
-
-    // ── pure body builders ────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn build_task_body_shape_and_attribution() {
-        let v = build_task_body(16, "Fix the thing", "as reported on GitHub", "github-bridge", Some("github:octocat"));
+    fn build_task_body_shape_attribution_and_external_link() {
+        let v = build_task_body(
+            16, "Fix the thing", "as reported on GitHub", "github-bridge",
+            Some("github:octocat"), "camshaft/fleet#42",
+        );
         assert_eq!(v["project_id"], 16);
         assert_eq!(v["title"], "Fix the thing");
         assert_eq!(v["description"], "as reported on GitHub");
         assert_eq!(v["created_by"], "github-bridge");
         assert_eq!(v["external_author"], "github:octocat");
+        assert_eq!(v["external_link"]["source"], "github");
+        assert_eq!(v["external_link"]["external_id"], "camshaft/fleet#42");
     }
 
     #[test]
-    fn build_task_body_omits_external_author_when_absent() {
-        let v = build_task_body(1, "t", "d", "github-bridge", None);
+    fn build_task_body_omits_external_author_but_always_links() {
+        let v = build_task_body(1, "t", "d", "github-bridge", None, "o/r#1");
         assert!(v.get("external_author").is_none(), "no explicit null");
+        assert_eq!(v["external_link"]["external_id"], "o/r#1", "link always present for idempotency");
     }
 
     #[test]
-    fn build_comment_body_shape_and_attribution() {
-        let v = build_comment_body("github-bridge", "a reply", Some("github:hubot"));
+    fn build_comment_body_shape_attribution_and_external_link() {
+        let v = build_comment_body("github-bridge", "a reply", Some("github:hubot"), "o/r#c555");
         assert_eq!(v["author"], "github-bridge");
         assert_eq!(v["body"], "a reply");
         assert_eq!(v["external_author"], "github:hubot");
+        assert_eq!(v["external_link"]["source"], "github");
+        assert_eq!(v["external_link"]["external_id"], "o/r#c555");
     }
 
     #[test]
-    fn build_comment_body_omits_external_author_when_absent() {
-        let v = build_comment_body("github-bridge", "internal note", None);
+    fn build_comment_body_omits_external_author_but_always_links() {
+        let v = build_comment_body("github-bridge", "internal note", None, "o/r#c1");
         assert!(v.get("external_author").is_none(), "no explicit null");
+        assert_eq!(v["external_link"]["external_id"], "o/r#c1");
     }
 
     #[test]

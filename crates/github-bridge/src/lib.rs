@@ -14,9 +14,10 @@
 //!   file path is a `--config` CLI flag), including the localhost board REST base the firehose reads and the
 //!   GitHub API base + token + `owner/repo` + board `project_id` to ingest into.
 //! - [`board`] — the token-less localhost board REST client: subscribe to the event firehose
-//!   (`GET /events`, board-core #150), create/comment mirrored tasks with GitHub-author attribution
-//!   (board-core #149), and read/register the durable GitHub-issue↔board-task links (board-core #149 slice 2
-//!   / #151). Pure parsers + body builders unit-tested without a network.
+//!   (`GET /events`, board-core #150/#264), and create/comment mirrored tasks with GitHub-author attribution
+//!   (board-core #149) IDEMPOTENTLY on the external link (board-core #270 — the create/comment carry the
+//!   issue/comment ref and return `created`, so no separate register call and no create→link race). Pure
+//!   parsers + body builders unit-tested without a network.
 //! - [`github`] — the GitHub REST transport: the issue/comment domain model, pure parsers (unit-tested
 //!   against captured GitHub JSON), and a thin authenticated client for polling a repo's issues + comments.
 //! - [`sync`] — the pure bidirectional PLANNING. IN: GitHub issues → mirrored board tasks to create
@@ -42,8 +43,7 @@ pub mod sync;
 
 pub use board::{
     build_comment_body, build_identity_body, build_task_body, comment_ref, issue_ref, parse_events,
-    parse_issue_links, parse_issue_ref, BoardClient, Event, IssueTaskLink, TaskReflect, LINK_KIND_COMMENT,
-    LINK_KIND_TASK, LINK_SOURCE, TASK_OUTBOUND_REFLECT,
+    parse_issue_ref, BoardClient, Event, TaskReflect, LINK_SOURCE, TASK_OUTBOUND_REFLECT,
 };
 pub use config::{Config, DEFAULT_CONFIG_FILENAME};
 pub use github::{
