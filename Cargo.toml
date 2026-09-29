@@ -7,3 +7,4 @@ members = ["crates/fleet"]
 [workspace.package]
 edition = "2024"
 publish = false
+license = "MIT"
