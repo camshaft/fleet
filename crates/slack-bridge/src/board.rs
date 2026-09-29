@@ -167,12 +167,17 @@ impl BoardClient {
         external_author: Option<&str>,
         reply_to: Option<i64>,
     ) -> Result<(), String> {
+        self.post_raw(channel_id, &build_post_body(sender, body, external_author, reply_to))
+    }
+
+    /// Post a pre-built post body (as produced by [`build_post_body`] / [`crate::sync::plan_inbound`]) to
+    /// board channel `channel_id`. The transport uses this so it posts exactly the tested planner output.
+    pub fn post_raw(&self, channel_id: i64, body: &Value) -> Result<(), String> {
         let url = format!("{}/channels/{}/posts", self.base, channel_id);
-        let payload = build_post_body(sender, body, external_author, reply_to).to_string();
         self.agent
             .post(&url)
             .set("content-type", "application/json")
-            .send_string(&payload)
+            .send_string(&body.to_string())
             .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?;
         Ok(())
     }

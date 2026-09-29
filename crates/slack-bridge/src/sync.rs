@@ -29,6 +29,9 @@ pub fn slack_external_author(slack_user_id: &str) -> String {
 /// post was a reply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboundPost {
+    /// The firehose event `seq` this post came from — the transport advances its persisted cursor to this
+    /// after the post is terminally handled, so a restart resumes without re-posting or gapping.
+    pub event_seq: i64,
     /// The Slack channel id to post into (resolved from the board `channel_id`).
     pub slack_channel: String,
     /// The board reflect to render + send.
@@ -58,6 +61,7 @@ where
             && let Some(slack_channel) = resolve(reflect.channel_id)
         {
             posts.push(OutboundPost {
+                event_seq: ev.seq,
                 slack_channel,
                 reflect,
             });
@@ -146,7 +150,9 @@ mod tests {
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[0].slack_channel, "C7");
         assert_eq!(posts[0].reflect.body, "hi");
+        assert_eq!(posts[0].event_seq, 10, "carries the firehose event seq");
         assert_eq!(posts[1].slack_channel, "C8");
+        assert_eq!(posts[1].event_seq, 11);
         assert_eq!(cursor, 11, "cursor advances to the max seq");
     }
 
