@@ -54,5 +54,28 @@
           default = app;
         }
       );
+
+      # `nix flake check` only EVALUATES bare `packages` (it reports "build skipped"); a `checks` entry is
+      # what it actually builds. Point it at the package so a compile break fails `nix flake check` — the
+      # gate CI runs. (The crate's `cargo test` stays the dev/CI test gate; it isn't run here because some
+      # tests spawn git/tmux, absent in the build sandbox.)
+      checks = forAllSystems (pkgs: {
+        fleet = fleetPackage pkgs;
+      });
+
+      # `nix develop` — the toolchain to build/lint/test the crate, plus the git/tmux the fleet drives at
+      # runtime, so a contributor gets a working environment without a host rust install.
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
+            pkgs.rustfmt
+            pkgs.git
+            pkgs.tmux
+          ];
+        };
+      });
     };
 }
