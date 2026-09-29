@@ -130,6 +130,15 @@ pub fn build_post_body(
     m
 }
 
+/// Build the JSON body for an external-identity upsert (`POST /external-identities`, board-core #149):
+/// map a stable identity `id` (e.g. `slack:U123`) + `source` to a human `display_name`. The board resolves
+/// this to `external_author_name` alongside the stable `external_author` key on read (board-core #85), so
+/// agents see WHO posted rather than a bare id. Pure — unit-tested. Idempotent server-side (a null
+/// `display_name` preserves the prior value; we only ever send one when we've resolved a name).
+pub fn build_identity_body(id: &str, source: &str, display_name: &str) -> Value {
+    json!({ "id": id, "source": source, "display_name": display_name })
+}
+
 /// One row of the board's generic `external_link` table (board-core #149 slice 2). Only the fields the
 /// channel map needs are modeled; `external_parent_id`/`metadata` and any future columns are ignored.
 #[derive(Debug, Clone, Deserialize)]
@@ -271,6 +280,26 @@ impl BoardClient {
             .set("content-type", "application/json")
             .send_string(&body)
             .map_err(|e| format!("board POST /external-links failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Upsert (idempotent on `id`) an external identity's display name (board-core #149; the endpoint is
+    /// live independent of the #85 rendering redeploy). The inbound path calls this to attach a resolved
+    /// Slack display name to the stable `slack:<user_id>` key, so board readers see `external_author_name`
+    /// instead of a bare id. Best-effort at the call site (fail-soft — a failure just leaves the name
+    /// absent and readers fall back to the id).
+    pub fn upsert_external_identity(
+        &self,
+        id: &str,
+        source: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
+        let url = format!("{}/external-identities", self.base);
+        self.agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .send_string(&build_identity_body(id, source, display_name).to_string())
+            .map_err(|e| format!("board POST /external-identities failed: {e}"))?;
         Ok(())
     }
 }
@@ -427,5 +456,15 @@ mod tests {
     #[test]
     fn parse_channel_links_empty_is_ok() {
         assert!(parse_channel_links("[]").unwrap().is_empty());
+    }
+
+    // ── external-identity display name (board-core #149 / #85) ───────────────────────────────────────
+
+    #[test]
+    fn build_identity_body_shape() {
+        let v = build_identity_body("slack:U0ALLK04G3T", "slack", "Cameron Bytheway");
+        assert_eq!(v["id"], "slack:U0ALLK04G3T");
+        assert_eq!(v["source"], "slack");
+        assert_eq!(v["display_name"], "Cameron Bytheway");
     }
 }

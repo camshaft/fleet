@@ -2,16 +2,16 @@
 //! `main.rs` so `main` reads as a wiring diagram. Not unit-tested (live WebSocket + blocking board I/O
 //! moved off the runtime via `spawn_blocking`); the pure decisions it calls into ARE tested in the lib.
 
-use slack_bridge::board::BoardClient;
+use slack_bridge::board::{BoardClient, LINK_SOURCE};
 use slack_bridge::config::Config;
 use slack_bridge::format::{render_outbound_reflect, render_outbound_reflect_plain};
 use slack_bridge::{
-    plan_inbound, plan_outbound, relay_plan, ChannelLink, ChannelMap, Event, RelayPlan, SlackTokens,
-    RELAY_QUEUE_WARN,
+    plan_inbound, plan_outbound, relay_plan, slack_external_author, ChannelLink, ChannelMap, Event,
+    RelayPlan, SlackTokens, RELAY_QUEUE_WARN,
 };
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -277,8 +277,12 @@ pub async fn run_socket_mode(
     let callbacks = SlackSocketModeListenerCallbacks::new().with_push_events(on_push_event);
     let bot = SlackApiToken::new(tokens.bot_token.clone().into());
     let listener_environment = Arc::new(
-        SlackClientEventsListenerEnvironment::new(client.clone())
-            .with_user_state(BridgeState { cfg, map, bot }),
+        SlackClientEventsListenerEnvironment::new(client.clone()).with_user_state(BridgeState {
+            cfg,
+            map,
+            bot,
+            registered: Arc::new(RwLock::new(HashSet::new())),
+        }),
     );
     let listener = SlackClientSocketModeListener::new(
         &SlackClientSocketModeConfig::new(),
@@ -300,6 +304,10 @@ struct BridgeState {
     cfg: Arc<Config>,
     map: SharedMap,
     bot: SlackApiToken,
+    /// Slack user ids whose display name we've already registered as a board external-identity this run.
+    /// Register-once cache: guards against a `users.info` + upsert round-trip on every message from a
+    /// known user (the upsert is idempotent, and a restart re-registers, so this can be lossy safely).
+    registered: Arc<RwLock<HashSet<String>>>,
 }
 
 async fn on_push_event(
@@ -391,4 +399,67 @@ async fn handle_message(state: &BridgeState, client: &SlackHyperClient, msg: Sla
         Ok(Err(e)) => tracing::warn!(error = %e, "inbound: board post failed"),
         Err(e) => tracing::warn!(error = %e, "inbound: post task join failed"),
     }
+
+    // Best-effort: attach the Slack user's display name to their stable external-identity so board readers
+    // see `external_author_name` (WHO posted) alongside the `slack:<id>` key. AFTER the relay so the
+    // users.info + upsert round-trip never delays the message; register-once per user per run.
+    maybe_register_identity(state, client, &user).await;
+}
+
+/// Best-effort registration of a Slack user's display name as a board external-identity (board-core #149;
+/// the endpoint is live independent of the #85 rendering redeploy). Resolves the name via Slack `users.info`
+/// (needs `users:read`; fail-soft if absent), then upserts to the board so readers get `external_author_name`
+/// instead of the bare `slack:<id>` key. Registers each user at most once per run (idempotent server-side; a
+/// restart refreshes). Never blocks or fails the message relay.
+async fn maybe_register_identity(state: &BridgeState, client: &SlackHyperClient, user: &str) {
+    // Register-once: skip the users.info + upsert for a user already registered this run.
+    if state.registered.read().map(|s| s.contains(user)).unwrap_or(false) {
+        return;
+    }
+    let req = SlackApiUsersInfoRequest::new(user.to_string().into());
+    let name = match client.open_session(&state.bot).users_info(&req).await {
+        Ok(resp) => pick_display_name(&resp.user),
+        Err(e) => {
+            tracing::debug!(error = %e, %user, "inbound: users.info failed (needs users:read?) — leaving identity name absent");
+            return;
+        }
+    };
+    let Some(name) = name else {
+        tracing::debug!(%user, "inbound: no display name on the Slack profile — leaving identity name absent");
+        return;
+    };
+    let external_id = slack_external_author(user);
+    let board_api = state.cfg.board_api.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        BoardClient::new(&board_api).upsert_external_identity(&external_id, LINK_SOURCE, &name)
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => {
+            if let Ok(mut w) = state.registered.write() {
+                w.insert(user.to_string());
+            }
+            tracing::info!(%user, "inbound: registered Slack display name as board external-identity");
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, %user, "inbound: external-identity upsert failed (retries next message)")
+        }
+        Err(e) => tracing::debug!(error = %e, "inbound: external-identity upsert task join failed"),
+    }
+}
+
+/// Pick the best human display name from a Slack user: profile `display_name`, then profile `real_name`,
+/// then the top-level `real_name`, then the handle (`name`) — first non-empty (trimmed) wins; `None` when
+/// all are absent/blank (so the board keeps the id, never a fabricated name).
+fn pick_display_name(user: &SlackUser) -> Option<String> {
+    let nonempty = |s: &Option<String>| {
+        s.as_ref()
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+    };
+    user.profile
+        .as_ref()
+        .and_then(|p| nonempty(&p.display_name).or_else(|| nonempty(&p.real_name)))
+        .or_else(|| nonempty(&user.real_name))
+        .or_else(|| nonempty(&user.name))
 }
