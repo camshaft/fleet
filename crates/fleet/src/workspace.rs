@@ -73,9 +73,11 @@ fn mirror_default_base(mirror: &str) -> Result<String, String> {
     Err(format!("no remote-tracking base in {mirror} to branch from"))
 }
 
-/// Ensure `<agent>`'s worktree of `<repo_spec>` on `<branch>` exists off a shared bare mirror; return the
-/// workspace dir. Idempotent: refreshes an existing mirror (prune touches only remote-tracking refs) and
-/// leaves an existing worktree as-is.
+/// Ensure `<agent>`'s worktree of `<repo_spec>` exists off a shared bare mirror; return the workspace dir.
+/// The worktree is on a per-agent branch `fleet/<agent>` cut from `<branch>` (the declared base), so many
+/// agents can share one repo mirror without colliding on a single checked-out branch. Idempotent:
+/// refreshes an existing mirror (prune touches only remote-tracking refs) and leaves an existing worktree
+/// as-is.
 pub fn ensure(fleet_root: &str, agent: &str, repo_spec: &str, branch: &str) -> Result<String, String> {
     let name = repo_name(repo_spec);
     let mirrors = format!("{fleet_root}/mirrors");
@@ -95,12 +97,22 @@ pub fn ensure(fleet_root: &str, agent: &str, repo_spec: &str, branch: &str) -> R
     if !Path::new(&workdir).exists() {
         let adir = format!("{fleet_root}/agents/{agent}");
         std::fs::create_dir_all(&adir).map_err(|e| format!("mkdir {adir}: {e}"))?;
-        let head_ref = format!("refs/heads/{branch}");
-        if git(&["-C", &mirror, "show-ref", "--verify", "--quiet", &head_ref]).is_ok() {
-            git(&["-C", &mirror, "worktree", "add", "--quiet", &workdir, branch])?; // resume existing branch
+        // Each agent gets its OWN branch (`fleet/<agent>`) so N agents can share ONE repo mirror — git
+        // refuses to check out the same branch (e.g. `main`) in two worktrees, so N agents on a shared
+        // repo cannot all check out the declared branch directly. The declared `branch` is the BASE the
+        // per-agent branch is cut from (its remote-tracking ref), not the checked-out branch itself.
+        let agent_branch = format!("fleet/{agent}");
+        let agent_head = format!("refs/heads/{agent_branch}");
+        if git(&["-C", &mirror, "show-ref", "--verify", "--quiet", &agent_head]).is_ok() {
+            git(&["-C", &mirror, "worktree", "add", "--quiet", &workdir, &agent_branch])?; // resume
         } else {
-            let base = mirror_default_base(&mirror)?;
-            git(&["-C", &mirror, "worktree", "add", "--quiet", "-b", branch, &workdir, &base])?;
+            let declared = format!("refs/remotes/origin/{branch}");
+            let base = if git(&["-C", &mirror, "show-ref", "--verify", "--quiet", &declared]).is_ok() {
+                format!("origin/{branch}")
+            } else {
+                mirror_default_base(&mirror)?
+            };
+            git(&["-C", &mirror, "worktree", "add", "--quiet", "-b", &agent_branch, &workdir, &base])?;
         }
     }
     Ok(workdir)
