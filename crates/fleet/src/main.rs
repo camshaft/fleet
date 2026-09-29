@@ -1702,6 +1702,19 @@ fn status(stale_only: bool) {
 /// candidate: one missed tick is jitter, but several missed intervals means the loop isn't cycling.
 const WATCHDOG_OVERDUE_INTERVALS: u64 = 3;
 
+/// At/above this loop interval, an agent holding OPEN assigned tasks is a retighten candidate: it should be
+/// cycling faster to drain its queue (the work-conserving principle), not idling on a long cadence.
+const WATCHDOG_LONG_INTERVAL_SECS: u64 = 3600; // 1h
+
+/// A watchdog re-arm/retighten candidate: either the heartbeat is overdue for its interval (`late`/`STALE`),
+/// OR the agent holds open assigned work while sitting on a long idle interval (work-conserving — it should
+/// loop tighter until its queue drains). Pure — unit-tested.
+fn is_retighten_candidate(verdict: &str, open_tasks: usize, interval_secs: u64) -> bool {
+    verdict == "late"
+        || verdict == "STALE"
+        || (open_tasks > 0 && interval_secs >= WATCHDOG_LONG_INTERVAL_SECS)
+}
+
 /// Parse a fleet loop interval into seconds: a bare number is seconds; a trailing `s`/`m`/`h`/`d` scales.
 /// Returns `None` for an empty or unrecognized value. Pure — unit-tested.
 fn parse_interval_secs(spec: &str) -> Option<u64> {
@@ -1735,12 +1748,12 @@ fn watchdog_verdict(age_secs: i64, interval_secs: u64) -> &'static str {
     }
 }
 
-/// Board-native liveness watchdog (read side): for each BOARD-NATIVE agent (metadata.native == true),
-/// compare its heartbeat age to its own declared loop interval and flag re-arm candidates. Report-only —
-/// it never touches an agent (the operator banned auto-reap); a follow-on slice adds the opt-in re-arm and
-/// the "open assigned tasks on a long interval" dimension (needs a board list_tasks read). File-hub mirror
-/// rows (no `native` flag) are skipped: they don't run a board-native loop, so their `last_seen` is
-/// meaningless here.
+/// Board-native liveness watchdog (read side): for each BOARD-NATIVE agent (metadata.native == true), flag
+/// re-arm/retighten candidates on two signals — (1) heartbeat age overdue for its own loop interval
+/// (late/STALE), and (2) open assigned tasks while on a long idle interval (work-conserving). Report-only —
+/// it never touches an agent (the operator banned auto-reap); the opt-in re-arm ACTION is a follow-on slice.
+/// File-hub mirror rows (no `native` flag) are skipped: they don't run a board-native loop, so their
+/// `last_seen` is meaningless here.
 fn watchdog(stale_only: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet watchdog: {e}");
@@ -1751,7 +1764,10 @@ fn watchdog(stale_only: bool) {
         std::process::exit(1);
     });
     let now = time::OffsetDateTime::now_utc();
-    println!("{:<28} {:<8} {:<8} {:<8} last_seen", "agent", "interval", "age", "verdict");
+    println!(
+        "{:<28} {:<8} {:<7} {:<5} {:<8} last_seen",
+        "agent", "interval", "age", "open", "verdict"
+    );
     let mut flagged = 0usize;
     let mut native = 0usize;
     for a in &agents {
@@ -1775,19 +1791,28 @@ fn watchdog(stale_only: bool) {
             Some(age) => (watchdog_verdict(age, interval_secs), format!("{}m", age / 60)),
             None => ("?", "?".to_string()),
         };
-        if stale_only && verdict == "ok" {
+        // Best-effort open assigned-task count (the second signal); a query error degrades to 0/"?" and
+        // simply doesn't flag on the task dimension rather than failing the whole watchdog.
+        let (open_tasks, open_str) = match board.open_task_count(id) {
+            Ok(n) => (n, n.to_string()),
+            Err(_) => (0, "?".to_string()),
+        };
+        let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
+        if stale_only && !retighten {
             continue;
         }
-        if verdict == "late" || verdict == "STALE" {
+        if retighten {
             flagged += 1;
         }
         let iv = if interval_str.is_empty() { "?" } else { interval_str };
-        println!("{id:<28} {iv:<8} {age_str:<8} {verdict:<8} {ls}");
+        println!("{id:<28} {iv:<8} {age_str:<7} {open_str:<5} {verdict:<8} {ls}");
     }
     if stale_only && flagged == 0 {
         println!("(all {native} board-native agents ok)");
     } else {
-        println!("-- {native} board-native agent(s); {flagged} re-arm candidate(s) (late/STALE)");
+        println!(
+            "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval)"
+        );
     }
 }
 
@@ -1925,6 +1950,20 @@ mod tests {
         assert_eq!(watchdog_verdict(ivi * 3, iv), "STALE", "beyond the overdue window → re-arm candidate");
         assert_eq!(watchdog_verdict(-120, iv), "ok", "clock skew (future last_seen) is ok");
         assert_eq!(watchdog_verdict(999999, 0), "ok", "unknown interval → never flagged");
+    }
+
+    #[test]
+    fn is_retighten_candidate_flags_overdue_or_work_on_a_long_interval() {
+        // An overdue heartbeat is always a candidate, regardless of task count.
+        assert!(is_retighten_candidate("late", 0, 600));
+        assert!(is_retighten_candidate("STALE", 0, 600));
+        // A healthy heartbeat with NO open work is fine on any interval.
+        assert!(!is_retighten_candidate("ok", 0, 6 * 3600));
+        // Open work on a LONG interval → retighten (should loop tighter to drain the queue).
+        assert!(is_retighten_candidate("ok", 2, 3600), "1h+ with open tasks");
+        assert!(is_retighten_candidate("ok", 1, 6 * 3600));
+        // Open work on a SHORT interval is fine — it's already cycling fast.
+        assert!(!is_retighten_candidate("ok", 3, 600), "10m with tasks is already tight");
     }
 
     #[test]
