@@ -63,6 +63,29 @@
           };
         };
 
+      # The github-bridge daemon (crates/github-bridge) — the second bridge adapter over the same board
+      # core (design #141, task #136). Its blocking poll-loop binary is `required-features = ["daemon"]`-
+      # gated, so the `daemon` feature is REQUIRED to produce the binary (it pulls clap/tracing). The
+      # dotfiles github-bridge role (#265) consumes this as inputs.fleet.packages.${system}.github-bridge.
+      githubBridgePackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "github-bridge";
+          version = "0.0.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          # Build just the github-bridge crate, with the daemon feature (produces bin/github-bridge).
+          buildAndTestSubdir = "crates/github-bridge";
+          buildFeatures = [ "daemon" ];
+          # The daemon shells no build-time deps; it talks to GitHub + the board over the network at
+          # RUNTIME. Tests aren't run under the sandbox (the lib's `cargo test` is the gate).
+          doCheck = false;
+          meta = {
+            description = "Fleet GitHub↔board bridge daemon (design #141, task #136)";
+            mainProgram = "github-bridge";
+          };
+        };
+
       # The fleet-tunnel daemon (crates/fleet-tunnel): a reverse HTTP-over-websocket bridge run on a
       # fleet host — dials OUT to the board so the board can reach the host-local notifier. Its async
       # transport binary is `required-features = ["transport"]`-gated, so the `transport` feature is
@@ -199,6 +222,7 @@
       packages = forAllSystems (pkgs: rec {
         fleet = fleetPackage pkgs;
         slack-bridge = slackBridgePackage pkgs;
+        github-bridge = githubBridgePackage pkgs;
         fleet-tunnel = fleetTunnelPackage pkgs;
         # Self-contained + hermetic: bundles its own prebuilt sherpa lib (see sherpaOnnxLib above),
         # CUDA-free at build (CUDA is runtime-only). Builds on any x86_64-linux.
@@ -212,6 +236,7 @@
         let
           fleet = fleetPackage pkgs;
           slackBridge = slackBridgePackage pkgs;
+          githubBridge = githubBridgePackage pkgs;
           fleetTunnel = fleetTunnelPackage pkgs;
           voiceAssistant = voiceAssistantPackage pkgs;
           kb = kbPackage pkgs;
@@ -224,6 +249,10 @@
           slack-bridge = {
             type = "app";
             program = "${slackBridge}/bin/slack-bridge";
+          };
+          github-bridge = {
+            type = "app";
+            program = "${githubBridge}/bin/github-bridge";
           };
           fleet-tunnel = {
             type = "app";
