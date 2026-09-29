@@ -1838,6 +1838,71 @@ fn inbox_pending_count(fleet: &Fleet, name: &str) -> usize {
 /// human was doing by hand for stalled loops. A benign prompt: worst case the agent no-ops one tick.
 const WATCHDOG_REARM_WAKE: &str = "[watchdog] you have pending work (an overdue loop and/or open assigned tasks) — run a tick NOW: check_notifications, do one unit, set_status, and keep looping until your queue drains (do not idle-sleep while you hold assigned tasks).";
 
+/// A re-arm to the SAME agent is never sent more often than this, even for a short or unparsed (0s) interval.
+const WATCHDOG_REARM_COOLDOWN_FLOOR_SECS: u64 = 300; // 5 min = 5× the 1-min poll
+
+/// Pure: is a re-arm to this agent still on cooldown? The watchdog re-arms an agent at most once per its OWN
+/// loop interval (floored at [`WATCHDOG_REARM_COOLDOWN_FLOOR_SECS`]) — so an agent whose self-firing loop the
+/// watchdog is covering is woken on ITS cadence, not on every 1-min poll. Without this, a healthy long-interval
+/// agent (e.g. a 4h disk-sweep whose cron never armed) is nudged every single sweep. `None` (never armed) is
+/// not on cooldown. Unit-tested.
+fn rearm_on_cooldown(last_rearm: Option<u64>, now: u64, interval_secs: u64) -> bool {
+    let cooldown = interval_secs.max(WATCHDOG_REARM_COOLDOWN_FLOOR_SECS);
+    last_rearm.is_some_and(|last| now.saturating_sub(last) < cooldown)
+}
+
+/// The per-agent last-re-arm stamp path: `<hub>/.claude/fleet/watchdog/<name>.rearm` (contents = unix secs).
+fn rearm_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("watchdog").join(format!("{name}.rearm"))
+}
+
+/// Read an agent's last-re-arm unix time from its stamp; `None` on an absent or unparseable stamp (never armed).
+fn read_rearm_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(rearm_stamp_path(fleet, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record that an agent was just re-armed at `now` (best-effort — a write failure is non-fatal, it just means
+/// the cooldown isn't enforced for that agent next sweep).
+fn write_rearm_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = rearm_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
+/// The fenced, cooldown-limited re-arm of ONE candidate window, shared by the board and file-hub scans:
+/// skip if still on cooldown (`"cooldown"`), skip if the pane is actively working (`"working-skip"`, the hard
+/// fence), else inject the wake and stamp (`"re-armed"`); a missing window is `"no-window"`. Returns the action
+/// label and whether a wake was actually sent. Never reaps or restarts.
+fn rearm_candidate(
+    fleet: &Fleet,
+    session: &str,
+    name: &str,
+    interval_secs: u64,
+    now: u64,
+) -> (&'static str, bool) {
+    if rearm_on_cooldown(read_rearm_stamp(fleet, name), now, interval_secs) {
+        return ("cooldown", false);
+    }
+    // HARD FENCE (operator ban 2026-09-10 + seq-1387 wake-only): NEVER inject into a pane that is actively
+    // working — that would interrupt a heads-down turn. A working candidate is left alone this sweep.
+    if window_is_working(session, name) {
+        return ("working-skip", false);
+    }
+    match notify::tmux_inject(session, name, WATCHDOG_REARM_WAKE) {
+        Ok(()) => {
+            write_rearm_stamp(fleet, name, now);
+            ("re-armed", true)
+        }
+        Err(_) => ("no-window", false),
+    }
+}
+
 /// Board-native liveness watchdog: for each BOARD-NATIVE agent (metadata.native == true), flag
 /// re-arm/retighten candidates on two signals — (1) heartbeat age overdue for its own loop interval
 /// (late/STALE), and (2) open assigned tasks while on a long idle interval (work-conserving). Report-only by
@@ -1863,6 +1928,8 @@ fn watchdog(stale_only: bool, rearm: bool) {
 /// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
 fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only: bool, rearm: bool) {
     let now = time::OffsetDateTime::now_utc();
+    let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
+    let fleet = Fleet::resolve(); // stamp store (<hub>/.claude/fleet/watchdog/); shared with the file-hub scan
     let session = board_session();
     println!(
         "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
@@ -1902,25 +1969,16 @@ fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only
         if stale_only && !retighten {
             continue;
         }
-        // With --rearm, ACT on each candidate: inject a wake into its window so it runs a tick now. A
-        // missing window (tmux_inject Err) is reported, not fatal. Never reaps/restarts.
+        // With --rearm, ACT on each candidate: a cooldown-limited, pane-fenced wake so it runs a tick now
+        // (never reaps/restarts). See [`rearm_candidate`].
         let action = if retighten {
             flagged += 1;
             if rearm {
-                // HARD FENCE (operator ban 2026-09-10 + seq-1387 wake-only): NEVER inject into a pane that
-                // is actively working — that would interrupt a heads-down turn. Only wake a genuinely idle
-                // (or gone) pane. A working candidate is left alone this sweep; the next sweep re-checks.
-                if window_is_working(&session, id) {
-                    "working-skip"
-                } else {
-                    match notify::tmux_inject(&session, id, WATCHDOG_REARM_WAKE) {
-                        Ok(()) => {
-                            rearmed += 1;
-                            "re-armed"
-                        }
-                        Err(_) => "no-window",
-                    }
+                let (act, did) = rearm_candidate(&fleet, &session, id, interval_secs, now_unix);
+                if did {
+                    rearmed += 1;
                 }
+                act
             } else {
                 "candidate"
             }
@@ -1985,18 +2043,11 @@ fn watchdog_file_hub(stale_only: bool, rearm: bool) {
         let action = if retighten {
             flagged += 1;
             if rearm {
-                // Same HARD FENCE as the board path: never inject into a working pane.
-                if window_is_working(&session, &a.name) {
-                    "working-skip"
-                } else {
-                    match notify::tmux_inject(&session, &a.name, WATCHDOG_REARM_WAKE) {
-                        Ok(()) => {
-                            rearmed += 1;
-                            "re-armed"
-                        }
-                        Err(_) => "no-window",
-                    }
+                let (act, did) = rearm_candidate(&fleet, &session, &a.name, interval_secs, now);
+                if did {
+                    rearmed += 1;
                 }
+                act
             } else {
                 "candidate"
             }
@@ -2186,6 +2237,19 @@ mod tests {
         assert!(pane_shows_working("(ctrl+b to run in background)"));
         // No prompt and no working affordance → not working (e.g. a dead/shell pane) — safe to wake.
         assert!(!pane_shows_working("bash-5.2$ "));
+    }
+
+    #[test]
+    fn rearm_cooldown_uses_the_interval_floored_and_treats_never_armed_as_free() {
+        // Never armed → free to re-arm.
+        assert!(!rearm_on_cooldown(None, 10_000, 600));
+        // A 4h-interval agent re-armed 1h ago is still on cooldown (< its own interval).
+        assert!(rearm_on_cooldown(Some(10_000), 10_000 + 3_600, 4 * 3_600));
+        // …and free again once a full interval has elapsed.
+        assert!(!rearm_on_cooldown(Some(10_000), 10_000 + 4 * 3_600, 4 * 3_600));
+        // A short/zero interval is floored at 5 min: a re-arm 60s ago is still on cooldown.
+        assert!(rearm_on_cooldown(Some(10_000), 10_000 + 60, 0));
+        assert!(!rearm_on_cooldown(Some(10_000), 10_000 + 301, 0));
     }
 
     #[test]
