@@ -22,6 +22,18 @@ license.workspace = true
 name = "slack_bridge"
 path = "src/lib.rs"
 
+# The daemon binary — the thin async transport shell. Gated behind `required-features = ["transport"]` so
+# the default `cargo test --workspace` / `nix flake check` never builds it or COMPILES its heavy async
+# tree (slack-morphism/tokio/hyper/rustls). Build/run it with `--features transport`.
+[[bin]]
+name = "slack-bridge"
+path = "src/main.rs"
+required-features = ["transport"]
+
+[features]
+# The live Slack Socket Mode transport. Off by default; pulls the heavy async tree only when enabled.
+transport = ["dep:slack-morphism", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:clap"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -32,3 +44,12 @@ toml = "0.8"
 # `POST /channels/:id/posts`). Same client the `fleet` orchestrator uses for its board REST access; light
 # and blocking — the sync core, NOT the heavy async Slack transport (that's the `transport` feature).
 ureq = "2"
+
+# ── The async Slack transport tree — OPTIONAL, pulled only by the `transport` feature (see above). ──
+# The Slack transport. `hyper` feature bundles Socket Mode (via tokio-tungstenite) + the Hyper client.
+slack-morphism = { version = "2.23", features = ["hyper"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate #159).
+clap = { version = "4", features = ["derive"], optional = true }
