@@ -147,8 +147,9 @@ impl Default for Stt {
 // ─────────────────────────────── [tts] ───────────────────────────────
 
 /// Text-to-speech via sherpa-onnx Kokoro. The Kokoro model package bundles the phonemization data
-/// (espeak-ng-data + lexicons), so no separate G2P wiring is needed; British and American voices ship
-/// in the same package selected by `speaker_id`.
+/// (espeak-ng-data + lexicons); British and American voices ship in the same package selected by
+/// `speaker_id`. A multi-lingual Kokoro model (>= v1.0) additionally REQUIRES a `lexicon` or `lang` (it
+/// aborts init otherwise) — see those fields.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tts {
@@ -163,6 +164,15 @@ pub struct Tts {
     pub provider: String,
     /// ONNX intra-op threads.
     pub num_threads: i32,
+    /// Kokoro lexicon file(s) — comma-separated, resolved relative to `model_dir` (a component with a
+    /// leading `/` is taken as an absolute path). REQUIRED for a multi-lingual Kokoro model (>= v1.0),
+    /// which aborts init without a `lexicon` or `lang`; empty is fine for the old single-lang Kokoro.
+    /// English example: `"lexicon-gb-en.txt,lexicon-us-en.txt"`. Don't add the `zh` lexicon unless you
+    /// also stage its jieba dict (`dict/`).
+    pub lexicon: String,
+    /// espeak-ng language for Kokoro G2P (e.g. `"en-us"`) — an alternative to `lexicon` for satisfying a
+    /// multi-lingual Kokoro model. Empty → not set.
+    pub lang: String,
 }
 
 impl Default for Tts {
@@ -173,7 +183,39 @@ impl Default for Tts {
             speed: 1.0,
             provider: "cpu".to_string(),
             num_threads: 2,
+            lexicon: String::new(),
+            lang: String::new(),
         }
+    }
+}
+
+impl Tts {
+    /// The Kokoro `lexicon` argument: the comma-separated `lexicon` entries resolved against `model_dir`
+    /// (an entry with a leading `/` is taken as absolute), or `None` when unset. sherpa accepts a
+    /// comma-separated lexicon path list.
+    pub fn resolved_lexicon(&self) -> Option<String> {
+        let dir = self.model_dir.to_string_lossy();
+        let joined = self
+            .lexicon
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                if p.starts_with('/') {
+                    p.to_string()
+                } else {
+                    format!("{dir}/{p}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        (!joined.is_empty()).then_some(joined)
+    }
+
+    /// The Kokoro `lang` argument, or `None` when unset.
+    pub fn lang_opt(&self) -> Option<String> {
+        let t = self.lang.trim();
+        (!t.is_empty()).then(|| t.to_string())
     }
 }
 
@@ -457,6 +499,33 @@ mod tests {
     fn unknown_key_is_rejected() {
         // deny_unknown_fields: a typo'd knob is an error, not a silently-ignored setting.
         assert!(parse("[audio]\nsampel_rate = 8000\n").is_err());
+    }
+
+    #[test]
+    fn tts_lexicon_resolves_against_model_dir_and_lang_is_optional() {
+        let cfg = parse(
+            r#"
+            [tts]
+            model_dir = "/models/kokoro"
+            lexicon = "lexicon-gb-en.txt, lexicon-us-en.txt, /abs/extra.txt"
+            lang = "en-us"
+            "#,
+        )
+        .unwrap();
+        // Relative entries join to model_dir; an absolute entry (leading /) passes through; ws trimmed.
+        assert_eq!(
+            cfg.tts.resolved_lexicon().as_deref(),
+            Some("/models/kokoro/lexicon-gb-en.txt,/models/kokoro/lexicon-us-en.txt,/abs/extra.txt")
+        );
+        assert_eq!(cfg.tts.lang_opt().as_deref(), Some("en-us"));
+    }
+
+    #[test]
+    fn tts_lexicon_and_lang_unset_by_default() {
+        // The old single-lang Kokoro needs neither — an empty config leaves both unset (no crash arg).
+        let cfg = parse("").unwrap();
+        assert_eq!(cfg.tts.resolved_lexicon(), None);
+        assert_eq!(cfg.tts.lang_opt(), None);
     }
 
     #[test]
