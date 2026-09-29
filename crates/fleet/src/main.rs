@@ -1244,6 +1244,14 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Report every board-declared agent's liveness off its board `last_seen` (the watchdog's read side).
+    /// Reads the roster from the board (orchestrator read — agents coordinate via their own MCP) and
+    /// classifies each by how stale its heartbeat is: live / quiet / STALE.
+    Status {
+        /// Only print agents that are not `live` (quiet or STALE) — the ones a watchdog would look at.
+        #[arg(long)]
+        stale_only: bool,
+    },
 }
 
 fn main() {
@@ -1274,6 +1282,7 @@ fn main() {
             launch,
         } => up(&fleet, &config, provision || launch, launch),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
+        Cmd::Status { stale_only } => status(stale_only),
     }
 }
 
@@ -1465,6 +1474,74 @@ fn pre_trust_fleet_root(fleet_root: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// How stale a board `last_seen` is allowed to get before the watchdog cares. An agent heartbeats far more
+/// often than any of these bounds, so `live` is the steady state; `quiet` is worth a glance; `STALE` is a
+/// candidate for a wedge/dead check.
+const LIVE_SECS: i64 = 15 * 60; // < this: freshly heartbeating
+const QUIET_SECS: i64 = 60 * 60; // < this: quiet but plausibly alive; beyond: STALE
+
+/// Classify a heartbeat age (seconds since the board `last_seen`) into a liveness bucket. A negative age
+/// (clock skew — a `last_seen` in the future) is reported as `live` rather than treated as stale.
+fn liveness_verdict(age_secs: i64) -> &'static str {
+    if age_secs < LIVE_SECS {
+        "live"
+    } else if age_secs < QUIET_SECS {
+        "quiet"
+    } else {
+        "STALE"
+    }
+}
+
+/// Age in whole seconds between `now` and an RFC3339 `last_seen`, or `None` if it doesn't parse.
+fn last_seen_age_secs(last_seen: &str, now: time::OffsetDateTime) -> Option<i64> {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(last_seen, &Rfc3339)
+        .ok()
+        .map(|t| (now - t).whole_seconds())
+}
+
+/// Report every board-declared agent's liveness off its board `last_seen` — the read side of the watchdog.
+/// Reads the roster from the board (orchestrator read; agents coordinate via their own MCP) and prints one
+/// line per agent: id, board status, liveness bucket + heartbeat age, and the raw `last_seen`.
+fn status(stale_only: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet status: {e}");
+        std::process::exit(1);
+    });
+    let agents = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet status: {e}");
+        std::process::exit(1);
+    });
+    let now = time::OffsetDateTime::now_utc();
+    println!("{:<28} {:<10} {:<14} last_seen", "agent", "status", "liveness");
+    let mut shown = 0usize;
+    for a in &agents {
+        let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let st = a.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let ls = a.get("last_seen").and_then(|v| v.as_str()).unwrap_or("");
+        let live = match last_seen_age_secs(ls, now) {
+            Some(age) => {
+                let verdict = liveness_verdict(age);
+                if stale_only && verdict == "live" {
+                    continue;
+                }
+                format!("{verdict}({}m)", age / 60)
+            }
+            None => {
+                if stale_only {
+                    continue;
+                }
+                "?".to_string()
+            }
+        };
+        println!("{id:<28} {st:<10} {live:<14} {ls}");
+        shown += 1;
+    }
+    if stale_only && shown == 0 {
+        println!("(all {} agents live)", agents.len());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1480,6 +1557,28 @@ mod tests {
             root: base.join(".claude/fleet"),
         };
         (base, fleet)
+    }
+
+    #[test]
+    fn liveness_verdict_buckets_by_heartbeat_age() {
+        assert_eq!(liveness_verdict(-30), "live", "clock skew (future) is not stale");
+        assert_eq!(liveness_verdict(0), "live");
+        assert_eq!(liveness_verdict(LIVE_SECS - 1), "live");
+        assert_eq!(liveness_verdict(LIVE_SECS), "quiet", "at the live bound → quiet");
+        assert_eq!(liveness_verdict(QUIET_SECS - 1), "quiet");
+        assert_eq!(liveness_verdict(QUIET_SECS), "STALE", "at the quiet bound → STALE");
+        assert_eq!(liveness_verdict(6 * 60 * 60), "STALE");
+    }
+
+    #[test]
+    fn last_seen_age_is_positive_for_a_past_stamp_and_none_for_garbage() {
+        use time::format_description::well_known::Rfc3339;
+        use time::{Duration, OffsetDateTime};
+        let now = OffsetDateTime::now_utc();
+        let past = (now - Duration::minutes(20)).format(&Rfc3339).unwrap();
+        let age = last_seen_age_secs(&past, now).expect("parses");
+        assert!((1190..=1210).contains(&age), "≈20m in seconds, got {age}");
+        assert_eq!(last_seen_age_secs("not-a-timestamp", now), None);
     }
 
     #[test]

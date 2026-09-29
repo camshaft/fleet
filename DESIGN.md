@@ -58,8 +58,14 @@ state lives on the board now. What remains for `fleet` to own is exactly the set
   --apply` spun the pilot up end-to-end: it materialized `~/.fleet/agents/v-task-board/task-board` off the
   shared mirror, read its OWN charter via `get_agent`, and now coordinates entirely via the board — it has
   autonomously shipped real PRs in its target repo since. Cadenza-nonspecific, board-native, unattended.
-- **P2 (next)** — liveness/watchdog off the board `last_seen` + host-health + the per-repo adapter
-  interface; migrate more agents onto the `fleet spin-up` path.
+- **P2 (in progress)** — liveness/watchdog off the board `last_seen` + host-health + the per-repo adapter
+  interface; migrate more agents onto the `fleet spin-up` path. **Read side landed** (PR #6): `fleet status`
+  reads the board roster and classifies each agent by heartbeat age — `live` (<15m) / `quiet` (<1h) /
+  `STALE`, `--stale-only` for the watchdog's candidate set. It confirms the board `last_seen` is fresh only
+  for **board-native** agents (the `v-task-board` pilot reads `live`; legacy file-hub agents read `STALE`
+  because they heartbeat to the file hub, not the board) — so the acting side of the watchdog is meaningful
+  as agents migrate onto the `fleet spin-up` path, and until then it must not treat a legacy agent's stale
+  board stamp as dead. Still to land: the acting side (re-arm/reissue/escalate), host-health, the adapter.
 - **P3** — retire `registry.json` and deprecate the cadenza-embedded fleet once parity is proven.
 
 The 2026-09-05 architecture below is retained for history; treat the board-offloaded scope above as the
