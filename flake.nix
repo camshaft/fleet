@@ -34,6 +34,10 @@
           # needed to compile. Tests are run in CI / `cargo test`, not under the nix sandbox: some spawn
           # git/tmux which aren't in the build sandbox, so building the artifact does not run them.
           doCheck = false;
+          # Bake the build revision into the binary so `fleet version` reports which commit a deployed binary
+          # was built from (the hermetic sandbox has no .git, so build.rs can't `git rev-parse` — it reads
+          # this env). Diagnoses a stale deployed binary silently running old logic.
+          FLEET_BUILD_REV = self.rev or self.dirtyRev or "unknown";
           meta = {
             description = "Standalone multi-repo agent-fleet orchestrator";
             mainProgram = "fleet";
