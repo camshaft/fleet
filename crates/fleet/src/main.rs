@@ -1769,8 +1769,22 @@ const WATCHDOG_LONG_INTERVAL_SECS: u64 = 3600; // 1h
 
 /// A watchdog re-arm/retighten candidate: either the heartbeat is overdue for its interval (`late`/`STALE`),
 /// OR the agent holds open assigned work while sitting on a long idle interval (work-conserving — it should
-/// loop tighter until its queue drains). Pure — unit-tested.
-fn is_retighten_candidate(verdict: &str, open_tasks: usize, interval_secs: u64) -> bool {
+/// loop tighter until its queue drains).
+///
+/// `stood_down` short-circuits to NOT a candidate when the agent has ZERO open tasks: an agent that
+/// deliberately went `offline` with a drained queue stopped its loop on purpose, so its stale heartbeat is
+/// expected, not a stall — re-arming it just burns a tick every sweep (reported live by a stood-down agent).
+/// A stood-down agent that STILL holds open tasks is not short-circuited: it should not have parked with work,
+/// so it stays a candidate. Pure — unit-tested.
+fn is_retighten_candidate(
+    verdict: &str,
+    open_tasks: usize,
+    interval_secs: u64,
+    stood_down: bool,
+) -> bool {
+    if stood_down && open_tasks == 0 {
+        return false;
+    }
     verdict == "late"
         || verdict == "STALE"
         || (open_tasks > 0 && interval_secs >= WATCHDOG_LONG_INTERVAL_SECS)
@@ -2029,7 +2043,10 @@ fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only
             Ok(n) => (n, n.to_string()),
             Err(_) => (0, "?".to_string()),
         };
-        let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
+        // A deliberately stood-down agent (board presence `offline`) with a drained queue is not a stall —
+        // don't re-arm it (else every at-rest board-native agent burns a tick per sweep).
+        let stood_down = a.get("status").and_then(serde_json::Value::as_str) == Some("offline");
+        let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs, stood_down);
         if stale_only && !retighten {
             continue;
         }
@@ -2108,7 +2125,9 @@ fn watchdog_file_hub(stale_only: bool, rearm: bool, native_ids: &std::collection
             None => ("?", "?".to_string()),
         };
         let pending = inbox_pending_count(&fleet, &a.name);
-        let retighten = is_retighten_candidate(verdict, pending, interval_secs);
+        // File-hub rows have no board presence; board-native (offline-capable) agents are already excluded
+        // from this scan (see `native_ids`), so no stand-down short-circuit applies here.
+        let retighten = is_retighten_candidate(verdict, pending, interval_secs, false);
         if stale_only && !retighten {
             continue;
         }
@@ -2364,16 +2383,27 @@ mod tests {
 
     #[test]
     fn is_retighten_candidate_flags_overdue_or_work_on_a_long_interval() {
-        // An overdue heartbeat is always a candidate, regardless of task count.
-        assert!(is_retighten_candidate("late", 0, 600));
-        assert!(is_retighten_candidate("STALE", 0, 600));
+        // An overdue heartbeat is always a candidate, regardless of task count (not stood down).
+        assert!(is_retighten_candidate("late", 0, 600, false));
+        assert!(is_retighten_candidate("STALE", 0, 600, false));
         // A healthy heartbeat with NO open work is fine on any interval.
-        assert!(!is_retighten_candidate("ok", 0, 6 * 3600));
+        assert!(!is_retighten_candidate("ok", 0, 6 * 3600, false));
         // Open work on a LONG interval → retighten (should loop tighter to drain the queue).
-        assert!(is_retighten_candidate("ok", 2, 3600), "1h+ with open tasks");
-        assert!(is_retighten_candidate("ok", 1, 6 * 3600));
+        assert!(is_retighten_candidate("ok", 2, 3600, false), "1h+ with open tasks");
+        assert!(is_retighten_candidate("ok", 1, 6 * 3600, false));
         // Open work on a SHORT interval is fine — it's already cycling fast.
-        assert!(!is_retighten_candidate("ok", 3, 600), "10m with tasks is already tight");
+        assert!(!is_retighten_candidate("ok", 3, 600, false), "10m with tasks is already tight");
+    }
+
+    #[test]
+    fn is_retighten_candidate_never_nudges_a_stood_down_agent_with_a_drained_queue() {
+        // Deliberately offline + zero open tasks → NOT a candidate even with a STALE heartbeat (its loop
+        // stopped on purpose; re-arming just burns a tick — the design-fleet-self-improve report).
+        assert!(!is_retighten_candidate("STALE", 0, 600, true));
+        assert!(!is_retighten_candidate("late", 0, 3600, true));
+        // …but a stood-down agent that STILL holds open work IS a candidate (it shouldn't have parked).
+        assert!(is_retighten_candidate("ok", 1, 6 * 3600, true), "offline with open work → still nudge");
+        assert!(is_retighten_candidate("STALE", 2, 600, true));
     }
 
     #[test]
