@@ -1,0 +1,5 @@
+# Local/dev config (holds the GitHub token) — NEVER commit. In deploy the daemon reads its TOML config from
+# the agenix-decrypted secret (a `roles/github-bridge.nix` in camshaft/dotfiles); no env-var config anywhere
+# (operator mandate #159).
+/github-bridge.toml
+/github.toml
