@@ -57,6 +57,13 @@ speed = 1.0
 # Provider: "cpu" (default — fast enough for short replies) or "cuda".
 provider = "cpu"
 num_threads = 2
+# Kokoro lexicon file(s), comma-separated, resolved relative to model_dir (a leading "/" = absolute).
+# REQUIRED for a multi-lingual Kokoro model (>= v1.0, e.g. kokoro-multi-lang-v1_0) — sherpa aborts TTS
+# init without a lexicon or lang. Empty is fine for the old single-lang Kokoro. English example below;
+# don't add lexicon-zh.txt unless you also stage its jieba dict/ dir.
+# lexicon = "lexicon-gb-en.txt,lexicon-us-en.txt"
+# espeak-ng language for Kokoro G2P (e.g. "en-us") — an alternative to lexicon for a multi-lingual model.
+# lang = ""
 
 # ── Brain (the `claude` CLI + MCP servers) ─────────────────────────────────
 [brain]

@@ -16,7 +16,9 @@ pub struct Synthesizer {
 
 impl Synthesizer {
     /// Build the synthesizer from the [`Tts`] config. The model dir holds `model.onnx`, `voices.bin`,
-    /// `tokens.txt`, `espeak-ng-data/`, and the lexicon files (sherpa's Kokoro package layout).
+    /// `tokens.txt`, `espeak-ng-data/`, and the lexicon files (sherpa's Kokoro package layout). A
+    /// multi-lingual Kokoro model (>= v1.0) additionally needs `tts.lexicon` or `tts.lang` set — sherpa
+    /// aborts `InitFrontend` without one; the old single-lang model works with neither.
     pub fn new(cfg: &Tts) -> Result<Self, String> {
         let dir = cfg.model_dir.to_string_lossy();
         let config = OfflineTtsConfig {
@@ -26,6 +28,8 @@ impl Synthesizer {
                     voices: Some(format!("{dir}/voices.bin")),
                     tokens: Some(format!("{dir}/tokens.txt")),
                     data_dir: Some(format!("{dir}/espeak-ng-data")),
+                    lexicon: cfg.resolved_lexicon(),
+                    lang: cfg.lang_opt(),
                     ..Default::default()
                 },
                 num_threads: cfg.num_threads,
