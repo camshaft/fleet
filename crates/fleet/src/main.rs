@@ -32,6 +32,41 @@ fn board_session() -> String {
         .unwrap_or_else(|| "main".to_string())
 }
 
+/// This box's host id for host-affinity (`config.host`, else the system hostname). `fleet up`/`watchdog` use
+/// it to skip agents pinned to a different host. HOME/hostname are OS locators, not fleet knobs.
+fn this_host() -> String {
+    if let Some(h) = config::get().host.clone().filter(|s| !s.trim().is_empty()) {
+        return h;
+    }
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// Whether an agent (by its board `metadata`) should be managed on `this_host`: an agent whose `host` is unset
+/// is unpinned (run-anywhere → managed everywhere, today's behavior); a set `host` (a string or an array of
+/// strings) matches only when `this_host` is among them. Pure — unit-tested.
+fn agent_host_matches(metadata: Option<&serde_json::Value>, this_host: &str) -> bool {
+    let Some(host) = metadata.and_then(|m| m.get("host")) else {
+        return true; // unpinned
+    };
+    match host {
+        serde_json::Value::String(s) => s.trim().is_empty() || s == this_host,
+        serde_json::Value::Array(items) => {
+            // An empty array is treated as unpinned; otherwise this_host must be listed.
+            items.is_empty()
+                || items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|h| h == this_host)
+        }
+        serde_json::Value::Null => true, // host: null → unpinned
+        _ => true,                       // an odd shape shouldn't strand the agent — treat as unpinned
+    }
+}
+
 /// One agent's durable row in the runtime registry (the machine-local manifest that survives a reboot).
 /// Lifted verbatim from cadenza fleet.rs so the registry.json format is byte-identical across the cutover.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1300,6 +1335,10 @@ enum Cmd {
         /// Set the agent's loop interval (e.g. `2m`, `30m`, `2h`).
         #[arg(long)]
         interval: Option<String>,
+        /// Pin the agent to a host (host-affinity — only that box's `fleet up`/`watchdog` manages it). Pass
+        /// `""` to clear the pin (unpinned = run-anywhere).
+        #[arg(long)]
+        host: Option<String>,
         /// Perform the write (default: just print the metadata patch that would be sent).
         #[arg(long)]
         apply: bool,
@@ -1379,8 +1418,9 @@ fn main() {
             agent,
             repos,
             interval,
+            host,
             apply,
-        } => set_meta(&agent, &repos, interval.as_deref(), apply),
+        } => set_meta(&agent, &repos, interval.as_deref(), host.as_deref(), apply),
         Cmd::SetInterval { agent, interval } => set_interval(&fleet, &agent, &interval),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
@@ -2009,6 +2049,7 @@ fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
     let fleet = Fleet::resolve(); // stamp store (<hub>/.claude/fleet/watchdog/); shared with the file-hub scan
     let session = board_session();
+    let host = this_host(); // host-affinity: this box only manages agents pinned here (or unpinned)
     println!(
         "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
         "agent", "interval", "age", "open", "verdict", "action"
@@ -2023,6 +2064,11 @@ fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if !is_native {
+            continue;
+        }
+        // Host affinity: skip agents pinned to a DIFFERENT box — their tmux windows aren't on this host, so
+        // re-arming them here would mis-target (or no-op). Unpinned agents are managed everywhere (as today).
+        if !agent_host_matches(md, &host) {
             continue;
         }
         native += 1;
@@ -2176,7 +2222,11 @@ fn parse_repo_spec(spec: &str) -> serde_json::Value {
 
 /// Build the metadata patch (the subset of keys to merge) from the requested `repos` + `interval`, or an
 /// error string if nothing was requested. Pure — unit-tested.
-fn build_meta_patch(repos: &[String], interval: Option<&str>) -> Result<serde_json::Value, String> {
+fn build_meta_patch(
+    repos: &[String],
+    interval: Option<&str>,
+    host: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let mut patch = serde_json::Map::new();
     if !repos.is_empty() {
         let entries: Vec<serde_json::Value> = repos.iter().map(|s| parse_repo_spec(s)).collect();
@@ -2185,8 +2235,17 @@ fn build_meta_patch(repos: &[String], interval: Option<&str>) -> Result<serde_js
     if let Some(iv) = interval {
         patch.insert("interval".to_string(), serde_json::Value::String(iv.to_string()));
     }
+    if let Some(h) = host {
+        // Pin the agent to a host (host-affinity). `""` clears the pin (unpinned) via JSON null.
+        let val = if h.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(h.to_string())
+        };
+        patch.insert("host".to_string(), val);
+    }
     if patch.is_empty() {
-        return Err("nothing to set — pass at least one --repo or --interval".to_string());
+        return Err("nothing to set — pass at least one --repo, --interval, or --host".to_string());
     }
     Ok(serde_json::Value::Object(patch))
 }
@@ -2194,8 +2253,8 @@ fn build_meta_patch(repos: &[String], interval: Option<&str>) -> Result<serde_js
 /// Write launch-shaping metadata (`repos` / `interval`) onto an agent's board record — the migration
 /// primitive. Reports the patch by default; `--apply` PATCHes it (key-level merge, so untouched keys are
 /// preserved) and reads the record back to confirm.
-fn set_meta(agent: &str, repos: &[String], interval: Option<&str>, apply: bool) {
-    let patch = build_meta_patch(repos, interval).unwrap_or_else(|e| {
+fn set_meta(agent: &str, repos: &[String], interval: Option<&str>, host: Option<&str>, apply: bool) {
+    let patch = build_meta_patch(repos, interval, host).unwrap_or_else(|e| {
         eprintln!("fleet set-meta: {e}");
         std::process::exit(2);
     });
@@ -2218,9 +2277,10 @@ fn set_meta(agent: &str, repos: &[String], interval: Option<&str>, apply: bool) 
     }
     match board.get_agent(agent).ok().and_then(|r| r.get("metadata").cloned()) {
         Some(md) => println!(
-            "  written. metadata now: repos={} interval={}",
+            "  written. metadata now: repos={} interval={} host={}",
             md.get("repos").map(|v| v.to_string()).unwrap_or_else(|| "<none>".into()),
-            md.get("interval").and_then(|v| v.as_str()).unwrap_or("<none>")
+            md.get("interval").and_then(|v| v.as_str()).unwrap_or("<none>"),
+            md.get("host").map(|v| v.to_string()).unwrap_or_else(|| "<none>".into())
         ),
         None => println!("  written (could not read back the record to confirm)"),
     }
@@ -2471,19 +2531,40 @@ mod tests {
 
     #[test]
     fn build_meta_patch_includes_only_requested_keys_and_errors_when_empty() {
-        let p = build_meta_patch(&["o/r@b".to_string()], Some("2m")).unwrap();
+        let p = build_meta_patch(&["o/r@b".to_string()], Some("2m"), None).unwrap();
         assert_eq!(p["repos"], serde_json::json!([{"repo":"o/r","branch":"b"}]));
         assert_eq!(p["interval"], "2m");
-        // repos only — no interval key
-        let p = build_meta_patch(&["o/r".to_string()], None).unwrap();
-        assert!(p.get("interval").is_none());
+        // repos only — no interval/host key
+        let p = build_meta_patch(&["o/r".to_string()], None, None).unwrap();
+        assert!(p.get("interval").is_none() && p.get("host").is_none());
         assert!(p.get("repos").is_some());
         // interval only — no repos key
-        let p = build_meta_patch(&[], Some("30m")).unwrap();
+        let p = build_meta_patch(&[], Some("30m"), None).unwrap();
         assert!(p.get("repos").is_none());
         assert_eq!(p["interval"], "30m");
+        // host set, and "" clears the pin (JSON null)
+        let p = build_meta_patch(&[], None, Some("green-machine")).unwrap();
+        assert_eq!(p["host"], "green-machine");
+        let p = build_meta_patch(&[], None, Some("")).unwrap();
+        assert_eq!(p["host"], serde_json::Value::Null, "empty host clears the pin");
         // nothing requested → error (guards a no-op PATCH)
-        assert!(build_meta_patch(&[], None).is_err());
+        assert!(build_meta_patch(&[], None, None).is_err());
+    }
+
+    #[test]
+    fn agent_host_matches_honors_pin_and_treats_unset_as_run_anywhere() {
+        // unpinned (no host / null / empty) → managed everywhere
+        assert!(agent_host_matches(Some(&serde_json::json!({})), "dev-desk"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":null})), "dev-desk"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":""})), "dev-desk"));
+        assert!(agent_host_matches(None, "dev-desk"));
+        // string pin: matches only its host
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":"green-machine"})), "green-machine"));
+        assert!(!agent_host_matches(Some(&serde_json::json!({"host":"green-machine"})), "dev-desk"));
+        // array pin: matches if listed; empty array = unpinned
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
+        assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
     }
 
     #[test]

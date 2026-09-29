@@ -28,6 +28,9 @@ pub struct Config {
     pub window_sh: Option<String>,
     /// This process's agent id — the `fleet send` sender identity when not given explicitly.
     pub agent: Option<String>,
+    /// This box's host id for host-affinity: `fleet up`/`watchdog` only manage agents whose `host` metadata
+    /// matches this (unpinned agents are unaffected). Default = the system hostname.
+    pub host: Option<String>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -91,8 +94,10 @@ mod tests {
             board_api = "http://board.local/api"
             window_sh = "/opt/fleet/window.sh"
             agent = "v-fleet-tooling"
+            host = "green-machine"
             "#,
         );
+        assert_eq!(cfg.host.as_deref(), Some("green-machine"));
         assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
         assert_eq!(cfg.hub.as_deref(), Some("/srv/hub"));
         assert_eq!(cfg.root.as_deref(), Some("/home/x/.fleet"));
