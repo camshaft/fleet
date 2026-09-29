@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod board;
+mod workspace;
 
 /// One agent's durable row in the runtime registry (the machine-local manifest that survives a reboot).
 /// Lifted verbatim from cadenza fleet.rs so the registry.json format is byte-identical across the cutover.
@@ -1276,15 +1277,10 @@ fn main() {
     }
 }
 
-/// The workspace dir for `<agent>`'s checkout of `<repo>` under the fleet root (repo's basename).
-fn workspace_dir(fleet_root: &str, agent: &str, repo: &str) -> String {
-    let name = repo.trim_end_matches(".git").rsplit('/').next().unwrap_or(repo);
-    format!("{fleet_root}/agents/{agent}/{name}")
-}
-
 /// Spin up one board-declared agent into its `~/.fleet` workspace. Reads the board record (orchestrator
-/// read — agents coordinate via their own MCP) and reports the materialize + launch plan; `--apply` will
-/// perform it (materialize + launch land in the next slice). See ../../DESIGN.md.
+/// read — agents coordinate via their own MCP), then reports the materialize + launch plan; `--apply`
+/// materializes each repo's worktree off a shared bare mirror and launches a tmux window running `claude`
+/// with a self-discovery kickoff (the agent fetches its own charter). See ../../DESIGN.md.
 fn spin_up(agent: &str, apply: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet spin-up: {e}");
@@ -1312,10 +1308,10 @@ fn spin_up(agent: &str, apply: bool) {
     let fleet_root = std::env::var("FLEET_ROOT")
         .unwrap_or_else(|_| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
 
-    println!("spin-up plan for '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    println!("spin-up '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
     println!(
         "  charter on board: {}",
-        if has_charter { "yes — fetched in-session at boot" } else { "NO — declare a charter first" }
+        if has_charter { "yes — the agent fetches it in-session at boot" } else { "NO — declare a charter first" }
     );
     println!("  model={model}  effort={effort}  interval={interval}");
     if repos.is_empty() {
@@ -1325,26 +1321,93 @@ fn spin_up(agent: &str, apply: bool) {
     for r in &repos {
         let repo = r.get("repo").and_then(|v| v.as_str()).unwrap_or("?");
         let branch = r.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
-        let wd = workspace_dir(&fleet_root, agent, repo);
-        println!("  workspace: {wd}  (worktree of {repo}@{branch} off {fleet_root}/mirrors)");
+        let wd = if apply {
+            match workspace::ensure(&fleet_root, agent, repo, branch) {
+                Ok(wd) => {
+                    println!("  workspace ready: {wd}  (worktree of {repo}@{branch} off a shared mirror)");
+                    wd
+                }
+                Err(e) => {
+                    eprintln!("  workspace FAILED for {repo}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            let wd = workspace::workspace_dir(&fleet_root, agent, repo);
+            println!("  would materialize: {wd}  (worktree of {repo}@{branch} off {fleet_root}/mirrors)");
+            wd
+        };
         if primary_workdir.is_none() {
             primary_workdir = Some(wd);
         }
     }
-    match &primary_workdir {
-        Some(wd) => {
-            println!("  launch: claude in {wd} (board MCP already in-session), then /loop {interval}");
-            println!(
-                "  kickoff (self-discovery): \"you are '{agent}' — query your OWN board record \
-                 (get_agent {agent}) for your charter + metadata, then follow it\""
-            );
+
+    let Some(workdir) = primary_workdir else {
+        println!("  launch: skipped — no primary repo to run in");
+        return;
+    };
+    if !apply {
+        println!("  would launch: claude in {workdir} (board MCP in-session) with a self-discovery kickoff, then /loop {interval}");
+        println!("  (dry-run — re-run with --apply to materialize + launch)");
+        return;
+    }
+    if !has_charter {
+        eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
+        std::process::exit(1);
+    }
+    match launch_board_agent(agent, &workdir, &model, &effort, &interval) {
+        Ok(win) => println!(
+            "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then /loop {interval}"
+        ),
+        Err(e) => {
+            eprintln!("  launch FAILED: {e}");
+            std::process::exit(1);
         }
-        None => println!("  launch: skipped — no primary repo to run in"),
     }
-    if apply {
-        println!("  NOTE: --apply (materialize worktrees + launch the window) lands in the next slice; \
-                  showing the dry-run plan for now.");
+}
+
+/// Open a tmux window running `claude` in `workdir` with a SELF-DISCOVERY kickoff (the agent fetches its
+/// own charter from the board via its in-session MCP — nothing is injected). Refuses to double-launch an
+/// existing same-named window. The kickoff is passed via a tmux env var so no shell quoting can mangle it.
+fn launch_board_agent(agent: &str, workdir: &str, model: &str, effort: &str, interval: &str) -> Result<String, String> {
+    let session = std::env::var("CDZ_FLEET_SESSION").unwrap_or_else(|_| "main".to_string());
+    if let Ok(out) = std::process::Command::new("tmux")
+        .args(["list-windows", "-t", &session, "-F", "#W"])
+        .output()
+        && String::from_utf8_lossy(&out.stdout).lines().any(|w| w == agent)
+    {
+        return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
     }
+    let tick = "run one tick of your charter: drain your board notifications (check_notifications), \
+                do ONE unit of work per your charter, then update your presence (set_status)";
+    let kickoff = format!(
+        "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
+         this session. FIRST call get_agent with agent_id '{agent}' to read your OWN charter + metadata \
+         from the board, and follow that charter as your role. Coordinate through the board (send_message \
+         / check_notifications / comment_task / set_status) — there is no file inbox. You work in \
+         {workdir}. Start your recurring loop now: /loop {interval} {tick}"
+    );
+    // effort/model are single-quoted (no single-quotes in them) so `[1m]` can't glob; the kickoff rides in
+    // $CDZ_KICKOFF (set literally via `-e`, expanded double-quoted) so its spaces/quotes are safe.
+    let cmd = format!(
+        "exec claude --disallowedTools AskUserQuestion --effort '{effort}' --model '{model}' \
+         --autocompact 600000 --dangerously-skip-permissions \"$CDZ_KICKOFF\""
+    );
+    let status = std::process::Command::new("tmux")
+        .args([
+            "new-window", "-d",
+            "-t", &session,
+            "-n", agent,
+            "-c", workdir,
+            "-e", &format!("CDZ_KICKOFF={kickoff}"),
+            &cmd,
+        ])
+        .status()
+        .map_err(|e| format!("tmux new-window: {e}"))?;
+    if !status.success() {
+        return Err("tmux new-window failed (is the fleet tmux session running?)".to_string());
+    }
+    Ok(format!("{session}:{agent}"))
 }
 
 #[cfg(test)]
