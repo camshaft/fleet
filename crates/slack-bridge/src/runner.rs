@@ -275,9 +275,10 @@ pub async fn run_socket_mode(
 ) -> Result<(), BoxErr> {
     let client = Arc::new(hyper_client()?);
     let callbacks = SlackSocketModeListenerCallbacks::new().with_push_events(on_push_event);
+    let bot = SlackApiToken::new(tokens.bot_token.clone().into());
     let listener_environment = Arc::new(
         SlackClientEventsListenerEnvironment::new(client.clone())
-            .with_user_state(BridgeState { cfg, map }),
+            .with_user_state(BridgeState { cfg, map, bot }),
     );
     let listener = SlackClientSocketModeListener::new(
         &SlackClientSocketModeConfig::new(),
@@ -290,17 +291,20 @@ pub async fn run_socket_mode(
     Ok(())
 }
 
-/// Shared state handed to the push-events callback: the config + the channel map. The inbound path posts
-/// to the board (never to Slack — that's the outbound loop's job), so no bot token here.
+/// Shared state handed to the push-events callback: the config, the channel map, and the bot token. The
+/// inbound path posts the message CONTENT to the board (never mirrors it to Slack — that's the outbound
+/// loop's job); the bot token is only used to drop an immediate 👀 read-receipt reaction on the operator's
+/// Slack message so they get instant confirmation the bridge received + is relaying it.
 #[derive(Clone)]
 struct BridgeState {
     cfg: Arc<Config>,
     map: SharedMap,
+    bot: SlackApiToken,
 }
 
 async fn on_push_event(
     event: SlackPushEventCallback,
-    _client: Arc<SlackHyperClient>,
+    client: Arc<SlackHyperClient>,
     states: SlackClientEventsUserState,
 ) -> Result<(), BoxErr> {
     if let SlackEventCallbackBody::Message(msg) = event.event {
@@ -309,20 +313,23 @@ async fn on_push_event(
             read.get_user_state::<BridgeState>().cloned()
         };
         let Some(state) = state else { return Ok(()) };
-        handle_message(&state, msg).await;
+        handle_message(&state, &client, msg).await;
     }
     Ok(())
 }
 
 /// Turn an operator's Slack message into an attributed board post. Skips the bot's own posts, edits/other
 /// subtypes, empty text, and messages in an unmapped Slack channel.
-async fn handle_message(state: &BridgeState, msg: SlackMessageEvent) {
+async fn handle_message(state: &BridgeState, client: &SlackHyperClient, msg: SlackMessageEvent) {
     if msg.sender.bot_id.is_some() || msg.subtype.is_some() {
         return;
     }
-    let Some(channel) = msg.origin.channel.as_ref().map(|c| c.to_string()) else {
+    let Some(channel_id) = msg.origin.channel.clone() else {
         return;
     };
+    let channel = channel_id.to_string();
+    // The message timestamp — the reaction target (`reactions.add` keys on channel + ts).
+    let msg_ts = msg.origin.ts.clone();
     let text = msg
         .content
         .as_ref()
@@ -356,6 +363,19 @@ async fn handle_message(state: &BridgeState, msg: SlackMessageEvent) {
         tracing::debug!(%channel, "inbound: unmapped Slack channel — ignored");
         return;
     };
+
+    // Immediate read-receipt: drop a 👀 on the operator's Slack message the instant we've resolved it to a
+    // mapped board channel (i.e. we ARE relaying it), so they get instant confirmation the bridge is live —
+    // before the board round-trip / any concierge reply. Best-effort: a missing `reactions:write` scope or
+    // a transient Slack error is logged and never blocks the board post (the message still relays).
+    let react_req = SlackApiReactionsAddRequest::new(
+        channel_id.clone(),
+        SlackReactionName("eyes".to_string()),
+        msg_ts.clone(),
+    );
+    if let Err(e) = client.open_session(&state.bot).reactions_add(&react_req).await {
+        tracing::warn!(error = %e, %channel, "inbound: could not add 👀 read-receipt (bot may be missing reactions:write scope)");
+    }
 
     let board_api = cfg.board_api.clone();
     let board_channel = plan.board_channel_id;
