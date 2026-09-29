@@ -2059,11 +2059,13 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
     let tick = format!(
         "run one tick of your charter: drain your board notifications (check_notifications), do ONE unit \
          of work per your charter, then update your presence (set_status). WORK-CONSERVING PACING: after \
-         the unit, check your OPEN assigned tasks (list_tasks with assignee '{agent}', counting any not \
-         done/cancelled) and your unread notifications. If you hold open assigned work OR unread messages, \
-         keep going — schedule your next tick SOON (60-120s). Only when your assigned queue is empty AND \
-         your inbox is drained may you fall back to the long idle cadence (about {interval}). NEVER \
-         idle-sleep on the long cadence while you still hold open assigned tasks."
+         the unit, check your OPEN assigned tasks (list_tasks with assignee '{agent}', counting ONLY \
+         todo/in_progress tasks that are NOT blocked/parked — a blocked task, or one parked on a blocker or \
+         a not-yet-existing prereq, is NOT actionable pending work) and your unread notifications. If you \
+         hold actionable assigned work OR unread messages, keep going — schedule your next tick SOON \
+         (60-120s). Only when you have no actionable assigned task AND your inbox is drained may you fall \
+         back to the long idle cadence (about {interval}). NEVER idle-sleep on the long cadence while you \
+         still hold an actionable assigned task."
     );
     format!(
         "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
@@ -2073,7 +2075,12 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
          metadata from the board, and follow that charter as your role. On every board write pass your \
          identity EXPLICITLY as a fallback (agent_id / created_by / author / actor = '{agent}') — the board \
          defaults these to null. Coordinate through the board (send_message / check_notifications / \
-         comment_task / set_status) — there is no file inbox. If any task of yours becomes BLOCKED ON THE \
+         comment_task / set_status) — there is no file inbox. Any board Document you author (design / \
+         proposal / plan) MUST follow the Fleet Doc-Writing Style Guide — wiki guides/doc-writing-style-guide \
+         (Background then Problem Statement then Requirements/Goals/Non-Goals (measurable) then Solutions, \
+         each its own section with prose + Pros/Cons, then Recommendation; implementation in an appendix; NO \
+         tables/images/TL;DR/idioms in the body — the board viewer is minimal Markdown). If any task of \
+         yours becomes BLOCKED ON THE \
          OPERATOR, do not idle on it: set the task status=blocked with blocked_on {{kind:operator, note}}, \
          assign it to 'cameron', and stash your own id in metadata.blocked_owner — so list_tasks(assignee \
          'cameron') is the operator's single 'my asks' dashboard; when the operator answers, reassign the task \
@@ -3743,6 +3750,11 @@ mod tests {
         assert!(k.contains("list_tasks with assignee 'v-x'"));
         assert!(k.contains("NEVER idle-sleep"));
         assert!(k.contains("about 30m"), "the interval is the idle-fallback ceiling");
+        // blocked/parked ≠ actionable (board-pm refinement): the self-check counts only todo/in_progress and
+        // excludes a blocked/parked task, so a task parked on a blocker doesn't keep the loop hot.
+        assert!(k.contains("todo/in_progress") && k.contains("NOT blocked/parked"), "blocked/parked is not actionable work");
+        // Doc-writing style guide clause (board-pm, operator-approved): every future author carries it.
+        assert!(k.contains("Fleet Doc-Writing Style Guide"), "kickoff points authors at the doc-writing style guide");
         // Operator-blocked dashboard convention (operator seq-2292): a task blocked on the operator gets
         // reassigned to 'cameron' + typed blocked_on so list_tasks(assignee cameron) is the operator's one dashboard.
         assert!(k.contains("BLOCKED ON THE") && k.contains("assign it to 'cameron'"), "carries the operator-blocked convention");
