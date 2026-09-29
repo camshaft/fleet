@@ -1280,6 +1280,10 @@ enum Cmd {
         /// Only print agents that are not `ok` (late/STALE) — the re-arm candidates.
         #[arg(long)]
         stale_only: bool,
+        /// ACT on each candidate: inject a wake into its tmux window so it runs a tick now (automates the
+        /// manual loop-reissue). Without this the watchdog is report-only.
+        #[arg(long)]
+        rearm: bool,
     },
     /// Write launch-shaping metadata onto an agent's board record — the migration primitive that makes an
     /// agent spin-up-ready. Merges (only the given keys change). Reports the patch by default; `--apply`
@@ -1338,7 +1342,7 @@ fn main() {
         } => up(&fleet, &config, provision || launch, launch),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::Status { stale_only } => status(stale_only),
-        Cmd::Watchdog { stale_only } => watchdog(stale_only),
+        Cmd::Watchdog { stale_only, rearm } => watchdog(stale_only, rearm),
         Cmd::SetMeta {
             agent,
             repos,
@@ -1766,13 +1770,18 @@ fn watchdog_verdict(age_secs: i64, interval_secs: u64) -> &'static str {
     }
 }
 
-/// Board-native liveness watchdog (read side): for each BOARD-NATIVE agent (metadata.native == true), flag
+/// The wake injected into a re-arm candidate's window by `fleet watchdog --rearm`. It never reaps or
+/// restarts (the operator banned auto-reap) — it nudges the agent to run a tick, which is exactly what a
+/// human was doing by hand for stalled loops. A benign prompt: worst case the agent no-ops one tick.
+const WATCHDOG_REARM_WAKE: &str = "[watchdog] you have pending work (an overdue loop and/or open assigned tasks) — run a tick NOW: check_notifications, do one unit, set_status, and keep looping until your queue drains (do not idle-sleep while you hold assigned tasks).";
+
+/// Board-native liveness watchdog: for each BOARD-NATIVE agent (metadata.native == true), flag
 /// re-arm/retighten candidates on two signals — (1) heartbeat age overdue for its own loop interval
-/// (late/STALE), and (2) open assigned tasks while on a long idle interval (work-conserving). Report-only —
-/// it never touches an agent (the operator banned auto-reap); the opt-in re-arm ACTION is a follow-on slice.
-/// File-hub mirror rows (no `native` flag) are skipped: they don't run a board-native loop, so their
-/// `last_seen` is meaningless here.
-fn watchdog(stale_only: bool) {
+/// (late/STALE), and (2) open assigned tasks while on a long idle interval (work-conserving). Report-only by
+/// default; with `rearm` it ACTS on each candidate by injecting a wake into its tmux window (automating the
+/// manual loop-reissue) — it still never reaps or restarts. File-hub mirror rows (no `native` flag) are
+/// skipped: they don't run a board-native loop, so their `last_seen` is meaningless here.
+fn watchdog(stale_only: bool, rearm: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet watchdog: {e}");
         std::process::exit(1);
@@ -1782,11 +1791,13 @@ fn watchdog(stale_only: bool) {
         std::process::exit(1);
     });
     let now = time::OffsetDateTime::now_utc();
+    let session = board_session();
     println!(
-        "{:<28} {:<8} {:<7} {:<5} {:<8} last_seen",
-        "agent", "interval", "age", "open", "verdict"
+        "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
+        "agent", "interval", "age", "open", "verdict", "action"
     );
     let mut flagged = 0usize;
+    let mut rearmed = 0usize;
     let mut native = 0usize;
     for a in &agents {
         let md = a.get("metadata");
@@ -1819,17 +1830,36 @@ fn watchdog(stale_only: bool) {
         if stale_only && !retighten {
             continue;
         }
-        if retighten {
+        // With --rearm, ACT on each candidate: inject a wake into its window so it runs a tick now. A
+        // missing window (tmux_inject Err) is reported, not fatal. Never reaps/restarts.
+        let action = if retighten {
             flagged += 1;
-        }
+            if rearm {
+                match notify::tmux_inject(&session, id, WATCHDOG_REARM_WAKE) {
+                    Ok(()) => {
+                        rearmed += 1;
+                        "re-armed"
+                    }
+                    Err(_) => "no-window",
+                }
+            } else {
+                "candidate"
+            }
+        } else {
+            "ok"
+        };
         let iv = if interval_str.is_empty() { "?" } else { interval_str };
-        println!("{id:<28} {iv:<8} {age_str:<7} {open_str:<5} {verdict:<8} {ls}");
+        println!("{id:<28} {iv:<8} {age_str:<7} {open_str:<5} {verdict:<8} {action:<12} {ls}");
     }
     if stale_only && flagged == 0 {
         println!("(all {native} board-native agents ok)");
+    } else if rearm {
+        println!(
+            "-- {native} board-native agent(s); {flagged} candidate(s); {rearmed} re-armed (wake injected)"
+        );
     } else {
         println!(
-            "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval)"
+            "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval); pass --rearm to wake them"
         );
     }
 }
