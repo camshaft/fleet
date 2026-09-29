@@ -31,6 +31,11 @@ pub struct Config {
     /// This box's host id for host-affinity: `fleet up`/`watchdog` only manage agents whose `host` metadata
     /// matches this (unpinned agents are unaffected). Default = the system hostname.
     pub host: Option<String>,
+    /// The fleet-tunnel health-probe URL (e.g. `http://127.0.0.1:8898/`). When set, `watchdog` GETs it each
+    /// sweep and reports the wake-delivery path's health — a non-200 / unreachable probe means a WEDGED
+    /// tunnel (event-wakes are silently not being delivered). Absent → the tunnel-health check is skipped
+    /// (a host with no tunnel, e.g. the board host itself).
+    pub tunnel_health_url: Option<String>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -95,8 +100,10 @@ mod tests {
             window_sh = "/opt/fleet/window.sh"
             agent = "v-fleet-tooling"
             host = "green-machine"
+            tunnel_health_url = "http://127.0.0.1:8898/"
             "#,
         );
+        assert_eq!(cfg.tunnel_health_url.as_deref(), Some("http://127.0.0.1:8898/"));
         assert_eq!(cfg.host.as_deref(), Some("green-machine"));
         assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
         assert_eq!(cfg.hub.as_deref(), Some("/srv/hub"));
