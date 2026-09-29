@@ -133,20 +133,39 @@ impl Capture {
 
 /// Pick the input device whose name contains `want` (case-insensitive), else the host default. An empty
 /// `want` goes straight to the default.
+///
+/// NOTE (#279): cpal reports ALSA **PCM names** (e.g. `sysdefault:CARD=USB`, `front:CARD=USB,DEV=0`) from
+/// `device.name()`, NOT the human card description ("Jabra SPEAK 410 USB") — so `want` must match the PCM
+/// name. When nothing matches we LOG the available names so an operator can see exactly what to configure,
+/// rather than silently falling back to `default` (which on some hosts can't even be opened).
 fn pick_input(host: &cpal::Host, want: &str) -> Option<cpal::Device> {
-    if !want.is_empty() {
-        let want_lc = want.to_lowercase();
-        if let Ok(mut devs) = host.input_devices()
-            && let Some(d) = devs.find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase().contains(&want_lc))
-                    .unwrap_or(false)
-            })
-        {
-            return Some(d);
-        }
-        eprintln!("[audio] input device matching {want:?} not found; using default");
+    if want.is_empty() {
+        return host.default_input_device();
     }
+    let want_lc = want.to_lowercase();
+    let devices: Vec<cpal::Device> = match host.input_devices() {
+        Ok(devs) => devs.collect(),
+        Err(e) => {
+            eprintln!("[audio] could not enumerate input devices ({e}); using the default device");
+            return host.default_input_device();
+        }
+    };
+    if let Some(d) = devices.iter().find(|d| {
+        d.name()
+            .map(|n| n.to_lowercase().contains(&want_lc))
+            .unwrap_or(false)
+    }) {
+        return Some(d.clone());
+    }
+    // No match — surface what IS available so the misconfiguration is self-diagnosing (the substring must
+    // match a listed PCM name; the human device label is not what cpal exposes).
+    let names: Vec<String> = devices.iter().filter_map(|d| d.name().ok()).collect();
+    eprintln!(
+        "[audio] no input device matches {want:?}; available input devices: [{}]. Falling back to the \
+         default device — set audio.input_device to a substring of one of the names above (e.g. \
+         \"CARD=USB\" for a USB mic).",
+        names.join(", ")
+    );
     host.default_input_device()
 }
 
