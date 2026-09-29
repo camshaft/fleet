@@ -49,7 +49,7 @@ toml = "0.8"
 base64 = "0.22"
 
 # ── The async transport tree — OPTIONAL, pulled only by the `transport` feature (see above). ──
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "process"], optional = true }
 # WebSocket client; rustls-tls-native-roots for the wss:// public-gateway dial (matches the TLS
 # stack slack-bridge already pulls, so no new lockfile entries).
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"], optional = true }

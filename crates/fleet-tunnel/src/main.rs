@@ -110,14 +110,52 @@ fn jitter() -> f64 {
     nanos as f64 / (u32::MAX as f64 + 1.0)
 }
 
+/// Resolve the served-agent set for this connection. When `agents_cmd` is configured, run it and use
+/// its stdout (one id per line) — so a moved/new agent is picked up on the NEXT reconnect with no
+/// static-list edit (the staleness that silently starves an agent of event-wakes). Fail-safe: a command
+/// that errors, exits non-zero, or prints no ids falls back to the static `agents` list rather than
+/// declaring an empty set (which would tear down every tunnel on this host).
+async fn resolve_served_agents(cfg: &Config) -> Vec<String> {
+    let Some(argv) = cfg.agents_cmd_argv() else {
+        return cfg.agents.clone();
+    };
+    let (bin, rest) = argv.split_first().expect("agents_cmd_argv is non-empty when Some");
+    match tokio::process::Command::new(bin).args(rest).output().await {
+        Ok(out) if out.status.success() => {
+            let derived = fleet_tunnel::config::parse_agent_lines(&String::from_utf8_lossy(&out.stdout));
+            if derived.is_empty() {
+                tracing::warn!("agents_cmd `{}` produced no ids; falling back to the static agents list", argv.join(" "));
+                cfg.agents.clone()
+            } else {
+                tracing::info!("derived {} served agents from `{}`", derived.len(), argv.join(" "));
+                derived
+            }
+        }
+        Ok(out) => {
+            tracing::warn!(
+                "agents_cmd `{}` exited {}; falling back to the static agents list ({})",
+                argv.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            cfg.agents.clone()
+        }
+        Err(e) => {
+            tracing::warn!("agents_cmd `{}` failed to run ({e}); falling back to the static agents list", argv.join(" "));
+            cfg.agents.clone()
+        }
+    }
+}
+
 /// One connection lifetime: dial, handshake, then serve frames until the socket closes.
 async fn run_once(cfg: &Config) -> Result<(), BoxError> {
     let request = build_request(cfg)?;
+    let agents = resolve_served_agents(cfg).await;
     tracing::info!(
         "dialing board ws {} (host={} agents={:?})",
         cfg.board_ws,
         cfg.host_id_or_hostname(),
-        cfg.agents
+        agents
     );
     let (ws, _resp) = tokio_tungstenite::connect_async(request).await?;
     let (mut write, mut read) = ws.split();
@@ -126,7 +164,7 @@ async fn run_once(cfg: &Config) -> Result<(), BoxError> {
     let hello = Frame::Hello {
         v: PROTOCOL_VERSION,
         host: cfg.host_id_or_hostname(),
-        agents: cfg.agents.clone(),
+        agents,
         token: cfg.token.clone(),
     };
     write.send(Message::Text(hello.to_json().into())).await?;

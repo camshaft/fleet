@@ -14,8 +14,15 @@ board_ws = "ws://127.0.0.1:8880/board/tunnel/ws"
 # This host's id in the hello frame. Defaults to the system hostname if omitted.
 # host_id = "dev-desk"
 
+# Optional: DERIVE the served-agent set at each (re)connect instead of hand-maintaining `agents` below.
+# The command's stdout is read one agent id per line. `fleet served-set` prints exactly the board agents
+# that have a live tmux window on THIS host and aren't pinned elsewhere — so a moved/new agent picks up
+# event-wakes on the next reconnect with no config edit (a stale static list silently starves an agent).
+# On command failure or empty output the daemon falls back to the static `agents` list below.
+# agents_cmd = "fleet served-set"
+
 # Agent ids whose loops run on this host. The board keys live tunnels by this set and routes each
-# agent's wakes down the matching socket.
+# agent's wakes down the matching socket. Used verbatim unless `agents_cmd` (above) yields a set.
 agents = [
   "board-pm",
   "fleet-tunnel",

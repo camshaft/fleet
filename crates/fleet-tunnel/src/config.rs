@@ -16,9 +16,16 @@ pub struct Config {
     /// This host's id in the hello frame. Falls back to the system hostname when unset/empty.
     #[serde(default)]
     pub host_id: Option<String>,
-    /// Agent ids this host serves; the board keys live tunnels by this set.
+    /// Agent ids this host serves; the board keys live tunnels by this set. Used verbatim UNLESS
+    /// `agents_cmd` is set and yields a non-empty list, in which case this is the fallback.
     #[serde(default)]
     pub agents: Vec<String>,
+    /// Optional command to DERIVE the served-agent set at each (re)connect — stdout is read one agent
+    /// id per line. When set, it overrides the static `agents` list, so a moved/new agent window is
+    /// picked up hands-free on the next reconnect (no static-list edit). On command failure or empty
+    /// output the daemon falls back to `agents`. Example: `agents_cmd = "fleet served-set"`.
+    #[serde(default)]
+    pub agents_cmd: Option<String>,
     /// Optional per-host bearer sent in the hello frame.
     #[serde(default)]
     pub token: Option<String>,
@@ -72,6 +79,14 @@ impl Config {
         self.upstream.trim_end_matches('/')
     }
 
+    /// The `agents_cmd` split into an argv (whitespace-separated, no shell), or `None` when unset/blank.
+    /// Whitespace-only tokens are dropped; an all-blank command is treated as unset. Pure — unit-tested.
+    pub fn agents_cmd_argv(&self) -> Option<Vec<String>> {
+        let cmd = self.agents_cmd.as_deref()?;
+        let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        if argv.is_empty() { None } else { Some(argv) }
+    }
+
     /// The Cloudflare Access service-token pair, if both are present + non-empty.
     pub fn cf_credentials(&self) -> Option<(String, String)> {
         match (&self.cf_client_id, &self.cf_client_secret) {
@@ -90,6 +105,20 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "fleet-host".to_string())
+}
+
+/// Parse an `agents_cmd`'s stdout into a served-agent list: one id per line, trimmed, blanks dropped,
+/// de-duplicated (order preserved). `fleet served-set` already emits sorted/unique ids, but the dedup +
+/// trim keep this robust to any command. Pure — unit-tested.
+pub fn parse_agent_lines(stdout: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| seen.insert(l.to_string()))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Config load errors.
@@ -122,6 +151,7 @@ mod tests {
         assert_eq!(cfg.board_ws, "ws://127.0.0.1:8079/tunnel/ws");
         assert_eq!(cfg.upstream, DEFAULT_UPSTREAM);
         assert!(cfg.agents.is_empty());
+        assert!(cfg.agents_cmd.is_none(), "absent agents_cmd → use the static list");
         assert!(cfg.token.is_none());
         assert!(cfg.cf_credentials().is_none());
     }
@@ -158,6 +188,35 @@ mod tests {
         // trailing slash trimmed so `path` (which starts with /) appends cleanly.
         assert_eq!(cfg.upstream_trimmed(), "http://127.0.0.1:9000");
         assert_eq!(cfg.cf_credentials(), Some(("cid".into(), "csec".into())));
+    }
+
+    #[test]
+    fn agents_cmd_argv_splits_or_none() {
+        let none = Config::from_toml_str(r#"board_ws = "ws://x/tunnel/ws""#).unwrap();
+        assert_eq!(none.agents_cmd_argv(), None, "absent → static list");
+        let set = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            agents_cmd = "  fleet   served-set  "
+            "#,
+        )
+        .unwrap();
+        assert_eq!(set.agents_cmd_argv(), Some(vec!["fleet".into(), "served-set".into()]));
+        let blank = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            agents_cmd = "   "
+            "#,
+        )
+        .unwrap();
+        assert_eq!(blank.agents_cmd_argv(), None, "all-blank command → treated as unset");
+    }
+
+    #[test]
+    fn parse_agent_lines_trims_drops_blanks_and_dedups() {
+        let out = "v-a\n v-b \n\n  \nv-a\nv-c\n";
+        assert_eq!(parse_agent_lines(out), vec!["v-a", "v-b", "v-c"]);
+        assert!(parse_agent_lines("   \n\n").is_empty(), "no ids → empty (caller falls back to static)");
     }
 
     #[test]
