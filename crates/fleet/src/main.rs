@@ -2130,7 +2130,11 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
          proposal / plan) MUST follow the Fleet Doc-Writing Style Guide — wiki guides/doc-writing-style-guide \
          (Background then Problem Statement then Requirements/Goals/Non-Goals (measurable) then Solutions, \
          each its own section with prose + Pros/Cons, then Recommendation; implementation in an appendix; NO \
-         tables/images/TL;DR/idioms in the body — the board viewer is minimal Markdown). If any task of \
+         tables/images/TL;DR/idioms in the body — the board viewer is minimal Markdown). Before submitting \
+         ANY board doc OR comment, self-check your wording against the banned-phrases list \
+         (wiki guides/banned-phrases) and rephrase anything it flags — that list is maintained/data-driven, so \
+         read it rather than a fixed set here; until the pre-submit scanner (#308) lands this self-check is \
+         yours. If any task of \
          yours becomes BLOCKED ON THE \
          OPERATOR, do not idle on it: set the task status=blocked with blocked_on {{kind:operator, note}}, \
          assign it to 'cameron', and stash your own id in metadata.blocked_owner — so list_tasks(assignee \
@@ -3881,6 +3885,9 @@ mod tests {
         assert!(k.contains("todo/in_progress") && k.contains("NOT blocked/parked"), "blocked/parked is not actionable work");
         // Doc-writing style guide clause (board-pm, operator-approved): every future author carries it.
         assert!(k.contains("Fleet Doc-Writing Style Guide"), "kickoff points authors at the doc-writing style guide");
+        // Banned-phrases self-check (operator writing policy): reference the maintained list (data-driven),
+        // applied to any doc OR comment, until the #308 pre-submit scanner lands.
+        assert!(k.contains("banned-phrases") && k.contains("doc OR comment"), "kickoff points authors at the banned-phrases list for docs and comments");
         // Operator-blocked dashboard convention (operator seq-2292): a task blocked on the operator gets
         // reassigned to 'cameron' + typed blocked_on so list_tasks(assignee cameron) is the operator's one dashboard.
         assert!(k.contains("BLOCKED ON THE") && k.contains("assign it to 'cameron'"), "carries the operator-blocked convention");
