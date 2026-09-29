@@ -24,6 +24,12 @@
           version = "0.0.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # Build ONLY the fleet crate — not the whole workspace. Without this, buildRustPackage compiles
+          # every workspace member (incl. voice-assistant → ort-sys/onnxruntime), whose build.rs fetches a
+          # binary over the network and thus can NEVER build in the no-network nix sandbox. The fleet
+          # orchestrator (spin-up/notify/watchdog/board/transcripts) has no speech deps, so scoping the build
+          # to crates/fleet drops ort-sys out of the tree entirely and the package builds hermetically.
+          buildAndTestSubdir = "crates/fleet";
           # The crate shells out to tmux/git at RUNTIME (never at build time), so no extra buildInputs are
           # needed to compile. Tests are run in CI / `cargo test`, not under the nix sandbox: some spawn
           # git/tmux which aren't in the build sandbox, so building the artifact does not run them.
