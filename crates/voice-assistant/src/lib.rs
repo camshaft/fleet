@@ -10,6 +10,7 @@
 //!     `tiny_http` receiver and board register/call HTTP (thin, testable seams).
 //!   - [`brain`]   — decoding the `claude` CLI's `stream-json` output into the final spoken text (pure).
 //!   - [`scope`]   — the filesystem-scope guard: pure containment policy + the `scope-guard` hook shim.
+//!   - [`retry`]   — the capped-exponential backoff schedule the runtime's audio-device reconnect uses.
 //!
 //! The live runtime — microphone capture + VAD, sherpa-onnx STT/TTS/wake, the `claude` subprocess, and
 //! the main loop — lives behind the `runtime` feature (see [`runtime`]) so the default `cargo test` /
@@ -19,6 +20,7 @@ pub mod brain;
 pub mod chime;
 pub mod config;
 pub mod events;
+pub mod retry;
 pub mod scope;
 
 #[cfg(feature = "runtime")]

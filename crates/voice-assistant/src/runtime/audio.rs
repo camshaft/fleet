@@ -12,12 +12,15 @@
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::config::Audio;
+use crate::retry::next_backoff;
 
 /// The external players tried in order (first that exists wins), matching the Python `_PLAYERS`.
 const PLAYERS: &[&[&str]] = &[&["paplay"], &["pw-play"], &["aplay", "-q"]];
@@ -29,11 +32,15 @@ pub struct Capture {
     _stream: cpal::Stream,
     frames: Receiver<Vec<i16>>,
     frame: usize,
+    /// Set by cpal's error callback when the stream faults (typically `StreamError::DeviceNotAvailable`
+    /// on a hot-unplug). The loop polls [`healthy`](Self::healthy) and rebuilds the capture when it flips.
+    dead: Arc<AtomicBool>,
 }
 
 impl Capture {
     /// Open capture per the [`Audio`] config. Errors if no input device is available or the stream can't
-    /// be built at the requested rate.
+    /// be built at the requested rate. See [`open_with_retry`](Self::open_with_retry) for the non-fatal
+    /// path the daemon actually uses.
     pub fn open(audio: &Audio) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = pick_input(&host, &audio.input_device)
@@ -51,7 +58,14 @@ impl Capture {
         // VAD sees the same geometry the wake/STT models expect.
         let frame = audio.frame;
         let mut acc: Vec<i16> = Vec::with_capacity(frame * 2);
-        let err_fn = |e| eprintln!("[audio] capture stream error: {e}");
+        // A device fault (unplug) is delivered to the error callback, not the data callback, so record it
+        // on a shared flag the main loop can see and act on (reconnect) rather than crashing.
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_cb = dead.clone();
+        let err_fn = move |e| {
+            eprintln!("[audio] capture stream error: {e}");
+            dead_cb.store(true, Ordering::Relaxed);
+        };
         let stream = device
             .build_input_stream(
                 &cfg,
@@ -72,7 +86,34 @@ impl Capture {
             _stream: stream,
             frames: rx,
             frame,
+            dead,
         })
+    }
+
+    /// Open capture, retrying with capped backoff until it succeeds — NEVER fatal. This is the operator's
+    /// requirement (#239): with no mic present at startup the daemon must stay up and keep trying, then
+    /// begin the loop the moment a device appears, instead of exiting and letting the supervisor
+    /// crash-loop. Blocks until a device is open.
+    pub fn open_with_retry(audio: &Audio) -> Self {
+        let mut backoff = Duration::ZERO;
+        loop {
+            match Self::open(audio) {
+                Ok(c) => return c,
+                Err(e) => {
+                    backoff = next_backoff(backoff);
+                    eprintln!(
+                        "[audio] capture open failed ({e}); retrying in {backoff:?} (waiting for a device)"
+                    );
+                    std::thread::sleep(backoff);
+                }
+            }
+        }
+    }
+
+    /// True while the capture stream is healthy; flips to false once cpal reports a stream error (e.g. the
+    /// device was unplugged). The loop uses this to trigger a reconnect.
+    pub fn healthy(&self) -> bool {
+        !self.dead.load(Ordering::Relaxed)
     }
 
     /// Block for the next frame, up to `timeout`. `None` on timeout or if the stream has ended.
