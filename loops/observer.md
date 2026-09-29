@@ -113,11 +113,17 @@ root memory index (`MEMORY.md`) — route any root-index pointer request to the 
 
 ## The completion contract (why your last step matters)
 
-The watchdog advances the observed agent's per-agent watermark **only after you have actually read the
-window AND emitted** your proposal(s)/corroboration and report (or an explicit no-op report). So emitting
-your output is the LAST thing you do — a crashed, timed-out, or half-finished observation must leave the
-span UNOBSERVED so it re-fires on the next sweep. This durability matters most for spin-down observations
-(the closing read of a retiring agent — its context is about to be gone). Do not signal done until your
-report exists.
+The observed agent's per-agent watermark advances **only when YOU confirm** — as your VERY LAST step, after
+you have read the window AND emitted your proposal(s)/corroboration and report (or an explicit no-op report),
+run:
+
+```sh
+fleet observe-record <target-agent> --session <session> --offset <final-line-count-you-read-through>
+```
+
+`observe-record` is the ONLY writer of the watermark. So a crashed, timed-out, or half-finished observation
+that never reaches it leaves the span UNOBSERVED and it re-fires on the next sweep — which is correct. Never
+call `observe-record` without having emitted. This durability matters most for spin-down observations (the
+closing read of a retiring agent — its context is about to be gone).
 
 Then EXIT. One observation per session; you do not loop.
