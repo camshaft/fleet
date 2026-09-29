@@ -63,7 +63,7 @@ pub fn run(cfg: Config) {
     let mut state = State::load(&cfg.state_dir);
 
     // First run: initialize the firehose cursor at HEAD so OUT skips the board backlog. IN intentionally
-    // leaves issues_since = None so it DOES ingest the existing issue backlog (idempotent via links).
+    // leaves the per-repo cursors empty so each repo DOES ingest its existing issue backlog (idempotent).
     if state.firehose_seq.is_none() {
         let head = initialize_firehose_head(&board);
         state.firehose_seq = Some(head);
@@ -73,10 +73,14 @@ pub fn run(cfg: Config) {
 
     tracing::info!(interval_secs = POLL_INTERVAL.as_secs(), "entering poll loop");
     loop {
-        if let Some((repo, project_id)) = cfg.ingest_target()
-            && let Err(e) = in_tick(&cfg, &gh, &board, repo, project_id, self_login.as_deref(), &mut state)
-        {
-            tracing::warn!(error = %e, "IN tick error (will retry next tick)");
+        // IN: each configured repo scans independently (per-repo cursor), sequentially — a handful of repos
+        // on the ~15s cadence stays well under GitHub's 5000/hr. A per-repo error doesn't stop the others.
+        for (repo, project_id) in cfg.ingest_targets() {
+            if let Err(e) =
+                in_tick_repo(&cfg, &gh, &board, repo, project_id, self_login.as_deref(), &mut state)
+            {
+                tracing::warn!(error = %e, %repo, "IN tick error for repo (will retry next tick)");
+            }
         }
         if let Err(e) = out_tick(&cfg, &gh, &board, &mut state) {
             tracing::warn!(error = %e, "OUT tick error (will retry next tick)");
@@ -142,9 +146,9 @@ fn register_author(board: &BoardClient, login: &str, seen: &mut HashSet<String>)
     }
 }
 
-/// IN: poll GitHub issues + comments, create attributed tasks for new issues and attributed board comments
-/// for new comments (idempotent via the board's external_links). Advances `issues_since`.
-fn in_tick(
+/// IN, for ONE repo: poll its issues + comments, create attributed tasks for new issues and attributed board
+/// comments for new comments (idempotent via the board's external_links). Advances this repo's cursor.
+fn in_tick_repo(
     cfg: &Config,
     gh: &GithubClient,
     board: &BoardClient,
@@ -153,7 +157,7 @@ fn in_tick(
     self_login: Option<&str>,
     state: &mut State,
 ) -> Result<(), String> {
-    let since = state.issues_since.clone();
+    let since = state.since_for(repo).map(str::to_string);
     let issues = collect_pages(|page| gh.list_issues(repo, since.as_deref(), page))?;
     if issues.is_empty() {
         return Ok(());
@@ -204,11 +208,10 @@ fn in_tick(
         }
     }
 
-    // Advance the IN cursor forward only.
+    // Advance this repo's IN cursor forward only.
     if let Some(newest) = newest_timestamp(&issues)
-        && state.issues_since.as_deref().is_none_or(|cur| newest.as_str() > cur)
+        && state.advance_repo(repo, &newest)
     {
-        state.issues_since = Some(newest);
         persist(cfg, state);
     }
     Ok(())

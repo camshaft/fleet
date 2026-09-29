@@ -20,10 +20,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The localhost board REST base the firehose subscriber reads, used when the config file omits it. This is
-/// the board front-door loopback proxy on the deploy host (the same default the `fleet` orchestrator uses):
-/// the daemon appends `/events`, `/tasks`, `/tasks/:id/comments`, `/external-links`, `/external-identities`.
-/// Override per-environment via config `board_api`.
-const DEFAULT_BOARD_API: &str = "http://127.0.0.1:8880/board/api";
+/// the board loopback on the green deploy host (the same base the deployed slack-bridge uses; green has no
+/// Caddy front-door): the daemon appends `/events`, `/tasks`, `/tasks/:id/comments`, `/external-links`,
+/// `/external-identities`. Override per-environment via config `board_api`.
+const DEFAULT_BOARD_API: &str = "http://127.0.0.1:8079/api";
 /// The GitHub REST API base, used when the config omits it. Overridable so the same adapter works against a
 /// GitHub Enterprise Server (`https://ghe.example.com/api/v3`) as well as public GitHub.
 const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -62,9 +62,10 @@ fn redact_opt(secret: &Option<String>) -> String {
 pub struct Config {
     /// The GitHub token (PAT or App installation token), if set in the file. `None` = fail-soft dormant mode.
     pub github_token: Option<String>,
-    /// The `owner/name` repository whose issues the bridge ingests (e.g. `camshaft/fleet`). Optional: without
-    /// it there is nothing to ingest and the bridge stays dormant (a valid state).
-    pub repo: Option<String>,
+    /// The `owner/name` repositories whose issues the bridge ingests (e.g. `camshaft/fleet`). Empty ⇒
+    /// nothing to ingest (the bridge stays up but idle — a valid state). Resolved from the config `repos`
+    /// list plus the singular `repo` sugar, de-duplicated in first-occurrence order.
+    pub repos: Vec<String>,
     /// The board project id that ingested issues become tasks in. Optional: without it ingest is dormant
     /// (the bridge can't decide where to create the mirrored tasks).
     pub project_id: Option<i64>,
@@ -84,7 +85,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("github_token", &redact_opt(&self.github_token))
-            .field("repo", &self.repo)
+            .field("repos", &self.repos)
             .field("project_id", &self.project_id)
             .field("board_api", &self.board_api)
             .field("api_base", &self.api_base)
@@ -102,7 +103,11 @@ impl fmt::Debug for Config {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     github_token: Option<String>,
+    /// Singular sugar for a one-repo config; folded into [`Config::repos`].
     repo: Option<String>,
+    /// The multi-repo list; each `owner/name`. Folded together with `repo`.
+    #[serde(default)]
+    repos: Vec<String>,
     project_id: Option<i64>,
     board_api: Option<String>,
     api_base: Option<String>,
@@ -117,12 +122,14 @@ impl Config {
         self.github_token.as_deref().filter(|s| !s.is_empty())
     }
 
-    /// The ingest target `(repo, project_id)` iff BOTH are set — the precondition for issue→task ingest. A
-    /// token without a repo/project is a valid (dormant) config: the bridge is up but mirrors nothing.
-    pub fn ingest_target(&self) -> Option<(&str, i64)> {
-        match (self.repo.as_deref(), self.project_id) {
-            (Some(r), Some(p)) if !r.is_empty() => Some((r, p)),
-            _ => None,
+    /// The ingest targets — one `(repo, project_id)` per configured repo, iff a `project_id` is set and at
+    /// least one repo is configured. Empty when either is absent: a token without repos/project is a valid
+    /// (dormant) config — the bridge is up but mirrors nothing. All repos share the one `project_id` (v1);
+    /// per-repo project mapping is a non-breaking future extension.
+    pub fn ingest_targets(&self) -> Vec<(&str, i64)> {
+        match self.project_id {
+            Some(p) if !self.repos.is_empty() => self.repos.iter().map(|r| (r.as_str(), p)).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -130,9 +137,17 @@ impl Config {
     /// `state_dir` when the file doesn't set one. Pure.
     fn from_file_config(file: FileConfig, base_dir: &Path) -> Config {
         let nonempty = |o: Option<String>| o.filter(|s| !s.is_empty());
+        // Resolve repos: the `repos` list plus the singular `repo` sugar, dropping empties and de-duplicating
+        // in first-occurrence order (a copy-paste dup doesn't double-ingest).
+        let mut repos: Vec<String> = file.repos.into_iter().filter(|s| !s.is_empty()).collect();
+        if let Some(r) = nonempty(file.repo) {
+            repos.push(r);
+        }
+        let mut seen = std::collections::HashSet::new();
+        repos.retain(|r| seen.insert(r.clone()));
         Config {
             github_token: nonempty(file.github_token),
-            repo: nonempty(file.repo),
+            repos,
             project_id: file.project_id,
             board_api: nonempty(file.board_api).unwrap_or_else(|| DEFAULT_BOARD_API.to_string()),
             api_base: nonempty(file.api_base).unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
@@ -192,13 +207,14 @@ mod tests {
     fn empty_toml_is_dormant_but_valid() {
         let cfg = Config::from_toml_str("", &base()).unwrap();
         assert!(cfg.token().is_none(), "no token → dormant");
-        assert!(cfg.ingest_target().is_none(), "no repo/project → nothing to ingest");
+        assert!(cfg.ingest_targets().is_empty(), "no repo/project → nothing to ingest");
+        assert!(cfg.repos.is_empty());
         assert_eq!(cfg.default_to, "concierge");
         assert_eq!(cfg.bridge_agent, "github-bridge");
         assert_eq!(cfg.state_dir, base(), "state_dir defaults to the config file's dir");
         assert_eq!(
-            cfg.board_api, "http://127.0.0.1:8880/board/api",
-            "board_api defaults to the local board front-door"
+            cfg.board_api, "http://127.0.0.1:8079/api",
+            "board_api defaults to the green board loopback"
         );
         assert_eq!(cfg.api_base, "https://api.github.com", "api_base defaults to public GitHub");
     }
@@ -208,28 +224,56 @@ mod tests {
         // A token with no repo/project is a valid, running-but-idle config (bridge up, mirrors nothing).
         let cfg = Config::from_toml_str("github_token = \"ghp_abc\"\n", &base()).unwrap();
         assert_eq!(cfg.token(), Some("ghp_abc"));
-        assert!(cfg.ingest_target().is_none());
+        assert!(cfg.ingest_targets().is_empty());
     }
 
     #[test]
-    fn ingest_target_needs_both_repo_and_project() {
+    fn ingest_targets_needs_both_repos_and_project() {
         let only_repo = Config::from_toml_str(
             "github_token = \"ghp_a\"\nrepo = \"camshaft/fleet\"\n",
             &base(),
         )
         .unwrap();
-        assert!(only_repo.ingest_target().is_none(), "repo without project is not a target");
+        assert!(only_repo.ingest_targets().is_empty(), "repo without project is not a target");
 
         let only_project =
             Config::from_toml_str("github_token = \"ghp_a\"\nproject_id = 16\n", &base()).unwrap();
-        assert!(only_project.ingest_target().is_none(), "project without repo is not a target");
+        assert!(only_project.ingest_targets().is_empty(), "project without repos is not a target");
 
         let both = Config::from_toml_str(
             "github_token = \"ghp_a\"\nrepo = \"camshaft/fleet\"\nproject_id = 16\n",
             &base(),
         )
         .unwrap();
-        assert_eq!(both.ingest_target(), Some(("camshaft/fleet", 16)));
+        assert_eq!(both.ingest_targets(), vec![("camshaft/fleet", 16)]);
+    }
+
+    #[test]
+    fn repos_list_maps_all_repos_to_one_project() {
+        let toml = r#"
+            github_token = "ghp_a"
+            repos = ["camshaft/fleet", "camshaft/dotfiles", "camshaft/s2n-quic"]
+            project_id = 16
+        "#;
+        let cfg = Config::from_toml_str(toml, &base()).unwrap();
+        assert_eq!(cfg.repos, ["camshaft/fleet", "camshaft/dotfiles", "camshaft/s2n-quic"]);
+        assert_eq!(
+            cfg.ingest_targets(),
+            vec![("camshaft/fleet", 16), ("camshaft/dotfiles", 16), ("camshaft/s2n-quic", 16)]
+        );
+    }
+
+    #[test]
+    fn singular_repo_is_sugar_and_merges_deduped() {
+        // `repo` folds into the list; a dup across `repos`+`repo` collapses; empties dropped; order kept.
+        let toml = r#"
+            github_token = "ghp_a"
+            project_id = 3
+            repos = ["o/a", "", "o/b", "o/a"]
+            repo = "o/b"
+        "#;
+        let cfg = Config::from_toml_str(toml, &base()).unwrap();
+        assert_eq!(cfg.repos, ["o/a", "o/b"], "empties dropped, dups collapsed, first-occurrence order");
     }
 
     #[test]
@@ -246,7 +290,7 @@ mod tests {
         "#;
         let cfg = Config::from_toml_str(toml, &base()).unwrap();
         assert_eq!(cfg.token(), Some("github_pat_XYZ"));
-        assert_eq!(cfg.ingest_target(), Some(("camshaft/fleet", 16)));
+        assert_eq!(cfg.ingest_targets(), vec![("camshaft/fleet", 16)]);
         assert_eq!(cfg.board_api, "http://board.local/api");
         assert_eq!(cfg.api_base, "https://ghe.example.com/api/v3");
         assert_eq!(cfg.default_to, "pr-sync");
@@ -279,7 +323,7 @@ mod tests {
         std::fs::write(&path, "github_token = \"ghp_f\"\nrepo = \"o/r\"\nproject_id = 3\n").unwrap();
         let cfg = Config::load(&path);
         assert_eq!(cfg.token(), Some("ghp_f"));
-        assert_eq!(cfg.ingest_target(), Some(("o/r", 3)));
+        assert_eq!(cfg.ingest_targets(), vec![("o/r", 3)]);
         assert_eq!(cfg.state_dir, dir, "state_dir defaults to the config file's dir");
     }
 
@@ -307,9 +351,9 @@ mod tests {
     fn debug_redacts_the_token() {
         let cfg = Config {
             github_token: Some("ghp_SECRETBODY".into()),
-            repo: Some("camshaft/fleet".into()),
+            repos: vec!["camshaft/fleet".into()],
             project_id: Some(16),
-            board_api: "http://127.0.0.1:8880/board/api".into(),
+            board_api: "http://127.0.0.1:8079/api".into(),
             api_base: "https://api.github.com".into(),
             default_to: "concierge".into(),
             bridge_agent: "github-bridge".into(),

@@ -39,12 +39,13 @@ fn main() {
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILENAME));
     let cfg = Config::load(&config_path);
+    let repos = if cfg.repos.is_empty() { "<none>".to_string() } else { cfg.repos.join(",") };
     tracing::info!(
         config = %config_path.display(),
         board_api = %cfg.board_api,
         api_base = %cfg.api_base,
         bridge_agent = %cfg.bridge_agent,
-        repo = cfg.repo.as_deref().unwrap_or("<none>"),
+        %repos,
         "github↔board bridge starting"
     );
 
