@@ -19,6 +19,8 @@
 //! - [`sync`] — the pure bidirectional-sync planning (firehose events → Slack posts + cursor advance;
 //!   inbound Slack → attributed board post), with the board↔Slack channel MAP injected as a resolver so
 //!   the adapter stays decoupled from board-core #149 slice-2 and generic across external sources.
+//! - [`resolver`] — the concrete board↔Slack channel MAP built from the TOML config (`[[channel_map]]`),
+//!   providing the bidirectional lookups the sync planner takes; swappable for a board-backed map later.
 //!
 //! Later slices add the async transport binary (Socket Mode) that wires these together, behind the
 //! `transport` feature.
@@ -29,6 +31,7 @@
 pub mod board;
 pub mod config;
 pub mod format;
+pub mod resolver;
 pub mod sync;
 
 pub use board::{BoardClient, Event, OutboundReflect, OUTBOUND_REFLECT};
@@ -37,4 +40,5 @@ pub use format::{
     help_text, is_valid_agent_name, parse_operator_message, relay_plan, render_outbound_reflect,
     render_outbound_reflect_plain, Intent, RelayPlan, RELAY_QUEUE_WARN,
 };
+pub use resolver::{ChannelLink, ChannelMap};
 pub use sync::{plan_inbound, plan_outbound, slack_external_author, InboundPost, OutboundPost};
