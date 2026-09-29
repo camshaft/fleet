@@ -1877,7 +1877,12 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
          metadata from the board, and follow that charter as your role. On every board write pass your \
          identity EXPLICITLY as a fallback (agent_id / created_by / author / actor = '{agent}') — the board \
          defaults these to null. Coordinate through the board (send_message / check_notifications / \
-         comment_task / set_status) — there is no file inbox. You work in {workdir}. Start your recurring \
+         comment_task / set_status) — there is no file inbox. If any task of yours becomes BLOCKED ON THE \
+         OPERATOR, do not idle on it: set the task status=blocked with blocked_on {{kind:operator, note}}, \
+         assign it to 'cameron', and stash your own id in metadata.blocked_owner — so list_tasks(assignee \
+         'cameron') is the operator's single 'my asks' dashboard; when the operator answers, reassign the task \
+         back to yourself and clear blocked (if your MCP cannot set a typed blocked_on, ask concierge or \
+         board-pm to stamp it). You work in {workdir}. Start your recurring \
          loop now: /loop {tick}"
     )
 }
@@ -3241,6 +3246,10 @@ mod tests {
         assert!(k.contains("list_tasks with assignee 'v-x'"));
         assert!(k.contains("NEVER idle-sleep"));
         assert!(k.contains("about 30m"), "the interval is the idle-fallback ceiling");
+        // Operator-blocked dashboard convention (operator seq-2292): a task blocked on the operator gets
+        // reassigned to 'cameron' + typed blocked_on so list_tasks(assignee cameron) is the operator's one dashboard.
+        assert!(k.contains("BLOCKED ON THE") && k.contains("assign it to 'cameron'"), "carries the operator-blocked convention");
+        assert!(k.contains("metadata.blocked_owner"), "stashes the real owner for reassign-back");
     }
 
     #[test]
