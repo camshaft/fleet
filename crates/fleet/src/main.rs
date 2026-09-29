@@ -2072,6 +2072,45 @@ fn watchdog(stale_only: bool, rearm: bool) {
     // them — the poll watchdog is their only liveness. Scan the file-hub registry too (no-op when no hub is
     // configured / no active file-hub agents, i.e. a board-only host). Runs regardless of board health above.
     watchdog_file_hub(stale_only, rearm, &native_ids);
+
+    // TUNNEL health: the reverse tunnel carries event-wakes to this host's agents; a WEDGED socket delivers
+    // nothing silently, so a starved agent only falls back to its (slow) poll interval. If a health-probe URL
+    // is configured, GET it each sweep and report — surfacing a wedge here beats an idle agent discovering it.
+    watchdog_tunnel_health();
+}
+
+/// Probe the fleet-tunnel health endpoint (config `tunnel_health_url`) and print its verdict. A no-op when
+/// unset (a host with no tunnel). Report-only — like the rest of the watchdog it never reaps/restarts; it
+/// makes a WEDGED wake-delivery path visible. The bounded GET can't hang the sweep.
+fn watchdog_tunnel_health() {
+    let Some(url) = config::get().tunnel_health_url.clone().filter(|s| !s.trim().is_empty()) else {
+        return;
+    };
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    let probe: Result<u16, String> = match agent.get(&url).call() {
+        Ok(resp) => Ok(resp.status()),
+        Err(ureq::Error::Status(code, _)) => Ok(code), // a 503 is a reachable "not ok", not a transport error
+        Err(e) => Err(e.to_string()),
+    };
+    let (ok, msg) = tunnel_health_line(&probe);
+    println!("-- tunnel --");
+    println!("{}", msg);
+    if !ok {
+        eprintln!("  ⚠ tunnel wedged: event-wakes are NOT being delivered to this host — agents fall back to slow poll. Probe {url}");
+    }
+}
+
+/// Classify a tunnel health-probe outcome into `(ok, one-line report)`. `Ok(200)` = healthy; any other
+/// status (e.g. the daemon's own `503` when the socket is wedged) or a transport error = NOT ok. Pure so the
+/// verdict is unit-testable without a live daemon; the caller does the bounded GET. See fleet-tunnel #59.
+fn tunnel_health_line(probe: &Result<u16, String>) -> (bool, String) {
+    match probe {
+        Ok(200) => (true, "tunnel health: OK (HTTP 200 — board WS connected, frame fresh, upstream reachable)".to_string()),
+        Ok(code) => (false, format!("tunnel health: WEDGED (HTTP {code} — probe reachable but not ok)")),
+        Err(e) => (false, format!("tunnel health: UNREACHABLE (probe failed: {e})")),
+    }
 }
 
 /// The ids of every board-native agent (metadata.native == true) in a board roster. The file-hub scan uses
@@ -2689,6 +2728,22 @@ mod tests {
         assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
         assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
         assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+    }
+
+    #[test]
+    fn tunnel_health_line_ok_only_on_200_else_wedged_or_unreachable() {
+        // 200 = healthy wake-delivery path.
+        let (ok, msg) = tunnel_health_line(&Ok(200));
+        assert!(ok && msg.contains("OK"));
+        // The daemon's own 503 (socket wedged / stale frame / upstream down) = reachable but NOT ok.
+        let (ok, msg) = tunnel_health_line(&Ok(503));
+        assert!(!ok && msg.contains("WEDGED") && msg.contains("503"));
+        // Any other non-200 is also not ok (defensive).
+        let (ok, _) = tunnel_health_line(&Ok(404));
+        assert!(!ok);
+        // A transport error (daemon down / no port) = unreachable, not ok.
+        let (ok, msg) = tunnel_health_line(&Err("connection refused".to_string()));
+        assert!(!ok && msg.contains("UNREACHABLE") && msg.contains("connection refused"));
     }
 
     #[test]
