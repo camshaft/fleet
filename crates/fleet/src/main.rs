@@ -67,6 +67,23 @@ fn agent_host_matches(metadata: Option<&serde_json::Value>, this_host: &str) -> 
     }
 }
 
+/// Whether an agent's `host` metadata EXPLICITLY names `this_host` — a non-empty string equal to it, or an
+/// array that contains it. Unlike [`agent_host_matches`], an UNSET / empty / null host returns FALSE: such an
+/// agent is not deliberately assigned here. This is the `--pinned-only` launch predicate: a per-box durable
+/// reconcile must launch only agents explicitly pinned to it, never the unpinned "run-anywhere" agents — else
+/// a second box would double-launch the first box's whole roster (its live-but-unpinned agents). Pure —
+/// unit-tested.
+fn agent_host_is_explicit(metadata: Option<&serde_json::Value>, this_host: &str) -> bool {
+    match metadata.and_then(|m| m.get("host")) {
+        Some(serde_json::Value::String(s)) => s == this_host,
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|h| h == this_host),
+        _ => false,
+    }
+}
+
 /// Derive the set of agents this host should serve on the reverse tunnel: the tmux `windows` that are also
 /// board agents (`id`→optional host metadata) AND whose host-affinity matches `this_host`. Sorted, deduped.
 /// This replaces a hand-maintained static list — a window that isn't a board agent (a daemon/scratch window)
@@ -1005,7 +1022,7 @@ fn up(fleet: &Fleet, config_path: &Path, provision: bool, launch: bool) {
 /// box brings up exactly its own declared, host-pinned agents — green's reconcile never touches dev-desk
 /// windows and vice-versa. Reads the board only (agents coordinate via their own MCP). NOTE: a hard per-agent
 /// launch failure exits (spin_up's contract), aborting the remaining launches — re-run to continue.
-fn up_board(launch: bool) {
+fn up_board(launch: bool, pinned_only: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet up-board: board unavailable ({e}); cannot read the roster");
         std::process::exit(1);
@@ -1015,28 +1032,49 @@ fn up_board(launch: bool) {
         std::process::exit(1);
     });
     let host = this_host();
-    // Board-native agents (metadata.native == true) pinned to this box (or unpinned) → (id, is_offline).
+    // Board-native agents (metadata.native == true) whose host-affinity matches this box → (id, is_offline).
+    // Under --pinned-only, an agent whose host is not EXPLICITLY this box is excluded from the launch set and
+    // reported as skipped — so a per-box reconcile can't launch another box's unpinned run-anywhere agents.
+    let mut skipped_unpinned: Vec<String> = Vec::new();
     let declared: Vec<(String, bool)> = roster
         .iter()
-        .filter(|a| {
-            let md = a.get("metadata");
-            md.and_then(|m| m.get("native"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-                && agent_host_matches(md, &host)
-        })
         .filter_map(|a| {
+            let md = a.get("metadata");
+            let is_native = md
+                .and_then(|m| m.get("native"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !is_native || !agent_host_matches(md, &host) {
+                return None;
+            }
             let id = a.get("id").and_then(serde_json::Value::as_str)?.to_string();
+            if pinned_only && !agent_host_is_explicit(md, &host) {
+                skipped_unpinned.push(id);
+                return None;
+            }
             let offline = a.get("status").and_then(serde_json::Value::as_str) == Some("offline");
             Some((id, offline))
         })
         .collect();
+    skipped_unpinned.sort();
     let windows = tmux_window_names(&board_session());
     let plan = board_reconcile_plan(&declared, &windows);
     println!(
-        "fleet up-board: host '{host}' — {} board-native agent(s) pinned here:",
-        declared.len()
+        "fleet up-board: host '{host}'{} — {} board-native agent(s){}:",
+        if pinned_only { " [--pinned-only]" } else { "" },
+        declared.len(),
+        if pinned_only {
+            " explicitly pinned here"
+        } else {
+            " pinned here"
+        }
     );
+    if !skipped_unpinned.is_empty() {
+        println!(
+            "  ⊘ skipped (unpinned — reported not launched under --pinned-only): {}",
+            skipped_unpinned.join(", ")
+        );
+    }
     if !plan.already_running.is_empty() {
         println!("  ✓ already running: {}", plan.already_running.join(", "));
     }
@@ -1427,6 +1465,11 @@ enum Cmd {
         /// Spin up each to-launch agent (default: just report the plan).
         #[arg(long)]
         launch: bool,
+        /// Launch ONLY agents whose `host` is EXPLICITLY this box (exclude unpinned run-anywhere agents from
+        /// the launch set; they are still reported as skipped). Required for a safe per-box durable reconcile
+        /// on a second box — without it, an unpinned agent live on another box would be double-launched here.
+        #[arg(long)]
+        pinned_only: bool,
     },
     /// Spin up ONE board-declared agent into its `~/.fleet` workspace (the new-system launch path).
     /// Reads the agent's board record (charter + metadata incl. `repos`) and reports the materialize +
@@ -1614,7 +1657,7 @@ fn main() {
             provision,
             launch,
         } => up(&fleet, &config, provision || launch, launch),
-        Cmd::UpBoard { launch } => up_board(launch),
+        Cmd::UpBoard { launch, pinned_only } => up_board(launch, pinned_only),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::Status { stale_only } => status(stale_only),
         Cmd::Watchdog {
@@ -3393,6 +3436,23 @@ mod tests {
         assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
         assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
         assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+    }
+
+    #[test]
+    fn agent_host_is_explicit_requires_a_deliberate_pin_to_this_box() {
+        // EXPLICIT pin → true only for the named box (this is the --pinned-only launch predicate).
+        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":"green-machine"})), "green-machine"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":"green-machine"})), "dev-desk"));
+        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
+        // UNPINNED (unset / null / empty string / empty array) → FALSE — the key difference from
+        // agent_host_matches: an unpinned run-anywhere agent is NOT an explicit launch candidate here, so a
+        // second box's --pinned-only reconcile won't double-launch it.
+        assert!(!agent_host_is_explicit(None, "dev-desk"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({})), "dev-desk"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":null})), "dev-desk"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":""})), "dev-desk"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":[]})), "dev-desk"));
     }
 
     #[test]
