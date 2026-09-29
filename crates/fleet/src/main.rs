@@ -67,6 +67,26 @@ fn agent_host_matches(metadata: Option<&serde_json::Value>, this_host: &str) -> 
     }
 }
 
+/// Derive the set of agents this host should serve on the reverse tunnel: the tmux `windows` that are also
+/// board agents (`id`→optional host metadata) AND whose host-affinity matches `this_host`. Sorted, deduped.
+/// This replaces a hand-maintained static list — a window that isn't a board agent (a daemon/scratch window)
+/// is dropped, and an agent pinned to another host is dropped. Pure — unit-tested.
+fn derive_served_set(
+    windows: &[String],
+    agents: &[(String, Option<serde_json::Value>)],
+    this_host: &str,
+) -> Vec<String> {
+    let win: std::collections::BTreeSet<&str> = windows.iter().map(String::as_str).collect();
+    let mut served: Vec<String> = agents
+        .iter()
+        .filter(|(id, md)| win.contains(id.as_str()) && agent_host_matches(md.as_ref(), this_host))
+        .map(|(id, _)| id.clone())
+        .collect();
+    served.sort();
+    served.dedup();
+    served
+}
+
 /// One agent's durable row in the runtime registry (the machine-local manifest that survives a reboot).
 /// Lifted verbatim from cadenza fleet.rs so the registry.json format is byte-identical across the cutover.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1380,6 +1400,15 @@ enum Cmd {
         #[arg(long, default_value_t = 40)]
         overlap: usize,
     },
+    /// Print the set of agents THIS host should serve on the reverse tunnel — the board agents that have a
+    /// live tmux window in this session AND aren't pinned to another host. Replaces a hand-maintained static
+    /// list (a stale list silently starves new agents of event-wakes). `--toml` emits the `agents = [...]`
+    /// block for a tunnel config; default prints one id per line.
+    ServedSet {
+        /// Emit the `agents = [ ... ]` TOML array block (paste/redirect into the fleet-tunnel config).
+        #[arg(long)]
+        toml: bool,
+    },
 }
 
 fn main() {
@@ -1434,6 +1463,7 @@ fn main() {
             since,
             overlap,
         } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap),
+        Cmd::ServedSet { toml } => served_set(toml),
     }
 }
 
@@ -2367,6 +2397,59 @@ fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, ove
     println!("=== watermark: {sid}:{} ===", records.len());
 }
 
+/// List the tmux windows in `session` by name (`#W`), or an empty list if tmux is unreachable — a host with
+/// no session yet serves nothing, which is the correct degenerate answer, not an error.
+fn tmux_window_names(session: &str) -> Vec<String> {
+    std::process::Command::new("tmux")
+        .args(["list-windows", "-t", session, "-F", "#W"])
+        .output()
+        .ok()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `fleet served-set` — print the agents THIS host should serve on the reverse tunnel: the board agents that
+/// have a live tmux window in this session AND aren't pinned to another host. This replaces the hand-kept
+/// static tunnel served list, whose staleness silently starves a new/moved agent of event-wakes (the
+/// v-s2n-quic starvation). Default: one id per line; `--toml`: the `agents = [ ... ]` block for the tunnel
+/// config. A board outage prints an error and exits non-zero (never a partial/misleading list).
+fn served_set(toml: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet served-set: board unavailable ({e}); cannot derive the served set");
+        std::process::exit(1);
+    });
+    let roster = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet served-set: board roster query failed ({e})");
+        std::process::exit(1);
+    });
+    let agents: Vec<(String, Option<serde_json::Value>)> = roster
+        .iter()
+        .filter_map(|a| {
+            let id = a.get("id").and_then(serde_json::Value::as_str)?.to_string();
+            Some((id, a.get("metadata").cloned()))
+        })
+        .collect();
+    let windows = tmux_window_names(&board_session());
+    let served = derive_served_set(&windows, &agents, &this_host());
+    if toml {
+        println!("agents = [");
+        for id in &served {
+            println!("  \"{id}\",");
+        }
+        println!("]");
+    } else {
+        for id in &served {
+            println!("{id}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2565,6 +2648,35 @@ mod tests {
         assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
         assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
         assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+    }
+
+    #[test]
+    fn served_set_is_windows_intersect_board_minus_off_host_pins() {
+        // Board roster: two unpinned, one pinned here, one pinned elsewhere.
+        let agents = vec![
+            ("v-a".to_string(), Some(serde_json::json!({}))),
+            ("v-b".to_string(), Some(serde_json::json!({"host": "dev-desk"}))),
+            ("v-elsewhere".to_string(), Some(serde_json::json!({"host": "green-machine"}))),
+            ("v-nometa".to_string(), None),
+        ];
+        // tmux windows: some agents, plus daemon/scratch windows that are NOT board agents, plus a board
+        // agent (v-noagent-window ... actually a board agent with no window is v-noagent) — cover both drops.
+        let windows = vec![
+            "v-a".to_string(),
+            "v-b".to_string(),
+            "v-elsewhere".to_string(), // pinned to green-machine → dropped even though a window exists here
+            "v-nometa".to_string(),
+            "notify".to_string(),   // a daemon window, not a board agent → dropped
+            "scratch".to_string(),  // not a board agent → dropped
+        ];
+        // A board agent with NO window here (v-c) must also be absent (nothing to wake on this host).
+        let mut with_windowless = agents.clone();
+        with_windowless.push(("v-c".to_string(), Some(serde_json::json!({}))));
+        let served = derive_served_set(&windows, &with_windowless, "dev-desk");
+        assert_eq!(served, vec!["v-a", "v-b", "v-nometa"], "window∩board, minus off-host pins and non-agents");
+        // sorted + deduped even if the board lists a duplicate id
+        let dupe = vec![("v-a".to_string(), None), ("v-a".to_string(), None)];
+        assert_eq!(derive_served_set(&["v-a".to_string()], &dupe, "dev-desk"), vec!["v-a"]);
     }
 
     #[test]
