@@ -1,0 +1,79 @@
+# `kb` — the knowledge-base server: Qdrant vector search + local ONNX embeddings + an MCP tool surface.
+#
+# A Python→Rust port of the `camshaft/knowledge-base` project (operator task #157 / seq-1376: port to Rust
+# + bring into a repo/flake; fleet named as the home). Phase 1 = the always-on, agent-facing path: the MCP
+# server (`kb serve`) + a terminal search CLI (`kb search`). The board-driven ingest workers (inbox /
+# pipeline / crate-docs) are a phase-2 follow-up (they stay Python until ported).
+#
+# HARD CONSTRAINT — embedding fidelity: the live Qdrant holds ~29 collections built with
+# BAAI/bge-large-en-v1.5 (1024-dim / cosine). This crate MUST reproduce those vectors, so it embeds with
+# the `fastembed` crate (same ONNX model + HF tokenizer as Python fastembed, via `ort`/onnxruntime). Proven
+# bit-compatible against a live production vector before cutover.
+[package]
+name = "kb"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kb"
+path = "src/main.rs"
+
+[dependencies]
+# MCP over streamable-HTTP — the exact stack the sibling task-board crate uses for its Python→Rust MCP port.
+rmcp = { version = "3", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+] }
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-util = "0.7"
+schemars = "1"
+# Local embeddings + cross-encoder rerank. Pulls ort (onnxruntime); the CUDA execution provider is a
+# runtime concern (LD_LIBRARY_PATH), so no build-time CUDA dep. Same models as Python fastembed.
+# default-features OFF so we don't force ort's `download-binaries` (which fetches onnxruntime over the network
+# at build time — fine for `cargo build`, but the Nix sandbox has no network). The `download-binaries` and
+# `load-dynamic` kb features below re-add the right ort linking mode per build environment. `hf-hub-*` stays
+# on either way (model files download at RUNTIME on first use, into the HF cache — never at build time).
+fastembed = { version = "4", default-features = false, features = ["hf-hub-rustls-tls"] }
+# ort is a direct dep ONLY to name the CUDA execution provider + arena strategy (fastembed re-exports just
+# ExecutionProviderDispatch). Pinned to the exact rc fastembed 4.9 resolves to, so both link one ort — a
+# version skew here is a hard linker/ABI error, not a soft failure. Bump in lockstep with fastembed.
+ort = { version = "=2.0.0-rc.9", default-features = false }
+# Pin the -sys crate too: a fresh resolve otherwise floats it to rc.13, whose build script demands an
+# explicit ureq-TLS feature and fails to compile. rc.9 is what fastembed 4.9 builds against (proven at the
+# embedding-parity gate). Bump in lockstep with `ort`/`fastembed`.
+ort-sys = "=2.0.0-rc.9"
+# Qdrant is reached over its plain REST API with a thin blocking client — matches the fleet/slack-bridge
+# `ureq` house idiom and keeps the dep tree light (no qdrant-client/tonic/gRPC).
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: payloads round-trip through Qdrant without silently reordering an agent's fields.
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+# Deterministic point ids: uuid(md5("source|path|page|chunk")) — must match the Python `_id` byte-for-byte
+# so a re-ingest updates in place instead of duplicating.
+md-5 = "0.10"
+# v4: random ids for kb_remember/kb_supersede (Python `uuid.uuid4()`); default features cover from_bytes.
+uuid = { version = "1", features = ["v4"] }
+# RFC3339 UTC timestamps (created_at/updated_at/last_verified) + recency-decay math input.
+time = { version = "0.3", features = ["formatting", "parsing"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[features]
+# How ort/onnxruntime is linked. Exactly one should be on. `default` picks the download path for a plain
+# `cargo build`/`cargo test`; the Nix package overrides to `load-dynamic` (see flake.nix), matching how the
+# deployed role puts libonnxruntime on LD_LIBRARY_PATH.
+default = ["download-binaries"]
+# Fetch a prebuilt onnxruntime at BUILD time (network required). Convenient for dev; unusable in the Nix
+# sandbox. This is what fastembed's own default feature turns on.
+download-binaries = ["fastembed/ort-download-binaries"]
+# dlopen libonnxruntime.so at RUNTIME (no build-time download). The binary finds it via LD_LIBRARY_PATH — the
+# CUDA/onnxruntime lib list the dotfiles role already sets. This is the Nix build path.
+load-dynamic = ["fastembed/ort-load-dynamic", "ort/load-dynamic"]

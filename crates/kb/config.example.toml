@@ -1,0 +1,62 @@
+# kb — knowledge-base server configuration (TOML).
+#
+# Every key is OPTIONAL: an omitted key falls back to the built-in default shown below, which matches the
+# Python `kb/config.py` `KB_*` default one-for-one. A host with no config file at all behaves identically to
+# the Python server's defaults. Point the binary at this file with `kb --config <path> serve`.
+#
+# The deployed always-on server (dotfiles `knowledge-base.nix`) runs on CPU; the GPU knobs matter only to the
+# phase-2 ingest workers.
+
+# --- Qdrant ---
+# Base URL of the Qdrant instance holding the collections. (was KB_QDRANT_URL)
+qdrant_url = "http://localhost:6333"
+
+# --- Embeddings ---
+# Embedding model. DO NOT CHANGE from bge-large-en-v1.5 for the live DB: every existing vector is 1024-dim
+# and built with this model; a different model would make all ~29 collections unsearchable. (was KB_EMBED_MODEL)
+embed_model = "BAAI/bge-large-en-v1.5"
+# "cpu" or "gpu". Same model → same vectors either way (switching device needs no re-ingest). (KB_EMBED_DEVICE)
+embed_device = "cpu"
+# Cap the CUDA memory arena in BYTES on GPU so a bulk ingest can't grab all VRAM and starve other GPU users
+# (e.g. the voice assistant's STT). 0 = uncapped. Example: 4294967296 for a 4 GiB cap. (KB_EMBED_GPU_MEM_LIMIT)
+embed_gpu_mem_limit = 0
+# Embed in small batches so one big file can't request a multi-GB allocation. (was KB_EMBED_BATCH)
+embed_batch = 16
+
+# --- Reranking (cross-encoder, always CPU) ---
+# Reorder the top vector candidates by a query↔passage relevance model. (was KB_RERANK)
+rerank_enabled = true
+# Reranker model id. (was KB_RERANK_MODEL)
+rerank_model = "BAAI/bge-reranker-base"
+# How many vector candidates to pull + rerank before blending. (was KB_RERANK_CANDIDATES)
+rerank_candidates = 40
+
+# --- MCP server ---
+# Bind address for `kb serve`. (was KB_MCP_HOST / KB_MCP_PORT)
+mcp_host = "0.0.0.0"
+mcp_port = 8077
+# rmcp's DNS-rebinding Host allowlist. rmcp defaults to loopback-only; the Python server accepted any Host
+# (LAN agents connect directly), so the default is ["*"] (check disabled). Set an explicit list to restrict.
+mcp_allowed_hosts = ["*"]
+
+# --- Collections ---
+# Collection the CLI + single-collection tool calls default to. (was KB_DEFAULT_COLLECTION)
+default_collection = "voron_manuals"
+# Where kb_remember / kb_supersede write by default. (was KB_MEMORY_COLLECTION)
+memory_collection = "memory"
+
+# --- Ranking blend ---
+# final = relevance + w_quality*tanh(quality) + w_authority*authority + w_votes*tanh(net_votes/3)
+#         + w_recency*recency   (recency decays only for kind="memory"). (was KB_W_*)
+w_quality = 0.15
+w_authority = 0.10
+w_votes = 0.15
+w_recency = 0.05
+# Memory recency half-life in days. (was KB_RECENCY_HALFLIFE_DAYS)
+recency_halflife_days = 90.0
+
+# Provenance weight in [0,1] by item kind; unknown kinds default to 0.5. (was the AUTHORITY map)
+[authority]
+manual = 1.0
+doc = 0.8
+memory = 0.5

@@ -1,0 +1,590 @@
+//! MCP server exposing the curated knowledge base to agents over streamable-HTTP.
+//!
+//! A faithful port of the Python `kb/server.py` tool surface. The tool NAMES, argument names/defaults, and
+//! the plain-text output (esp. the `[id=… col=…]` head + `source:` citation of `kb_search`) are FROZEN — live
+//! agents and the registered `kb-mcp` MCP call them and parse that text, so any drift breaks callers.
+//!
+//! Tools:
+//!   kb_search        semantic search (rerank + curation blend); returns TEXT + citation + id
+//!   kb_read_pages    read a doc's pages IN ORDER (walk a manual/section sequentially)
+//!   kb_remember      store a durable memory
+//!   kb_feedback      up/down-vote a result's usefulness (id comes from kb_search)
+//!   kb_mark_outdated hide an item from results
+//!   kb_supersede     replace an evolving fact with a new version
+//!   kb_update        edit an item (text/status/quality/tags)
+//!   kb_collections   list collections + counts
+//!
+//! Embedding, reranking, and Qdrant I/O are all BLOCKING (fastembed/ONNX + ureq). Each tool body therefore
+//! runs inside `spawn_blocking` so it never stalls the axum/tokio reactor; the async fns are thin shells.
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
+};
+use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+
+use crate::{config, curate, embed, search, store::Store};
+
+/// The MCP handler. Stateless — every tool opens a fresh `Store` (a Qdrant REST call is sessionless and the
+/// `ureq::Agent` is cheap), and the embedder/reranker are process-global singletons in their modules.
+#[derive(Clone)]
+pub struct Kb {
+    #[allow(dead_code)]
+    tool_router: ToolRouter<Kb>,
+}
+
+fn text_result(s: String) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
+}
+
+fn map_err(e: String) -> McpError {
+    McpError::internal_error(e, None)
+}
+
+/// Run a blocking closure (embed/rerank/Qdrant I/O) off the reactor, flattening the join error.
+async fn blocking<F, T>(f: F) -> Result<T, McpError>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| McpError::internal_error(format!("task panicked: {e}"), None))?
+        .map_err(map_err)
+}
+
+// --- string/payload helpers (ports of the Python inline formatting) ---
+
+fn ps(p: &Map<String, Value>, key: &str) -> Option<String> {
+    p.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn ptext(p: &Map<String, Value>, key: &str) -> String {
+    p.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// `page` as an integer if present and non-zero (Python treats 0/absent as "no page").
+fn ppage(p: &Map<String, Value>) -> Option<i64> {
+    match p.get("page") {
+        Some(Value::Number(n)) => n.as_i64().filter(|&v| v != 0),
+        _ => None,
+    }
+}
+
+/// Build a citation string — the Python `_cite`.
+fn cite(p: &Map<String, Value>) -> String {
+    let title = ps(p, "title")
+        .or_else(|| ps(p, "path"))
+        .unwrap_or_else(|| "?".to_string());
+    let mut loc = ps(p, "path").unwrap_or_else(|| "?".to_string());
+    if let Some(page) = ppage(p) {
+        loc.push_str(&format!(" p.{page}"));
+    }
+    let mut src = format!("{title} — {loc}");
+    if let Some(mut url) = ps(p, "ipfs_url") {
+        if let Some(page) = ppage(p) {
+            url.push_str(&format!("#page={page}"));
+        }
+        src.push_str(&format!("\nipfs: {url}"));
+    } else if let Some(abs) = ps(p, "abs_path") {
+        src.push_str(&format!("\nfile: {abs}"));
+    }
+    src
+}
+
+// --- argument structs (schemars-derived; defaults mirror the Python signatures) ---
+
+fn default_search_collection() -> String {
+    "all".to_string()
+}
+fn default_limit() -> i64 {
+    5
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchArgs {
+    pub query: String,
+    #[serde(default = "default_search_collection")]
+    pub collection: String,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub include_outdated: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadPagesArgs {
+    pub collection: String,
+    pub path: String,
+    pub start_page: i64,
+    #[serde(default)]
+    pub end_page: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RememberArgs {
+    pub text: String,
+    /// Defaults to the configured memory collection when omitted.
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default)]
+    pub authority: Option<f64>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FeedbackArgs {
+    pub id: String,
+    pub helpful: bool,
+    /// Defaults to the configured default search collection when omitted.
+    #[serde(default)]
+    pub collection: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MarkOutdatedArgs {
+    pub id: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SupersedeArgs {
+    pub old_id: String,
+    pub new_text: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub tags: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateArgs {
+    pub id: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub quality: Option<f64>,
+    #[serde(default)]
+    pub tags: Option<String>,
+}
+
+/// Merge an optional string field into a payload extras map only when present — the Python idiom of passing
+/// `tags=tags` and having `base_payload` drop `None` values (`if v is not None`).
+fn put_opt_str(m: &mut Map<String, Value>, key: &str, v: Option<String>) {
+    if let Some(v) = v {
+        m.insert(key.to_string(), Value::from(v));
+    }
+}
+fn put_opt_f64(m: &mut Map<String, Value>, key: &str, v: Option<f64>) {
+    if let Some(v) = v {
+        m.insert(key.to_string(), Value::from(v));
+    }
+}
+
+#[tool_router]
+impl Kb {
+    pub fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(
+        description = "Semantic search over the knowledge base. By default searches ALL collections (manuals, this shop's printers/build, and stored memories) in one shot — you do not need to know which collection holds a fact. Pass a specific collection name only to narrow. Returns each matching passage's TEXT (self-contained) plus a citation and its `id`/`col` (pass both to kb_feedback / kb_mark_outdated)."
+    )]
+    async fn kb_search(
+        &self,
+        Parameters(a): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = a.limit.max(0) as usize;
+        let collection = a.collection.clone();
+        let out = blocking(move || {
+            let store = Store::connect()?;
+            let results = if collection == "all" {
+                search::search_all(&store, &a.query, limit, a.include_outdated, None)?
+            } else {
+                search::search(
+                    &store,
+                    &collection,
+                    &a.query,
+                    limit,
+                    a.include_outdated,
+                    None,
+                )?
+            };
+            if results.is_empty() {
+                return Ok(format!("No results in '{}'.", a.collection));
+            }
+            let blocks: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    let p = &r.payload;
+                    let head = format!(
+                        "[id={} col={} score={:.3} kind={} status={}]",
+                        r.id,
+                        r.collection,
+                        r.final_score,
+                        ptext(p, "kind"),
+                        ptext(p, "status"),
+                    );
+                    format!("{head}\nsource: {}\n\n{}", cite(p), ptext(p, "text").trim())
+                })
+                .collect();
+            Ok(blocks.join("\n\n---\n\n"))
+        })
+        .await?;
+        text_result(out)
+    }
+
+    #[tool(
+        description = "Read a paginated document's pages IN ORDER — for walking through any document sequentially (e.g. \"what's the next step?\", reading a section start to finish). kb_search finds the single best-matching passage but not what comes after it; use this to read forward. Workflow: kb_search to locate the right page, then pass that result's `col` as `collection` and its source `path` + page number here. Pages are inclusive; `end_page` defaults to a short window after `start_page`."
+    )]
+    async fn kb_read_pages(
+        &self,
+        Parameters(a): Parameters<ReadPagesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = blocking(move || {
+            let store = Store::connect()?;
+            let start = a.start_page;
+            // end_page defaults to start+4, then is clamped to [start, start+24] (bound the span).
+            let mut end = a.end_page.unwrap_or(start + 4);
+            end = end.min(start + 24).max(start);
+
+            let mut rows = store.read_pages(&a.collection, &a.path, start, end, 1000)?;
+            if rows.is_empty() {
+                // Tolerate path variants (same doc ingested under different paths).
+                let want = a.path.to_lowercase();
+                if !want.is_empty() {
+                    rows = store
+                        .scroll_page_range(&a.collection, start, end, 2000)?
+                        .into_iter()
+                        .filter(|p| {
+                            let path = ptext(p, "path").to_lowercase();
+                            let title = ptext(p, "title").to_lowercase();
+                            path.ends_with(&want) || want.ends_with(&path) || title == want
+                        })
+                        .collect();
+                }
+            }
+            if rows.is_empty() {
+                return Ok(format!(
+                    "No pages {start}-{end} found for '{}' in '{}'. Run kb_search first and pass the exact \
+                     `col` and source path it cites.",
+                    a.path, a.collection
+                ));
+            }
+            // Order by (page, chunk), both defaulting to 0.
+            rows.sort_by_key(|p| (pnum(p, "page"), pnum(p, "chunk")));
+
+            let mut out = String::new();
+            let mut cur: Option<i64> = None;
+            for p in &rows {
+                let page = pnum(p, "page");
+                if Some(page) != cur {
+                    cur = Some(page);
+                    out.push_str(&format!("\n--- p.{page} ---\n"));
+                }
+                out.push_str(ptext(p, "text").trim());
+                out.push('\n');
+            }
+            let first = &rows[0];
+            let last = &rows[rows.len() - 1];
+            let title = ps(first, "title")
+                .or_else(|| ps(first, "path"))
+                .unwrap_or_else(|| a.path.clone());
+            let lo = pnum(first, "page");
+            let hi = pnum(last, "page");
+            Ok(format!("{title} — pages {lo}–{hi}:\n{}", out.trim_end()))
+        })
+        .await?;
+        text_result(out)
+    }
+
+    #[tool(
+        description = "Store a durable fact/note any future agent can retrieve. Use for knowledge worth keeping across sessions."
+    )]
+    async fn kb_remember(
+        &self,
+        Parameters(a): Parameters<RememberArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = blocking(move || {
+            let cfg = config::get();
+            let collection = a
+                .collection
+                .unwrap_or_else(|| cfg.memory_collection.clone());
+            let store = Store::connect()?;
+            store.ensure_collection(&collection, embed::dim()?)?;
+            let vec = embed::embed_docs(std::slice::from_ref(&a.text))?
+                .pop()
+                .ok_or("embed produced no vector")?;
+            let pid = uuid::Uuid::new_v4().to_string();
+            let mut extra = Map::new();
+            extra.insert("text".into(), Value::from(a.text));
+            extra.insert("source".into(), Value::from("memory"));
+            put_opt_str(&mut extra, "tags", a.tags);
+            put_opt_f64(&mut extra, "confidence", a.confidence);
+            let payload = curate::base_payload(cfg, "memory", a.authority, extra);
+            store.upsert(&collection, &[(pid.clone(), vec, payload)])?;
+            Ok(format!("Stored memory {pid} in '{collection}'."))
+        })
+        .await?;
+        text_result(out)
+    }
+
+    #[tool(
+        description = "Record whether a result (by its id from kb_search) was actually helpful. Nudges ranking so proven items surface higher."
+    )]
+    async fn kb_feedback(
+        &self,
+        Parameters(a): Parameters<FeedbackArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = blocking(move || {
+            let cfg = config::get();
+            let collection = a
+                .collection
+                .unwrap_or_else(|| cfg.default_collection.clone());
+            let store = Store::connect()?;
+            let Some(pt) = store.get_point(&collection, &a.id)? else {
+                return Ok(format!("No item {} in '{collection}'.", a.id));
+            };
+            let p = &pt.payload;
+            let key = if a.helpful { "helpful" } else { "unhelpful" };
+            let now = curate::now_iso();
+            let mut patch = Map::new();
+            patch.insert(key.into(), Value::from(pnum(p, key) + 1));
+            patch.insert("use_count".into(), Value::from(pnum(p, "use_count") + 1));
+            patch.insert("last_verified".into(), Value::from(now.clone()));
+            patch.insert("updated_at".into(), Value::from(now));
+            store.set_payload(&collection, &a.id, patch)?;
+            Ok(format!(
+                "Recorded {} for {}.",
+                if a.helpful { "helpful" } else { "not-helpful" },
+                a.id
+            ))
+        })
+        .await?;
+        text_result(out)
+    }
+
+    #[tool(description = "Hide an item from future results (marks it 'outdated').")]
+    async fn kb_mark_outdated(
+        &self,
+        Parameters(a): Parameters<MarkOutdatedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = blocking(move || {
+            let cfg = config::get();
+            let collection = a
+                .collection
+                .unwrap_or_else(|| cfg.default_collection.clone());
+            let store = Store::connect()?;
+            if store.get_point(&collection, &a.id)?.is_none() {
+                return Ok(format!("No item {} in '{collection}'.", a.id));
+            }
+            let mut patch = Map::new();
+            patch.insert("status".into(), Value::from("outdated"));
+            patch.insert("updated_at".into(), Value::from(curate::now_iso()));
+            if !a.reason.is_empty() {
+                patch.insert("outdated_reason".into(), Value::from(a.reason));
+            }
+            store.set_payload(&collection, &a.id, patch)?;
+            Ok(format!("Marked {} outdated.", a.id))
+        })
+        .await?;
+        text_result(out)
+    }
+
+    #[tool(
+        description = "Replace an evolving fact: mark old_id superseded and store new_text as active."
+    )]
+    async fn kb_supersede(
+        &self,
+        Parameters(a): Parameters<SupersedeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = blocking(move || {
+            let cfg = config::get();
+            let collection = a
+                .collection
+                .unwrap_or_else(|| cfg.memory_collection.clone());
+            let store = Store::connect()?;
+            let old = store.get_point(&collection, &a.old_id)?;
+            let kind = old
+                .as_ref()
+                .and_then(|o| ps(&o.payload, "kind"))
+                .unwrap_or_else(|| "memory".to_string());
+            store.ensure_collection(&collection, embed::dim()?)?;
+            let vec = embed::embed_docs(std::slice::from_ref(&a.new_text))?
+                .pop()
+                .ok_or("embed produced no vector")?;
+            let new_id = uuid::Uuid::new_v4().to_string();
+            let mut extra = Map::new();
+            extra.insert("text".into(), Value::from(a.new_text));
+            extra.insert("source".into(), Value::from("memory"));
+            extra.insert("supersedes".into(), Value::from(a.old_id.clone()));
+            put_opt_str(&mut extra, "tags", a.tags);
+            let payload = curate::base_payload(cfg, &kind, None, extra);
+            store.upsert(&collection, &[(new_id.clone(), vec, payload)])?;
+            if old.is_some() {
+                let mut patch = Map::new();
+                patch.insert("status".into(), Value::from("superseded"));
+                patch.insert("superseded_by".into(), Value::from(new_id.clone()));
+                patch.insert("updated_at".into(), Value::from(curate::now_iso()));
+                store.set_payload(&collection, &a.old_id, patch)?;
+            }
+            Ok(format!("Superseded {} -> {}.", a.old_id, new_id))
+        })
+        .await?;
+        text_result(out)
+    }
+
+    #[tool(
+        description = "Edit an item. If text changes it is re-embedded; otherwise just metadata."
+    )]
+    async fn kb_update(
+        &self,
+        Parameters(a): Parameters<UpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = blocking(move || {
+            let cfg = config::get();
+            let collection = a
+                .collection
+                .unwrap_or_else(|| cfg.memory_collection.clone());
+            let store = Store::connect()?;
+            let Some(pt) = store.get_point(&collection, &a.id)? else {
+                return Ok(format!("No item {} in '{collection}'.", a.id));
+            };
+            let mut patch = Map::new();
+            patch.insert("updated_at".into(), Value::from(curate::now_iso()));
+            if let Some(status) = a.status {
+                patch.insert("status".into(), Value::from(status));
+            }
+            if let Some(quality) = a.quality {
+                patch.insert("quality".into(), Value::from(quality));
+            }
+            if let Some(tags) = a.tags {
+                patch.insert("tags".into(), Value::from(tags));
+            }
+            if let Some(text) = a.text {
+                // Re-embed: merge existing payload + patch + new text, then upsert in place (same id).
+                let mut newp = pt.payload.clone();
+                for (k, v) in &patch {
+                    newp.insert(k.clone(), v.clone());
+                }
+                newp.insert("text".into(), Value::from(text.clone()));
+                let vec = embed::embed_docs(&[text])?
+                    .pop()
+                    .ok_or("embed produced no vector")?;
+                store.upsert(&collection, &[(a.id.clone(), vec, newp)])?;
+                return Ok(format!("Updated {} (re-embedded).", a.id));
+            }
+            store.set_payload(&collection, &a.id, patch)?;
+            Ok(format!("Updated {}.", a.id))
+        })
+        .await?;
+        text_result(out)
+    }
+
+    #[tool(description = "List all collections and their item counts.")]
+    async fn kb_collections(&self) -> Result<CallToolResult, McpError> {
+        let out = blocking(move || {
+            let store = Store::connect()?;
+            let cols = store.collections()?;
+            if cols.is_empty() {
+                return Ok("No collections yet.".to_string());
+            }
+            Ok(cols
+                .iter()
+                .map(|(n, c)| format!("{n}: {c} items"))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        })
+        .await?;
+        text_result(out)
+    }
+}
+
+/// A payload numeric field as i64 (page/chunk/counters), defaulting to 0 — matches the Python `p.get(k) or 0`.
+fn pnum(p: &Map<String, Value>, key: &str) -> i64 {
+    match p.get(key) {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .unwrap_or(0),
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for Kb {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions(
+                "Curated knowledge base: semantic search over manuals, shop docs, and durable memories. \
+                 kb_search (all collections by default) returns passages with an id/col; feed those back \
+                 via kb_feedback / kb_mark_outdated. kb_read_pages walks a document in order. kb_remember \
+                 stores a durable fact."
+                    .to_string(),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::schemars::schema_for;
+    use serde_json::json;
+
+    fn obj(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn cite_uses_title_then_path_and_page() {
+        let p =
+            obj(json!({ "title": "Voron 2.4 Manual", "path": "voron/assembly.pdf", "page": 12 }));
+        assert_eq!(cite(&p), "Voron 2.4 Manual — voron/assembly.pdf p.12");
+    }
+
+    #[test]
+    fn cite_ipfs_appends_page_anchor() {
+        let p = obj(json!({ "path": "a.pdf", "page": 3, "ipfs_url": "ipfs://cid/a.pdf" }));
+        let c = cite(&p);
+        assert!(c.contains("ipfs: ipfs://cid/a.pdf#page=3"), "{c}");
+    }
+
+    #[test]
+    fn cite_missing_everything_is_question_marks() {
+        let p = Map::new();
+        assert_eq!(cite(&p), "? — ?");
+    }
+
+    #[test]
+    fn ppage_treats_zero_as_absent() {
+        assert_eq!(ppage(&obj(json!({ "page": 0 }))), None);
+        assert_eq!(ppage(&obj(json!({ "page": 5 }))), Some(5));
+        assert_eq!(ppage(&Map::new()), None);
+    }
+
+    // Every tool arg struct with no required-object fields still needs valid schemas; spot-check that the
+    // schema generation doesn't panic and search's required field is present.
+    #[test]
+    fn search_schema_has_query() {
+        let schema = serde_json::to_value(schema_for!(SearchArgs)).unwrap();
+        assert!(schema.pointer("/properties/query").is_some(), "{schema}");
+    }
+}

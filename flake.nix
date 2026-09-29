@@ -124,6 +124,32 @@
             mainProgram = "voice-assistant";
           };
         };
+
+      # The knowledge-base server (crates/kb): Qdrant vector search + local ONNX embeddings + an MCP tool
+      # surface (Python→Rust port, board task #157). Built with the `load-dynamic` feature so ort/onnxruntime
+      # is dlopen'd at RUNTIME (via LD_LIBRARY_PATH) rather than downloaded at build time — the default
+      # `download-binaries` feature fetches onnxruntime over the network, which the Nix sandbox forbids. The
+      # dotfiles kb role puts libonnxruntime.so (+ CUDA libs, for the GPU ingest path) on LD_LIBRARY_PATH.
+      # Model files (bge-large / reranker) download on first use into the HF cache at runtime, not here.
+      kbPackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "kb";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildAndTestSubdir = "crates/kb";
+          # Drop the default (download-binaries) feature; link onnxruntime dynamically at runtime instead.
+          buildNoDefaultFeatures = true;
+          buildFeatures = [ "load-dynamic" ];
+          # No build-time native deps: onnxruntime is dlopen'd at runtime, Qdrant is reached over HTTP. Tests
+          # (`cargo test -p kb`) are the dev/CI gate; several would need a live Qdrant/model, so not run here.
+          doCheck = false;
+          meta = {
+            description = "Knowledge-base server: Qdrant vector search + ONNX embeddings + MCP (task #157)";
+            mainProgram = "kb";
+          };
+        };
     in
     {
       packages = forAllSystems (pkgs: rec {
@@ -134,6 +160,7 @@
         # where the native sherpa lib is supplied (green-machine overrides `sherpaOnnxLib` to the CUDA
         # archive). See voiceAssistantPackage above.
         voice-assistant = voiceAssistantPackage pkgs { };
+        kb = kbPackage pkgs;
         default = fleet;
       });
 
@@ -144,6 +171,7 @@
           slackBridge = slackBridgePackage pkgs;
           fleetTunnel = fleetTunnelPackage pkgs;
           voiceAssistant = voiceAssistantPackage pkgs { };
+          kb = kbPackage pkgs;
         in
         {
           fleet = {
@@ -161,6 +189,10 @@
           voice-assistant = {
             type = "app";
             program = "${voiceAssistant}/bin/voice-assistant";
+          };
+          kb = {
+            type = "app";
+            program = "${kb}/bin/kb";
           };
           default = {
             type = "app";

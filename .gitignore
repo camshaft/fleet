@@ -1,2 +1,4 @@
 /target
 /result
+# fastembed downloads model files here on first run (crates/kb tests/dev); ~1.5GB, never commit.
+/.fastembed_cache
