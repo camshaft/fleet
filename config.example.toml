@@ -24,3 +24,7 @@
 
 # This process's agent id — the `fleet send` sender identity when --from is not given.
 # agent = "v-fleet-tooling"
+
+# This box's host id for host-affinity. `fleet up`/`watchdog` only manage agents whose `host` metadata
+# matches this (agents with no `host` are unpinned = managed everywhere). Absent → the system hostname.
+# host = "green-machine"
