@@ -81,25 +81,62 @@
           };
         };
 
+      # The prebuilt sherpa-onnx shared library (v1.13.8, GPU archive), autoPatchelf'd for NixOS.
+      # sherpa-onnx-sys links `libsherpa-onnx-c-api.so` + `libonnxruntime.so` at BUILD time; its build
+      # script normally DOWNLOADS this archive, which the hermetic nix sandbox forbids — so we fetch the
+      # exact pinned archive here and point the build at it via SHERPA_ONNX_LIB_DIR. We use the GPU
+      # (CUDA-12.x / cuDNN-9.x) archive so the runtime CUDA provider is present; but note the LINK only
+      # needs c-api + onnxruntime — the CUDA provider (libonnxruntime_providers_cuda.so) and TensorRT
+      # provider are dlopen'd at RUNTIME, so their CUDA/cuDNN/TensorRT deps are IGNORED at patch time and
+      # resolved from LD_LIBRARY_PATH on green-machine (the knowledge-base.nix pattern). That keeps THIS
+      # derivation CUDA-free and buildable on any x86_64-linux — no cudaPackages, no unfree, hermetic.
+      # Version is pinned to the `sherpa-onnx` crate version (crates/voice-assistant/Cargo.toml).
+      sherpaOnnxLib =
+        pkgs:
+        pkgs.stdenvNoCC.mkDerivation rec {
+          pname = "libsherpa-onnx";
+          version = "1.13.8";
+          src = pkgs.fetchurl {
+            url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${version}/sherpa-onnx-v${version}-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2";
+            hash = "sha256-ITKvGujITIT4asCR5DEYOSh4UdK/XmYDMuvOOJih4LI=";
+          };
+          nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+          buildInputs = [ pkgs.stdenv.cc.cc.lib ]; # libstdc++/libgcc_s; glibc is implicit
+          # CUDA / cuDNN / TensorRT libs are dlopen'd by the ONNX providers at RUNTIME (LD_LIBRARY_PATH on
+          # the host), never linked here — so autoPatchelf must not fail on them.
+          autoPatchelfIgnoreMissingDeps = [
+            "libcudart.so.12"
+            "libcublas.so.12"
+            "libcublasLt.so.12"
+            "libcurand.so.10"
+            "libcudnn.so.9"
+            "libcuda.so.1"
+            "libnvinfer.so.10"
+            "libnvinfer_plugin.so.10"
+            "libnvonnxparser.so.10"
+          ];
+          dontConfigure = true;
+          dontBuild = true;
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r lib $out/lib
+            runHook postInstall
+          '';
+          meta.description = "Prebuilt sherpa-onnx ${version} shared libs (GPU archive), patched for NixOS";
+        };
+
       # The voice-assistant daemon (crates/voice-assistant): a local voice loop (custom wake phrase → STT →
       # Claude+MCP → TTS). Its audio+ML shell is `required-features = ["runtime"]`-gated, so the `runtime`
       # feature is REQUIRED to produce the binary (it pulls sherpa-onnx for STT/TTS/wake + cpal for audio).
       # The dotfiles voice-assistant role consumes this as inputs.fleet.packages.${system}.voice-assistant.
       #
-      # Unlike the other crates, this one links NATIVE libraries at build time:
-      #   • sherpa-onnx-sys — with the crate's `shared` feature it links a prebuilt libsherpa-onnx. The
-      #     build script normally DOWNLOADS a CPU archive, which the hermetic nix sandbox forbids, so the
-      #     build must be pointed at a lib via SHERPA_ONNX_LIB_DIR. On green-machine that's the CUDA 11.8
-      #     GPU build (runs on the Pascal 1080 Ti); CUDA itself is exposed at RUNTIME via LD_LIBRARY_PATH
-      #     from the dotfiles role (the knowledge-base.nix pattern), not linked here.
-      #   • cpal — needs ALSA headers/libs (alsa-lib) to build.
-      # `sherpaOnnxLib` is the derivation providing $out/lib/libsherpa-onnx-c-api.so; on green-machine it is
-      # overridden to the GPU archive. Left as null here so a non-green host still evaluates (the package
-      # only builds where the lib is supplied) — this is why voice-assistant is NOT in `checks` below: the
-      # native/GPU build is not hermetic on arbitrary CI.
+      # Native build deps: `sherpaOnnxLib` (above) supplies the prebuilt libsherpa-onnx the `shared`-feature
+      # sys crate links (via SHERPA_ONNX_LIB_DIR); cpal needs alsa-lib. This is self-contained + hermetic —
+      # CUDA is a pure RUNTIME concern (the dotfiles role puts the CUDA-12 libs + driver on LD_LIBRARY_PATH,
+      # exactly as it does for the kb server's onnxruntime-gpu), so nothing GPU is linked here.
       voiceAssistantPackage =
         pkgs:
-        { sherpaOnnxLib ? null }:
         pkgs.rustPlatform.buildRustPackage {
           pname = "voice-assistant";
           version = "0.0.0";
@@ -113,9 +150,10 @@
           ];
           buildInputs = [
             pkgs.alsa-lib
-          ] ++ pkgs.lib.optional (sherpaOnnxLib != null) sherpaOnnxLib;
+            (sherpaOnnxLib pkgs)
+          ];
           # Point sherpa-onnx-sys at the prebuilt lib instead of letting it fetch (no network in sandbox).
-          SHERPA_ONNX_LIB_DIR = pkgs.lib.optionalString (sherpaOnnxLib != null) "${sherpaOnnxLib}/lib";
+          SHERPA_ONNX_LIB_DIR = "${sherpaOnnxLib pkgs}/lib";
           # The daemon shells no build-time deps beyond the native libs; its tests are the pure lib's
           # `cargo test` gate (the default-features build), not run under the sandbox.
           doCheck = false;
@@ -156,10 +194,9 @@
         fleet = fleetPackage pkgs;
         slack-bridge = slackBridgePackage pkgs;
         fleet-tunnel = fleetTunnelPackage pkgs;
-        # Built with no sherpaOnnxLib by default: the derivation evaluates everywhere but only *builds*
-        # where the native sherpa lib is supplied (green-machine overrides `sherpaOnnxLib` to the CUDA
-        # archive). See voiceAssistantPackage above.
-        voice-assistant = voiceAssistantPackage pkgs { };
+        # Self-contained + hermetic: bundles its own prebuilt sherpa lib (see sherpaOnnxLib above),
+        # CUDA-free at build (CUDA is runtime-only). Builds on any x86_64-linux.
+        voice-assistant = voiceAssistantPackage pkgs;
         kb = kbPackage pkgs;
         default = fleet;
       });
@@ -170,7 +207,7 @@
           fleet = fleetPackage pkgs;
           slackBridge = slackBridgePackage pkgs;
           fleetTunnel = fleetTunnelPackage pkgs;
-          voiceAssistant = voiceAssistantPackage pkgs { };
+          voiceAssistant = voiceAssistantPackage pkgs;
           kb = kbPackage pkgs;
         in
         {
@@ -205,9 +242,17 @@
       # what it actually builds. Point it at the package so a compile break fails `nix flake check` — the
       # gate CI runs. (The crate's `cargo test` stays the dev/CI test gate; it isn't run here because some
       # tests spawn git/tmux, absent in the build sandbox.)
-      checks = forAllSystems (pkgs: {
-        fleet = fleetPackage pkgs;
-      });
+      checks = forAllSystems (
+        pkgs:
+        {
+          fleet = fleetPackage pkgs;
+        }
+        # voice-assistant bundles a linux-x64 prebuilt sherpa lib, so it only builds there; gate the
+        # check to that system so `nix flake check` on arm/darwin doesn't try (and fail) to build it.
+        // pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+          voice-assistant = voiceAssistantPackage pkgs;
+        }
+      );
 
       # `nix develop` — the toolchain to build/lint/test the crate, plus the git/tmux the fleet drives at
       # runtime, so a contributor gets a working environment without a host rust install.
