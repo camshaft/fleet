@@ -25,6 +25,14 @@ const DEFAULT_BASE: &str = "http://127.0.0.1:8880/board/api";
 /// ("browser_signature_banned", #209) — so send a browser-ish UA defensively; harmless on loopback.
 const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) fleet-orchestrator";
 
+/// The board query path for an OPEN observation task tagged `observes=<target>` in a project — the #290
+/// idempotency check. Both `meta_key` and `meta_value` must be present for the board to filter on metadata
+/// (either alone is inert). Agent ids are kebab-case with no URL-special characters, so no encoding is
+/// needed (as with `open_task_count`'s assignee). Pure — unit-tested.
+fn open_observation_query(project_id: i64, observes: &str) -> String {
+    format!("/tasks?project_id={project_id}&status=todo&meta_key=observes&meta_value={observes}")
+}
+
 /// A handle to the board's REST API (stateless — each call is one `GET`).
 pub struct Board {
     base: String,
@@ -116,6 +124,60 @@ impl Board {
         }
     }
 
+    /// Create a task via `POST /api/tasks` → its numeric `id`. `metadata` is a free-form JSON object (stamp
+    /// an idempotency tag here, e.g. `{"observes": "<target>"}`); `parent_id` links it as a child of another
+    /// task (the observation-task → proposal-children tree, #290). The watchdog creates the observation task
+    /// this way; `Err` on a non-2xx response.
+    pub fn create_task(
+        &self,
+        project_id: i64,
+        title: &str,
+        description: &str,
+        created_by: &str,
+        metadata: Value,
+        parent_id: Option<i64>,
+    ) -> Result<i64, String> {
+        let url = format!("{}/tasks", self.base);
+        let mut body = serde_json::json!({
+            "project_id": project_id,
+            "title": title,
+            "description": description,
+            "created_by": created_by,
+            "metadata": metadata,
+        });
+        if let Some(p) = parent_id {
+            body["parent_id"] = serde_json::json!(p);
+        }
+        let resp = self
+            .agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&body.to_string())
+            .map_err(|e| format!("board POST /tasks failed: {e}"))?;
+        let raw = resp
+            .into_string()
+            .map_err(|e| format!("board POST /tasks read failed: {e}"))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST /tasks: response was not JSON: {e}"))?;
+        v.get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("board POST /tasks: no numeric id in response {v}"))
+    }
+
+    /// The #290 idempotency check: the numeric id of an OPEN observation task tagged `observes=<target>` in
+    /// `project_id`, or `None` if none is open. A non-empty result means an observation for that target is
+    /// already in flight (or a crashed observer left one open) → reuse it rather than creating a duplicate.
+    /// Uses the board's server-side metadata filter (both `meta_key` and `meta_value` set together).
+    pub fn open_observation_task(&self, project_id: i64, observes: &str) -> Result<Option<i64>, String> {
+        let path = open_observation_query(project_id, observes);
+        let tasks = match self.get_json(&path)? {
+            Value::Array(a) => a,
+            other => return Err(format!("board {path}: expected an array, got {other}")),
+        };
+        Ok(tasks.iter().find_map(|t| t.get("id").and_then(Value::as_i64)))
+    }
+
     /// Merge `metadata` into an agent's board record via `PATCH /agents/<id>`. The board merges at the KEY
     /// level, so only the keys present in `metadata` change — every other metadata key is preserved. `Err`
     /// on a non-2xx response (e.g. an unknown agent).
@@ -195,6 +257,14 @@ mod tests {
         // The default is the front-door /board/api proxy, not the board's own unreachable port.
         assert!(DEFAULT_BASE.ends_with("/board/api"));
         assert!(DEFAULT_BASE.starts_with("http://"));
+    }
+
+    #[test]
+    fn open_observation_query_sets_project_status_and_both_meta_params() {
+        // The #290 idempotency query: project + open-status + the metadata tag (both meta params present).
+        let q = open_observation_query(28, "v-example");
+        assert_eq!(q, "/tasks?project_id=28&status=todo&meta_key=observes&meta_value=v-example");
+        assert!(q.contains("meta_key=observes") && q.contains("meta_value=v-example"), "both meta params set");
     }
 
     #[test]

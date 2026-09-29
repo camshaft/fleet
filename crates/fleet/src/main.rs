@@ -2918,6 +2918,7 @@ fn spawn_observer(
     target: &str,
     obs_session: &str,
     since_offset: usize,
+    observation_task: Option<i64>,
     dry_run: bool,
 ) -> String {
     let fleet_root = config::get()
@@ -2939,21 +2940,15 @@ fn spawn_observer(
         .and_then(|p| p.ancestors().nth(3))
         .map(|repo| repo.join("loops/observer.md").to_string_lossy().into_owned())
         .unwrap_or_else(|| "loops/observer.md".to_string());
-    // Slice A (#290): pass None — the observation-task enqueue (create the parent task, thread its id here so
-    // the observer files proposals as its children + closes it) turns on once the board POST /tasks contract
-    // is confirmed. The kickoff already carries the child-filing + close contract for that flip.
-    let kickoff = build_observer_kickoff(target, obs_session, since_offset, &role_path, &fleet_bin, None);
+    // The observation task this observer drives from (#290): the caller resolved it (reuse an open one, else
+    // create) and threads its id here so the observer files proposals as its children + closes it. `None`
+    // (dry-run, or a board hiccup) → the observer falls back to standalone proposals.
+    let kickoff =
+        build_observer_kickoff(target, obs_session, since_offset, &role_path, &fleet_bin, observation_task);
     // A per-target tmux window (local only — the BOARD identity stays `observer`), so several observations
     // can run at once without a name clash.
     let window = format!("obs-{}", target.replace(['/', ':', '.'], "-"));
     if dry_run {
-        // Surface the observation task this window WOULD enqueue (#290), so the dry-run shows the reactive
-        // pipeline's exact shape before --apply turns the live enqueue on.
-        let spec = observation_task_spec(target, obs_session, since_offset);
-        println!(
-            "   would-create observation task in project #{}: \"{}\"\n     body: {}",
-            spec.project_id, spec.title, spec.body
-        );
         return format!("would-spawn({window}←{obs_session}:{since_offset})");
     }
     if let Err(e) = std::fs::create_dir_all(&workdir) {
@@ -3298,16 +3293,67 @@ fn watchdog_board(
             println!("-- observation candidates ({}){}: {}", obs.len(), tail, display.join(", "));
         }
         if spawn {
-            observe_spawn_pass(&fleet, &session, &mut obs, now_unix, spawn_dry_run);
+            observe_spawn_pass(board, &fleet, &session, &mut obs, now_unix, spawn_dry_run);
+        }
+    }
+}
+
+/// Resolve the observation task an observer should be spawned against for `target` (#290): REUSE an OPEN one
+/// if present (an in-flight or crashed observer's task — never a duplicate), else CREATE a fresh task stamped
+/// `metadata.observes=target` so the idempotency query finds it next sweep. Authored as `observer` so the
+/// whole self-improve lane stays single-author (the observer's proposal children match). In `dry_run` this
+/// only QUERIES (read-only) and reports what it WOULD create/reuse, returning the existing id or `None` (no
+/// create). Best-effort: a board error returns `None` and the observer runs without a parent task (falling
+/// back to standalone proposals) rather than aborting the sweep.
+fn resolve_observation_task(
+    board: &board::Board,
+    target: &str,
+    session: &str,
+    since_offset: usize,
+    dry_run: bool,
+) -> Option<i64> {
+    match board.open_observation_task(SELF_IMPROVE_PROJECT, target) {
+        Ok(Some(existing)) => {
+            println!("   observation task: reuse OPEN #{existing} (observes {target})");
+            Some(existing)
+        }
+        Ok(None) => {
+            let spec = observation_task_spec(target, session, since_offset);
+            if dry_run {
+                println!(
+                    "   observation task: would CREATE in project #{} — \"{}\"",
+                    spec.project_id, spec.title
+                );
+                None
+            } else {
+                let meta = serde_json::json!({ "observes": target });
+                match board.create_task(spec.project_id, &spec.title, &spec.body, "observer", meta, None) {
+                    Ok(id) => {
+                        println!("   observation task: created #{id} (observes {target})");
+                        Some(id)
+                    }
+                    Err(e) => {
+                        eprintln!("   observation task: create FAILED ({e}); observer runs without a parent task");
+                        None
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("   observation task: open-check FAILED ({e}); observer runs without a parent task");
+            None
         }
     }
 }
 
 /// The --spawn half (#188): launch ephemeral observers for the highest-growth candidates, bounded by a
 /// per-sweep CAP and a per-target COOLDOWN (an in-flight/crashed observer's target must not re-spawn every
-/// 60s sweep — the watermark only advances on confirmation). `dry_run` previews without launching. Splitting
-/// this out keeps the sweep loop readable; sorting by increment puts the most-grown windows first.
+/// 60s sweep — the watermark only advances on confirmation). Each spawn is driven by an observation task
+/// (#290): [`resolve_observation_task`] reuses/creates it and its id threads into the observer. `dry_run`
+/// previews without launching (or creating). Splitting this out keeps the sweep loop readable; sorting by
+/// increment puts the most-grown windows first.
 fn observe_spawn_pass(
+    board: &board::Board,
     fleet: &Fleet,
     session: &str,
     obs: &mut [(String, bool, ObserveDecision)],
@@ -3337,7 +3383,8 @@ fn observe_spawn_pass(
             actions.push(format!("{id}=cooldown"));
             continue;
         }
-        let act = spawn_observer(session, id, &d.session, d.since_offset, dry_run);
+        let obs_task = resolve_observation_task(board, id, &d.session, d.since_offset, dry_run);
+        let act = spawn_observer(session, id, &d.session, d.since_offset, obs_task, dry_run);
         if !dry_run && act.starts_with("spawned") {
             write_observe_spawn_stamp(fleet, id, now_unix);
         }
