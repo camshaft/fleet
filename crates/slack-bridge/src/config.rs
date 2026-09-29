@@ -12,6 +12,7 @@
 //! has written the config / created the Slack app. A [`Config`] whose [`Config::tokens`] returns `None`
 //! is valid: the caller logs "tokens absent, idle" and the transport loop stays dormant, retrying.
 
+use crate::resolver::ChannelLink;
 use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -86,6 +87,9 @@ pub struct Config {
     pub bridge_agent: String,
     /// The bridge's local state dir (persisted thread-map etc.). Defaults to the config file's dir.
     pub state_dir: PathBuf,
+    /// The board↔Slack channel links (TOML `[[channel_map]]`). Empty = no channels mirrored (dormant),
+    /// which is valid. Superseded by a board-backed map once board-core #149 slice 2 lands.
+    pub channel_map: Vec<ChannelLink>,
 }
 
 impl fmt::Debug for Config {
@@ -98,6 +102,7 @@ impl fmt::Debug for Config {
             .field("default_to", &self.default_to)
             .field("bridge_agent", &self.bridge_agent)
             .field("state_dir", &self.state_dir)
+            .field("channel_map", &self.channel_map)
             .finish()
     }
 }
@@ -115,6 +120,8 @@ struct FileConfig {
     default_to: Option<String>,
     bridge_agent: Option<String>,
     state_dir: Option<String>,
+    #[serde(default)]
+    channel_map: Vec<ChannelLink>,
 }
 
 impl Config {
@@ -145,6 +152,7 @@ impl Config {
             state_dir: nonempty(file.state_dir)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| base_dir.to_path_buf()),
+            channel_map: file.channel_map,
         }
     }
 
@@ -244,6 +252,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_channel_map_array_of_tables() {
+        let toml = r#"
+            bot_token = "xoxb-b"
+            app_token = "xapp-a"
+            [[channel_map]]
+            board_channel_id = 7
+            slack_channel = "C7"
+            [[channel_map]]
+            board_channel_id = 8
+            slack_channel = "C8"
+        "#;
+        let cfg = Config::from_toml_str(toml, &base()).unwrap();
+        assert_eq!(cfg.channel_map.len(), 2);
+        assert_eq!(cfg.channel_map[0].board_channel_id, 7);
+        assert_eq!(cfg.channel_map[0].slack_channel, "C7");
+        assert_eq!(cfg.channel_map[1].board_channel_id, 8);
+    }
+
+    #[test]
+    fn channel_map_defaults_to_empty_when_absent() {
+        let cfg = Config::from_toml_str("bot_token = \"xoxb-b\"\n", &base()).unwrap();
+        assert!(cfg.channel_map.is_empty());
+    }
+
+    #[test]
     fn empty_string_values_fall_back_to_defaults() {
         // An explicitly-empty non-secret string must not blank out the default (treated as unset).
         let cfg = Config::from_toml_str("default_to = \"\"\nbot_token = \"\"\n", &base()).unwrap();
@@ -313,6 +346,7 @@ mod tests {
             default_to: "concierge".into(),
             bridge_agent: "slack-bridge".into(),
             state_dir: PathBuf::from("/tmp/f"),
+            channel_map: Vec::new(),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SECRETBODY"), "config Debug must not leak tokens: {dbg}");
