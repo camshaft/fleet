@@ -34,7 +34,7 @@ pub mod format;
 pub mod resolver;
 pub mod sync;
 
-pub use board::{BoardClient, Event, OutboundReflect, OUTBOUND_REFLECT};
+pub use board::{parse_channel_links, BoardClient, Event, OutboundReflect, OUTBOUND_REFLECT};
 pub use config::{Config, SlackTokens};
 pub use format::{
     help_text, is_valid_agent_name, parse_operator_message, relay_plan, render_outbound_reflect,

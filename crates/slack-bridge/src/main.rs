@@ -17,7 +17,7 @@ mod runner;
 
 use clap::Parser;
 use slack_bridge::config::DEFAULT_CONFIG_FILENAME;
-use slack_bridge::{ChannelMap, Config};
+use slack_bridge::{BoardClient, ChannelLink, ChannelMap, Config};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,34 @@ struct Cli {
     /// file — there is no env-var configuration (operator mandate #159).
     #[arg(long)]
     config: Option<PathBuf>,
+}
+
+/// Merge the board-registered channel links (board-core #149 slice 2) with the static config
+/// `[[channel_map]]`. Board links are the dynamic source of truth; the config links are applied AFTER so
+/// an explicit local override wins ([`ChannelMap`] is last-wins). The board fetch is best-effort — on any
+/// error we fall back to the config links alone (fail-soft). Fetched once at startup; a link registered
+/// later (e.g. the #154 operator-DM wiring) is picked up on the next restart.
+async fn load_channel_links(cfg: &Config) -> Vec<ChannelLink> {
+    let board_api = cfg.board_api.clone();
+    let mut links =
+        match tokio::task::spawn_blocking(move || BoardClient::new(&board_api).list_channel_links())
+            .await
+        {
+            Ok(Ok(l)) => {
+                tracing::info!(count = l.len(), "loaded board-registered channel links");
+                l
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "could not read board channel links — using config only");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "channel-link fetch task join failed — using config only");
+                Vec::new()
+            }
+        };
+    links.extend(cfg.channel_map.clone());
+    links
 }
 
 #[tokio::main]
@@ -45,7 +73,7 @@ async fn main() {
         .config
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILENAME));
     let cfg = Arc::new(Config::load(&config_path));
-    let map = Arc::new(ChannelMap::from_links(&cfg.channel_map));
+    let map = Arc::new(ChannelMap::from_links(&load_channel_links(&cfg).await));
     tracing::info!(
         config = %config_path.display(),
         board_api = %cfg.board_api,
