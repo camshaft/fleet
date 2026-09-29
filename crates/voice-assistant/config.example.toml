@@ -1,0 +1,119 @@
+# voice-assistant configuration — TOML only (no environment variables).
+#
+# Location: pass `--config <path>`, else $XDG_CONFIG_HOME/voice-assistant/config.toml,
+# else ~/.config/voice-assistant/config.toml. Every table and key is optional; an omitted
+# key falls back to the built-in default shown below, so a host with no config file at all
+# runs on these exact defaults. `deny_unknown_fields` is on: a typo'd key is a hard error.
+
+# ── Identity + spoken persona ──────────────────────────────────────────────
+[assistant]
+# The assistant's spoken name (used as the board display name).
+name = "assistant"
+# The system prompt shaping every reply. Replies are SPOKEN, so the default asks for
+# brevity. De-personalized by default — tailor it to your world here (this is the one place
+# the persona lives). The loop depends on a few behaviors encoded in it: a spoken reply is
+# short; ending on a question reopens the mic; the knowledge-base / task-board / surfaces MCP
+# tools are reachable. Keep those if you rewrite it.
+# system_prompt = "You are a personal voice assistant. Your replies are spoken aloud, so ..."
+
+# ── Wake phrase (sherpa-onnx keyword spotting) ─────────────────────────────
+# Unlike a fixed wake-word model, KWS matches an arbitrary phrase from `keywords_file`, so
+# the wake phrase is yours to define. Stage the KWS transducer model + keywords file, then
+# point these at them.
+[wake]
+# Dir with the KWS transducer model: encoder.onnx, decoder.onnx, joiner.onnx, tokens.txt.
+model_dir = "~/.local/share/voice-assistant/kws"        # default (with $HOME expanded)
+# The sherpa KWS keywords file declaring the wake phrase(s).
+keywords_file = "~/.local/share/voice-assistant/kws/keywords.txt"
+# Detection score threshold; higher = fewer false wakes.
+threshold = 0.25
+# Inference provider: "cpu" (default — wake is tiny) or "cuda".
+provider = "cpu"
+num_threads = 1
+
+# ── Speech-to-text (sherpa-onnx Whisper, GPU) ──────────────────────────────
+[stt]
+# Dir with the Whisper ONNX files: <model>-encoder.onnx, <model>-decoder.onnx, <model>-tokens.txt.
+model_dir = "~/.local/share/voice-assistant/whisper"
+# Whisper model basename inside model_dir (e.g. small.en → small.en-encoder.onnx, …).
+model = "small.en"
+# Provider: "cuda" (default, GPU — runs on the box's card) or "cpu".
+provider = "cuda"
+num_threads = 2
+# Decode language ("en"). Empty → Whisper auto-detects.
+language = "en"
+# NOTE: sherpa-onnx's Whisper does not expose decoder priming, so this key is currently
+# inert (kept for forward-compat / documentation of intended domain vocabulary).
+initial_prompt = ""
+
+# ── Text-to-speech (sherpa-onnx Kokoro) ────────────────────────────────────
+[tts]
+# Dir with the Kokoro package: model.onnx, voices.bin, tokens.txt, espeak-ng-data/, lexicon*.txt.
+model_dir = "~/.local/share/voice-assistant/kokoro"
+# Kokoro speaker id (voice). Kokoro ships many; pick a British-male id to match the original.
+speaker_id = 0
+# Speaking rate multiplier (1.0 = natural).
+speed = 1.0
+# Provider: "cpu" (default — fast enough for short replies) or "cuda".
+provider = "cpu"
+num_threads = 2
+
+# ── Brain (the `claude` CLI + MCP servers) ─────────────────────────────────
+[brain]
+# The `claude` CLI binary (on PATH by name, or an absolute path).
+claude_bin = "claude"
+# Model override; empty → the CLI/account default.
+model = ""
+# The three MCP servers the brain wires (HTTP). Names must stay in sync with the
+# `mcp__<server>` prefixes in allowed_tools below.
+kb_mcp_url = "http://localhost:8077/mcp"
+task_board_mcp_url = "http://localhost:8079/mcp"
+surfaced_mcp_url = "http://localhost:8787/surfaced/mcp"
+# Allowed tools: MCP server wildcards auto-enable new tools without editing this list.
+allowed_tools = [
+    "mcp__knowledge-base",
+    "mcp__task-board",
+    "mcp__surfaced",
+    "WebSearch",
+    "WebFetch",
+    "Read",
+    "Glob",
+    "Grep",
+]
+# Filesystem reads (Read/Glob/Grep) are confined to this tree by the PreToolUse scope guard.
+projects_dir = "~/Projects"
+# Max agent turns per query (bounds a runaway tool loop).
+max_turns = 8
+# Hard timeout for one brain turn, in seconds — a hung tool/API call must not wedge the loop.
+ask_timeout_secs = 90.0
+
+# ── Task board identity + proactive webhook ────────────────────────────────
+[board]
+# This assistant's agent id on the board.
+agent = "assistant"
+# The local webhook receiver bind host/port (the board POSTs task-status events here).
+webhook_host = "127.0.0.1"
+webhook_port = 8076
+# The webhook URL registered with the board; omit to default to http://<host>:<port>/hook.
+# webhook_url = "http://127.0.0.1:8076/hook"
+
+# ── Audio capture + energy VAD ─────────────────────────────────────────────
+[audio]
+# Capture sample rate (Hz). 16 kHz is what the wake/STT models expect.
+sample_rate = 16000
+# Frame size in samples (80 ms @ 16 kHz = 1280).
+frame = 1280
+# Input device name substring to pin capture to (empty → the system default input).
+input_device = ""
+# Quiet needed to END an utterance (seconds) — long enough to survive a thinking pause.
+silence_secs = 2.5
+# Minimum real speech before an utterance can end (seconds).
+min_speech_secs = 0.3
+# Give up if no speech begins within this window after the wake (seconds).
+start_timeout_secs = 5.0
+# More patient window for a reopened follow-up mic (seconds).
+followup_timeout_secs = 10.0
+# Hard cap on one utterance (seconds).
+max_utterance_secs = 25.0
+# int16 RMS speech/silence floor for the energy VAD.
+vad_rms = 500.0
