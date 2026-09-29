@@ -1682,6 +1682,10 @@ enum Cmd {
         #[arg(long)]
         bin: Option<String>,
     },
+    /// Print the build provenance — package version + the commit the binary was built from (baked at build
+    /// time). Compare the rev to `origin/main` to tell whether a deployed binary is current (a stale binary
+    /// silently runs old logic — the failure mode a stale watchdog binary hit).
+    Version,
 }
 
 fn main() {
@@ -1765,6 +1769,7 @@ fn main() {
             interval_secs,
             bin,
         } => watchdog_unit(observe, pinned_only, interval_secs, bin),
+        Cmd::Version => println!("{}", version_line()),
     }
 }
 
@@ -3830,6 +3835,13 @@ fn watchdog_unit(observe: bool, pinned_only: bool, interval_secs: u64, bin: Opti
     print!("{}", render_watchdog_units(&fleet_bin, &exec_args, interval_secs));
 }
 
+/// The build-provenance line: package version + the revision the binary was built from (baked by `build.rs`
+/// into `FLEET_BUILD_REV`). Lets an operator or agent tell whether a deployed binary is current by comparing
+/// the rev to `origin/main` — the signal that was missing when a stale watchdog binary silently ran old logic.
+fn version_line() -> String {
+    format!("fleet {} (rev {})", env!("CARGO_PKG_VERSION"), env!("FLEET_BUILD_REV"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4198,6 +4210,15 @@ mod tests {
         assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
         assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
         assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+    }
+
+    #[test]
+    fn version_line_reports_package_version_and_a_baked_rev() {
+        let v = version_line();
+        assert!(v.starts_with(&format!("fleet {} (rev ", env!("CARGO_PKG_VERSION"))), "names the pkg version");
+        assert!(v.ends_with(")"), "wraps the rev");
+        // build.rs always bakes a non-empty rev (a real short-sha, or the "unknown" fallback).
+        assert!(!env!("FLEET_BUILD_REV").is_empty(), "the build rev is always baked");
     }
 
     #[test]
