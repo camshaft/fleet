@@ -1794,10 +1794,14 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
     );
     format!(
         "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
-         this session. FIRST call get_agent with agent_id '{agent}' to read your OWN charter + metadata \
-         from the board, and follow that charter as your role. Coordinate through the board (send_message \
-         / check_notifications / comment_task / set_status) — there is no file inbox. You work in \
-         {workdir}. Start your recurring loop now: /loop {tick}"
+         this session. FIRST call register_agent with agent_id '{agent}' (idempotent) to BIND this session \
+         to your identity — get_agent ALONE does NOT bind it, so a board write before register_agent fails \
+         with 'no identity for this session'. THEN call get_agent '{agent}' to read your OWN charter + \
+         metadata from the board, and follow that charter as your role. On every board write pass your \
+         identity EXPLICITLY as a fallback (agent_id / created_by / author / actor = '{agent}') — the board \
+         defaults these to null. Coordinate through the board (send_message / check_notifications / \
+         comment_task / set_status) — there is no file inbox. You work in {workdir}. Start your recurring \
+         loop now: /loop {tick}"
     )
 }
 
@@ -3052,8 +3056,11 @@ mod tests {
     #[test]
     fn build_kickoff_is_work_conserving_and_self_discovering() {
         let k = build_kickoff("v-x", "/wt/v-x", "30m");
-        // Self-discovery: the agent fetches its own charter, nothing is injected.
-        assert!(k.contains("get_agent"), "self-discovers its charter");
+        // Identity binding (#216): register_agent FIRST binds the session; get_agent alone does not, so the
+        // kickoff must register before any write + name the explicit-identity fallback (board defaults null).
+        assert!(k.contains("register_agent"), "binds identity before writing");
+        assert!(k.contains("get_agent ALONE does NOT bind") || k.contains("get_agent"), "still self-discovers charter");
+        assert!(k.contains("created_by") && k.contains("actor"), "names the explicit-identity fallback params");
         assert!(k.contains("'v-x'") && k.contains("/wt/v-x"));
         // Dynamic loop (no fixed interval arg after /loop) — the agent self-paces.
         assert!(k.contains("/loop run one tick"), "dynamic /loop, not `/loop 30m`");
