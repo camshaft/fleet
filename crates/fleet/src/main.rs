@@ -2344,8 +2344,12 @@ fn build_observer_kickoff(
 ) -> String {
     format!(
         "You are an EPHEMERAL fleet `observer`. Board IDENTITY: you act as the single stable board agent id \
-         `observer` — ensure it is registered (register_agent 'observer', idempotent) and author EVERYTHING \
-         (tasks, comments, kb entries) as `observer`. This session makes exactly ONE observation and EXITS — \
+         `observer`. FIRST call register_agent 'observer' (idempotent). Then author EVERY board write AS \
+         `observer` by PASSING THE IDENTITY PARAMETER on each call — the board defaults these to NULL, so you \
+         MUST set them or the lane's single-author dedup query breaks: create_task with created_by=\"observer\", \
+         comment_task / comment_document with author=\"observer\", update_task with actor=\"observer\", and \
+         attribute kb_remember to `observer`. Never leave created_by/author null. This session makes exactly \
+         ONE observation and EXITS — \
          do NOT start a /loop. IMPORTANT: for every `fleet` command use THIS binary by its absolute path — \
          `{fleet_bin}` — NOT the `fleet` on PATH (which may be a different build lacking `transcripts` / \
          `observe-record`). Read your full role and method at {role_path} and follow it exactly. YOUR TARGET \
@@ -3716,6 +3720,9 @@ mod tests {
         assert!(k.contains("EPHEMERAL"));
         assert!(k.contains("ONE observation") && k.contains("do NOT start a /loop"), "one-shot, not looping");
         assert!(k.contains("`observer`") && k.contains("register_agent"));
+        // Author identity must be PASSED explicitly on each board write (board defaults to null) — the gap
+        // the first live dry-run surfaced (created_by came out null).
+        assert!(k.contains("created_by=\"observer\"") && k.contains("author=\"observer\""));
         // Uses the ABSOLUTE standalone binary (not PATH `fleet`) for transcripts + observe-record, with the
         // exact target window (agent, session, offset).
         assert!(k.contains("/repo/target/release/fleet transcripts v-x --session sess-9 --since sess-9:1200"));
