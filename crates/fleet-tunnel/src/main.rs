@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,7 +18,10 @@ use std::time::Duration;
 use clap::Parser;
 use fleet_tunnel::config::Config;
 use fleet_tunnel::frame::{Frame, PROTOCOL_VERSION, decode_body, encode_body};
+use fleet_tunnel::health::HealthState;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -38,6 +42,9 @@ const DEFAULT_KEEPALIVE: u64 = 30;
 
 // Cap a forwarded response body so a misbehaving upstream can't exhaust memory.
 const MAX_RESP_BODY: u64 = 16 * 1024 * 1024;
+
+// Bound the health probe's upstream reachability check so a hung notifier can't wedge the probe.
+const HEALTH_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(about = "fleet-tunnel reverse HTTP-over-websocket bridge (fleet-host daemon)")]
@@ -64,10 +71,27 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Shared liveness state, updated as frames flow. The health probe (if configured) reads it
+    // across reconnects, so a watchdog polling during a reconnect gap sees `disconnected`, not a
+    // refused connection.
+    let health = Arc::new(HealthState::new());
+    if let Some(bind) = cfg.health_bind() {
+        match bind.parse::<SocketAddr>() {
+            Ok(addr) => {
+                tokio::spawn(serve_health(
+                    addr,
+                    health.clone(),
+                    cfg.upstream_trimmed().to_string(),
+                ));
+            }
+            Err(e) => tracing::warn!("health probe disabled: invalid health_addr {bind:?}: {e}"),
+        }
+    }
+
     // Graceful shutdown: a supervisor (tmux keep-alive wrapper, or systemd) stops us with
     // SIGTERM/SIGINT. Break out of the reconnect loop so the socket closes cleanly and we exit 0.
     tokio::select! {
-        _ = run_forever(cfg) => {}
+        _ = run_forever(cfg, health) => {}
         _ = shutdown_signal() => tracing::info!("signal received; shutting down"),
     }
     tracing::info!("stopped");
@@ -84,10 +108,12 @@ async fn shutdown_signal() {
     }
 }
 
-async fn run_forever(cfg: Arc<Config>) {
+async fn run_forever(cfg: Arc<Config>, health: Arc<HealthState>) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        match run_once(&cfg).await {
+        let outcome = run_once(&cfg, &health).await;
+        health.set_connected(false); // socket is down until the next handshake completes
+        match outcome {
             Ok(()) => {
                 backoff = BACKOFF_MIN;
                 tracing::info!("board closed the tunnel; reconnecting");
@@ -119,15 +145,25 @@ async fn resolve_served_agents(cfg: &Config) -> Vec<String> {
     let Some(argv) = cfg.agents_cmd_argv() else {
         return cfg.agents.clone();
     };
-    let (bin, rest) = argv.split_first().expect("agents_cmd_argv is non-empty when Some");
+    let (bin, rest) = argv
+        .split_first()
+        .expect("agents_cmd_argv is non-empty when Some");
     match tokio::process::Command::new(bin).args(rest).output().await {
         Ok(out) if out.status.success() => {
-            let derived = fleet_tunnel::config::parse_agent_lines(&String::from_utf8_lossy(&out.stdout));
+            let derived =
+                fleet_tunnel::config::parse_agent_lines(&String::from_utf8_lossy(&out.stdout));
             if derived.is_empty() {
-                tracing::warn!("agents_cmd `{}` produced no ids; falling back to the static agents list", argv.join(" "));
+                tracing::warn!(
+                    "agents_cmd `{}` produced no ids; falling back to the static agents list",
+                    argv.join(" ")
+                );
                 cfg.agents.clone()
             } else {
-                tracing::info!("derived {} served agents from `{}`", derived.len(), argv.join(" "));
+                tracing::info!(
+                    "derived {} served agents from `{}`",
+                    derived.len(),
+                    argv.join(" ")
+                );
                 derived
             }
         }
@@ -141,14 +177,17 @@ async fn resolve_served_agents(cfg: &Config) -> Vec<String> {
             cfg.agents.clone()
         }
         Err(e) => {
-            tracing::warn!("agents_cmd `{}` failed to run ({e}); falling back to the static agents list", argv.join(" "));
+            tracing::warn!(
+                "agents_cmd `{}` failed to run ({e}); falling back to the static agents list",
+                argv.join(" ")
+            );
             cfg.agents.clone()
         }
     }
 }
 
 /// One connection lifetime: dial, handshake, then serve frames until the socket closes.
-async fn run_once(cfg: &Config) -> Result<(), BoxError> {
+async fn run_once(cfg: &Config, health: &Arc<HealthState>) -> Result<(), BoxError> {
     let request = build_request(cfg)?;
     let agents = resolve_served_agents(cfg).await;
     tracing::info!(
@@ -184,6 +223,11 @@ async fn run_once(cfg: &Config) -> Result<(), BoxError> {
         }
     };
     tracing::info!("tunnel up (keepalive={keepalive}s); serving board requests");
+    // Tunnel is live: mark connected, record the keepalive the freshness threshold scales off, and
+    // stamp the hello_ok as the first board frame.
+    health.set_keepalive(keepalive);
+    health.set_connected(true);
+    health.mark_board_frame();
 
     // A single writer task owns the sink; heartbeat, req responses, and pongs push Messages to it
     // over an mpsc, so nothing has to lock the sink.
@@ -213,7 +257,7 @@ async fn run_once(cfg: &Config) -> Result<(), BoxError> {
 
     let agent = ureq::AgentBuilder::new().timeout(UPSTREAM_TIMEOUT).build();
     let upstream = cfg.upstream_trimmed().to_string();
-    let result = serve(&mut read, &tx, &upstream, &agent).await;
+    let result = serve(&mut read, &tx, &upstream, &agent, health).await;
 
     heartbeat.abort();
     drop(tx); // let the writer drain + finish
@@ -226,11 +270,15 @@ async fn serve<S>(
     tx: &mpsc::UnboundedSender<Message>,
     upstream: &str,
     agent: &ureq::Agent,
+    health: &Arc<HealthState>,
 ) -> Result<(), BoxError>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     while let Some(msg) = read.next().await {
+        // Any inbound frame proves the socket is alive; stamp it for the health probe's staleness
+        // check before dispatching.
+        health.mark_board_frame();
         match msg? {
             Message::Text(t) => match Frame::from_json(t.as_str()) {
                 Ok(Frame::Req {
@@ -353,6 +401,70 @@ fn resp_to_frame(id: i64, resp: ureq::Response) -> Frame {
         headers,
         body: encode_body(&buf),
     }
+}
+
+/// The liveness probe: a tiny loopback HTTP/1.1 server. Any request gets the current
+/// [`HealthState`] snapshot as JSON — HTTP 200 when the wake path is live (`ok`), 503 otherwise —
+/// so a watchdog can distinguish a working tunnel from a silently-wedged socket. Loopback-only;
+/// it exposes no control surface. Runs for the process lifetime, independent of connection state.
+async fn serve_health(addr: SocketAddr, health: Arc<HealthState>, upstream: String) {
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => {
+            tracing::info!("health probe listening on http://{addr}/ (any path)");
+            l
+        }
+        Err(e) => {
+            tracing::warn!("health probe disabled: cannot bind {addr}: {e}");
+            return;
+        }
+    };
+    loop {
+        let (mut sock, _) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("health probe accept failed: {e}");
+                continue;
+            }
+        };
+        let health = health.clone();
+        let upstream = upstream.clone();
+        tokio::spawn(async move {
+            // Drain the request (we don't route on path/method — any request returns health).
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let reachable = probe_upstream(&upstream).await;
+            let snap = health.snapshot(reachable, &upstream);
+            let body = snap.to_json();
+            let status = if snap.ok() {
+                "200 OK"
+            } else {
+                "503 Service Unavailable"
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+    }
+}
+
+/// Is the local upstream (the notifier) reachable right now? A bounded GET to its base URL: any
+/// HTTP response (including a non-2xx status) proves reachability; only a transport/connect error
+/// means unreachable — the same "reachable vs not" distinction [`forward`] draws.
+async fn probe_upstream(upstream: &str) -> bool {
+    let base = upstream.to_string();
+    tokio::task::spawn_blocking(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(HEALTH_UPSTREAM_TIMEOUT)
+            .build();
+        matches!(
+            agent.get(&base).call(),
+            Ok(_) | Err(ureq::Error::Status(_, _))
+        )
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Build the WS handshake request, adding the Cloudflare Access service-token headers for the
