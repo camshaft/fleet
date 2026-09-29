@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+mod board;
+
 /// One agent's durable row in the runtime registry (the machine-local manifest that survives a reboot).
 /// Lifted verbatim from cadenza fleet.rs so the registry.json format is byte-identical across the cutover.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1230,6 +1232,17 @@ enum Cmd {
         #[arg(long)]
         launch: bool,
     },
+    /// Spin up ONE board-declared agent into its `~/.fleet` workspace (the new-system launch path).
+    /// Reads the agent's board record (charter + metadata incl. `repos`) and reports the materialize +
+    /// launch plan; `--apply` performs it. Agents coordinate via their own in-session board MCP — this
+    /// only READS the board to know what to launch.
+    SpinUp {
+        /// The board agent id to spin up.
+        agent: String,
+        /// Perform the materialize + launch (default: just report the plan).
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn main() {
@@ -1259,6 +1272,78 @@ fn main() {
             provision,
             launch,
         } => up(&fleet, &config, provision || launch, launch),
+        Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
+    }
+}
+
+/// The workspace dir for `<agent>`'s checkout of `<repo>` under the fleet root (repo's basename).
+fn workspace_dir(fleet_root: &str, agent: &str, repo: &str) -> String {
+    let name = repo.trim_end_matches(".git").rsplit('/').next().unwrap_or(repo);
+    format!("{fleet_root}/agents/{agent}/{name}")
+}
+
+/// Spin up one board-declared agent into its `~/.fleet` workspace. Reads the board record (orchestrator
+/// read — agents coordinate via their own MCP) and reports the materialize + launch plan; `--apply` will
+/// perform it (materialize + launch land in the next slice). See ../../DESIGN.md.
+fn spin_up(agent: &str, apply: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet spin-up: {e}");
+        std::process::exit(1);
+    });
+    let rec = board.get_agent(agent).unwrap_or_else(|e| {
+        eprintln!("fleet spin-up: {e}");
+        std::process::exit(1);
+    });
+    let md = rec.get("metadata").cloned().unwrap_or(serde_json::Value::Null);
+    let field = |k: &str| md.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let has_charter = rec
+        .get("charter")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let model = resolve_model(&field("model").unwrap_or_else(|| "opus".into()));
+    let effort = field("effort").unwrap_or_else(|| "high".into());
+    let interval = field("interval").unwrap_or_else(|| "30m".into());
+    let repos = md
+        .get("repos")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let fleet_root = std::env::var("FLEET_ROOT")
+        .unwrap_or_else(|_| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
+
+    println!("spin-up plan for '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    println!(
+        "  charter on board: {}",
+        if has_charter { "yes — fetched in-session at boot" } else { "NO — declare a charter first" }
+    );
+    println!("  model={model}  effort={effort}  interval={interval}");
+    if repos.is_empty() {
+        println!("  repos: NONE declared — no workspace to materialize (declare `repos` on the board record)");
+    }
+    let mut primary_workdir: Option<String> = None;
+    for r in &repos {
+        let repo = r.get("repo").and_then(|v| v.as_str()).unwrap_or("?");
+        let branch = r.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
+        let wd = workspace_dir(&fleet_root, agent, repo);
+        println!("  workspace: {wd}  (worktree of {repo}@{branch} off {fleet_root}/mirrors)");
+        if primary_workdir.is_none() {
+            primary_workdir = Some(wd);
+        }
+    }
+    match &primary_workdir {
+        Some(wd) => {
+            println!("  launch: claude in {wd} (board MCP already in-session), then /loop {interval}");
+            println!(
+                "  kickoff (self-discovery): \"you are '{agent}' — query your OWN board record \
+                 (get_agent {agent}) for your charter + metadata, then follow it\""
+            );
+        }
+        None => println!("  launch: skipped — no primary repo to run in"),
+    }
+    if apply {
+        println!("  NOTE: --apply (materialize worktrees + launch the window) lands in the next slice; \
+                  showing the dry-run plan for now.");
     }
 }
 
