@@ -1662,6 +1662,26 @@ enum Cmd {
         #[arg(long)]
         toml: bool,
     },
+    /// Print a systemd USER service + timer that runs the watchdog on a cadence (a host installs it
+    /// declaratively — home-manager `systemd.user.services`/`timers`, same as fleet-notify — no imperative
+    /// write path). The service is a oneshot (`fleet watchdog` is single-sweep); the timer re-fires it. Emit
+    /// the go-live shape with `--observe --pinned-only` (adds `--observe --spawn` for the observer cadence and
+    /// `--pinned-only` so a secondary box only manages its own pinned agents).
+    WatchdogUnit {
+        /// Include `--observe --spawn` (the fleet-self-improve observer cadence, #290).
+        #[arg(long)]
+        observe: bool,
+        /// Include `--pinned-only` (manage only agents explicitly pinned to this host — for a secondary box).
+        #[arg(long)]
+        pinned_only: bool,
+        /// Timer cadence in seconds (systemd `OnUnitActiveSec`).
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+        /// The fleet binary path to put in `ExecStart` (defaults to this binary's absolute path; set it to the
+        /// installed path on the target host, e.g. the flake output).
+        #[arg(long)]
+        bin: Option<String>,
+    },
 }
 
 fn main() {
@@ -1739,6 +1759,12 @@ fn main() {
             overlap,
         } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap),
         Cmd::ServedSet { toml } => served_set(toml),
+        Cmd::WatchdogUnit {
+            observe,
+            pinned_only,
+            interval_secs,
+            bin,
+        } => watchdog_unit(observe, pinned_only, interval_secs, bin),
     }
 }
 
@@ -3749,6 +3775,61 @@ fn served_set(toml: bool) {
     }
 }
 
+/// The watchdog invocation a cadence unit runs: always the liveness sweep (`--rearm --stale-only`), plus the
+/// observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. Pure so the
+/// exact flag string is unit-tested. See [`render_watchdog_units`].
+fn watchdog_exec_args(observe: bool, pinned_only: bool) -> String {
+    let mut args = String::from("watchdog --rearm --stale-only");
+    if observe {
+        args.push_str(" --observe --spawn");
+    }
+    if pinned_only {
+        args.push_str(" --pinned-only");
+    }
+    args
+}
+
+/// Render a systemd USER service + timer (INI unit text) that runs the watchdog every `interval_secs`. The
+/// service is a `oneshot` (the watchdog is single-sweep) ordered After/Wants `fleet-notify` (the wake path it
+/// complements); the timer re-fires it on `OnUnitActiveSec`. A host installs these DECLARATIVELY (home-manager
+/// `systemd.user.services`/`timers`) — the emitted text is the canonical shape to translate, not a file to
+/// write. Pure — unit-tested.
+fn render_watchdog_units(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> String {
+    format!(
+        "# ---- fleet-watchdog.service (systemd USER oneshot) ----\n\
+         [Unit]\n\
+         Description=Fleet watchdog — out-of-band /loop re-arm + observer cadence\n\
+         After=fleet-notify.service\n\
+         Wants=fleet-notify.service\n\n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={fleet_bin} {exec_args}\n\n\
+         # ---- fleet-watchdog.timer (fires the service every {interval_secs}s) ----\n\
+         [Unit]\n\
+         Description=Fleet watchdog cadence\n\n\
+         [Timer]\n\
+         OnBootSec=60\n\
+         OnUnitActiveSec={interval_secs}\n\
+         Persistent=true\n\n\
+         [Install]\n\
+         WantedBy=timers.target\n"
+    )
+}
+
+/// `fleet watchdog-unit` — print the watchdog cadence's systemd USER service + timer for a host to install
+/// declaratively (see [`render_watchdog_units`]). `bin` defaults to this binary's absolute path; a target host
+/// sets it to its installed fleet path.
+fn watchdog_unit(observe: bool, pinned_only: bool, interval_secs: u64, bin: Option<String>) {
+    let fleet_bin = bin.unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "fleet".to_string())
+    });
+    let exec_args = watchdog_exec_args(observe, pinned_only);
+    print!("{}", render_watchdog_units(&fleet_bin, &exec_args, interval_secs));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4117,6 +4198,30 @@ mod tests {
         assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
         assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
         assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+    }
+
+    #[test]
+    fn watchdog_exec_args_builds_the_liveness_base_plus_opt_ins() {
+        assert_eq!(watchdog_exec_args(false, false), "watchdog --rearm --stale-only");
+        assert_eq!(watchdog_exec_args(true, false), "watchdog --rearm --stale-only --observe --spawn");
+        assert_eq!(watchdog_exec_args(false, true), "watchdog --rearm --stale-only --pinned-only");
+        // The green go-live shape: liveness + observer cadence + host filter.
+        assert_eq!(
+            watchdog_exec_args(true, true),
+            "watchdog --rearm --stale-only --observe --spawn --pinned-only"
+        );
+    }
+
+    #[test]
+    fn render_watchdog_units_is_a_oneshot_service_plus_timer() {
+        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true), 60);
+        // A oneshot service (the watchdog is single-sweep) driven by a timer — not a Restart loop.
+        assert!(u.contains("Type=oneshot"), "single-sweep → oneshot, not a loop");
+        assert!(u.contains("ExecStart=/run/fleet/bin/fleet watchdog --rearm --stale-only --observe --spawn --pinned-only"));
+        assert!(u.contains("OnUnitActiveSec=60"), "the timer re-fires on the cadence");
+        // Ordered after the wake path it complements (green's request), and installable as a user timer.
+        assert!(u.contains("After=fleet-notify.service") && u.contains("Wants=fleet-notify.service"));
+        assert!(u.contains("WantedBy=timers.target"));
     }
 
     #[test]
