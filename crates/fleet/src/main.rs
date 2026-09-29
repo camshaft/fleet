@@ -1487,6 +1487,23 @@ enum Cmd {
         #[arg(long)]
         offset: usize,
     },
+    /// Post a deploy-confirmed event to the `deploys` board channel (#171) — the deploy pipeline (#73/#74
+    /// deployer role) calls this after a `colmena apply switch`, so agents subscribed to `deploys` (a waiter
+    /// blocked on a green deploy) are woken. Creates the channel if absent.
+    PostDeploy {
+        /// The repo that was deployed (e.g. `camshaft/task-board`).
+        #[arg(long)]
+        repo: String,
+        /// The deployed commit sha (a waiter matches its awaited commit against this).
+        #[arg(long)]
+        sha: String,
+        /// The host the deploy landed on (e.g. `green-machine`).
+        #[arg(long)]
+        host: String,
+        /// The deploy outcome — `live` (succeeded) or `failed` (a waiter must STOP + escalate, not wait).
+        #[arg(long)]
+        status: String,
+    },
     /// Write launch-shaping metadata onto an agent's board record — the migration primitive that makes an
     /// agent spin-up-ready. Merges (only the given keys change). Reports the patch by default; `--apply`
     /// writes it. Use this instead of hand-editing the board when pushing an agent to be board-backed.
@@ -1612,6 +1629,12 @@ fn main() {
             session,
             offset,
         } => observe_record(&fleet, &agent, &session, offset),
+        Cmd::PostDeploy {
+            repo,
+            sha,
+            host,
+            status,
+        } => post_deploy(&repo, &sha, &host, &status),
         Cmd::SetMeta {
             agent,
             repos,
@@ -2465,6 +2488,47 @@ fn observe_record(fleet: &Fleet, agent: &str, session: &str, offset: usize) {
     write_observe_watermark(fleet, agent, session, offset);
     let _ = std::fs::remove_file(observe_spawn_stamp_path(fleet, agent));
     println!("observe-record: {agent} watermark → {session}:{offset} (observation confirmed)");
+}
+
+// ── post-deploy (#171 deploy-notification channel) ─────────────────────────────────────────────────
+
+/// The board channel deploy events are posted to; agents subscribe while waiting on a green deploy and leave
+/// when done (board-pm approved one channel, #171). Created-if-absent on first post.
+const DEPLOYS_CHANNEL: &str = "deploys";
+/// The identity the deploy pipeline authors its posts as.
+const DEPLOY_SENDER: &str = "deployer";
+
+/// Format a deploy-confirmed channel message. A parseable, stable prefix so a waiter can match its commit:
+/// `deploy <repo>@<sha> → <host>: <STATUS>` (STATUS upper-cased, e.g. LIVE | FAILED — a waiter must STOP +
+/// escalate on FAILED, not wait forever, per board-pm). Pure — unit-tested.
+fn deploy_event_body(repo: &str, sha: &str, host: &str, status: &str) -> String {
+    format!("deploy {repo}@{sha} → {host}: {}", status.trim().to_uppercase())
+}
+
+/// `fleet post-deploy --repo --sha --host --status`: the deploy pipeline (#73/#74 deployer role) calls this
+/// after a `colmena apply switch` to post a deploy-confirmed event to the `deploys` channel (#171). Resolves
+/// the channel name → id (create-if-absent) then posts. Subscribed waiters are woken via the `channel.post`
+/// wake-arm. Exits non-zero on a board error so a deployer can log the miss (the deploy already happened; a
+/// failed NOTICE must not be silent).
+fn post_deploy(repo: &str, sha: &str, host: &str, status: &str) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet post-deploy: board unavailable ({e})");
+        std::process::exit(1);
+    });
+    let channel_id = board
+        .create_or_get_channel(DEPLOYS_CHANNEL, DEPLOY_SENDER)
+        .unwrap_or_else(|e| {
+            eprintln!("fleet post-deploy: resolve '{DEPLOYS_CHANNEL}' channel: {e}");
+            std::process::exit(1);
+        });
+    let body = deploy_event_body(repo, sha, host, status);
+    match board.post_to_channel(channel_id, DEPLOY_SENDER, &body) {
+        Ok(()) => println!("post-deploy: posted to #{DEPLOYS_CHANNEL} (id {channel_id}): {body}"),
+        Err(e) => {
+            eprintln!("fleet post-deploy: post to #{DEPLOYS_CHANNEL} (id {channel_id}) failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The fenced, cooldown-limited re-arm of ONE candidate window, shared by the board and file-hub scans:
@@ -3745,6 +3809,19 @@ mod tests {
         let done = observe_trigger(("s1", 950), ("s1", 950), 2000, true);
         assert!(!done.fire);
         assert_eq!(done.increment, 0);
+    }
+
+    #[test]
+    fn deploy_event_body_is_parseable_with_upper_status() {
+        assert_eq!(
+            deploy_event_body("camshaft/task-board", "abc123", "green-machine", "live"),
+            "deploy camshaft/task-board@abc123 → green-machine: LIVE"
+        );
+        // status is upper-cased + trimmed so a waiter keys on LIVE vs FAILED regardless of caller casing.
+        assert_eq!(
+            deploy_event_body("o/r", "deadbeef", "green-machine", " failed "),
+            "deploy o/r@deadbeef → green-machine: FAILED"
+        );
     }
 
     #[test]

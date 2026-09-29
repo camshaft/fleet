@@ -20,6 +20,11 @@ use serde_json::Value;
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:8880/board/api";
 
+/// A browser-like User-Agent for every board call. The default base is the loopback proxy (no Cloudflare),
+/// but if `config.board_api` points at the PUBLIC endpoint, the CF edge 403s a non-browser UA
+/// ("browser_signature_banned", #209) — so send a browser-ish UA defensively; harmless on loopback.
+const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) fleet-orchestrator";
+
 /// A handle to the board's REST API (stateless — each call is one `GET`).
 pub struct Board {
     base: String,
@@ -46,6 +51,7 @@ impl Board {
             .agent
             .get(&url)
             .set("accept", "application/json")
+            .set("user-agent", BOARD_UA)
             .call()
             .map_err(|e| format!("board GET {path} failed: {e}"))?;
         let raw = resp
@@ -93,8 +99,46 @@ impl Board {
         self.agent
             .request("PATCH", &url)
             .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
             .send_string(&body)
             .map_err(|e| format!("board PATCH /agents/{agent} failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Create-or-get a channel by name (`POST /channels`, idempotent — posting an existing name returns it),
+    /// returning its numeric `id`. `created_by` attributes the creation. Used to resolve a channel name → id
+    /// before posting (the board posts by id, not name).
+    pub fn create_or_get_channel(&self, name: &str, created_by: &str) -> Result<i64, String> {
+        let url = format!("{}/channels", self.base);
+        let body = serde_json::json!({ "name": name, "created_by": created_by }).to_string();
+        let resp = self
+            .agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&body)
+            .map_err(|e| format!("board POST /channels ({name}) failed: {e}"))?;
+        let raw = resp
+            .into_string()
+            .map_err(|e| format!("board POST /channels read failed: {e}"))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST /channels: response was not JSON: {e}"))?;
+        v.get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("board POST /channels ({name}): no numeric id in response {v}"))
+    }
+
+    /// Post a message to a channel by numeric id (`POST /channels/{id}/posts`). `sender` is the authoring
+    /// agent id. `Err` on a non-2xx response.
+    pub fn post_to_channel(&self, channel_id: i64, sender: &str, body: &str) -> Result<(), String> {
+        let url = format!("{}/channels/{}/posts", self.base, channel_id);
+        let payload = serde_json::json!({ "sender": sender, "body": body }).to_string();
+        self.agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&payload)
+            .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?;
         Ok(())
     }
 }
