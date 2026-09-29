@@ -1407,13 +1407,20 @@ fn spin_up(agent: &str, apply: bool) {
         eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
         std::process::exit(1);
     }
-    // Pre-trust the fleet root so claude does not stall on the one-time folder-trust prompt (an interactive
-    // agent can't answer it, and --dangerously-skip-permissions does NOT bypass it). Trust inherits down
-    // the tree, so trusting the root once covers every agent workspace under it. Non-fatal on error.
-    match pre_trust_fleet_root(&fleet_root) {
-        Ok(true) => println!("  pre-trusted fleet root {fleet_root} (workspaces under it inherit trust)"),
+    // Pre-trust so claude does not stall on the one-time folder-trust prompt (an interactive agent can't
+    // answer it, and --dangerously-skip-permissions does NOT bypass it). A worktree workspace is trusted by
+    // its git common dir (the shared MIRROR), which claude does not inherit from the fleet root — so trust
+    // each repo's mirror, plus the fleet root (for a repo-less workspace). Non-fatal on error.
+    let mut trust: Vec<String> = vec![fleet_root.clone()];
+    for r in &repos {
+        if let Some(repo) = r.get("repo").and_then(|v| v.as_str()) {
+            trust.push(workspace::mirror_dir(&fleet_root, repo));
+        }
+    }
+    match pre_trust_dirs(&trust) {
+        Ok(true) => println!("  pre-trusted {} path(s) (fleet root + repo mirror(s))", trust.len()),
         Ok(false) => {}
-        Err(e) => eprintln!("  WARN: could not pre-trust {fleet_root}: {e} (agent may hit a one-time trust prompt)"),
+        Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
     match launch_board_agent(agent, &workdir, &model, &effort, &interval) {
         Ok(win) => println!(
@@ -1495,19 +1502,32 @@ fn ensure_trusted(config: &mut serde_json::Value, dir: &str) -> bool {
     true
 }
 
-/// Idempotently mark the fleet root trusted in `~/.claude.json` (workspaces under it inherit trust, so a
-/// spun-up agent never stalls on the folder-trust prompt). Returns true if it wrote a change. Reads the
-/// resolved (symlink-canonical) path — that is the key claude stores. Writes atomically (temp + rename)
-/// only when a change is needed, so it can't tear the shared config and rarely races a concurrent writer.
-fn pre_trust_fleet_root(fleet_root: &str) -> Result<bool, String> {
+/// Idempotently mark each of `dirs` (and its symlink-canonical form) trusted in `~/.claude.json`, so a
+/// spun-up agent never stalls on the one-time folder-trust prompt. Returns true if it wrote a change.
+///
+/// Two subtleties this handles, both learned from a real stall: (1) for a git *worktree* workspace claude
+/// resolves the project to the worktree's git common dir — the shared bare **mirror** — not the workspace
+/// dir or the fleet root, and it does NOT reliably inherit trust from an ancestor, so the mirror path is
+/// what must be trusted; (2) claude launches with a cwd derived from the literal path (e.g.
+/// `/home/<u>/.fleet/...` when `$HOME` is a symlink) but stores/checks the canonical form, so trusting only
+/// one form leaves the other prompting — hence both. Writes atomically (temp + rename) only when a change
+/// is needed, so it can't tear the shared config and rarely races a concurrent writer.
+fn pre_trust_dirs(dirs: &[String]) -> Result<bool, String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     let cfg = format!("{home}/.claude.json");
-    let canon = std::fs::canonicalize(fleet_root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| fleet_root.to_string());
     let raw = std::fs::read_to_string(&cfg).map_err(|e| format!("read {cfg}: {e}"))?;
     let mut v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("parse {cfg}: {e}"))?;
-    if !ensure_trusted(&mut v, &canon) {
+    let mut changed = false;
+    for dir in dirs {
+        changed |= ensure_trusted(&mut v, dir);
+        let canon = std::fs::canonicalize(dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| dir.clone());
+        if &canon != dir {
+            changed |= ensure_trusted(&mut v, &canon);
+        }
+    }
+    if !changed {
         return Ok(false);
     }
     let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;

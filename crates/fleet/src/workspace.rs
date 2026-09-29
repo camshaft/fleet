@@ -44,6 +44,13 @@ pub fn workspace_dir(fleet_root: &str, agent: &str, repo: &str) -> String {
     format!("{fleet_root}/agents/{agent}/{}", repo_name(repo))
 }
 
+/// The shared bare-mirror directory for `<repo>` under the fleet root. This is the git *common dir* of
+/// every agent's worktree of the repo, and therefore the path claude resolves a worktree to for its
+/// folder-trust check — so it is what must be pre-trusted for an unattended launch.
+pub fn mirror_dir(fleet_root: &str, repo: &str) -> String {
+    format!("{fleet_root}/mirrors/{}.git", repo_name(repo))
+}
+
 /// The remote-tracking ref a NEW agent branch is cut from (never a local head, so a peer's `fetch --prune`
 /// can't delete it): `origin/HEAD`, else `origin/main`/`origin/master`.
 fn mirror_default_base(mirror: &str) -> Result<String, String> {
