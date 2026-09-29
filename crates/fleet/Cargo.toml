@@ -22,3 +22,5 @@ serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 # Minimal blocking HTTP client for the orchestrator's read-only board access (MCP JSON-RPC over HTTP).
 ureq = "2"
+# RFC3339 parse (+ format, for tests) of the board's last_seen for liveness — no macros.
+time = { version = "0.3", features = ["parsing", "formatting"] }
