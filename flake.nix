@@ -33,10 +33,34 @@
             mainProgram = "fleet";
           };
         };
+
+      # The slack-bridge daemon (crates/slack-bridge). Its Socket Mode transport binary is
+      # `required-features = ["transport"]`-gated, so the `transport` feature is REQUIRED to produce the
+      # binary (it pulls the async tree: slack-morphism/tokio/hyper/rustls). The dotfiles slack-bridge role
+      # (#153) consumes this as inputs.fleet.packages.${system}.slack-bridge.
+      slackBridgePackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "slack-bridge";
+          version = "0.0.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          # Build just the slack-bridge crate, with the transport feature (produces bin/slack-bridge).
+          buildAndTestSubdir = "crates/slack-bridge";
+          buildFeatures = [ "transport" ];
+          # The daemon shells no build-time deps; it talks to Slack + the board over the network at
+          # RUNTIME. Tests aren't run under the sandbox (the lib's `cargo test` is the gate).
+          doCheck = false;
+          meta = {
+            description = "Fleet Slack↔board bridge daemon (design #141)";
+            mainProgram = "slack-bridge";
+          };
+        };
     in
     {
       packages = forAllSystems (pkgs: rec {
         fleet = fleetPackage pkgs;
+        slack-bridge = slackBridgePackage pkgs;
         default = fleet;
       });
 
@@ -44,14 +68,21 @@
         pkgs:
         let
           fleet = fleetPackage pkgs;
-          app = {
+          slackBridge = slackBridgePackage pkgs;
+        in
+        {
+          fleet = {
             type = "app";
             program = "${fleet}/bin/fleet";
           };
-        in
-        {
-          fleet = app;
-          default = app;
+          slack-bridge = {
+            type = "app";
+            program = "${slackBridge}/bin/slack-bridge";
+          };
+          default = {
+            type = "app";
+            program = "${fleet}/bin/fleet";
+          };
         }
       );
 
