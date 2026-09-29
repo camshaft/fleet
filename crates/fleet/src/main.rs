@@ -84,6 +84,18 @@ fn agent_host_is_explicit(metadata: Option<&serde_json::Value>, this_host: &str)
     }
 }
 
+/// Whether the watchdog should manage an agent on this host. Under `pinned_only` (a secondary box like green),
+/// ONLY agents EXPLICITLY pinned here ([`agent_host_is_explicit`]) — so it never re-arms or spawns an observer
+/// against an unpinned agent whose tmux window / transcript lives on another box. Without it, the loose
+/// predicate ([`agent_host_matches`]): this-host-pinned OR unpinned run-anywhere. Pure — unit-tested.
+fn watchdog_manages_agent(md: Option<&serde_json::Value>, host: &str, pinned_only: bool) -> bool {
+    if pinned_only {
+        agent_host_is_explicit(md, host)
+    } else {
+        agent_host_matches(md, host)
+    }
+}
+
 /// Derive the set of agents this host should serve on the reverse tunnel: the tmux `windows` that are also
 /// board agents (`id`→optional host metadata) AND whose host-affinity matches `this_host`. Sorted, deduped.
 /// This replaces a hand-maintained static list — a window that isn't a board agent (a daemon/scratch window)
@@ -1532,6 +1544,13 @@ enum Cmd {
         /// With --observe --spawn, PREVIEW the spawn plan (which observers would launch) without launching.
         #[arg(long)]
         dry_run: bool,
+        /// Restrict the board scan to agents EXPLICITLY pinned to this host (metadata.host names it) — the same
+        /// predicate as `up-board --pinned-only`. Excludes unpinned "run-anywhere" agents, so a box running the
+        /// watchdog fleet-wide never re-arms or spawns an observer against an agent whose tmux window /
+        /// transcript lives on ANOTHER box. Use this on a secondary box (e.g. green) that should only manage its
+        /// own pinned agents; the primary box runs without it to cover the unpinned roster.
+        #[arg(long)]
+        pinned_only: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -1684,7 +1703,8 @@ fn main() {
             observe,
             spawn,
             dry_run,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run),
+            pinned_only,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -3097,14 +3117,21 @@ fn rearm_candidate(
 /// A board that is unreachable does NOT abort the watchdog: the board dimension is skipped with a warning
 /// and the FILE-HUB scan still runs. That resilience is the point — a flaky board is exactly when file-hub
 /// agents (which have NO board delivery) most need the poll, so their liveness must not hinge on it.
-fn watchdog(stale_only: bool, rearm: bool, observe: bool, spawn: bool, spawn_dry_run: bool) {
+fn watchdog(
+    stale_only: bool,
+    rearm: bool,
+    observe: bool,
+    spawn: bool,
+    spawn_dry_run: bool,
+    pinned_only: bool,
+) {
     // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
     // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
     // is unreachable — the file-hub scan then covers everything as a best-effort outage fallback.
     let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run);
+            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only);
             native_ids
         }
         Err(e) => {
@@ -3174,6 +3201,7 @@ fn native_agent_ids(agents: &[serde_json::Value]) -> std::collections::BTreeSet<
 
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
 /// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
+#[allow(clippy::too_many_arguments)]
 fn watchdog_board(
     board: &board::Board,
     agents: &[serde_json::Value],
@@ -3182,12 +3210,16 @@ fn watchdog_board(
     observe: bool,
     spawn: bool,
     spawn_dry_run: bool,
+    pinned_only: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
     let fleet = Fleet::resolve(); // stamp store (<hub>/.claude/fleet/watchdog/); shared with the file-hub scan
     let session = board_session();
     let host = this_host(); // host-affinity: this box only manages agents pinned here (or unpinned)
+    if pinned_only {
+        println!("(--pinned-only: managing only agents EXPLICITLY pinned to {host}; unpinned run-anywhere agents skipped)");
+    }
     // Observation (#187): per-agent transcript-growth threshold (lines/records). Read once per sweep.
     let observe_threshold = std::env::var("CDZ_OBSERVE_LINES")
         .ok()
@@ -3212,9 +3244,10 @@ fn watchdog_board(
         if !is_native {
             continue;
         }
-        // Host affinity: skip agents pinned to a DIFFERENT box — their tmux windows aren't on this host, so
-        // re-arming them here would mis-target (or no-op). Unpinned agents are managed everywhere (as today).
-        if !agent_host_matches(md, &host) {
+        // Host affinity: skip agents this box should not manage — a DIFFERENT-box pin always, and (under
+        // --pinned-only) unpinned run-anywhere agents too, so a secondary box never re-arms/observes an agent
+        // whose tmux window / transcript lives elsewhere. See [`watchdog_manages_agent`].
+        if !watchdog_manages_agent(md, &host, pinned_only) {
             continue;
         }
         native += 1;
@@ -4084,6 +4117,21 @@ mod tests {
         assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
         assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
         assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+    }
+
+    #[test]
+    fn watchdog_manages_agent_uses_strict_pin_only_under_pinned_only() {
+        let green = serde_json::json!({ "host": "green-machine" });
+        let unpinned = serde_json::json!({});
+        // Default (loose): this-host-pinned OR unpinned are managed here.
+        assert!(watchdog_manages_agent(Some(&green), "green-machine", false));
+        assert!(watchdog_manages_agent(Some(&unpinned), "green-machine", false), "unpinned managed everywhere by default");
+        assert!(!watchdog_manages_agent(Some(&green), "dev-desk", false), "other-box pin never managed here");
+        // --pinned-only: ONLY agents explicitly pinned here — unpinned run-anywhere agents are excluded, so a
+        // secondary box never re-arms/observes an agent whose window/transcript is on another box.
+        assert!(watchdog_manages_agent(Some(&green), "green-machine", true));
+        assert!(!watchdog_manages_agent(Some(&unpinned), "green-machine", true), "unpinned EXCLUDED under --pinned-only");
+        assert!(!watchdog_manages_agent(Some(&green), "dev-desk", true));
     }
 
     #[test]
