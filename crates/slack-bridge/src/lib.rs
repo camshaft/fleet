@@ -13,15 +13,23 @@
 //! - [`board`] — the token-less localhost board REST client: poll the event firehose (`GET /events`) and
 //!   act on `channel.outbound_reflect` events (board-core #150), and post attributed inbound messages
 //!   (`POST /channels/:id/posts`, board-core #149). Pure parsers unit-tested without a network.
+//! - [`format`] — board ↔ Slack message shaping: render an outbound-reflect as Slack mrkdwn (with
+//!   external-author attribution, HTML-escaping, length-capping + a degraded plain variant / relay-plan
+//!   resilience), and parse an operator's Slack line into a routed [`format::Intent`].
 //!
-//! Later slices add: `format` (board-event ↔ Slack mrkdwn shaping with external-author attribution) and
-//! the async transport binary (Socket Mode) that wires them together, behind the `transport` feature.
+//! Later slices add the async transport binary (Socket Mode) that wires these together, behind the
+//! `transport` feature.
 //!
 //! Kept generic on purpose: Slack-specifics live in this adapter; a second external-source adapter
 //! (GitHub, #136) drops in over the same board core.
 
 pub mod board;
 pub mod config;
+pub mod format;
 
 pub use board::{BoardClient, Event, OutboundReflect, OUTBOUND_REFLECT};
 pub use config::{Config, SlackTokens};
+pub use format::{
+    help_text, is_valid_agent_name, parse_operator_message, relay_plan, render_outbound_reflect,
+    render_outbound_reflect_plain, Intent, RelayPlan, RELAY_QUEUE_WARN,
+};
