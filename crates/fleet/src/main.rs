@@ -1972,27 +1972,31 @@ const WATCHDOG_OVERDUE_INTERVALS: u64 = 3;
 /// cycling faster to drain its queue (the work-conserving principle), not idling on a long cadence.
 const WATCHDOG_LONG_INTERVAL_SECS: u64 = 3600; // 1h
 
-/// A watchdog re-arm/retighten candidate: either the heartbeat is overdue for its interval (`late`/`STALE`),
-/// OR the agent holds open assigned work while sitting on a long idle interval (work-conserving — it should
-/// loop tighter until its queue drains).
+/// A watchdog re-arm/retighten candidate: either the heartbeat is `STALE` (lapsed several intervals — the loop
+/// isn't cycling), OR the agent holds open assigned work while sitting on a long idle interval (work-conserving
+/// — it should loop tighter until its queue drains).
 ///
-/// `stood_down` short-circuits to NOT a candidate when the agent has ZERO open tasks: an agent that
-/// deliberately went `offline` with a drained queue stopped its loop on purpose, so its stale heartbeat is
-/// expected, not a stall — re-arming it just burns a tick every sweep (reported live by a stood-down agent).
-/// A stood-down agent that STILL holds open tasks is not short-circuited: it should not have parked with work,
-/// so it stays a candidate. Pure — unit-tested.
+/// NOT `late`: an agent that heartbeats once per loop interval naturally reaches age ≈ 1× its interval right
+/// before its next scheduled tick, so `late` (1–3× interval) is the NORMAL band for a healthy idle agent, not
+/// a stall — re-arming on `late` pokes every idle agent once per interval (the v-slack-bridge report). Only
+/// `STALE` (≥ [`WATCHDOG_OVERDUE_INTERVALS`]× interval) means the loop actually stopped, matching
+/// [`watchdog_verdict`]'s own doc ("`STALE` (a re-arm candidate)"). A genuinely dead loop still reaches STALE.
+///
+/// `idle_presence` (board presence `away` OR `offline`) short-circuits to NOT a candidate when the agent has
+/// ZERO open tasks: an agent that deliberately went idle with a drained queue paused its loop on purpose (and
+/// typically holds a scheduled wakeup), so its lapsing heartbeat is expected, not a stall — re-arming it just
+/// burns a tick. An idle-presence agent that STILL holds open tasks is not short-circuited (it shouldn't have
+/// parked with work), so it stays a candidate. Pure — unit-tested.
 fn is_retighten_candidate(
     verdict: &str,
     open_tasks: usize,
     interval_secs: u64,
-    stood_down: bool,
+    idle_presence: bool,
 ) -> bool {
-    if stood_down && open_tasks == 0 {
+    if idle_presence && open_tasks == 0 {
         return false;
     }
-    verdict == "late"
-        || verdict == "STALE"
-        || (open_tasks > 0 && interval_secs >= WATCHDOG_LONG_INTERVAL_SECS)
+    verdict == "STALE" || (open_tasks > 0 && interval_secs >= WATCHDOG_LONG_INTERVAL_SECS)
 }
 
 /// Parse a fleet loop interval into seconds: a bare number is seconds; a trailing `s`/`m`/`h`/`d` scales.
@@ -2422,16 +2426,21 @@ fn watchdog_board(
             Ok(n) => (n, n.to_string()),
             Err(_) => (0, "?".to_string()),
         };
-        // A deliberately stood-down agent (board presence `offline`) with a drained queue is not a stall —
-        // don't re-arm it (else every at-rest board-native agent burns a tick per sweep).
-        let stood_down = a.get("status").and_then(serde_json::Value::as_str) == Some("offline");
+        // Presence-derived idleness. `stood_down` (board `offline`) = a RETIRED/spun-down agent → drives the
+        // observe spin-down trigger. `idle_presence` (`away` OR `offline`) = deliberately idle (a completed
+        // agent parked on a scheduled wakeup) → suppresses the re-arm when its queue is drained, so a healthy
+        // idle vertical isn't poked every interval (the v-slack-bridge report). Kept separate: an `away` agent
+        // is idle but NOT spun down, so it must not trigger a spin-down observation.
+        let status = a.get("status").and_then(serde_json::Value::as_str);
+        let stood_down = status == Some("offline");
+        let idle_presence = matches!(status, Some("away") | Some("offline"));
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
         if observe && let Some(cand) = observe_candidate(&fleet, id, stood_down, observe_threshold) {
             obs_candidates.push(cand);
         }
-        let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs, stood_down);
+        let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs, idle_presence);
         if stale_only && !retighten {
             continue;
         }
@@ -2859,27 +2868,34 @@ mod tests {
     }
 
     #[test]
-    fn is_retighten_candidate_flags_overdue_or_work_on_a_long_interval() {
-        // An overdue heartbeat is always a candidate, regardless of task count (not stood down).
-        assert!(is_retighten_candidate("late", 0, 600, false));
+    fn is_retighten_candidate_flags_stale_or_work_on_a_long_interval_but_not_late() {
+        // STALE (loop lapsed several intervals) is a candidate regardless of task count (not idle-presence).
         assert!(is_retighten_candidate("STALE", 0, 600, false));
+        // `late` is the NORMAL once-per-interval band for a healthy idle agent — NOT a re-arm (the
+        // v-slack-bridge report: a completed 30m-interval vertical sits at ~1× interval before its next tick).
+        assert!(
+            !is_retighten_candidate("late", 0, 600, false),
+            "late is normal idle, only STALE is a stall"
+        );
         // A healthy heartbeat with NO open work is fine on any interval.
         assert!(!is_retighten_candidate("ok", 0, 6 * 3600, false));
-        // Open work on a LONG interval → retighten (should loop tighter to drain the queue).
+        // Open work on a LONG interval → retighten (should loop tighter to drain the queue) — any verdict.
         assert!(is_retighten_candidate("ok", 2, 3600, false), "1h+ with open tasks");
-        assert!(is_retighten_candidate("ok", 1, 6 * 3600, false));
+        assert!(is_retighten_candidate("late", 1, 6 * 3600, false));
         // Open work on a SHORT interval is fine — it's already cycling fast.
         assert!(!is_retighten_candidate("ok", 3, 600, false), "10m with tasks is already tight");
     }
 
     #[test]
-    fn is_retighten_candidate_never_nudges_a_stood_down_agent_with_a_drained_queue() {
-        // Deliberately offline + zero open tasks → NOT a candidate even with a STALE heartbeat (its loop
-        // stopped on purpose; re-arming just burns a tick — the design-fleet-self-improve report).
+    fn is_retighten_candidate_never_nudges_an_idle_presence_agent_with_a_drained_queue() {
+        // Deliberately idle presence (away OR offline) + zero open tasks → NOT a candidate even at STALE: it
+        // paused its loop on purpose (typically holding a scheduled wakeup); re-arming just burns a tick.
+        // Covers BOTH the offline/spun-down case (design-fleet-self-improve) and the away/completed-but-not-
+        // retired case (v-slack-bridge: away, all tasks done, drained, scheduled 1800s wakeup pending).
         assert!(!is_retighten_candidate("STALE", 0, 600, true));
-        assert!(!is_retighten_candidate("late", 0, 3600, true));
-        // …but a stood-down agent that STILL holds open work IS a candidate (it shouldn't have parked).
-        assert!(is_retighten_candidate("ok", 1, 6 * 3600, true), "offline with open work → still nudge");
+        assert!(!is_retighten_candidate("late", 0, 1800, true), "the v-slack-bridge scenario");
+        // …but an idle-presence agent that STILL holds open work IS a candidate (it shouldn't have parked).
+        assert!(is_retighten_candidate("ok", 1, 6 * 3600, true), "idle with open work → still nudge");
         assert!(is_retighten_candidate("STALE", 2, 600, true));
     }
 
