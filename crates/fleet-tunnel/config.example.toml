@@ -41,6 +41,13 @@ agents = [
 # Optional per-host bearer sent in the hello frame.
 # token = ""
 
+# Optional health/liveness probe. When set, the daemon serves a tiny loopback HTTP endpoint that
+# reports {board_ws, last_board_frame_age_secs, upstream_reachable, ok} as JSON (HTTP 200 when the
+# wake path is live, 503 otherwise) so a watchdog can tell a working tunnel from a silently-wedged
+# socket — "process running" is not enough once wakes ride it. Unset = disabled (no inbound port).
+# Any request path returns the health JSON. Keep it loopback-only.
+# health_addr = "127.0.0.1:8898"
+
 # Cloudflare Access service token — set ONLY when dialing the public gateway DIRECTLY (off-LAN
 # without the local Caddy). Omit when using the local Caddy dial (it injects CF Access) or on the
 # LAN path. Keep the real values out of git.

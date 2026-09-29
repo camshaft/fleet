@@ -38,6 +38,10 @@ pub struct Config {
     /// Cloudflare Access service-token secret.
     #[serde(default)]
     pub cf_client_secret: Option<String>,
+    /// Optional loopback address for the health/liveness HTTP probe (e.g. "127.0.0.1:8898").
+    /// Unset = probe disabled and the daemon binds no inbound port (its default posture).
+    #[serde(default)]
+    pub health_addr: Option<String>,
 }
 
 fn default_upstream() -> String {
@@ -85,6 +89,15 @@ impl Config {
         let cmd = self.agents_cmd.as_deref()?;
         let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
         if argv.is_empty() { None } else { Some(argv) }
+    }
+
+    /// The health-probe bind address (trimmed, non-empty), or None when the probe is disabled.
+    /// Returned as a string; the transport shell parses it to a `SocketAddr`.
+    pub fn health_bind(&self) -> Option<&str> {
+        self.health_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// The Cloudflare Access service-token pair, if both are present + non-empty.
@@ -151,9 +164,34 @@ mod tests {
         assert_eq!(cfg.board_ws, "ws://127.0.0.1:8079/tunnel/ws");
         assert_eq!(cfg.upstream, DEFAULT_UPSTREAM);
         assert!(cfg.agents.is_empty());
-        assert!(cfg.agents_cmd.is_none(), "absent agents_cmd → use the static list");
+        assert!(
+            cfg.agents_cmd.is_none(),
+            "absent agents_cmd → use the static list"
+        );
         assert!(cfg.token.is_none());
         assert!(cfg.cf_credentials().is_none());
+        assert!(cfg.health_bind().is_none()); // probe disabled by default
+    }
+
+    #[test]
+    fn health_addr_parses_and_trims() {
+        let cfg = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            health_addr = "  127.0.0.1:8898  "
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.health_bind(), Some("127.0.0.1:8898"));
+        // an empty/whitespace value is treated as disabled
+        let off = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            health_addr = "   "
+            "#,
+        )
+        .unwrap();
+        assert!(off.health_bind().is_none());
     }
 
     #[test]
@@ -201,7 +239,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(set.agents_cmd_argv(), Some(vec!["fleet".into(), "served-set".into()]));
+        assert_eq!(
+            set.agents_cmd_argv(),
+            Some(vec!["fleet".into(), "served-set".into()])
+        );
         let blank = Config::from_toml_str(
             r#"
             board_ws = "ws://x/tunnel/ws"
@@ -209,14 +250,21 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(blank.agents_cmd_argv(), None, "all-blank command → treated as unset");
+        assert_eq!(
+            blank.agents_cmd_argv(),
+            None,
+            "all-blank command → treated as unset"
+        );
     }
 
     #[test]
     fn parse_agent_lines_trims_drops_blanks_and_dedups() {
         let out = "v-a\n v-b \n\n  \nv-a\nv-c\n";
         assert_eq!(parse_agent_lines(out), vec!["v-a", "v-b", "v-c"]);
-        assert!(parse_agent_lines("   \n\n").is_empty(), "no ids → empty (caller falls back to static)");
+        assert!(
+            parse_agent_lines("   \n\n").is_empty(),
+            "no ids → empty (caller falls back to static)"
+        );
     }
 
     #[test]

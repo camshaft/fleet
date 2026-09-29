@@ -7,9 +7,11 @@
 //! requests. A single long-lived socket carries many multiplexed request/response pairs, correlated
 //! by an integer `id` the board allocates.
 //!
-//! This lib is the pure, synchronously-testable core: [`config`] (TOML parse/validate) and
-//! [`frame`] (the wire protocol + base64 body codec). The async transport that drives them lives in
-//! the `fleet-tunnel` binary (`src/main.rs`), behind the `transport` feature.
+//! This lib is the pure, synchronously-testable core: [`config`] (TOML parse/validate), [`frame`]
+//! (the wire protocol + base64 body codec), and [`health`] (the liveness state + snapshot the
+//! health probe renders). The async transport that drives them lives in the `fleet-tunnel` binary
+//! (`src/main.rs`), behind the `transport` feature.
 
 pub mod config;
 pub mod frame;
+pub mod health;
