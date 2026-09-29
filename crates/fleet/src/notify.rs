@@ -13,11 +13,17 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// Map a board webhook event to the wake prompt to inject, or `None` to ignore the event (only assignments
-/// and direct messages wake an agent; presence/comment churn does not). Pure — unit-tested.
+/// Map a board webhook event to the wake prompt to inject, or `None` to ignore the event. An assignment, a
+/// direct message, or a COMMENT on a task the agent subscribes to wakes it (routing the loop to the task /
+/// message); presence churn and the agent's own actions do not. Comments are safe to wake on because the
+/// board only delivers `task.commented` to a task's subscribers/assignee/creator (minus the actor), so the
+/// subscription IS the filter — this satisfies #145 ("notify a subscribed agent when its task is commented on
+/// + drive the loop wake"). Pure — unit-tested.
 pub fn notification_prompt(event_type: &str, task_id: Option<i64>, event_seq: Option<i64>) -> Option<String> {
     match event_type {
         "task.assigned" => task_id.map(|id| format!("[notification] task #{id}")),
+        // A comment on a subscribed task → wake and point the loop at the task (where the new comment is).
+        "task.commented" => task_id.map(|id| format!("[notification] task #{id}")),
         "message.direct" => event_seq.map(|seq| format!("[notification] message #{seq}")),
         _ => None,
     }
@@ -86,15 +92,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_wakes_on_assignment_and_dm_only() {
+    fn prompt_wakes_on_assignment_comment_and_dm() {
         assert_eq!(notification_prompt("task.assigned", Some(42), None).as_deref(), Some("[notification] task #42"));
+        // a comment on a subscribed task wakes and points the loop at the task (#145)
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9)).as_deref(), Some("[notification] task #42"));
         assert_eq!(notification_prompt("message.direct", None, Some(438)).as_deref(), Some("[notification] message #438"));
-        // an assignment without a task_id, or a DM without a seq, can't form a prompt
+        // an assignment/comment without a task_id, or a DM without a seq, can't form a prompt
         assert_eq!(notification_prompt("task.assigned", None, Some(1)), None);
+        assert_eq!(notification_prompt("task.commented", None, Some(2)), None);
         assert_eq!(notification_prompt("message.direct", Some(1), None), None);
-        // non-actionable event types are ignored
-        assert_eq!(notification_prompt("task.commented", Some(1), Some(2)), None);
+        // presence churn and other non-actionable event types are ignored
         assert_eq!(notification_prompt("presence.updated", None, Some(3)), None);
+        assert_eq!(notification_prompt("task.updated", Some(5), None), None);
     }
 
     #[test]
