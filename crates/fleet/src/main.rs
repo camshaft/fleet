@@ -1301,6 +1301,17 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Change an agent's loop interval on BOTH the board metadata (what the pending-work watchdog reads to
+    /// compute overdue) and its file-hub registry row if one still exists — so the two never disagree. Writing
+    /// only the registry (the frozen cadenza `set-interval` does this) leaves the board metadata stale, so an
+    /// agent that lowers its cadence gets false overdue-nudges every cycle; this writes the board too. Applies
+    /// directly (it's a routine cadence change, not the migration primitive that `set-meta` is).
+    SetInterval {
+        /// The agent id whose loop interval to change.
+        agent: String,
+        /// The new loop interval (e.g. `2m`, `30m`, `2h`).
+        interval: String,
+    },
     /// Run the event-driven wake notifier: a local HTTP endpoint that receives the board's per-agent
     /// webhook POSTs and `tmux send-keys` injects `[notification] task #<id>` / `message #<seq>` into the
     /// recipient agent's window (register this endpoint as each board-backed agent's `webhook_url`). Blocks.
@@ -1349,6 +1360,7 @@ fn main() {
             interval,
             apply,
         } => set_meta(&agent, &repos, interval.as_deref(), apply),
+        Cmd::SetInterval { agent, interval } => set_interval(&fleet, &agent, &interval),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
                 eprintln!("{e}");
@@ -2168,6 +2180,40 @@ fn set_meta(agent: &str, repos: &[String], interval: Option<&str>, apply: bool) 
     }
 }
 
+/// Set `agent`'s interval in its file-hub registry row if one exists; returns whether a row was updated. Pure
+/// over the registry so it's unit-testable; the caller persists with [`Fleet::save`].
+fn registry_set_interval(reg: &mut Registry, agent: &str, interval: &str) -> bool {
+    if let Some(a) = reg.agents.iter_mut().find(|a| a.name == agent) {
+        a.interval = interval.to_string();
+        true
+    } else {
+        false
+    }
+}
+
+/// Change an agent's loop interval on the board metadata (the source of truth the watchdog reads) AND, if the
+/// agent still has a file-hub registry row, that row — so a still-migrating agent's two records never disagree
+/// and the watchdog can't false-nudge an agent that lowered its cadence.
+fn set_interval(fleet: &Fleet, agent: &str, interval: &str) {
+    // 1) Board metadata — the write that actually stops the false overdue-nudges (the watchdog reads it).
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet set-interval: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = board.patch_metadata(agent, serde_json::json!({ "interval": interval })) {
+        eprintln!("fleet set-interval: board write FAILED: {e}");
+        std::process::exit(1);
+    }
+    println!("set-interval '{agent}': board metadata interval = {interval}");
+    // 2) Keep the legacy file-hub registry row in sync if one still exists (migration hygiene; a board-only
+    // host or an already-deregistered agent simply has no row to update).
+    let mut reg = fleet.load();
+    if registry_set_interval(&mut reg, agent, interval) {
+        fleet.save(&reg);
+        println!("  also updated the file-hub registry row (kept in sync during migration)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2766,6 +2812,15 @@ mod tests {
         assert_eq!(reg.agents.len(), 2, "no duplicate row for 'a'");
         let a = reg.agents.iter().find(|x| x.name == "a").unwrap();
         assert_eq!(a.status, "active", "stopped row replaced by the active one");
+    }
+
+    #[test]
+    fn registry_set_interval_updates_a_present_row_and_reports_absent() {
+        let mut reg = Registry { agents: vec![mk_agent("a", "active"), mk_agent("b", "active")] };
+        assert!(registry_set_interval(&mut reg, "a", "2h"), "row present → updated");
+        assert_eq!(reg.agents.iter().find(|x| x.name == "a").unwrap().interval, "2h");
+        assert_eq!(reg.agents.iter().find(|x| x.name == "b").unwrap().interval, "10m", "other rows untouched");
+        assert!(!registry_set_interval(&mut reg, "nobody", "5m"), "absent agent → false, no-op");
     }
 
     #[test]
