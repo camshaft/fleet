@@ -17,9 +17,10 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// The localhost board REST base the firehose subscriber reads (mirrors the orchestrator's `Board`
-/// client), used when the config file omits it.
-const DEFAULT_BOARD_API: &str = "http://127.0.0.1:8880/board/api";
+/// The localhost board REST base the firehose subscriber reads, used when the config file omits it.
+/// This is the board front-door on the deploy host (green): port 8079, path `/api` (the daemon appends
+/// `/events`, `/channels/:id/posts`, `/external-links`). Override per-environment via config `board_api`.
+const DEFAULT_BOARD_API: &str = "http://127.0.0.1:8079/api";
 const DEFAULT_DEFAULT_TO: &str = "concierge";
 const DEFAULT_BRIDGE_AGENT: &str = "slack-bridge";
 
@@ -207,10 +208,9 @@ mod tests {
         assert_eq!(cfg.default_to, "concierge");
         assert_eq!(cfg.bridge_agent, "slack-bridge");
         assert_eq!(cfg.state_dir, base(), "state_dir defaults to the config file's dir");
-        assert!(
-            cfg.board_api.ends_with("/board/api"),
-            "board_api defaults to the local front-door proxy: {}",
-            cfg.board_api
+        assert_eq!(
+            cfg.board_api, "http://127.0.0.1:8079/api",
+            "board_api defaults to the local board front-door"
         );
     }
 
@@ -342,7 +342,7 @@ mod tests {
             bot_token: Some("xoxb-SECRETBODY".into()),
             app_token: Some("xapp-SECRETBODY".into()),
             channel: Some("D0X".into()),
-            board_api: "http://127.0.0.1:8880/board/api".into(),
+            board_api: "http://127.0.0.1:8079/api".into(),
             default_to: "concierge".into(),
             bridge_agent: "slack-bridge".into(),
             state_dir: PathBuf::from("/tmp/f"),

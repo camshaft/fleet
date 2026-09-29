@@ -183,7 +183,7 @@ pub struct BoardClient {
 }
 
 impl BoardClient {
-    /// Build a client against the board REST base (e.g. `http://127.0.0.1:8880/board/api`). No network
+    /// Build a client against the board REST base (e.g. `http://127.0.0.1:8079/api`). No network
     /// round-trip — the REST API is sessionless. A trailing slash on `base_api` is trimmed so path joins
     /// don't double up.
     pub fn new(base_api: &str) -> Self {
