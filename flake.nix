@@ -56,11 +56,36 @@
             mainProgram = "slack-bridge";
           };
         };
+
+      # The fleet-tunnel daemon (crates/fleet-tunnel): a reverse HTTP-over-websocket bridge run on a
+      # fleet host — dials OUT to the board so the board can reach the host-local notifier. Its async
+      # transport binary is `required-features = ["transport"]`-gated, so the `transport` feature is
+      # REQUIRED to produce the binary (it pulls the async tree: tokio/tokio-tungstenite/rustls). The
+      # dotfiles fleet-tunnel role consumes this as inputs.fleet.packages.${system}.fleet-tunnel; it
+      # also gives the fleet host a pinned binary to run instead of the old Python + uv.
+      fleetTunnelPackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "fleet-tunnel";
+          version = "0.0.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildAndTestSubdir = "crates/fleet-tunnel";
+          buildFeatures = [ "transport" ];
+          # Pure network daemon: no build-time deps, and its tests are the lib's `cargo test` gate,
+          # not run under the sandbox.
+          doCheck = false;
+          meta = {
+            description = "Fleet reverse HTTP-over-websocket bridge daemon";
+            mainProgram = "fleet-tunnel";
+          };
+        };
     in
     {
       packages = forAllSystems (pkgs: rec {
         fleet = fleetPackage pkgs;
         slack-bridge = slackBridgePackage pkgs;
+        fleet-tunnel = fleetTunnelPackage pkgs;
         default = fleet;
       });
 
@@ -69,6 +94,7 @@
         let
           fleet = fleetPackage pkgs;
           slackBridge = slackBridgePackage pkgs;
+          fleetTunnel = fleetTunnelPackage pkgs;
         in
         {
           fleet = {
@@ -78,6 +104,10 @@
           slack-bridge = {
             type = "app";
             program = "${slackBridge}/bin/slack-bridge";
+          };
+          fleet-tunnel = {
+            type = "app";
+            program = "${fleetTunnel}/bin/fleet-tunnel";
           };
           default = {
             type = "app";

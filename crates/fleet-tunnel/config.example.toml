@@ -1,0 +1,34 @@
+# fleet-tunnel daemon config — copy, edit, and pass with `--config` (no env vars, mandate #159).
+
+# REQUIRED. The board websocket URL to dial.
+#   on-LAN hosts:  "ws://green-machine.lan:8079/tunnel/ws"        (no auth)
+#   off-LAN hosts: "wss://green-machine.camshaft.dev/tunnel/ws"   (set cf_client_* below)
+board_ws = "wss://green-machine.camshaft.dev/tunnel/ws"
+
+# This host's id in the hello frame. Defaults to the system hostname if omitted.
+# host_id = "dev-desk"
+
+# Agent ids whose loops run on this host. The board keys live tunnels by this set and routes each
+# agent's wakes down the matching socket.
+agents = [
+  "board-pm",
+  "fleet-tunnel",
+  "v-backbeat",
+  "v-bolero",
+  "v-capmeshd",
+  "v-fleet-tooling",
+  "v-nmidid",
+  "v-surfaced",
+  "v-task-board",
+]
+
+# Local upstream the daemon forwards board requests to (the notifier). Default shown.
+# upstream = "http://127.0.0.1:8899"
+
+# Optional per-host bearer sent in the hello frame.
+# token = ""
+
+# Cloudflare Access service token — REQUIRED for off-LAN hosts dialing the public gateway, omit for
+# the LAN path. Keep the real values out of git.
+# cf_client_id = ""
+# cf_client_secret = ""
