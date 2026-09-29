@@ -17,9 +17,9 @@ mod runner;
 
 use clap::Parser;
 use slack_bridge::config::DEFAULT_CONFIG_FILENAME;
-use slack_bridge::{BoardClient, ChannelLink, ChannelMap, Config};
+use slack_bridge::Config;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -29,34 +29,6 @@ struct Cli {
     /// file — there is no env-var configuration (operator mandate #159).
     #[arg(long)]
     config: Option<PathBuf>,
-}
-
-/// Merge the board-registered channel links (board-core #149 slice 2) with the static config
-/// `[[channel_map]]`. Board links are the dynamic source of truth; the config links are applied AFTER so
-/// an explicit local override wins ([`ChannelMap`] is last-wins). The board fetch is best-effort — on any
-/// error we fall back to the config links alone (fail-soft). Fetched once at startup; a link registered
-/// later (e.g. the #154 operator-DM wiring) is picked up on the next restart.
-async fn load_channel_links(cfg: &Config) -> Vec<ChannelLink> {
-    let board_api = cfg.board_api.clone();
-    let mut links =
-        match tokio::task::spawn_blocking(move || BoardClient::new(&board_api).list_channel_links())
-            .await
-        {
-            Ok(Ok(l)) => {
-                tracing::info!(count = l.len(), "loaded board-registered channel links");
-                l
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "could not read board channel links — using config only");
-                Vec::new()
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "channel-link fetch task join failed — using config only");
-                Vec::new()
-            }
-        };
-    links.extend(cfg.channel_map.clone());
-    links
 }
 
 #[tokio::main]
@@ -73,13 +45,14 @@ async fn main() {
         .config
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILENAME));
     let cfg = Arc::new(Config::load(&config_path));
-    let map = Arc::new(ChannelMap::from_links(&load_channel_links(&cfg).await));
+    let map: runner::SharedMap = Arc::new(RwLock::new(runner::fetch_channel_map(&cfg).await));
+    let channels = map.read().map(|m| m.len()).unwrap_or(0);
     tracing::info!(
         config = %config_path.display(),
         board_api = %cfg.board_api,
         bridge_agent = %cfg.bridge_agent,
         default_to = %cfg.default_to,
-        channels = map.len(),
+        channels,
         "slack↔board bridge starting"
     );
 
@@ -88,11 +61,15 @@ async fn main() {
             tracing::info!("slack tokens present — starting Socket Mode + the outbound reflect loop");
             let outbound =
                 tokio::spawn(runner::outbound_loop(cfg.clone(), tokens.clone(), map.clone()));
+            // Keep the channel map fresh so a link registered while running (e.g. the #154 operator-DM
+            // wiring) is honored without a restart.
+            let refresh = tokio::spawn(runner::refresh_loop(cfg.clone(), map.clone()));
             // The inbound Socket Mode listener blocks until the socket closes / a fatal error.
             if let Err(e) = runner::run_socket_mode(cfg.clone(), tokens, map.clone()).await {
                 tracing::error!(error = %e, "socket mode listener exited");
             }
             outbound.abort();
+            refresh.abort();
         }
         None => {
             tracing::warn!(
