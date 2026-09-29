@@ -95,15 +95,23 @@ state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file
 
 ## Operational notes
 
-- **Firehose cursor** (`<state_dir>/github-bridge.cursor`): advanced only past terminally-handled events; a
-  restart resumes without gap. First run initializes at the firehose head (skips backlog).
+- **Persisted cursors** (`<state_dir>/github-bridge.state.json`): the board firehose `seq` (OUT) + the
+  GitHub `?since=` timestamp (IN). Advanced only past terminally-handled work; a restart resumes without a
+  gap. First run initializes the firehose at HEAD (skip the board backlog) but leaves the issue cursor empty
+  (ingest the issue backlog).
 - **No echo loop:** the bridge writes board tasks/comments as its own `bridge_agent`, which is not an
-  authorized OUT reflector, so its own writes never reflect back OUT to GitHub.
+  authorized OUT reflector, so its own writes never reflect back OUT to GitHub; and IN comment sync skips
+  comments authored by the bridge's own GitHub account (`viewer_login`).
 - **Attribution:** ingested GitHub authors are attributed via `external_author = github:<login>` +
   `upsert_external_identity` (board-core #149), so board readers see the GitHub author, not the bridge.
+- **Delivery is at-least-once.** Steady state is exactly-once (external-link dedup + persisted cursor); the
+  one residual window is a remote write that succeeds but whose response we fail to read — a rare network
+  blip then duplicates one GitHub comment / board task on retry. Inherent (no GitHub comment idempotency
+  key; `create_task` links only after it returns). See the `runner` module doc + the follow-on below.
 
 ## Follow-ons (coordinate with v-task-board)
 
-- **OUT-reflect contract for task comments:** #150 shipped the reflect event for channel posts; the GitHub
-  OUT direction reflects a *task comment* onto a GitHub issue. The exact firehose event kind + payload for a
-  task-comment reflect is being confirmed with v-task-board before the OUT-reflect slice decodes it.
+- **Idempotent create-keyed-on-external-link (board core):** to make IN ingest exactly-once, `create_task`
+  (and `comment_task`) should accept the intended `external_link` and atomically create-or-return-existing
+  keyed on `(source, external_id)`. Removes the duplicate-task/comment risk on a create-succeeded-response-
+  -failed retry. Proposed to v-task-board.
