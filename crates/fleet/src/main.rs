@@ -847,6 +847,44 @@ fn reconcile_plan(declared: &[RosterEntry], running: &[Agent]) -> ReconcilePlan 
     plan
 }
 
+/// The BOARD-native reconcile plan for one host: of the board-native agents pinned to this box, which are
+/// already running (have a live tmux window), which are intentionally stood down (board presence `offline`,
+/// no window — left down, never auto-launched), and which need launching. This is the board-registry analogue
+/// of [`ReconcilePlan`], where "declared" is the board roster (filtered to native + host by the caller) and
+/// "running" is the live tmux window set rather than the file-hub registry.
+#[derive(Debug, PartialEq, Eq, Default)]
+struct BoardReconcile {
+    /// Declared agents with no live window that should be launched.
+    to_launch: Vec<String>,
+    /// Declared agents with a live tmux window — nothing to do.
+    already_running: Vec<String>,
+    /// Declared agents deliberately stood down (`offline`) with no window — reported, never auto-launched.
+    stood_down: Vec<String>,
+}
+
+/// Compute the board-native host reconcile from the host-matched native roster (`(id, is_offline)`) and the
+/// live tmux `windows`. An agent with a live window counts as running regardless of its board presence (it is
+/// up); an agent with no window is to-launch UNLESS it is deliberately `offline`, in which case it is reported
+/// as stood-down and left down. Pure so the host reconcile policy is unit-tested without the board or tmux.
+fn board_reconcile_plan(declared: &[(String, bool)], windows: &[String]) -> BoardReconcile {
+    let win: std::collections::BTreeSet<&str> = windows.iter().map(String::as_str).collect();
+    let mut plan = BoardReconcile::default();
+    for (id, offline) in declared {
+        if win.contains(id.as_str()) {
+            plan.already_running.push(id.clone());
+        } else if *offline {
+            plan.stood_down.push(id.clone());
+        } else {
+            plan.to_launch.push(id.clone());
+        }
+    }
+    for v in [&mut plan.to_launch, &mut plan.already_running, &mut plan.stood_down] {
+        v.sort();
+        v.dedup();
+    }
+    plan
+}
+
 /// `fleet up <config>`: parse a target repo's `fleet.toml`, load the hub's runtime registry, and REPORT
 /// the reconcile plan (declared → running). DRY-RUN / reporting only in this P1 slice — the actual
 /// worktree-mint + window-launch of `to_launch` agents lands with the window-management slice (it needs
@@ -955,6 +993,74 @@ fn up(fleet: &Fleet, config_path: &Path, provision: bool, launch: bool) {
             "  ✓ provisioned {provisioned}/{} declared-to-launch agent(s) — pass --launch to also open tmux windows.",
             plan.to_launch.len()
         );
+    }
+}
+
+/// `fleet up-board`: reconcile the BOARD-native roster host-filtered to THIS box against the running tmux
+/// windows — the board-registry analogue of [`up`] (which reconciles a checked-in `fleet.toml`). Reads the
+/// board roster, keeps only board-native agents (`metadata.native == true`) whose host-affinity matches this
+/// box ([`agent_host_matches`] — unset/unpinned = managed everywhere, as today), and reports which are already
+/// running, which are intentionally stood down, and which need launching. With `--launch` it spins up each
+/// to-launch agent via the per-agent board-native launch path ([`spin_up`] with apply). Host affinity means a
+/// box brings up exactly its own declared, host-pinned agents — green's reconcile never touches dev-desk
+/// windows and vice-versa. Reads the board only (agents coordinate via their own MCP). NOTE: a hard per-agent
+/// launch failure exits (spin_up's contract), aborting the remaining launches — re-run to continue.
+fn up_board(launch: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet up-board: board unavailable ({e}); cannot read the roster");
+        std::process::exit(1);
+    });
+    let roster = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet up-board: board roster query failed ({e})");
+        std::process::exit(1);
+    });
+    let host = this_host();
+    // Board-native agents (metadata.native == true) pinned to this box (or unpinned) → (id, is_offline).
+    let declared: Vec<(String, bool)> = roster
+        .iter()
+        .filter(|a| {
+            let md = a.get("metadata");
+            md.and_then(|m| m.get("native"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && agent_host_matches(md, &host)
+        })
+        .filter_map(|a| {
+            let id = a.get("id").and_then(serde_json::Value::as_str)?.to_string();
+            let offline = a.get("status").and_then(serde_json::Value::as_str) == Some("offline");
+            Some((id, offline))
+        })
+        .collect();
+    let windows = tmux_window_names(&board_session());
+    let plan = board_reconcile_plan(&declared, &windows);
+    println!(
+        "fleet up-board: host '{host}' — {} board-native agent(s) pinned here:",
+        declared.len()
+    );
+    if !plan.already_running.is_empty() {
+        println!("  ✓ already running: {}", plan.already_running.join(", "));
+    }
+    if !plan.stood_down.is_empty() {
+        println!(
+            "  ⏸ stood down (offline, not launched): {}",
+            plan.stood_down.join(", ")
+        );
+    }
+    if plan.to_launch.is_empty() {
+        println!("  ✓ reconciled — every active declared agent for this host is running.");
+        return;
+    }
+    if !launch {
+        println!(
+            "  ⟳ TO LAUNCH ({}): {}  [dry-run — pass --launch to spin each up]",
+            plan.to_launch.len(),
+            plan.to_launch.join(", ")
+        );
+        return;
+    }
+    println!("  ⟳ launching {} agent(s):", plan.to_launch.len());
+    for id in &plan.to_launch {
+        spin_up(id, true);
     }
 }
 
@@ -1312,6 +1418,16 @@ enum Cmd {
         #[arg(long)]
         launch: bool,
     },
+    /// Reconcile the BOARD-native roster host-filtered to THIS box (the board-registry analogue of `up`,
+    /// which reconciles a checked-in `fleet.toml`). Reads the board roster, keeps board-native agents
+    /// (`metadata.native == true`) pinned to this host (unset host = managed everywhere), and reports which
+    /// are already running, stood down, or need launching; `--launch` spins each to-launch agent up. Host
+    /// affinity keeps a box from launching another box's agents. Reads the board only.
+    UpBoard {
+        /// Spin up each to-launch agent (default: just report the plan).
+        #[arg(long)]
+        launch: bool,
+    },
     /// Spin up ONE board-declared agent into its `~/.fleet` workspace (the new-system launch path).
     /// Reads the agent's board record (charter + metadata incl. `repos`) and reports the materialize +
     /// launch plan; `--apply` performs it. Agents coordinate via their own in-session board MCP — this
@@ -1447,6 +1563,7 @@ fn main() {
             provision,
             launch,
         } => up(&fleet, &config, provision || launch, launch),
+        Cmd::UpBoard { launch } => up_board(launch),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::Status { stale_only } => status(stale_only),
         Cmd::Watchdog { stale_only, rearm } => watchdog(stale_only, rearm),
@@ -3098,6 +3215,39 @@ mod tests {
             vec!["x".to_string()],
             "stopped y is not drift"
         );
+    }
+
+    #[test]
+    fn board_reconcile_launches_windowless_active_running_windowed_skips_offline() {
+        let declared = vec![
+            ("a".to_string(), false), // active, has window → already_running
+            ("b".to_string(), false), // active, no window → to_launch
+            ("c".to_string(), true),  // offline, no window → stood_down (never launched)
+            ("d".to_string(), true),  // offline BUT has window → already_running (it is up)
+        ];
+        let windows = vec!["a".to_string(), "d".to_string(), "scratch".to_string()];
+        let plan = board_reconcile_plan(&declared, &windows);
+        assert_eq!(plan.already_running, vec!["a".to_string(), "d".to_string()]);
+        assert_eq!(plan.to_launch, vec!["b".to_string()]);
+        assert_eq!(plan.stood_down, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn board_reconcile_all_running_or_stood_down_has_nothing_to_launch() {
+        let declared = vec![("x".to_string(), false), ("y".to_string(), true)];
+        let windows = vec!["x".to_string()];
+        let plan = board_reconcile_plan(&declared, &windows);
+        assert!(plan.to_launch.is_empty(), "x runs, y is stood down");
+        assert_eq!(plan.already_running, vec!["x".to_string()]);
+        assert_eq!(plan.stood_down, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn board_reconcile_empty_declared_is_a_noop_plan() {
+        let plan = board_reconcile_plan(&[], &["anything".to_string()]);
+        assert!(plan.to_launch.is_empty());
+        assert!(plan.already_running.is_empty());
+        assert!(plan.stood_down.is_empty());
     }
 
     #[test]
