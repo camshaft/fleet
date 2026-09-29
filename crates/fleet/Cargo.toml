@@ -16,7 +16,9 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: when we surgically add one trusted-project entry to the user's ~/.claude.json we must
+# NOT reorder the rest of their config (it is shared with every live claude session).
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 # Minimal blocking HTTP client for the orchestrator's read-only board access (MCP JSON-RPC over HTTP).
 ureq = "2"
