@@ -2822,6 +2822,36 @@ fn observe_on_spawn_cooldown(last_spawn: Option<u64>, now: u64, cooldown: u64) -
     last_spawn.is_some_and(|last| now.saturating_sub(last) < cooldown)
 }
 
+/// The board project that holds the fleet-self-improve lane — observation tasks and their proposal children
+/// (#28). An observation task is the parent; each proposal the observer files is a child, so the lane reads
+/// as a tree and child_rollup counts "proposals from this observation" (#290).
+const SELF_IMPROVE_PROJECT: i64 = 28;
+
+/// The board observation task an observer works: the "observe <target>'s window" work item the watchdog
+/// enqueues per fired candidate (#290). Pure to build so the exact shape is unit-tested and previewable in
+/// the spawn dry-run before any live create.
+struct ObservationTaskSpec {
+    title: String,
+    body: String,
+    project_id: i64,
+}
+
+/// Build the observation task for one candidate window: a titled work item naming the target and the exact
+/// transcript window the observer will read, in the fleet-self-improve project. The observer drives from this
+/// task, files its proposals as children, and closes it on completion (#290). Pure — unit-tested.
+fn observation_task_spec(target: &str, session: &str, since_offset: usize) -> ObservationTaskSpec {
+    ObservationTaskSpec {
+        title: format!("observe {target} — {session}:{since_offset}"),
+        body: format!(
+            "Observe agent `{target}`'s transcript window (session `{session}`, from line offset \
+             {since_offset}) and file each above-floor, evidence-cited improvement as a CHILD proposal task \
+             of this one. Close this task when the observation is complete. Kicked off by the fleet watchdog \
+             self-improve cadence (#290)."
+        ),
+        project_id: SELF_IMPROVE_PROJECT,
+    }
+}
+
 /// The kickoff for an EPHEMERAL observer session: it acts as the stable board id `observer`, reads exactly
 /// the target window, files curated proposals into project #28, CONFIRMS via `observe-record` as its last
 /// step, then exits (no loop). Pure so the prompt is unit-tested. `fleet_bin` is the ABSOLUTE path to THIS
@@ -2829,13 +2859,33 @@ fn observe_on_spawn_cooldown(last_spawn: Option<u64>, now: u64, cooldown: u64) -
 /// different build (during the migration it is the cadenza embedded fleet, which lacks `transcripts` /
 /// `observe-record`). `role_path` points at the full role body (the authoritative method); the kickoff
 /// carries the parameters + identity + completion command so the observation is well-formed regardless.
+/// `observation_task` is the board task (in project #28) this observation is driven by, when the watchdog
+/// enqueued one (#290): the observer files each proposal as a CHILD of it and CLOSES it on completion, so the
+/// lane reads as a tree and the closed task is the "observation ran" signal. `None` keeps the pre-pipeline
+/// behavior (standalone proposals in #28) for the rollout window before the enqueue is turned on.
 fn build_observer_kickoff(
     target: &str,
     session: &str,
     since_offset: usize,
     role_path: &str,
     fleet_bin: &str,
+    observation_task: Option<i64>,
 ) -> String {
+    let filing = match observation_task {
+        Some(n) => format!(
+            "You are working OBSERVATION TASK #{n} in board project #28 (fleet-self-improve). File each \
+             above-floor, evidence-cited, deduped finding as a CHILD proposal task of it (create_task with \
+             parent_id={n}, created_by=\"observer\") so the lane reads as a tree (#{n} → its proposals). Dedup \
+             against the OPEN proposal children of #{n} and other OPEN `observer` proposals in #28. When you \
+             have filed every proposal (or an explicit no-op finding), CLOSE the observation: update_task {n} \
+             with status=\"done\", actor=\"observer\" — the closed task IS the signal the observation ran."
+        ),
+        None =>
+            "File only above-floor, evidence-cited, deduped proposals into board project #28 \
+             (fleet-self-improve) per that project's template; dedup against OPEN proposals by author \
+             `observer` in #28."
+                .to_string(),
+    };
     format!(
         "You are an EPHEMERAL fleet `observer`. Board IDENTITY: you act as the single stable board agent id \
          `observer`. FIRST call register_agent 'observer' (idempotent). Then author EVERY board write AS \
@@ -2849,11 +2899,10 @@ fn build_observer_kickoff(
          `observe-record`). Read your full role and method at {role_path} and follow it exactly. YOUR TARGET \
          WINDOW: agent '{target}', session '{session}', from line offset {since_offset}. Read it IN FULL \
          with: {fleet_bin} transcripts {target} --session {session} --since {session}:{since_offset} \
-         --overlap 40 . Lean HARD on kb_search; dedup against OPEN proposals by author `observer` in board \
-         project #28 (fleet-self-improve); file only above-floor, evidence-cited, deduped proposals per that \
-         project's template (the Target field + agent·session·turn evidence say WHICH agent it is about). \
-         As your VERY LAST step — after emitting your report/proposal(s) or an explicit no-op report — \
-         CONFIRM the observation so the watermark advances and this span is not re-observed: run \
+         --overlap 40 . Lean HARD on kb_search. {filing} The Target field + agent·session·turn evidence say \
+         WHICH agent each proposal is about. As your VERY LAST step — after filing your proposal(s)/close \
+         above or an explicit no-op report — CONFIRM the observation so the watermark advances and this span \
+         is not re-observed: run \
          `{fleet_bin} observe-record {target} --session {session} --offset <final-line-count-you-read-through>`. \
          Then exit. If you crash or stop before observe-record, the span stays unobserved and re-fires — \
          which is correct; never observe-record without having emitted."
@@ -2890,11 +2939,21 @@ fn spawn_observer(
         .and_then(|p| p.ancestors().nth(3))
         .map(|repo| repo.join("loops/observer.md").to_string_lossy().into_owned())
         .unwrap_or_else(|| "loops/observer.md".to_string());
-    let kickoff = build_observer_kickoff(target, obs_session, since_offset, &role_path, &fleet_bin);
+    // Slice A (#290): pass None — the observation-task enqueue (create the parent task, thread its id here so
+    // the observer files proposals as its children + closes it) turns on once the board POST /tasks contract
+    // is confirmed. The kickoff already carries the child-filing + close contract for that flip.
+    let kickoff = build_observer_kickoff(target, obs_session, since_offset, &role_path, &fleet_bin, None);
     // A per-target tmux window (local only — the BOARD identity stays `observer`), so several observations
     // can run at once without a name clash.
     let window = format!("obs-{}", target.replace(['/', ':', '.'], "-"));
     if dry_run {
+        // Surface the observation task this window WOULD enqueue (#290), so the dry-run shows the reactive
+        // pipeline's exact shape before --apply turns the live enqueue on.
+        let spec = observation_task_spec(target, obs_session, since_offset);
+        println!(
+            "   would-create observation task in project #{}: \"{}\"\n     body: {}",
+            spec.project_id, spec.title, spec.body
+        );
         return format!("would-spawn({window}←{obs_session}:{since_offset})");
     }
     if let Err(e) = std::fs::create_dir_all(&workdir) {
@@ -3711,6 +3770,43 @@ mod tests {
     }
 
     #[test]
+    fn observation_task_spec_names_the_target_and_window_in_project_28() {
+        let s = observation_task_spec("v-example", "sess-abc", 1200);
+        assert_eq!(s.project_id, SELF_IMPROVE_PROJECT);
+        assert_eq!(s.title, "observe v-example — sess-abc:1200");
+        assert!(s.body.contains("v-example"), "body names the target");
+        assert!(s.body.contains("sess-abc"), "body names the session");
+        assert!(s.body.contains("1200"), "body names the offset");
+        assert!(s.body.contains("CHILD proposal task"), "body states the child-filing contract");
+        assert!(s.body.contains("Close this task"), "body states the close-on-done contract");
+    }
+
+    #[test]
+    fn observer_kickoff_drives_from_the_observation_task_when_given_one() {
+        let with = build_observer_kickoff("v-t", "sess-9", 42, "loops/observer.md", "/abs/fleet", Some(207));
+        // The observation-task variant carries the child-filing + close-the-parent contract.
+        assert!(with.contains("OBSERVATION TASK #207"), "names the observation task");
+        assert!(with.contains("parent_id=207"), "proposals are children of the observation task");
+        assert!(with.contains("update_task 207"), "closes the observation task");
+        assert!(with.contains("status=\"done\""), "close = mark done");
+
+        let without = build_observer_kickoff("v-t", "sess-9", 42, "loops/observer.md", "/abs/fleet", None);
+        // The rollout-compat variant files standalone proposals — no parent linkage, no task close. ("update_task"
+        // alone appears in the shared identity preamble; the CLOSE contract is `status="done"` on the task.)
+        assert!(!without.contains("parent_id="), "no child linkage without an observation task");
+        assert!(!without.contains("OBSERVATION TASK #"), "not driven by an observation task");
+        assert!(!without.contains("status=\"done\""), "no task close without an observation task");
+        assert!(without.contains("above-floor"), "still files curated proposals");
+
+        // Both variants keep the invariant boot + confirm contract.
+        for k in [&with, &without] {
+            assert!(k.contains("register_agent 'observer'"), "binds the observer identity");
+            assert!(k.contains("observe-record v-t --session sess-9"), "confirms via observe-record last");
+            assert!(k.contains("/abs/fleet"), "uses this binary's absolute path");
+        }
+    }
+
+    #[test]
     fn parse_workspace_kind_reads_setup_script_and_config_hints() {
         let rec = serde_json::json!({
             "name": "example-env",
@@ -4428,7 +4524,7 @@ mod tests {
 
     #[test]
     fn build_observer_kickoff_carries_identity_window_and_completion_command() {
-        let k = build_observer_kickoff("v-x", "sess-9", 1200, "/repo/loops/observer.md", "/repo/target/release/fleet");
+        let k = build_observer_kickoff("v-x", "sess-9", 1200, "/repo/loops/observer.md", "/repo/target/release/fleet", None);
         // Ephemeral + single stable board identity (one-shot; author as `observer`).
         assert!(k.contains("EPHEMERAL"));
         assert!(k.contains("ONE observation") && k.contains("do NOT start a /loop"), "one-shot, not looping");
