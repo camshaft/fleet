@@ -66,6 +66,33 @@ state lives on the board now. What remains for `fleet` to own is exactly the set
   because they heartbeat to the file hub, not the board) — so the acting side of the watchdog is meaningful
   as agents migrate onto the `fleet spin-up` path, and until then it must not treat a legacy agent's stale
   board stamp as dead. Still to land: the acting side (re-arm/reissue/escalate), host-health, the adapter.
+  **Metadata write landed** (PR #7): `fleet set-meta <agent> --repo owner/name@branch [--interval]` merges
+  launch-shaping metadata into an agent's board record via `PATCH /agents/<id>` (key-level merge) — the
+  migration primitive that declares an agent's repos/interval so `fleet spin-up` can materialize it. This
+  unblocks agents whose deployed board client predates `update_agent`.
+
+  **P2 event-driven notification wake — AGREED DESIGN (co-designed with v-task-board, seq-1335/1336):**
+  the operator wants board-backed agents to react to events, not poll, and to wake on a specific prompt
+  (`[notification] task #<id>` / `[notification] message #<id>`) rather than a bare "continue". The board
+  ALREADY provides the push half: `emit()` fires a best-effort HTTP POST to each agent's registered
+  `webhook_url` for every inbox event, carrying `recipient`, `type`, `task_id`, `channel_id`, `event_seq`,
+  `data`, `created_at`. Division of labor (agreed): **the board emits events; the fleet owns the tmux
+  injector** (the only side with tmux access). Concretely, the fleet stands up ONE notifier:
+  - a single long-running HTTP endpoint (`fleet notify` / a notifier daemon) registered as each
+    board-backed agent's `webhook_url` (set via `set-meta`-style PATCH of the top-level `webhook_url`);
+  - on each POST it demuxes by the payload's `recipient` and `tmux send-keys` injects the prompt into that
+    agent's window: `task.assigned` → `[notification] task #<task_id>`; `message.direct` → `[notification]
+    message #<event_seq>` (DMs have no separate message-id yet — `event_seq` is the stable monotonic id);
+  - fallback for a missed best-effort POST: poll `check_notifications(mark_read=false)` per agent, diffed by
+    `event_seq` (there is no per-agent SSE — only a board-wide resumable `GET /api/stream`).
+
+  **Adaptive interval (agreed):** the agent self-paces via a DYNAMIC `/loop` — tight (~60s) when it has
+  non-terminal assigned tasks or unread notifications, relaxed (~120s) when idle. "Pending work" = count of
+  `list_tasks(assignee=X)` in a non-terminal status + `check_notifications(mark_read=false)` unread count
+  ("owns a project" is charter-convention, not a board field, so it is NOT a signal). `v-task-board` already
+  re-armed to 60s-busy / 120s-idle as the reference. The fleet seeds the short base + the self-pacing rule
+  in the spin-up kickoff. Still to land: the notifier daemon + the adaptive-base kickoff, trialled on
+  `v-task-board` first.
 - **P3** — retire `registry.json` and deprecate the cadenza-embedded fleet once parity is proven.
 
 The 2026-09-05 architecture below is retained for history; treat the board-offloaded scope above as the
