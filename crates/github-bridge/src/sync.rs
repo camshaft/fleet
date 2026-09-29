@@ -14,18 +14,18 @@
 //! readers see WHO wrote it, not the bridge. A ghost (deleted) author has no login, so it stays unattributed
 //! (the bridge is the sole `author`) rather than fabricating an identity.
 //!
-//! Everything here is pure + unit-tested; the daemon feeds it what it read and executes what it returns
-//! (`board::create_task` + `register_issue_link`, `board::comment_task` + a `board_kind="comment"` link).
+//! Everything here is pure + unit-tested; the daemon feeds it what it read and executes what it returns via
+//! the idempotent `board::create_task` / `board::comment_task` (each carrying the `external_link`, board-core
+//! #270), so dedup is the board's job and this layer never tracks already-ingested state itself.
 
-use crate::board::{comment_ref, issue_ref, Event, IssueTaskLink, TaskReflect, LINK_SOURCE};
+use crate::board::{comment_ref, issue_ref, Event, TaskReflect, LINK_SOURCE};
 use crate::github::{github_external_author, Issue, IssueComment};
-use std::collections::HashSet;
 
-/// A mirrored board task to create from a GitHub issue (the daemon calls `board::create_task` then records
-/// the issue↔task link via `board::register_issue_link` using [`TaskCreate::issue_ref`]).
+/// A mirrored board task to create from a GitHub issue (the daemon calls the idempotent `board::create_task`
+/// passing [`TaskCreate::issue_ref`] as the `external_link`, so the board de-dupes + links atomically).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCreate {
-    /// The durable issue↔task link key (`owner/repo#number`).
+    /// The idempotency/link key (`owner/repo#number`) passed as the create's `external_link`.
     pub issue_ref: String,
     /// The GitHub issue number (for logging / the back-reference).
     pub issue_number: i64,
@@ -85,19 +85,14 @@ fn attribution(login: &str) -> Option<String> {
 /// Plan the board tasks to create from a batch of GitHub issues.
 ///
 /// - Pull requests are skipped (the issues endpoint returns them; they are not board tasks).
-/// - An issue whose [`issue_ref`] is already in `existing_links` is skipped (idempotent — the task exists).
+/// - Every remaining (non-PR) issue becomes a [`TaskCreate`]; de-duplication against already-ingested issues
+///   is the BOARD's job now (`board::create_task` is idempotent on the issue link, board-core #270), so this
+///   planner no longer needs the existing links — a `created:false` response is the "already there" signal.
 /// - Order is preserved so the daemon creates oldest-updated first (matching the `?sort=updated&asc` poll).
-///
-/// Pure: `existing_links` is what `board::list_issue_links` returned.
-pub fn plan_issue_ingest(issues: &[Issue], repo: &str, existing_links: &[IssueTaskLink]) -> IssueIngestPlan {
-    let linked: HashSet<&str> = existing_links.iter().map(|l| l.issue_ref.as_str()).collect();
+pub fn plan_issue_ingest(issues: &[Issue], repo: &str) -> IssueIngestPlan {
     let mut creates = Vec::new();
     for issue in issues {
         if issue.is_pull_request {
-            continue;
-        }
-        let iref = issue_ref(repo, issue.number);
-        if linked.contains(iref.as_str()) {
             continue;
         }
         creates.push(TaskCreate {
@@ -105,7 +100,7 @@ pub fn plan_issue_ingest(issues: &[Issue], repo: &str, existing_links: &[IssueTa
             description: render_task_description(repo, issue),
             external_author: attribution(&issue.author),
             issue_number: issue.number,
-            issue_ref: iref,
+            issue_ref: issue_ref(repo, issue.number),
         });
     }
     IssueIngestPlan { creates }
@@ -114,19 +109,19 @@ pub fn plan_issue_ingest(issues: &[Issue], repo: &str, existing_links: &[IssueTa
 /// Plan the attributed board comments to post from a batch of an issue's GitHub comments.
 ///
 /// - A comment authored by the bridge's own GitHub account (`self_login`) is skipped — loop-safety, so a
-///   comment the bridge reflected OUT to GitHub isn't re-ingested back IN. (The board side is separately
-///   loop-safe via the bridge's `author` ∉ `outbound_authors`; this guards the GitHub side.)
-/// - A comment whose [`comment_ref`] is already in `already_synced` is skipped (idempotent).
+///   comment the bridge reflected OUT to GitHub isn't re-ingested back IN as a *new* board comment. (The
+///   board side is separately loop-safe via the bridge's `author` ∉ `outbound_authors`; this guards the
+///   GitHub side, which link-dedup alone can't — a reflected comment is a genuinely new GitHub comment id.)
+/// - De-duplication of already-synced comments is the BOARD's job (`board::comment_task` is idempotent on the
+///   comment link, board-core #270 — a `created:false` response means "already synced").
 /// - Order is preserved (oldest-updated first).
 ///
-/// Pure: `already_synced` is the set of comment refs the board already has (from its `board_kind="comment"`
-/// links); `self_login` is the bridge's GitHub login (`None` when unknown — then nothing is filtered as self).
+/// Pure: `self_login` is the bridge's GitHub login (`None` when unknown — then nothing is filtered as self).
 pub fn plan_comment_ingest(
     comments: &[IssueComment],
     repo: &str,
     board_task_id: i64,
     self_login: Option<&str>,
-    already_synced: &HashSet<String>,
 ) -> CommentIngestPlan {
     let mut posts = Vec::new();
     for c in comments {
@@ -136,15 +131,11 @@ pub fn plan_comment_ingest(
         {
             continue; // loop-safety: don't re-ingest our own reflected comment
         }
-        let cref = comment_ref(repo, c.id);
-        if already_synced.contains(&cref) {
-            continue;
-        }
         posts.push(CommentPost {
             board_task_id,
             body: c.body.clone(),
             external_author: attribution(&c.author),
-            comment_ref: cref,
+            comment_ref: comment_ref(repo, c.id),
         });
     }
     CommentIngestPlan { posts }
@@ -236,16 +227,12 @@ mod tests {
         }
     }
 
-    fn link(repo: &str, number: i64, task: i64) -> IssueTaskLink {
-        IssueTaskLink { board_task_id: task, issue_ref: issue_ref(repo, number) }
-    }
-
-    // ── plan_issue_ingest ──────────────────────────────────────────────────────────────────────────
+    // ── plan_issue_ingest (dedup is now board-side, #270 — planner emits a create per non-PR issue) ──
 
     #[test]
-    fn ingest_creates_a_task_per_new_issue_attributed() {
+    fn ingest_creates_a_task_per_issue_attributed() {
         let issues = [issue(42, "Fix widget", "octocat"), issue(43, "Add gizmo", "hubot")];
-        let plan = plan_issue_ingest(&issues, "o/r", &[]);
+        let plan = plan_issue_ingest(&issues, "o/r");
         assert_eq!(plan.creates.len(), 2);
         assert_eq!(plan.creates[0].issue_ref, "o/r#42");
         assert_eq!(plan.creates[0].issue_number, 42);
@@ -260,30 +247,14 @@ mod tests {
     fn ingest_skips_pull_requests() {
         let mut pr = issue(7, "a PR", "dev");
         pr.is_pull_request = true;
-        let plan = plan_issue_ingest(&[pr, issue(8, "real", "dev")], "o/r", &[]);
+        let plan = plan_issue_ingest(&[pr, issue(8, "real", "dev")], "o/r");
         assert_eq!(plan.creates.len(), 1, "only the real issue is mirrored");
         assert_eq!(plan.creates[0].issue_number, 8);
     }
 
     #[test]
-    fn ingest_skips_already_linked_issues_idempotent() {
-        // #42 already has a task; only #43 is new.
-        let existing = [link("o/r", 42, 100)];
-        let plan = plan_issue_ingest(&[issue(42, "old", "a"), issue(43, "new", "b")], "o/r", &existing);
-        assert_eq!(plan.creates.len(), 1);
-        assert_eq!(plan.creates[0].issue_ref, "o/r#43");
-    }
-
-    #[test]
-    fn ingest_re_poll_of_only_known_issues_is_a_noop() {
-        let existing = [link("o/r", 42, 100)];
-        let plan = plan_issue_ingest(&[issue(42, "old", "a")], "o/r", &existing);
-        assert!(plan.creates.is_empty(), "nothing new to create");
-    }
-
-    #[test]
     fn ingest_ghost_author_is_unattributed() {
-        let plan = plan_issue_ingest(&[issue(9, "ghosted", "")], "o/r", &[]);
+        let plan = plan_issue_ingest(&[issue(9, "ghosted", "")], "o/r");
         assert_eq!(plan.creates[0].external_author, None, "no fabricated identity for a ghost");
     }
 
@@ -306,9 +277,9 @@ mod tests {
     // ── plan_comment_ingest ──────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn comment_ingest_posts_attributed_new_comments() {
+    fn comment_ingest_posts_attributed_comments() {
         let comments = [comment(1, "first", "octocat"), comment(2, "second", "hubot")];
-        let plan = plan_comment_ingest(&comments, "o/r", 100, Some("fleet-bot"), &HashSet::new());
+        let plan = plan_comment_ingest(&comments, "o/r", 100, Some("fleet-bot"));
         assert_eq!(plan.posts.len(), 2);
         assert_eq!(plan.posts[0].board_task_id, 100);
         assert_eq!(plan.posts[0].body, "first");
@@ -320,26 +291,17 @@ mod tests {
     #[test]
     fn comment_ingest_skips_the_bridges_own_comments_loop_safety() {
         // A comment authored by our own GitHub account is a reflected-OUT comment coming back — skip it.
+        // (Board link-dedup can't catch this: it's a genuinely new GitHub comment id.)
         let comments = [comment(1, "reflected", "fleet-bot"), comment(2, "human", "octocat")];
-        let plan = plan_comment_ingest(&comments, "o/r", 100, Some("fleet-bot"), &HashSet::new());
+        let plan = plan_comment_ingest(&comments, "o/r", 100, Some("fleet-bot"));
         assert_eq!(plan.posts.len(), 1, "own comment filtered");
         assert_eq!(plan.posts[0].external_author.as_deref(), Some("github:octocat"));
     }
 
     #[test]
-    fn comment_ingest_skips_already_synced() {
-        let already: HashSet<String> = [comment_ref("o/r", 1)].into_iter().collect();
-        let comments = [comment(1, "dup", "octocat"), comment(2, "new", "octocat")];
-        let plan = plan_comment_ingest(&comments, "o/r", 100, None, &already);
-        assert_eq!(plan.posts.len(), 1);
-        assert_eq!(plan.posts[0].comment_ref, "o/r#c2");
-    }
-
-    #[test]
     fn comment_ingest_none_self_login_filters_nothing_as_self() {
-        // With no known self login, don't drop anything as "self" (only dedup applies).
         let comments = [comment(1, "x", "anyone")];
-        let plan = plan_comment_ingest(&comments, "o/r", 100, None, &HashSet::new());
+        let plan = plan_comment_ingest(&comments, "o/r", 100, None);
         assert_eq!(plan.posts.len(), 1);
     }
 
@@ -347,7 +309,7 @@ mod tests {
     fn comment_ingest_ghost_author_is_unattributed_and_not_self_filtered() {
         // An empty-login (ghost) comment must not be mistaken for the bridge and must post unattributed.
         let comments = [comment(1, "ghost note", "")];
-        let plan = plan_comment_ingest(&comments, "o/r", 100, Some(""), &HashSet::new());
+        let plan = plan_comment_ingest(&comments, "o/r", 100, Some(""));
         assert_eq!(plan.posts.len(), 1, "empty author != self even when self_login is empty");
         assert_eq!(plan.posts[0].external_author, None);
     }
