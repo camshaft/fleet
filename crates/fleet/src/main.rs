@@ -1813,6 +1813,26 @@ fn window_is_working(session: &str, agent: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Unix mtime (whole seconds) of a file, or `None` if it's absent / unreadable. Used to age a file-hub
+/// heartbeat touch-file (`<hub>/.claude/fleet/heartbeat/<name>`).
+fn file_mtime_unix(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Count an agent's UNDRAINED file-hub inbox messages: the file entries under `<hub>/inbox/<name>` (the
+/// `processed/` archive subdir is a directory, so it's excluded). 0 when the inbox is absent.
+fn inbox_pending_count(fleet: &Fleet, name: &str) -> usize {
+    std::fs::read_dir(fleet.inbox(name))
+        .map(|rd| rd.flatten().filter(|e| e.path().is_file()).count())
+        .unwrap_or(0)
+}
+
 /// The wake injected into a re-arm candidate's window by `fleet watchdog --rearm`. It never reaps or
 /// restarts (the operator banned auto-reap) — it nudges the agent to run a tick, which is exactly what a
 /// human was doing by hand for stalled loops. A benign prompt: worst case the agent no-ops one tick.
@@ -1910,6 +1930,90 @@ fn watchdog(stale_only: bool, rearm: bool) {
     } else {
         println!(
             "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval); pass --rearm to wake them"
+        );
+    }
+
+    // FILE-HUB agents are not on the board (no board event delivery), so the event-wake path never reaches
+    // them — the poll watchdog is their only liveness. Scan the file-hub registry too (no-op when no hub is
+    // configured / no active file-hub agents, i.e. a board-only host).
+    watchdog_file_hub(stale_only, rearm);
+}
+
+/// Watchdog scan of the FILE-HUB registry (the agents not yet migrated board-native). Same signals adapted
+/// to the file hub: heartbeat age = the `heartbeat/<name>` touch-file mtime vs the agent's interval;
+/// "pending work" = undrained inbox messages. Same pane-fenced, wake-only re-arm. No-op (silent) when the
+/// hub resolves to no registry or has no active agents, so a board-only host prints nothing extra. Requires
+/// `config.hub` to point at the file hub for anything to scan.
+fn watchdog_file_hub(stale_only: bool, rearm: bool) {
+    let fleet = Fleet::resolve();
+    let reg = fleet.load();
+    let active: Vec<&Agent> = reg.agents.iter().filter(|a| a.status == "active").collect();
+    if active.is_empty() {
+        return;
+    }
+    let session = board_session();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("-- file-hub agents --");
+    println!(
+        "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} heartbeat-age",
+        "agent", "interval", "age", "inbox", "verdict", "action"
+    );
+    let mut flagged = 0usize;
+    let mut rearmed = 0usize;
+    for a in &active {
+        let interval_secs = parse_interval_secs(&a.interval).unwrap_or(0);
+        let hb = file_mtime_unix(&fleet.root.join("heartbeat").join(&a.name));
+        let (verdict, age_str) = match hb {
+            Some(m) => {
+                let age = now.saturating_sub(m) as i64;
+                (watchdog_verdict(age, interval_secs), format!("{}m", age / 60))
+            }
+            None => ("?", "?".to_string()),
+        };
+        let pending = inbox_pending_count(&fleet, &a.name);
+        let retighten = is_retighten_candidate(verdict, pending, interval_secs);
+        if stale_only && !retighten {
+            continue;
+        }
+        let action = if retighten {
+            flagged += 1;
+            if rearm {
+                // Same HARD FENCE as the board path: never inject into a working pane.
+                if window_is_working(&session, &a.name) {
+                    "working-skip"
+                } else {
+                    match notify::tmux_inject(&session, &a.name, WATCHDOG_REARM_WAKE) {
+                        Ok(()) => {
+                            rearmed += 1;
+                            "re-armed"
+                        }
+                        Err(_) => "no-window",
+                    }
+                }
+            } else {
+                "candidate"
+            }
+        } else {
+            "ok"
+        };
+        let iv = if a.interval.is_empty() { "?" } else { &a.interval };
+        println!(
+            "{:<28} {iv:<8} {age_str:<7} {pending:<5} {verdict:<8} {action:<12}",
+            a.name
+        );
+    }
+    if rearm {
+        println!(
+            "-- {} active file-hub agent(s); {flagged} candidate(s); {rearmed} re-armed",
+            active.len()
+        );
+    } else {
+        println!(
+            "-- {} active file-hub agent(s); {flagged} candidate(s); pass --rearm to wake them",
+            active.len()
         );
     }
 }
@@ -2078,6 +2182,18 @@ mod tests {
         assert!(pane_shows_working("(ctrl+b to run in background)"));
         // No prompt and no working affordance → not working (e.g. a dead/shell pane) — safe to wake.
         assert!(!pane_shows_working("bash-5.2$ "));
+    }
+
+    #[test]
+    fn inbox_pending_count_counts_files_not_the_processed_dir() {
+        let (base, fleet) = tmp_hub();
+        fleet.ensure_inbox("a1"); // creates inbox/a1/processed
+        assert_eq!(inbox_pending_count(&fleet, "a1"), 0, "empty inbox (processed dir excluded)");
+        std::fs::write(fleet.inbox("a1").join("0001-msg.json"), "{}").unwrap();
+        std::fs::write(fleet.inbox("a1").join("0002-msg.json"), "{}").unwrap();
+        assert_eq!(inbox_pending_count(&fleet, "a1"), 2, "two undrained messages; processed/ not counted");
+        assert_eq!(inbox_pending_count(&fleet, "nobody"), 0, "absent inbox → 0");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
