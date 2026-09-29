@@ -1,9 +1,15 @@
 # fleet-tunnel daemon config — copy, edit, and pass with `--config` (no env vars, mandate #159).
 
-# REQUIRED. The board websocket URL to dial.
-#   on-LAN hosts:  "ws://green-machine.lan:8079/tunnel/ws"        (no auth)
-#   off-LAN hosts: "wss://green-machine.camshaft.dev/tunnel/ws"   (set cf_client_* below)
-board_ws = "wss://green-machine.camshaft.dev/tunnel/ws"
+# REQUIRED. The board websocket URL to dial. The board is mounted under /board, so the WS
+# endpoint is /board/tunnel/ws (plain /tunnel/ws is the edge landing page — the upgrade fails there).
+#   off-LAN via local Caddy (recommended on a dev-dsk): "ws://127.0.0.1:8880/board/tunnel/ws"
+#       — a local Caddy proxy on :8880 injects the CF Access headers and forwards to green, so
+#         leave cf_client_* UNSET (Caddy does the auth).
+#   off-LAN direct to the public gateway:               "wss://green-machine.camshaft.dev/board/tunnel/ws"
+#       — set cf_client_* below (you present the CF Access service token yourself).
+#   on-LAN direct to the board:                         "ws://green-machine.lan:8079/tunnel/ws"
+#       — no auth, no /board prefix (that prefix is the external gateway mount, stripped before the board).
+board_ws = "ws://127.0.0.1:8880/board/tunnel/ws"
 
 # This host's id in the hello frame. Defaults to the system hostname if omitted.
 # host_id = "dev-desk"
@@ -28,7 +34,8 @@ agents = [
 # Optional per-host bearer sent in the hello frame.
 # token = ""
 
-# Cloudflare Access service token — REQUIRED for off-LAN hosts dialing the public gateway, omit for
-# the LAN path. Keep the real values out of git.
+# Cloudflare Access service token — set ONLY when dialing the public gateway DIRECTLY (off-LAN
+# without the local Caddy). Omit when using the local Caddy dial (it injects CF Access) or on the
+# LAN path. Keep the real values out of git.
 # cf_client_id = ""
 # cf_client_secret = ""
