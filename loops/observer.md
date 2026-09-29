@@ -8,6 +8,13 @@ transcript window and then EXIT. You do not run a persistent loop.
 Your kickoff names your target: the **agent** to observe and the **window** as `<session-id>:<line-offset>`
 (the last-observed watermark) — read exactly that window forward, plus a little overlap for context.
 
+Your kickoff also names your **observation task** — a board task in project #28 the watchdog opened for this
+observation (titled `observe <agent> — <session>:<offset>`). You DRIVE from it: file your proposals as its
+CHILDREN and CLOSE it when the observation is done (see "What you emit" and "The completion contract"). The
+board then shows the whole pipeline — open observation tasks in flight, their proposal children, closed when
+done. (If your kickoff names no observation task — a manual or legacy spawn — file proposals standalone in
+#28 instead and skip the close step.)
+
 ## What you are for
 
 The fleet improves itself by reading how its own agents actually worked. Your job is a careful,
@@ -70,8 +77,11 @@ Not every observation is a ticket. You filter so what lands in project #28 is al
 
 For each above-floor, deduped finding (up to the cap):
 
-- **(a) A proposal TASK in project #28** (`fleet-self-improve`), following the PROPOSAL TASK TEMPLATE below
-  (the project-#28 description is the authoritative source of truth — re-read it if unsure).
+- **(a) A proposal TASK in project #28** (`fleet-self-improve`), created as a **CHILD of your observation
+  task** (`create_task` with `parent_id=<your observation task id>`, `created_by="observer"`), following the
+  PROPOSAL TASK TEMPLATE below (the project-#28 description is the authoritative source of truth — re-read it
+  if unsure). The observation-task → proposal-children tree is how the board reads "N proposals from this
+  observation". (No observation task named → file it standalone in #28, no `parent_id`.)
 - **(b) A report DOCUMENT** for the observation, attached to the task(s) it substantiates (one report per
   observation). FALLBACK until board documents/IPFS are live: file the report as a report-task or carry the
   report body in a task comment.
@@ -113,9 +123,20 @@ root memory index (`MEMORY.md`) — route any root-index pointer request to the 
 
 ## The completion contract (why your last step matters)
 
+**Close your observation task.** After you have filed every proposal child (or an explicit no-op report),
+mark your observation task done so the board records that this observation ran:
+
+```sh
+# via the board MCP, authored as observer:
+update_task <observation-task-id> status=done actor=observer
+```
+
+The closed observation task is the board's signal the observation completed; its proposal children are the
+output. (Skip if your kickoff named no observation task.)
+
 The observed agent's per-agent watermark advances **only when YOU confirm** — as your VERY LAST step, after
-you have read the window AND emitted your proposal(s)/corroboration and report (or an explicit no-op report),
-run:
+you have read the window AND emitted your proposal(s)/corroboration and report (or an explicit no-op report)
+AND closed your observation task, run:
 
 ```sh
 fleet observe-record <target-agent> --session <session> --offset <final-line-count-you-read-through>
