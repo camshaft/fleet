@@ -1914,14 +1914,39 @@ fn rearm_candidate(
 /// and the FILE-HUB scan still runs. That resilience is the point — a flaky board is exactly when file-hub
 /// agents (which have NO board delivery) most need the poll, so their liveness must not hinge on it.
 fn watchdog(stale_only: bool, rearm: bool) {
-    match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
-        Ok((board, agents)) => watchdog_board(&board, &agents, stale_only, rearm),
-        Err(e) => eprintln!("fleet watchdog: board unavailable ({e}); scanning the file-hub only"),
-    }
+    // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
+    // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
+    // is unreachable — the file-hub scan then covers everything as a best-effort outage fallback.
+    let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
+        Ok((board, agents)) => {
+            let native_ids = native_agent_ids(&agents);
+            watchdog_board(&board, &agents, stale_only, rearm);
+            native_ids
+        }
+        Err(e) => {
+            eprintln!("fleet watchdog: board unavailable ({e}); scanning the file-hub only");
+            std::collections::BTreeSet::new()
+        }
+    };
     // FILE-HUB agents are not on the board (no board event delivery), so the event-wake path never reaches
     // them — the poll watchdog is their only liveness. Scan the file-hub registry too (no-op when no hub is
     // configured / no active file-hub agents, i.e. a board-only host). Runs regardless of board health above.
-    watchdog_file_hub(stale_only, rearm);
+    watchdog_file_hub(stale_only, rearm, &native_ids);
+}
+
+/// The ids of every board-native agent (metadata.native == true) in a board roster. The file-hub scan uses
+/// this to skip agents already covered by the board scan. Pure — unit-tested.
+fn native_agent_ids(agents: &[serde_json::Value]) -> std::collections::BTreeSet<String> {
+    agents
+        .iter()
+        .filter(|a| {
+            a.get("metadata")
+                .and_then(|m| m.get("native"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(String::from))
+        .collect()
 }
 
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
@@ -2005,11 +2030,19 @@ fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only
 /// to the file hub: heartbeat age = the `heartbeat/<name>` touch-file mtime vs the agent's interval;
 /// "pending work" = undrained inbox messages. Same pane-fenced, wake-only re-arm. No-op (silent) when the
 /// hub resolves to no registry or has no active agents, so a board-only host prints nothing extra. Requires
-/// `config.hub` to point at the file hub for anything to scan.
-fn watchdog_file_hub(stale_only: bool, rearm: bool) {
+/// `config.hub` to point at the file hub for anything to scan. `native_ids` are board-native agents to SKIP:
+/// an agent that migrated board-native but still has an active file-hub row heartbeats to the board, not the
+/// file, so its file mtime is stale by design — the board scan already covers it, and scanning it here would
+/// false-flag it STALE (the v-slack-bridge report). The real cleanup is `fleet deregister`, but skipping is
+/// the robust guard.
+fn watchdog_file_hub(stale_only: bool, rearm: bool, native_ids: &std::collections::BTreeSet<String>) {
     let fleet = Fleet::resolve();
     let reg = fleet.load();
-    let active: Vec<&Agent> = reg.agents.iter().filter(|a| a.status == "active").collect();
+    let active: Vec<&Agent> = reg
+        .agents
+        .iter()
+        .filter(|a| a.status == "active" && !native_ids.contains(&a.name))
+        .collect();
     if active.is_empty() {
         return;
     }
@@ -2237,6 +2270,21 @@ mod tests {
         assert!(pane_shows_working("(ctrl+b to run in background)"));
         // No prompt and no working affordance → not working (e.g. a dead/shell pane) — safe to wake.
         assert!(!pane_shows_working("bash-5.2$ "));
+    }
+
+    #[test]
+    fn native_agent_ids_collects_only_native_true_rows() {
+        let agents = vec![
+            serde_json::json!({"id":"v-slack-bridge","metadata":{"native":true}}),
+            serde_json::json!({"id":"v-file-hub-only","metadata":{"native":false}}),
+            serde_json::json!({"id":"v-no-flag","metadata":{}}),
+            serde_json::json!({"id":"v-board-pm","metadata":{"native":true,"role":"pm"}}),
+            serde_json::json!({"metadata":{"native":true}}), // no id → dropped
+        ];
+        let ids = native_agent_ids(&agents);
+        assert!(ids.contains("v-slack-bridge") && ids.contains("v-board-pm"));
+        assert!(!ids.contains("v-file-hub-only") && !ids.contains("v-no-flag"));
+        assert_eq!(ids.len(), 2, "only native:true rows with an id");
     }
 
     #[test]
