@@ -6,22 +6,76 @@ use slack_bridge::board::BoardClient;
 use slack_bridge::config::Config;
 use slack_bridge::format::{render_outbound_reflect, render_outbound_reflect_plain};
 use slack_bridge::{
-    plan_inbound, plan_outbound, relay_plan, ChannelMap, Event, RelayPlan, SlackTokens,
+    plan_inbound, plan_outbound, relay_plan, ChannelLink, ChannelMap, Event, RelayPlan, SlackTokens,
     RELAY_QUEUE_WARN,
 };
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+/// The live channel map, shared across the outbound loop, the inbound listener, and the refresh task. A
+/// std `RwLock` is fine because a guard is only ever held across PURE `sync` planning, never across an
+/// `.await` (the network I/O happens after the guard is dropped).
+pub type SharedMap = Arc<RwLock<ChannelMap>>;
 
 /// How many firehose events to pull per poll.
 const POLL_LIMIT: usize = 100;
 /// The outbound poll cadence.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often to re-read the board-registered channel links (board-core #149 slice 2) so a link registered
+/// while the daemon is running — e.g. the #154 operator-DM wiring — is picked up WITHOUT a restart.
+const MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Fetch the board-registered channel links (best-effort) and merge with the static config
+/// `[[channel_map]]` into a [`ChannelMap`]. Board links are the dynamic source of truth; config links are
+/// applied AFTER so an explicit local override wins (`ChannelMap` is last-wins). A board read error is
+/// fail-soft — falls back to the config links alone. Blocking board I/O runs off the runtime.
+pub async fn fetch_channel_map(cfg: &Config) -> ChannelMap {
+    let board_api = cfg.board_api.clone();
+    let mut links: Vec<ChannelLink> =
+        match tokio::task::spawn_blocking(move || BoardClient::new(&board_api).list_channel_links())
+            .await
+        {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "could not read board channel links — using config only");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "channel-link fetch task join failed — using config only");
+                Vec::new()
+            }
+        };
+    links.extend(cfg.channel_map.clone());
+    ChannelMap::from_links(&links)
+}
+
+/// Periodically rebuild the shared channel map from the board (+ config) so a newly-registered link is
+/// honored without a restart. Runs forever; each refresh is fail-soft (a fetch error keeps the last map).
+pub async fn refresh_loop(cfg: Arc<Config>, map: SharedMap) {
+    loop {
+        tokio::time::sleep(MAP_REFRESH_INTERVAL).await;
+        let fresh = fetch_channel_map(&cfg).await;
+        let changed = map
+            .read()
+            .map(|cur| cur.len() != fresh.len())
+            .unwrap_or(true);
+        match map.write() {
+            Ok(mut w) => {
+                *w = fresh;
+                if changed {
+                    tracing::info!(channels = w.len(), "refreshed channel map from the board");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "channel map lock poisoned on refresh"),
+        }
+    }
+}
 
 fn hyper_client() -> Result<SlackHyperClient, BoxErr> {
     Ok(SlackClient::new(SlackClientHyperConnector::new()?))
@@ -81,10 +135,11 @@ async fn initialize_cursor_at_head(board_api: &str) -> i64 {
 
 /// Poll the firehose and reflect authorized `channel.outbound_reflect` posts to the mapped Slack channel,
 /// advancing a persisted cursor. Needs at least one channel link — without one there's nothing to mirror.
-pub async fn outbound_loop(cfg: Arc<Config>, tokens: SlackTokens, map: Arc<ChannelMap>) {
-    if map.is_empty() {
-        tracing::warn!("no channel_map links — outbound reflect disabled (inbound still works)");
-        return;
+pub async fn outbound_loop(cfg: Arc<Config>, tokens: SlackTokens, map: SharedMap) {
+    if map.read().map(|m| m.is_empty()).unwrap_or(true) {
+        // Not fatal / not an early exit: the map auto-refreshes, so a link registered later (e.g. the
+        // #154 operator-DM wiring) starts flowing without a restart. Until then posts are simply empty.
+        tracing::info!("channel map currently empty — outbound idle until a link is registered");
     }
     let client = match hyper_client() {
         Ok(c) => c,
@@ -118,6 +173,16 @@ pub async fn outbound_loop(cfg: Arc<Config>, tokens: SlackTokens, map: Arc<Chann
     }
 }
 
+/// Resolve the OUT posts for a batch under a short-lived read guard (dropped before any `.await`).
+fn plan_outbound_locked(
+    map: &SharedMap,
+    events: &[Event],
+    cursor: i64,
+) -> Result<(Vec<slack_bridge::OutboundPost>, i64), BoxErr> {
+    let guard = map.read().map_err(|_| "channel map lock poisoned")?;
+    Ok(plan_outbound(events, cursor, |cid| guard.board_to_slack(cid)))
+}
+
 /// Classify a Slack post error: CONTENT (the message itself is un-postable — an API error like
 /// `internal_error`/`msg_too_long`) vs TRANSIENT (transport/HTTP/rate-limit — retry in place). Only content
 /// failures advance a message toward degrade/quarantine; `ratelimited` is transient.
@@ -132,7 +197,7 @@ async fn outbound_tick(
     cfg: &Config,
     client: &SlackHyperClient,
     bot: &SlackApiToken,
-    map: &ChannelMap,
+    map: &SharedMap,
     cursor: &mut i64,
     failures: &mut HashMap<i64, u32>,
 ) -> Result<(), BoxErr> {
@@ -140,7 +205,7 @@ async fn outbound_tick(
     if events.is_empty() {
         return Ok(());
     }
-    let (posts, batch_max) = plan_outbound(&events, *cursor, |cid| map.board_to_slack(cid));
+    let (posts, batch_max) = plan_outbound_locked(map, &events, *cursor)?;
     if posts.len() >= RELAY_QUEUE_WARN {
         tracing::warn!(depth = posts.len(), "outbound reflect backlog this batch");
     }
@@ -206,7 +271,7 @@ async fn outbound_tick(
 pub async fn run_socket_mode(
     cfg: Arc<Config>,
     tokens: SlackTokens,
-    map: Arc<ChannelMap>,
+    map: SharedMap,
 ) -> Result<(), BoxErr> {
     let client = Arc::new(hyper_client()?);
     let callbacks = SlackSocketModeListenerCallbacks::new().with_push_events(on_push_event);
@@ -230,7 +295,7 @@ pub async fn run_socket_mode(
 #[derive(Clone)]
 struct BridgeState {
     cfg: Arc<Config>,
-    map: Arc<ChannelMap>,
+    map: SharedMap,
 }
 
 async fn on_push_event(
@@ -276,10 +341,18 @@ async fn handle_message(state: &BridgeState, msg: SlackMessageEvent) {
 
     let cfg = &state.cfg;
     // reply_to threading (Slack thread_ts → board parent seq) needs the thread link from board-core #151
-    // slice 2; until then an inbound reply posts top-level (reply_to = None).
-    let Some(plan) = plan_inbound(&channel, &user, text, None, &cfg.bridge_agent, |ch| {
-        state.map.slack_to_board(ch)
-    }) else {
+    // slice 2; until then an inbound reply posts top-level (reply_to = None). Resolve under a short-lived
+    // read guard, dropped before the board post `.await`.
+    let planned = {
+        let Ok(guard) = state.map.read() else {
+            tracing::warn!("inbound: channel map lock poisoned — dropping message");
+            return;
+        };
+        plan_inbound(&channel, &user, text, None, &cfg.bridge_agent, |ch| {
+            guard.slack_to_board(ch)
+        })
+    };
+    let Some(plan) = planned else {
         tracing::debug!(%channel, "inbound: unmapped Slack channel — ignored");
         return;
     };
