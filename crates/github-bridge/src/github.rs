@@ -191,17 +191,41 @@ impl GithubClient {
     /// GET a path (already query-formed), returning the raw response body. Sends the auth + versioning +
     /// User-Agent headers GitHub requires (a missing User-Agent is a hard 403).
     fn get(&self, path: &str) -> Result<String, String> {
-        let url = format!("{}{}", self.api_base, path);
-        let resp = self
-            .agent
-            .get(&url)
+        self.agent
+            .get(&format!("{}{}", self.api_base, path))
             .set("authorization", &format!("Bearer {}", self.token))
             .set("accept", "application/vnd.github+json")
             .set("x-github-api-version", API_VERSION)
             .set("user-agent", "github-bridge")
             .call()
-            .map_err(|e| format!("github GET {path} failed: {e}"))?;
-        resp.into_string().map_err(|e| format!("github GET {path} read failed: {e}"))
+            .map_err(|e| format!("github GET {path} failed: {e}"))?
+            .into_string()
+            .map_err(|e| format!("github GET {path} read failed: {e}"))
+    }
+
+    /// Post a comment on an issue (`POST /repos/{repo}/issues/{number}/comments`) — the OUT direction, where
+    /// `repo` = `owner/name`. Body is the rendered reflect text. Returns the new comment's id (best-effort;
+    /// `0` if the response omits it). Errors on a non-2xx (the daemon then leaves its cursor unadvanced so
+    /// the reflect retries).
+    pub fn post_issue_comment(&self, repo: &str, number: i64, body: &str) -> Result<i64, String> {
+        let url = format!("{}/repos/{repo}/issues/{number}/comments", self.api_base);
+        let payload = serde_json::json!({ "body": body }).to_string();
+        let raw = self
+            .agent
+            .post(&url)
+            .set("authorization", &format!("Bearer {}", self.token))
+            .set("accept", "application/vnd.github+json")
+            .set("x-github-api-version", API_VERSION)
+            .set("user-agent", "github-bridge")
+            .set("content-type", "application/json")
+            .send_string(&payload)
+            .map_err(|e| format!("github POST issue {repo}#{number} comment failed: {e}"))?
+            .into_string()
+            .map_err(|e| format!("github POST comment read failed: {e}"))?;
+        Ok(serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("id").and_then(Value::as_i64))
+            .unwrap_or(0))
     }
 
     /// One page of a repo's issues (`repo` = `owner/name`), oldest-updated first so a cursor advances
@@ -217,6 +241,20 @@ impl GithubClient {
             path.push_str(s);
         }
         parse_issues(&self.get(&path)?)
+    }
+
+    /// The authenticated account's own login (`GET /user` → `login`). The daemon fetches this once at
+    /// startup so `sync::plan_comment_ingest` can skip comments the bridge itself posted (loop-safety: an
+    /// OUT-reflected comment must not re-ingest). Best-effort at the call site — a GitHub App installation
+    /// token may 403 on `/user`; the daemon then runs with no self-login (dedup still guards re-posts).
+    pub fn viewer_login(&self) -> Result<String, String> {
+        let raw = self.get("/user")?;
+        let v: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("github GET /user: not JSON: {e}"))?;
+        v.get("login")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("github GET /user: no login in response {v}"))
     }
 
     /// One page of an issue's comments, oldest-updated first. `since` filters incrementally. `page` 1-based.

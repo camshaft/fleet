@@ -24,8 +24,12 @@
 //!   (loop-safe, dedup'd). OUT: authorized `task.outbound_reflect` firehose events (board-core #264) →
 //!   GitHub issue comments to post (source-filtered, attribution-rendered). The daemon feeds it what it read
 //!   and executes what it returns.
+//! - [`state`] — the daemon's persisted cursors (board firehose seq for OUT, GitHub `?since=` for IN),
+//!   fail-soft load. Unit-tested here.
 //!
-//! Later slice adds: the daemon binary that wires the poll loop (GitHub poll + board firehose) together.
+//! The daemon binary (`src/main.rs` + `src/runner.rs`, behind the `daemon` feature) is a thin BLOCKING poll
+//! loop that wires these together — GitHub is plain REST polling, so no async runtime — and is exercised
+//! live, not unit-tested; the gate is this lib's `cargo test`.
 //!
 //! Kept generic on purpose: GitHub-specifics live in this adapter; the Slack adapter (#152) drops in over the
 //! same board core, so any concern shared by both belongs on the board, not duplicated here.
@@ -33,6 +37,7 @@
 pub mod board;
 pub mod config;
 pub mod github;
+pub mod state;
 pub mod sync;
 
 pub use board::{
@@ -44,6 +49,7 @@ pub use config::{Config, DEFAULT_CONFIG_FILENAME};
 pub use github::{
     github_external_author, parse_issue_comments, parse_issues, GithubClient, Issue, IssueComment, PER_PAGE,
 };
+pub use state::State;
 pub use sync::{
     plan_comment_ingest, plan_issue_ingest, plan_outbound, render_outbound_github_comment,
     render_task_description, CommentIngestPlan, CommentPost, IssueIngestPlan, OutboundComment, TaskCreate,
