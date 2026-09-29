@@ -17,18 +17,25 @@
 //!   (`GET /events`, board-core #150), create/comment mirrored tasks with GitHub-author attribution
 //!   (board-core #149), and read/register the durable GitHub-issue↔board-task links (board-core #149 slice 2
 //!   / #151). Pure parsers + body builders unit-tested without a network.
+//! - [`github`] — the GitHub REST transport: the issue/comment domain model, pure parsers (unit-tested
+//!   against captured GitHub JSON), and a thin authenticated client for polling a repo's issues + comments.
 //!
-//! Later slices add: the GitHub REST transport (issue + comment polling), issue→task ingest, attributed
-//! comment sync, and OUT-reflect-under-policy — plus the daemon binary that wires the poll loop together.
+//! Later slices add: issue→task ingest + attributed comment sync (a pure planner tying [`board`] + [`github`]
+//! together) and OUT-reflect-under-policy (board-core #264's `task.outbound_reflect`) — plus the daemon
+//! binary that wires the poll loop together.
 //!
 //! Kept generic on purpose: GitHub-specifics live in this adapter; the Slack adapter (#152) drops in over the
 //! same board core, so any concern shared by both belongs on the board, not duplicated here.
 
 pub mod board;
 pub mod config;
+pub mod github;
 
 pub use board::{
     build_comment_body, build_identity_body, build_task_body, issue_ref, parse_events, parse_issue_links,
     BoardClient, Event, IssueTaskLink, LINK_KIND_TASK, LINK_SOURCE, OUTBOUND_REFLECT,
 };
 pub use config::{Config, DEFAULT_CONFIG_FILENAME};
+pub use github::{
+    github_external_author, parse_issue_comments, parse_issues, GithubClient, Issue, IssueComment, PER_PAGE,
+};
