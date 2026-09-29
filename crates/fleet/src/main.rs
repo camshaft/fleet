@@ -1458,6 +1458,12 @@ enum Cmd {
         /// manual loop-reissue). Without this the watchdog is report-only.
         #[arg(long)]
         rearm: bool,
+        /// Also detect per-agent transcript-growth OBSERVATION candidates (#187): agents whose newest session
+        /// grew past the threshold (CDZ_OBSERVE_LINES, default 2000 lines) since last observed, plus stood-down
+        /// agents with a closing tail. Report-only — the ephemeral observer spawn lands with the observer role
+        /// (#188). Opt-in so the always-on re-arm sweep pays no transcript-read cost until the spawn is wired.
+        #[arg(long)]
+        observe: bool,
     },
     /// Write launch-shaping metadata onto an agent's board record — the migration primitive that makes an
     /// agent spin-up-ready. Merges (only the given keys change). Reports the patch by default; `--apply`
@@ -1566,7 +1572,11 @@ fn main() {
         Cmd::UpBoard { launch } => up_board(launch),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::Status { stale_only } => status(stale_only),
-        Cmd::Watchdog { stale_only, rearm } => watchdog(stale_only, rearm),
+        Cmd::Watchdog {
+            stale_only,
+            rearm,
+            observe,
+        } => watchdog(stale_only, rearm, observe),
         Cmd::SetMeta {
             agent,
             repos,
@@ -2132,6 +2142,114 @@ fn write_rearm_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+// ── observation triggers (#187, BUILD 2/5) ─────────────────────────────────────────────────────────
+// The watchdog is also the SPAWNER of ephemeral per-agent observer sessions: it tracks each agent's
+// transcript growth against a per-agent watermark and, when the unobserved increment crosses a threshold
+// (the size trigger) or a stood-down agent has a closing tail (the mandatory spin-down trigger), an
+// observation of exactly that increment is due. This slice implements the DETECTION + watermark store,
+// report-only — the actual ephemeral spawn (and advancing the watermark past an observed span) lands with
+// the observer role (BUILD 3, #188), which flips `--observe` on in the always-on sweep.
+
+/// The default per-agent transcript-growth threshold in JSONL lines/records (the unit the `transcripts
+/// --since <sid:offset>` window uses). Conservative first cut — a long-running agent emits thousands of
+/// records, so this bounds each observation to a large single span; tune DOWN on evidence. `CDZ_OBSERVE_LINES`
+/// overrides it; `0` disables the size trigger (the spin-down trigger still fires). See [`observe_trigger`].
+const OBSERVE_LINES_DEFAULT: usize = 2000;
+
+/// A per-agent observation decision derived from the last-observed watermark and the current newest session.
+#[derive(Debug, PartialEq, Eq)]
+struct ObserveDecision {
+    /// Observe now: the size increment crossed threshold, OR a stood-down agent has an unobserved tail.
+    fire: bool,
+    /// The session to observe.
+    session: String,
+    /// The line offset to observe FROM (0 on a session rotation / first observation).
+    since_offset: usize,
+    /// The unobserved line increment (for the report + the next watermark).
+    increment: usize,
+}
+
+/// Decide whether an agent's transcript growth warrants one observation. `wm` is the last-observed watermark
+/// `(session, line_offset)`; `cur` is the current newest session `(session, line_count)`. On the SAME session
+/// the unobserved span is `cur_lines - wm_offset` starting at `wm_offset`; on a session ROTATION (or the first
+/// observation — an empty watermark session) the whole new session is unobserved, so observe from 0. Fires on
+/// the SIZE trigger (increment ≥ `threshold`, when `threshold > 0`) OR the mandatory SPIN-DOWN trigger (a
+/// `stood_down`/offline agent with ANY unobserved tail — capture the closing read before context is gone).
+/// Pure — unit-tested.
+fn observe_trigger(
+    wm: (&str, usize),
+    cur: (&str, usize),
+    threshold: usize,
+    stood_down: bool,
+) -> ObserveDecision {
+    let (wm_session, wm_offset) = wm;
+    let (cur_session, cur_lines) = cur;
+    let (since_offset, increment) = if wm_session == cur_session {
+        (wm_offset, cur_lines.saturating_sub(wm_offset))
+    } else {
+        (0, cur_lines)
+    };
+    let size_fire = threshold > 0 && increment >= threshold;
+    let spindown_fire = stood_down && increment > 0;
+    ObserveDecision {
+        fire: size_fire || spindown_fire,
+        session: cur_session.to_string(),
+        since_offset,
+        increment,
+    }
+}
+
+/// The per-agent observation watermark path: `<hub>/.claude/fleet/observer/<name>.watermark` (contents =
+/// `<session-id>:<line-offset>`, the `transcripts --since` form). Sibling of the re-arm cooldown store.
+fn observe_watermark_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("observer").join(format!("{name}.watermark"))
+}
+
+/// Read an agent's last-observed watermark `(session, line_offset)`; `("", 0)` when absent/unparseable — so
+/// the first crossing observes the newest session from its start.
+fn read_observe_watermark(fleet: &Fleet, name: &str) -> (String, usize) {
+    std::fs::read_to_string(observe_watermark_path(fleet, name))
+        .ok()
+        .map(|s| transcripts::parse_watermark(s.trim()))
+        .unwrap_or_default()
+}
+
+/// Cheap line count of a session JSONL (streamed, no per-line JSON parse) — the growth measure, matching
+/// [`transcripts::parse_jsonl`]'s line semantics. `0` on an unreadable file.
+fn session_line_count(path: &Path) -> usize {
+    use std::io::BufRead;
+    match std::fs::File::open(path) {
+        Ok(f) => std::io::BufReader::new(f).lines().count(),
+        Err(_) => 0,
+    }
+}
+
+/// Report-only observation check for one agent (#187 detection half): measure its newest session's growth
+/// against its watermark and return a candidate description when an observation should fire (size threshold
+/// crossed, or a stood-down agent has a closing tail). Does NOT spawn or advance the watermark — that lands
+/// with the observer role (BUILD 3, #188). `None` when the agent has no session or is below threshold.
+fn observe_candidate(fleet: &Fleet, agent: &str, stood_down: bool, threshold: usize) -> Option<String> {
+    let sessions = transcripts::locate_sessions(agent);
+    let newest = sessions.first()?;
+    let session = transcripts::session_id_of(newest);
+    let lines = session_line_count(newest);
+    let (wm_session, wm_offset) = read_observe_watermark(fleet, agent);
+    let d = observe_trigger(
+        (wm_session.as_str(), wm_offset),
+        (session.as_str(), lines),
+        threshold,
+        stood_down,
+    );
+    if !d.fire {
+        return None;
+    }
+    let why = if stood_down { "spin-down" } else { "size" };
+    Some(format!(
+        "{agent}[{}:{}+{} {why}]",
+        d.session, d.since_offset, d.increment
+    ))
+}
+
 /// The fenced, cooldown-limited re-arm of ONE candidate window, shared by the board and file-hub scans:
 /// skip if still on cooldown (`"cooldown"`), skip if the pane is actively working (`"working-skip"`, the hard
 /// fence), else inject the wake and stamp (`"re-armed"`); a missing window is `"no-window"`. Returns the action
@@ -2170,14 +2288,14 @@ fn rearm_candidate(
 /// A board that is unreachable does NOT abort the watchdog: the board dimension is skipped with a warning
 /// and the FILE-HUB scan still runs. That resilience is the point — a flaky board is exactly when file-hub
 /// agents (which have NO board delivery) most need the poll, so their liveness must not hinge on it.
-fn watchdog(stale_only: bool, rearm: bool) {
+fn watchdog(stale_only: bool, rearm: bool, observe: bool) {
     // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
     // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
     // is unreachable — the file-hub scan then covers everything as a best-effort outage fallback.
     let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm);
+            watchdog_board(&board, &agents, stale_only, rearm, observe);
             native_ids
         }
         Err(e) => {
@@ -2247,12 +2365,24 @@ fn native_agent_ids(agents: &[serde_json::Value]) -> std::collections::BTreeSet<
 
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
 /// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
-fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only: bool, rearm: bool) {
+fn watchdog_board(
+    board: &board::Board,
+    agents: &[serde_json::Value],
+    stale_only: bool,
+    rearm: bool,
+    observe: bool,
+) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
     let fleet = Fleet::resolve(); // stamp store (<hub>/.claude/fleet/watchdog/); shared with the file-hub scan
     let session = board_session();
     let host = this_host(); // host-affinity: this box only manages agents pinned here (or unpinned)
+    // Observation (#187): per-agent transcript-growth threshold (lines/records). Read once per sweep.
+    let observe_threshold = std::env::var("CDZ_OBSERVE_LINES")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(OBSERVE_LINES_DEFAULT);
+    let mut obs_candidates: Vec<String> = Vec::new();
     println!(
         "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
         "agent", "interval", "age", "open", "verdict", "action"
@@ -2295,6 +2425,12 @@ fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only
         // A deliberately stood-down agent (board presence `offline`) with a drained queue is not a stall —
         // don't re-arm it (else every at-rest board-native agent burns a tick per sweep).
         let stood_down = a.get("status").and_then(serde_json::Value::as_str) == Some("offline");
+        // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
+        // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
+        // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
+        if observe && let Some(cand) = observe_candidate(&fleet, id, stood_down, observe_threshold) {
+            obs_candidates.push(cand);
+        }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs, stood_down);
         if stale_only && !retighten {
             continue;
@@ -2328,6 +2464,19 @@ fn watchdog_board(board: &board::Board, agents: &[serde_json::Value], stale_only
         println!(
             "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval); pass --rearm to wake them"
         );
+    }
+    if observe {
+        if obs_candidates.is_empty() {
+            println!(
+                "-- observation: no agent over the {observe_threshold}-line growth threshold (report-only)"
+            );
+        } else {
+            println!(
+                "-- observation candidates ({}, report-only — ephemeral spawn lands with the observer role #188): {}",
+                obs_candidates.len(),
+                obs_candidates.join(", ")
+            );
+        }
     }
 }
 
@@ -3248,6 +3397,58 @@ mod tests {
         assert!(plan.to_launch.is_empty());
         assert!(plan.already_running.is_empty());
         assert!(plan.stood_down.is_empty());
+    }
+
+    #[test]
+    fn observe_size_trigger_fires_only_at_or_above_threshold_from_the_watermark() {
+        // same session, increment 1200 (2000 - 800) — below the 2000 threshold → no fire.
+        let d = observe_trigger(("s1", 800), ("s1", 2000), 2000, false);
+        assert!(!d.fire);
+        assert_eq!((d.since_offset, d.increment), (800, 1200));
+        // grown to 2800 → increment 2000 == threshold → fires, observing FROM the watermark offset.
+        let d = observe_trigger(("s1", 800), ("s1", 2800), 2000, false);
+        assert!(d.fire);
+        assert_eq!(d.session, "s1");
+        assert_eq!((d.since_offset, d.increment), (800, 2000));
+    }
+
+    #[test]
+    fn observe_session_rotation_observes_the_new_session_from_zero() {
+        // watermark on the old session; the newest session is a different id → whole new session is unobserved.
+        let d = observe_trigger(("old", 5000), ("new", 2500), 2000, false);
+        assert!(d.fire, "2500 >= 2000 threshold");
+        assert_eq!(d.session, "new");
+        assert_eq!((d.since_offset, d.increment), (0, 2500));
+        // first observation ever (empty watermark) is the same shape: observe from 0.
+        let d = observe_trigger(("", 0), ("s1", 100), 2000, false);
+        assert!(!d.fire, "100 < 2000");
+        assert_eq!((d.since_offset, d.increment), (0, 100));
+    }
+
+    #[test]
+    fn observe_spindown_trigger_fires_on_any_tail_even_below_threshold() {
+        // A stood-down (offline) agent with a small unobserved tail STILL fires (capture the closing read),
+        // even though 50 < 2000; a live agent with the same tail does not.
+        let stood = observe_trigger(("s1", 900), ("s1", 950), 2000, true);
+        assert!(stood.fire);
+        assert_eq!((stood.since_offset, stood.increment), (900, 50));
+        let live = observe_trigger(("s1", 900), ("s1", 950), 2000, false);
+        assert!(!live.fire);
+        // A stood-down agent with NOTHING new (already fully observed) does not re-fire.
+        let done = observe_trigger(("s1", 950), ("s1", 950), 2000, true);
+        assert!(!done.fire);
+        assert_eq!(done.increment, 0);
+    }
+
+    #[test]
+    fn observe_threshold_zero_disables_the_size_trigger_but_not_spindown() {
+        // threshold 0 = size trigger off: a huge live increment does not fire.
+        let live = observe_trigger(("s1", 0), ("s1", 100_000), 0, false);
+        assert!(!live.fire);
+        // but a stood-down agent still fires (the mandatory closing read is independent of threshold).
+        let stood = observe_trigger(("s1", 0), ("s1", 100_000), 0, true);
+        assert!(stood.fire);
+        assert_eq!(stood.increment, 100_000);
     }
 
     #[test]
