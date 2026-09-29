@@ -126,4 +126,6 @@ that never reaches it leaves the span UNOBSERVED and it re-fires on the next swe
 call `observe-record` without having emitted. This durability matters most for spin-down observations (the
 closing read of a retiring agent — its context is about to be gone).
 
-Then EXIT. One observation per session; you do not loop.
+`observe-record` also CLOSES your own `obs-…` tmux window as its final act (the watermark is written first, so
+your record is safe) — so you do not need to exit or clean up the window yourself; running it IS your exit.
+One observation per session; you do not loop.

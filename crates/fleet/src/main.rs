@@ -2479,15 +2479,43 @@ fn spawn_observer(
     }
 }
 
+/// True iff `observe-record` is running inside an ephemeral observer's OWN tmux window (name `obs-…`), so it
+/// should close that window as the observation's final act. An observer does exactly one observation and its
+/// last step is this command, but the interactive harness it runs in does not exit on its own — it idles at
+/// the prompt, leaving the `obs-<target>` window (and its model session) lingering until reaped by hand. The
+/// `obs-` name guard means a manual `observe-record` run from any other window never self-closes. Pure —
+/// unit-tested.
+fn observer_should_self_close(in_tmux: bool, current_window: &str) -> bool {
+    in_tmux && current_window.starts_with("obs-")
+}
+
 /// `fleet observe-record <agent> --session <sid> --offset <n>`: the CONFIRMED-observation watermark advance
 /// (#188), called by the observer as its LAST step after emitting. This is the only writer of the watermark,
 /// so an observer that crashed before this leaves the span unobserved to re-fire. Also clears the spawn
 /// stamp: the observation completed, so a fresh growth past the new watermark may spawn immediately (the
-/// cooldown only exists to avoid re-spawning an in-flight/crashed observer, not a completed one).
+/// cooldown only exists to avoid re-spawning an in-flight/crashed observer, not a completed one). Finally, if
+/// this ran inside the observer's own `obs-<target>` tmux window, it closes that window (the observer's one
+/// job is done and the harness would otherwise idle there) — the watermark is written FIRST, so the record is
+/// durable even though the close tears down this process.
 fn observe_record(fleet: &Fleet, agent: &str, session: &str, offset: usize) {
     write_observe_watermark(fleet, agent, session, offset);
     let _ = std::fs::remove_file(observe_spawn_stamp_path(fleet, agent));
     println!("observe-record: {agent} watermark → {session}:{offset} (observation confirmed)");
+    // Self-close the observer's own window as the last act (see observer_should_self_close). Best-effort: any
+    // tmux hiccup just leaves the window for the manual reap it replaces. `kill-window` is dispatched to the
+    // tmux server before this pane is torn down, so it completes even though it kills our own process tree.
+    if std::env::var_os("TMUX").is_some()
+        && let Ok(out) = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "#W\t#{window_id}"])
+            .output()
+    {
+        let line = String::from_utf8_lossy(&out.stdout);
+        if let Some((name, id)) = line.trim().split_once('\t')
+            && observer_should_self_close(true, name)
+        {
+            let _ = std::process::Command::new("tmux").args(["kill-window", "-t", id]).status();
+        }
+    }
 }
 
 // ── post-deploy (#171 deploy-notification channel) ─────────────────────────────────────────────────
@@ -3861,6 +3889,19 @@ mod tests {
         assert!(k.contains("/repo/target/release/fleet observe-record v-x --session sess-9 --offset"));
         assert!(k.contains("/repo/loops/observer.md"), "points at the full role body");
         assert!(k.contains("project #28"), "files into the fleet-self-improve lane");
+    }
+
+    #[test]
+    fn observe_record_self_closes_only_an_observer_window_inside_tmux() {
+        // Inside tmux AND in the observer's own `obs-…` window → close it (the last act of a one-shot observer).
+        assert!(observer_should_self_close(true, "obs-v-task-board"));
+        assert!(observer_should_self_close(true, "obs-v-x"));
+        // A manual `observe-record` from any other window must NOT self-close (only obs- windows are observers).
+        assert!(!observer_should_self_close(true, "main"));
+        assert!(!observer_should_self_close(true, "v-fleet-tooling"));
+        assert!(!observer_should_self_close(true, "observer"), "the identity name is not the window prefix");
+        // Not inside tmux → never close (nothing to close; e.g. run from a plain shell / systemd).
+        assert!(!observer_should_self_close(false, "obs-v-x"));
     }
 
     #[test]
