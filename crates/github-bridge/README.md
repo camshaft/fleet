@@ -61,19 +61,23 @@ Each tick runs IN (GitHub → board) then OUT (board firehose → GitHub); loggi
 ## Config (TOML)
 
 ```toml
-github_token = "ghp_..."          # GitHub PAT or App installation token (issues:read/write, etc.)
-repo         = "camshaft/fleet"    # owner/name of the repo whose issues are ingested
-project_id   = 16                  # board project ingested issues become tasks in
-board_api    = "http://127.0.0.1:8880/board/api"  # optional; default shown (local board front-door)
+github_token = "ghp_..."          # GitHub PAT or App installation token (issues:read/write, across ALL repos below)
+repos        = ["camshaft/fleet", "camshaft/dotfiles"]  # owner/name list — ingested into project_id
+# repo       = "camshaft/fleet"   # singular sugar for a one-repo config (folds into `repos`)
+project_id   = 16                  # board project all ingested issues become tasks in
+board_api    = "http://127.0.0.1:8079/api"        # optional; default shown (green board loopback)
 api_base     = "https://api.github.com"           # optional; override for GitHub Enterprise Server
 default_to   = "concierge"        # optional; default
 bridge_agent = "github-bridge"    # optional; the board agent id this bridge writes as
-state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file's dir. Holds the firehose
-                                         # cursor — MUST be writable + durable across restarts.
+state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file's dir. Holds the cursor
+                                         # state.json — MUST be writable + durable across restarts.
 ```
 
 - Token present ⇒ live; missing ⇒ dormant (valid — deploy before the token is minted).
-- `repo` + `project_id` both present ⇒ ingest active; either missing ⇒ up-but-idle (valid).
+- `repos` (or the singular `repo`) + `project_id` both present ⇒ ingest active; either missing ⇒ up-but-idle
+  (valid). Multiple repos all mirror into the one `project_id`, each scanning independently (per-repo cursor).
+  The `github_token` must cover **every** listed repo (a fine-grained PAT enumerating them, a classic
+  `repo`-scoped PAT, or an org App installation). The repo set is **explicit** — there is no auto-discovery.
 - Unknown keys are rejected (`deny_unknown_fields`) — a typo surfaces as a "malformed config" (fail-soft
   dormant), not a silent drop.
 - `Debug` on the config **redacts** the token — it never prints into logs.
