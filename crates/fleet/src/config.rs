@@ -1,0 +1,118 @@
+//! `config` — TOML-file configuration for the fleet binary.
+//!
+//! Operator mandate seq-1377: the fleet binary is configured by a TOML file, NOT `FLEET_*` environment
+//! variables. Every fleet-specific knob (tmux session, hub root, workspace root, board API base, launcher
+//! path, this process's agent id) is read from the config here. The only environment still consulted is the
+//! OS-standard `HOME`/`XDG_CONFIG_HOME` used to LOCATE the config file (and as the workspace-root default) —
+//! never a fleet knob. An absent config file or an absent key falls back to the same built-in default as the
+//! pre-config binary, so a host with no config behaves exactly as before.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use serde::Deserialize;
+
+/// The fleet binary's settings. Every field is optional; a missing field uses the built-in default at its
+/// use site. Loaded once from the TOML config file (see [`get`]).
+#[derive(Debug, Default, Deserialize)]
+pub struct Config {
+    /// tmux session the fleet's windows live in (default `main`).
+    pub session: Option<String>,
+    /// File-hub root for legacy runtime state (heartbeat/inbox/registry); default = git-common-dir of cwd.
+    pub hub: Option<String>,
+    /// Per-agent workspace root for the `~/.fleet` model (default `$HOME/.fleet`).
+    pub root: Option<String>,
+    /// Board REST base URL (default the loopback front-door proxy).
+    pub board_api: Option<String>,
+    /// Path to the window launcher script (default `<hub>/.claude/fleet/window.sh`).
+    pub window_sh: Option<String>,
+    /// This process's agent id — the `fleet send` sender identity when not given explicitly.
+    pub agent: Option<String>,
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+static PATH_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The default config path: `$XDG_CONFIG_HOME/fleet/config.toml`, else `$HOME/.config/fleet/config.toml`,
+/// else `None`. `HOME`/`XDG_CONFIG_HOME` are OS-standard locators, not fleet knobs.
+fn default_path() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(xdg).join("fleet/config.toml"));
+    }
+    std::env::var_os("HOME")
+        .filter(|s| !s.is_empty())
+        .map(|h| PathBuf::from(h).join(".config/fleet/config.toml"))
+}
+
+/// Record the `--config <path>` override before the first [`get`]. A no-op once the config is loaded.
+pub fn set_path(path: Option<PathBuf>) {
+    let _ = PATH_OVERRIDE.set(path);
+}
+
+/// Parse a config from TOML text — the all-defaults config if it doesn't parse. Pure; unit-tested.
+fn parse(toml_text: &str) -> Config {
+    toml::from_str(toml_text).unwrap_or_default()
+}
+
+/// The loaded config (parsed once). Reads the `--config` override else the default path; an absent file
+/// yields the all-defaults config, and an unparseable file is reported to stderr then treated as defaults.
+pub fn get() -> &'static Config {
+    CONFIG.get_or_init(|| {
+        let path = PATH_OVERRIDE.get().cloned().flatten().or_else(default_path);
+        let Some(path) = path else {
+            return Config::default();
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                if toml::from_str::<Config>(&text).is_err() {
+                    eprintln!(
+                        "fleet: config {} is not valid TOML; using defaults",
+                        path.display()
+                    );
+                }
+                parse(&text)
+            }
+            Err(_) => Config::default(), // absent file → defaults (the common case)
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_reads_every_knob() {
+        let cfg = parse(
+            r#"
+            session = "fleet-main"
+            hub = "/srv/hub"
+            root = "/home/x/.fleet"
+            board_api = "http://board.local/api"
+            window_sh = "/opt/fleet/window.sh"
+            agent = "v-fleet-tooling"
+            "#,
+        );
+        assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
+        assert_eq!(cfg.hub.as_deref(), Some("/srv/hub"));
+        assert_eq!(cfg.root.as_deref(), Some("/home/x/.fleet"));
+        assert_eq!(cfg.board_api.as_deref(), Some("http://board.local/api"));
+        assert_eq!(cfg.window_sh.as_deref(), Some("/opt/fleet/window.sh"));
+        assert_eq!(cfg.agent.as_deref(), Some("v-fleet-tooling"));
+    }
+
+    #[test]
+    fn parse_empty_and_partial_default_the_rest() {
+        let empty = parse("");
+        assert!(empty.session.is_none() && empty.board_api.is_none());
+        let partial = parse(r#"session = "s""#);
+        assert_eq!(partial.session.as_deref(), Some("s"));
+        assert!(partial.hub.is_none(), "unset keys stay None → use the built-in default");
+    }
+
+    #[test]
+    fn parse_invalid_toml_is_defaults_not_a_panic() {
+        let cfg = parse("this is = = not toml");
+        assert!(cfg.session.is_none());
+    }
+}

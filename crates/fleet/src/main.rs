@@ -16,13 +16,17 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod board;
+mod config;
 mod notify;
 mod workspace;
 
 /// The tmux session board-native agents run in (their windows are opened here by `launch_board_agent`, and
-/// the notifier injects wakes here). `$CDZ_FLEET_SESSION`, else `main`.
+/// the notifier injects wakes here). From `config.session`, else `main`.
 fn board_session() -> String {
-    std::env::var("CDZ_FLEET_SESSION").unwrap_or_else(|_| "main".to_string())
+    config::get()
+        .session
+        .clone()
+        .unwrap_or_else(|| "main".to_string())
 }
 
 /// One agent's durable row in the runtime registry (the machine-local manifest that survives a reboot).
@@ -156,10 +160,10 @@ struct Fleet {
 }
 
 impl Fleet {
-    /// Resolve the hub. `$FLEET_HUB` (the eventual `~/.fleet` multi-repo model) wins; otherwise fall back
+    /// Resolve the hub. `config.hub` (the eventual `~/.fleet` multi-repo model) wins; otherwise fall back
     /// to git-common-dir discovery of the cwd (cadenza's current behavior) so P1 is byte-identical.
     fn resolve() -> Self {
-        let hub = match std::env::var_os("FLEET_HUB") {
+        let hub = match config::get().hub.as_ref() {
             Some(h) => PathBuf::from(h),
             None => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -577,8 +581,9 @@ fn send(
     let from = from
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
-            std::env::var("FLEET_AGENT")
-                .ok()
+            config::get()
+                .agent
+                .clone()
                 .filter(|s| !s.trim().is_empty())
         })
         .unwrap_or_else(|| "unknown".to_string());
@@ -679,15 +684,20 @@ fn ensure_worktree(
 
 // ── tmux window launch ─────────────────────────────────────────────────────────────────────────
 
-/// The tmux session the fleet's windows live in (`$FLEET_SESSION`, else `main`).
+/// The tmux session the fleet's windows live in (`config.session`, else `main`).
 fn fleet_session() -> String {
-    std::env::var("FLEET_SESSION").unwrap_or_else(|_| "main".to_string())
+    config::get()
+        .session
+        .clone()
+        .unwrap_or_else(|| "main".to_string())
 }
 
-/// Where the launcher script lives (`$FLEET_WINDOW_SH`, else the hub copy `<hub>/.claude/fleet/window.sh`
+/// Where the launcher script lives (`config.window_sh`, else the hub copy `<hub>/.claude/fleet/window.sh`
 /// materialized at setup). window.sh resolves the agent's config via `fleet describe` + launches claude.
 fn window_sh_path(fleet: &Fleet) -> PathBuf {
-    std::env::var_os("FLEET_WINDOW_SH")
+    config::get()
+        .window_sh
+        .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| fleet.root.join("window.sh"))
 }
@@ -1175,6 +1185,10 @@ fn should_auto_restart_wedge(ctx_pct: Option<u8>, restarted_recently: bool) -> b
     about = "Standalone multi-repo agent-fleet orchestrator"
 )]
 struct Cli {
+    /// Path to the TOML config file (else `$XDG_CONFIG_HOME/fleet/config.toml`, else
+    /// `$HOME/.config/fleet/config.toml`). The fleet binary is config-file driven, not `FLEET_*` env vars.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -1295,6 +1309,8 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
+    // Record the --config override before any setting is read (config is loaded lazily, once).
+    config::set_path(cli.config.clone());
     let fleet = Fleet::resolve();
     match cli.cmd {
         Cmd::Heartbeat { name } => heartbeat(&fleet, &name),
@@ -1368,8 +1384,10 @@ fn spin_up(agent: &str, apply: bool) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let fleet_root = std::env::var("FLEET_ROOT")
-        .unwrap_or_else(|_| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
+    let fleet_root = config::get()
+        .root
+        .clone()
+        .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
 
     println!("spin-up '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
     println!(
