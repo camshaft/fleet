@@ -14,7 +14,7 @@
 //! per-message failure count (runtime state), so [`OutboundPost`] carries the raw [`OutboundReflect`] and
 //! the transport renders at delivery time.
 
-use crate::board::{build_post_body, Event, OutboundReflect};
+use crate::board::{Event, OutboundReflect, build_post_body};
 use serde_json::Value;
 
 /// Format the stable external-identity id the bridge attributes an inbound author with (board-core #149):
@@ -170,7 +170,10 @@ mod tests {
         let events = [ev_reflect(30, 99, 1, "orphan")];
         let (posts, cursor) = plan_outbound(&events, 10, |_| None);
         assert!(posts.is_empty());
-        assert_eq!(cursor, 30, "unmapped event still advances the cursor (no reprocess loop)");
+        assert_eq!(
+            cursor, 30,
+            "unmapped event still advances the cursor (no reprocess loop)"
+        );
     }
 
     #[test]
@@ -184,7 +187,10 @@ mod tests {
     fn outbound_cursor_never_regresses_on_out_of_order_or_stale_seq() {
         let events = [ev_reflect(3, 7, 1, "old")];
         let (_posts, cursor) = plan_outbound(&events, 100, |_| Some("C7".into()));
-        assert_eq!(cursor, 100, "cursor is monotonic — a lower seq doesn't regress it");
+        assert_eq!(
+            cursor, 100,
+            "cursor is monotonic — a lower seq doesn't regress it"
+        );
     }
 
     #[test]
@@ -194,16 +200,25 @@ mod tests {
         ev.data["external_author"] = serde_json::json!("slack:U5");
         let (posts, _) = plan_outbound(&[ev], 0, |_| Some("C7".into()));
         assert_eq!(posts[0].reflect.reply_to, Some(199));
-        assert_eq!(posts[0].reflect.external_author.as_deref(), Some("slack:U5"));
+        assert_eq!(
+            posts[0].reflect.external_author.as_deref(),
+            Some("slack:U5")
+        );
     }
 
     // ── plan_inbound ──────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn inbound_builds_an_attributed_board_post() {
-        let post = plan_inbound("C7", "slack", "U123", "hello fleet", None, "slack-bridge", |ch| {
-            (ch == "C7").then_some(7)
-        })
+        let post = plan_inbound(
+            "C7",
+            "slack",
+            "U123",
+            "hello fleet",
+            None,
+            "slack-bridge",
+            |ch| (ch == "C7").then_some(7),
+        )
         .expect("mapped");
         assert_eq!(post.board_channel_id, 7);
         assert_eq!(post.body["sender"], "slack-bridge");
@@ -215,9 +230,15 @@ mod tests {
     #[test]
     fn inbound_is_source_agnostic() {
         // A voice transport reuses plan_inbound verbatim with its own source + speaker id.
-        let post = plan_inbound("voice-1", "voice", "cameron", "hey assistant", None, "voice-bridge", |_| {
-            Some(88)
-        })
+        let post = plan_inbound(
+            "voice-1",
+            "voice",
+            "cameron",
+            "hey assistant",
+            None,
+            "voice-bridge",
+            |_| Some(88),
+        )
         .expect("mapped");
         assert_eq!(post.board_channel_id, 88);
         assert_eq!(post.body["sender"], "voice-bridge");
@@ -226,14 +247,24 @@ mod tests {
 
     #[test]
     fn inbound_threads_a_reply() {
-        let post = plan_inbound("C7", "slack", "U1", "re: that", Some(88), "slack-bridge", |_| Some(7))
-            .expect("mapped");
+        let post = plan_inbound(
+            "C7",
+            "slack",
+            "U1",
+            "re: that",
+            Some(88),
+            "slack-bridge",
+            |_| Some(7),
+        )
+        .expect("mapped");
         assert_eq!(post.body["reply_to"], 88);
     }
 
     #[test]
     fn inbound_unmapped_channel_is_skipped() {
-        assert!(plan_inbound("Cnope", "slack", "U1", "x", None, "slack-bridge", |_| None).is_none());
+        assert!(
+            plan_inbound("Cnope", "slack", "U1", "x", None, "slack-bridge", |_| None).is_none()
+        );
     }
 
     #[test]

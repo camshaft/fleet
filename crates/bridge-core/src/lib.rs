@@ -39,14 +39,16 @@ pub mod sse;
 pub mod sync;
 
 pub use board::{
-    build_identity_body, build_post_body, parse_channel_links, parse_channels, parse_events,
-    BoardChannel, BoardClient, Event, OutboundReflect, LINK_KIND_CHANNEL, LINK_SOURCE,
-    OUTBOUND_REFLECT,
+    BoardChannel, BoardClient, Event, LINK_KIND_CHANNEL, LINK_SOURCE, OUTBOUND_REFLECT,
+    OutboundReflect, build_identity_body, build_post_body, parse_channel_links, parse_channels,
+    parse_events,
 };
-pub use sse::{SseDecoder, SseFrame};
-pub use channel_config::{bridged_channels, Bridged, BridgeConfig};
-pub use echo::{is_board_origin, mark_board_origin, MARK_EMOJI};
+pub use channel_config::{BridgeConfig, Bridged, bridged_channels};
+pub use echo::{MARK_EMOJI, MARK_EMOJI_SHORTCODE, is_board_origin, mark_board_origin};
 pub use mention::{is_mentioned, mentioned_agent};
-pub use relay::{relay_plan, RelayPlan, RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN};
+pub use relay::{
+    RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN, RelayPlan, relay_plan,
+};
 pub use resolver::{ChannelLink, ChannelMap};
-pub use sync::{external_author, plan_inbound, plan_outbound, InboundPost, OutboundPost};
+pub use sse::{SseDecoder, SseFrame};
+pub use sync::{InboundPost, OutboundPost, external_author, plan_inbound, plan_outbound};

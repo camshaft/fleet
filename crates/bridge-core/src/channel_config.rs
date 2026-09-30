@@ -50,7 +50,11 @@ fn as_object(meta: &Value) -> Value {
 /// Filter board channels to those wired to (`source`, `bridge_instance`) via their `metadata.bridge_config`.
 /// A channel is kept iff it has a well-formed `bridge_config` matching BOTH `source` and `bridge_instance`.
 /// Malformed/absent config on one channel is skipped (fail-soft — never drops the others). Pure.
-pub fn bridged_channels(channels: &[BoardChannel], source: &str, bridge_instance: &str) -> Vec<Bridged> {
+pub fn bridged_channels(
+    channels: &[BoardChannel],
+    source: &str,
+    bridge_instance: &str,
+) -> Vec<Bridged> {
     let mut out = Vec::new();
     for ch in channels {
         let meta = as_object(&ch.metadata);
@@ -62,7 +66,10 @@ pub fn bridged_channels(channels: &[BoardChannel], source: &str, bridge_instance
             Err(_) => continue,
         };
         if cfg.source == source && cfg.bridge_instance == bridge_instance {
-            out.push(Bridged { board_channel_id: ch.id, config: cfg });
+            out.push(Bridged {
+                board_channel_id: ch.id,
+                config: cfg,
+            });
         }
     }
     out
@@ -86,15 +93,28 @@ mod tests {
     use serde_json::json;
 
     fn chan(id: i64, metadata: Value) -> BoardChannel {
-        BoardChannel { id, name: format!("c{id}"), metadata }
+        BoardChannel {
+            id,
+            name: format!("c{id}"),
+            metadata,
+        }
     }
 
     #[test]
     fn keeps_only_matching_source_and_instance() {
         let channels = vec![
-            chan(30, json!({"bridge_config": {"source": "slack", "external_channel_id": "C30", "bridge_instance": "membrain"}})),
-            chan(31, json!({"bridge_config": {"source": "slack", "external_channel_id": "C31", "bridge_instance": "operator-dm"}})),
-            chan(32, json!({"bridge_config": {"source": "voice", "external_channel_id": "V1", "bridge_instance": "membrain"}})),
+            chan(
+                30,
+                json!({"bridge_config": {"source": "slack", "external_channel_id": "C30", "bridge_instance": "membrain"}}),
+            ),
+            chan(
+                31,
+                json!({"bridge_config": {"source": "slack", "external_channel_id": "C31", "bridge_instance": "operator-dm"}}),
+            ),
+            chan(
+                32,
+                json!({"bridge_config": {"source": "voice", "external_channel_id": "V1", "bridge_instance": "membrain"}}),
+            ),
         ];
         let b = bridged_channels(&channels, "slack", "membrain");
         assert_eq!(b.len(), 1, "only the slack+membrain channel matches");
@@ -107,7 +127,9 @@ mod tests {
         // The board sometimes stores metadata as a JSON-encoded string.
         let channels = vec![chan(
             7,
-            json!("{\"bridge_config\": {\"source\": \"slack\", \"external_channel_id\": \"C7\", \"bridge_instance\": \"membrain\"}}"),
+            json!(
+                "{\"bridge_config\": {\"source\": \"slack\", \"external_channel_id\": \"C7\", \"bridge_instance\": \"membrain\"}}"
+            ),
         )];
         let b = bridged_channels(&channels, "slack", "membrain");
         assert_eq!(b.len(), 1);
@@ -117,10 +139,13 @@ mod tests {
     #[test]
     fn skips_absent_or_malformed_config_but_keeps_others() {
         let channels = vec![
-            chan(1, json!({})),                                            // no bridge_config
-            chan(2, json!({"bridge_config": {"source": "slack"}})),        // malformed (missing fields)
-            chan(3, Value::Null),                                          // no metadata
-            chan(4, json!({"bridge_config": {"source": "slack", "external_channel_id": "C4", "bridge_instance": "membrain"}})),
+            chan(1, json!({})),                                     // no bridge_config
+            chan(2, json!({"bridge_config": {"source": "slack"}})), // malformed (missing fields)
+            chan(3, Value::Null),                                   // no metadata
+            chan(
+                4,
+                json!({"bridge_config": {"source": "slack", "external_channel_id": "C4", "bridge_instance": "membrain"}}),
+            ),
         ];
         let b = bridged_channels(&channels, "slack", "membrain");
         assert_eq!(b.len(), 1);
@@ -129,17 +154,33 @@ mod tests {
 
     #[test]
     fn different_source_or_instance_excluded() {
-        let channels = vec![chan(9, json!({"bridge_config": {"source": "voice", "external_channel_id": "V", "bridge_instance": "membrain"}}))];
-        assert!(bridged_channels(&channels, "slack", "membrain").is_empty(), "wrong source excluded");
-        let channels2 = vec![chan(9, json!({"bridge_config": {"source": "slack", "external_channel_id": "C", "bridge_instance": "other"}}))];
-        assert!(bridged_channels(&channels2, "slack", "membrain").is_empty(), "wrong instance excluded");
+        let channels = vec![chan(
+            9,
+            json!({"bridge_config": {"source": "voice", "external_channel_id": "V", "bridge_instance": "membrain"}}),
+        )];
+        assert!(
+            bridged_channels(&channels, "slack", "membrain").is_empty(),
+            "wrong source excluded"
+        );
+        let channels2 = vec![chan(
+            9,
+            json!({"bridge_config": {"source": "slack", "external_channel_id": "C", "bridge_instance": "other"}}),
+        )];
+        assert!(
+            bridged_channels(&channels2, "slack", "membrain").is_empty(),
+            "wrong instance excluded"
+        );
     }
 
     #[test]
     fn builds_bidirectional_map() {
         let b = vec![Bridged {
             board_channel_id: 30,
-            config: BridgeConfig { source: "slack".into(), external_channel_id: "C30".into(), bridge_instance: "membrain".into() },
+            config: BridgeConfig {
+                source: "slack".into(),
+                external_channel_id: "C30".into(),
+                bridge_instance: "membrain".into(),
+            },
         }];
         let m = channel_map(&b);
         assert_eq!(m.board_to_external(30).as_deref(), Some("C30"));

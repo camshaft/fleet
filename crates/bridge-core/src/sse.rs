@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn one_leading_space_stripped_from_value_only_once() {
         let frames = decode_all("data:  two-leading-spaces\n\n");
-        assert_eq!(frames[0].data, " two-leading-spaces", "exactly one leading space is stripped");
+        assert_eq!(
+            frames[0].data, " two-leading-spaces",
+            "exactly one leading space is stripped"
+        );
     }
 
     #[test]
@@ -219,7 +222,10 @@ mod tests {
     #[test]
     fn incomplete_block_yields_nothing_until_blank_line() {
         let mut d = SseDecoder::new();
-        assert!(d.push(b"data: partial\n").is_empty(), "no blank line yet -> no frame");
+        assert!(
+            d.push(b"data: partial\n").is_empty(),
+            "no blank line yet -> no frame"
+        );
         let frames = d.push(b"\n");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "partial");
@@ -241,7 +247,10 @@ mod tests {
         // not a second (blank-line) terminator.
         let mut d = SseDecoder::new();
         assert!(d.push(b"data: hi\r").is_empty(), "dangling CR is held back");
-        assert!(d.push(b"\n").is_empty(), "CRLF completes the line, still no blank line");
+        assert!(
+            d.push(b"\n").is_empty(),
+            "CRLF completes the line, still no blank line"
+        );
         let frames = d.push(b"\r\n");
         assert_eq!(frames.len(), 1, "the blank CRLF line dispatches");
         assert_eq!(frames[0].data, "hi");
@@ -255,7 +264,10 @@ mod tests {
         // Find a split point in the middle of the 'é'.
         let e_pos = full.find('é').unwrap();
         let mut d = SseDecoder::new();
-        assert!(d.push(&bytes[..e_pos + 1]).is_empty(), "split inside the multi-byte char");
+        assert!(
+            d.push(&bytes[..e_pos + 1]).is_empty(),
+            "split inside the multi-byte char"
+        );
         let frames = d.push(&bytes[e_pos + 1..]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "héllo");

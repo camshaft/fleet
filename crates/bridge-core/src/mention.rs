@@ -44,16 +44,31 @@ mod tests {
     fn plain_name_and_wake_phrase_match() {
         assert!(is_mentioned("frank what do you think?", "frank"));
         assert!(is_mentioned("hey frank, thoughts?", "frank"));
-        assert!(is_mentioned("so, Frank — any ideas", "frank"), "case-insensitive");
-        assert!(is_mentioned("cc @frank please", "frank"), "leading @ is a delimiter");
-        assert!(is_mentioned("frank: go", "frank"), "trailing colon delimits");
-        assert!(is_mentioned("what's frank's take", "frank"), "possessive: frank is its own token");
+        assert!(
+            is_mentioned("so, Frank — any ideas", "frank"),
+            "case-insensitive"
+        );
+        assert!(
+            is_mentioned("cc @frank please", "frank"),
+            "leading @ is a delimiter"
+        );
+        assert!(
+            is_mentioned("frank: go", "frank"),
+            "trailing colon delimits"
+        );
+        assert!(
+            is_mentioned("what's frank's take", "frank"),
+            "possessive: frank is its own token"
+        );
         assert!(is_mentioned("FRANK!!!", "Frank"), "punctuation + all-caps");
     }
 
     #[test]
     fn substrings_do_not_match() {
-        assert!(!is_mentioned("frankly I disagree", "frank"), "frankly is not a mention");
+        assert!(
+            !is_mentioned("frankly I disagree", "frank"),
+            "frankly is not a mention"
+        );
         assert!(!is_mentioned("I flew to frankfurt", "frank"));
         assert!(!is_mentioned("the framework is fine", "frank"));
         assert!(!is_mentioned("no mention here at all", "frank"));
@@ -68,21 +83,34 @@ mod tests {
 
     #[test]
     fn name_anywhere_in_the_message() {
-        assert!(is_mentioned("I really think that frank should weigh in", "frank"));
-        assert!(is_mentioned("start\nnewline then frank\nend", "frank"), "newline delimits");
+        assert!(is_mentioned(
+            "I really think that frank should weigh in",
+            "frank"
+        ));
+        assert!(
+            is_mentioned("start\nnewline then frank\nend", "frank"),
+            "newline delimits"
+        );
     }
 
     #[test]
     fn mentioned_agent_picks_the_addressed_one() {
         let agents = ["frank", "george"];
         assert_eq!(mentioned_agent("hey george, look", agents), Some("george"));
-        assert_eq!(mentioned_agent("frank and george", agents), Some("frank"), "first match wins");
+        assert_eq!(
+            mentioned_agent("frank and george", agents),
+            Some("frank"),
+            "first match wins"
+        );
         assert_eq!(mentioned_agent("nobody addressed", agents), None);
     }
 
     #[test]
     fn multichar_and_unicode_names() {
-        assert!(!is_mentioned("ping bot-1 now", "bot-1"), "a hyphenated name is two tokens; not matched as one");
+        assert!(
+            !is_mentioned("ping bot-1 now", "bot-1"),
+            "a hyphenated name is two tokens; not matched as one"
+        );
         // A single-token unicode name matches whole-token.
         assert!(is_mentioned("hola andré", "André"));
         assert!(!is_mentioned("andrés is someone else", "andré"));
