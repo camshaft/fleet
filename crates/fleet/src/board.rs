@@ -30,6 +30,48 @@ const DEFAULT_BASE: &str = "http://127.0.0.1:8880/board/api";
 /// ("browser_signature_banned", #209) — so send a browser-ish UA defensively; harmless on loopback.
 const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) fleet-orchestrator";
 
+/// Normalize text to the board's ASCII-only content rule. The board 400s on ANY non-ASCII character
+/// (`non-ASCII character '—' (U+2014) ... Board content must be ASCII`), which silently took the whole
+/// nudge daemon down — every body carried an em dash, so every comment POST was rejected while the oneshot
+/// still exited 0. Apply the board's own suggested substitutions (em/en dash -> '-', curly quotes ->
+/// straight, ellipsis/arrows -> ASCII) then drop any remaining non-ASCII (emoji, etc.), so a fleet-posted
+/// comment can never be rejected for a stray Unicode char again. Pure — unit-tested.
+fn to_board_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{2014}' | '\u{2013}' => out.push('-'),        // em / en dash
+            '\u{2018}' | '\u{2019}' => out.push('\''),       // curly single quotes
+            '\u{201C}' | '\u{201D}' => out.push('"'),        // curly double quotes
+            '\u{2026}' => out.push_str("..."),               // ellipsis
+            '\u{2192}' => out.push_str("->"),                // right arrow
+            '\u{2190}' => out.push_str("<-"),                // left arrow
+            c if c.is_ascii() => out.push(c),
+            _ => {} // drop any other non-ASCII rather than eat a 400
+        }
+    }
+    out
+}
+
+/// Render a ureq error with the server's response BODY on a non-2xx status. ureq's own `Display` shows only
+/// the status line (e.g. `https://.../comments: status code 400`), which hides the board's actual validation
+/// message and left the nudge-daemon 400 outage undiagnosable for its owner. On a `Status` error, read and
+/// append the response body (the board's JSON `{"error": "..."}`).
+fn status_err(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            let body = body.trim();
+            if body.is_empty() {
+                format!("status {code}")
+            } else {
+                format!("status {code}: {body}")
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Whether a task is ACTIONABLE pending work for the work-conserving loop (board-pm refinement): only a
 /// `todo`/`in_progress` task that is NOT blocked/parked and NOT monitor-exempt. A `blocked_on` link (waiting
 /// on a blocker, or on a prereq that does not exist yet) means the task is parked, not actionable — counting
@@ -344,13 +386,17 @@ impl Board {
     /// Post a comment on a task (`POST /tasks/{id}/comments`). `Err` on a non-2xx response.
     pub fn comment_task(&self, task_id: i64, author: &str, body: &str) -> Result<(), String> {
         let url = format!("{}/tasks/{}/comments", self.base, task_id);
-        let payload = serde_json::json!({ "author": author, "body": body }).to_string();
+        // The board rejects non-ASCII content with a 400; normalize so a stray Unicode char never silently
+        // fails the post (a whole-daemon outage class — see [`to_board_ascii`]).
+        let payload = serde_json::json!({ "author": author, "body": to_board_ascii(body) }).to_string();
         self.agent
             .post(&url)
             .set("content-type", "application/json")
             .set("user-agent", BOARD_UA)
             .send_string(&payload)
-            .map_err(|e| format!("board POST /tasks/{task_id}/comments failed: {e}"))?;
+            // Surface the board's response body on a non-2xx (e.g. the 400 validation message), not just the
+            // status line — a bare "status code 400" left the nudge-daemon failure undiagnosable.
+            .map_err(|e| format!("board POST /tasks/{task_id}/comments failed: {}", status_err(e)))?;
         Ok(())
     }
 
@@ -380,6 +426,21 @@ mod tests {
         // The default is the front-door /board/api proxy, not the board's own unreachable port.
         assert!(DEFAULT_BASE.ends_with("/board/api"));
         assert!(DEFAULT_BASE.starts_with("http://"));
+    }
+
+    #[test]
+    fn to_board_ascii_replaces_the_content_that_400s_and_is_identity_on_clean_text() {
+        // The exact char that took the nudge daemon down (U+2014 em dash) -> hyphen.
+        assert_eq!(to_board_ascii("routing — unassigned"), "routing - unassigned");
+        // Other board-suggested substitutions.
+        assert_eq!(to_board_ascii("it\u{2019}s \u{201C}done\u{201D} \u{2026} next\u{2192}here"), "it's \"done\" ... next->here");
+        // Any other non-ASCII (emoji) is dropped rather than left to 400.
+        assert_eq!(to_board_ascii("ship it \u{1F680} now"), "ship it  now");
+        // Clean ASCII is returned unchanged (no needless churn).
+        let clean = "fleet nudge: stale for over 1h - please update its status (done / blocked).";
+        assert_eq!(to_board_ascii(clean), clean);
+        // The result is always pure ASCII.
+        assert!(to_board_ascii("mixed \u{2014}\u{1F600}\u{201C}x\u{201D}").is_ascii());
     }
 
     #[test]
