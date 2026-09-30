@@ -57,6 +57,18 @@ Your worktree is a linked checkout of your target repo, cut from its declared ba
 tmux window runs unattended with the human-question tool disabled (except the interactive `design` role) —
 which is why routing human-shaped decisions to the concierge is mandatory, not optional.
 
+## Fleet-host daemons: a systemd user service, NEVER a bare tmux window
+
+A long-running fleet-host daemon (the notifier, the reverse tunnel, a bridge supervisor) MUST run as a
+systemd **user** service, never a `tmux new-window 'while true …'` keep-alive — a bare window gets reaped and
+the daemon silently dies, taking a wake path or the operator-alert path down with it. Bring one up in one
+shot with `fleet daemon-unit <name> --enable`: it writes `~/.config/systemd/user/fleet-<name>.service`
+(Type=simple, Restart=on-failure, a captured known-good PATH) and runs `daemon-reload` + `enable --now`, so it
+survives reaps + reboots and restarts on crash. The built-in `notifier` needs no `--exec` (`<bin> notify`); any
+other daemon passes `--exec '<command>'`. `--install` (write only, no enable) is for a declarative host that
+manages units itself. If you catch yourself reaching for a keep-alive window for something that must outlive
+this tick, that is the smell this rule exists to stop.
+
 ## Host, proxy + content-sharing specifics (internal board doc)
 
 This is a general-purpose fleet library — host and deployment specifics are NOT kept here. The concrete
