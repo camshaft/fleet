@@ -73,22 +73,65 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
     Some((recipient.to_string(), prompt))
 }
 
-/// Inject `text` as a submitted prompt into tmux window `session:window`. Sends the text literally (`-l`,
-/// so no character is read as a key binding) then a separate `Enter` to submit — the same wake path the
-/// file-hub nudge uses. `Err` if the window is absent or tmux is unreachable.
+/// Delay after the literal paste — and between the two submit `Enter`s — that lets a full-screen TUI composer
+/// commit the pasted text before a submitting keystroke arrives. See [`submit_steps`] for why.
+const INJECT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// One step of the wake-injection sequence built by [`submit_steps`].
+#[derive(Debug, PartialEq, Eq)]
+enum InjectStep<'a> {
+    /// `send-keys -l <text>`: paste the text literally (no character is read as a key binding).
+    Literal(&'a str),
+    /// `send-keys Enter`: a submit keystroke.
+    Enter,
+    /// Sleep [`INJECT_SETTLE`] to let the composer commit the preceding input before the next keystroke.
+    Settle,
+}
+
+/// The ordered steps to inject `text` as a SUBMITTED prompt: paste the text, settle, `Enter`, settle,
+/// `Enter`. The settle + second `Enter` exist because a full-screen TUI composer (the codex harness) processes
+/// a bracketed paste asynchronously — an `Enter` sent immediately after the paste can arrive before the
+/// composer has committed the text and be dropped, leaving the prompt sitting unsubmitted; settling lets the
+/// paste commit, and the second `Enter` is a belt-and-suspenders submit if the first still raced. This is
+/// harmless for the claude harness (the proven wake path): its `Enter` submits the now-committed prompt, and
+/// the second `Enter` lands on an empty composer, where `Enter` is a no-op — so the wake still fires exactly
+/// once. Pure — unit-tested.
+fn submit_steps(text: &str) -> Vec<InjectStep<'_>> {
+    vec![
+        InjectStep::Literal(text),
+        InjectStep::Settle,
+        InjectStep::Enter,
+        InjectStep::Settle,
+        InjectStep::Enter,
+    ]
+}
+
+/// Inject `text` as a submitted prompt into tmux window `session:window`, following [`submit_steps`] (paste
+/// literally, settle so a TUI composer commits the paste, then submit — with a second settle+`Enter` as a
+/// harmless-for-claude belt-and-suspenders submit that also lands a codex wake). `Err` if the window is absent
+/// or tmux is unreachable.
 pub fn tmux_inject(session: &str, window: &str, text: &str) -> Result<(), String> {
     let target = format!("{session}:{window}");
-    let sent = Command::new("tmux")
-        .args(["send-keys", "-t", &target, "-l", text])
-        .status()
-        .map_err(|e| format!("tmux send-keys -t {target}: {e}"))?;
-    if !sent.success() {
-        return Err(format!("tmux send-keys -l to {target} failed (window absent?)"));
+    for step in submit_steps(text) {
+        match step {
+            InjectStep::Literal(t) => {
+                let sent = Command::new("tmux")
+                    .args(["send-keys", "-t", &target, "-l", t])
+                    .status()
+                    .map_err(|e| format!("tmux send-keys -t {target}: {e}"))?;
+                if !sent.success() {
+                    return Err(format!("tmux send-keys -l to {target} failed (window absent?)"));
+                }
+            }
+            InjectStep::Enter => {
+                Command::new("tmux")
+                    .args(["send-keys", "-t", &target, "Enter"])
+                    .status()
+                    .map_err(|e| format!("tmux send-keys Enter -t {target}: {e}"))?;
+            }
+            InjectStep::Settle => std::thread::sleep(INJECT_SETTLE),
+        }
     }
-    Command::new("tmux")
-        .args(["send-keys", "-t", &target, "Enter"])
-        .status()
-        .map_err(|e| format!("tmux send-keys Enter -t {target}: {e}"))?;
     Ok(())
 }
 
@@ -152,6 +195,25 @@ pub fn serve(port: u16, session: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_steps_pastes_then_settles_and_double_enters() {
+        let steps = submit_steps("[notification] message #5");
+        // Paste the literal text first, so no character is read as a key binding.
+        assert_eq!(steps.first(), Some(&InjectStep::Literal("[notification] message #5")));
+        // A settle must separate the paste from the FIRST Enter — the codex composer commits the paste in that
+        // window, so the submitting Enter is not dropped racing the async paste.
+        let first_enter = steps.iter().position(|s| *s == InjectStep::Enter).expect("has an Enter");
+        assert!(
+            steps[..first_enter].contains(&InjectStep::Settle),
+            "a settle precedes the first Enter so the paste has committed"
+        );
+        // Two Enters submit: the second is the belt-and-suspenders that lands a codex wake if the first raced,
+        // and is a no-op at claude's (now-empty) composer — so a claude wake still fires exactly once.
+        assert_eq!(steps.iter().filter(|s| **s == InjectStep::Enter).count(), 2, "double-Enter submit");
+        // The very last step is an Enter (the submit), never a trailing settle.
+        assert_eq!(steps.last(), Some(&InjectStep::Enter));
+    }
 
     #[test]
     fn classify_request_routes_get_health_paths_to_a_probe_else_webhook() {
