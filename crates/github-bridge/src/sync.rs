@@ -185,6 +185,72 @@ pub fn pr_review_status(issue: &Issue) -> PrReviewStatus {
     }
 }
 
+/// A board code-review to create-or-advance from a GitHub pull request. The daemon calls the (BUILD-1 #372)
+/// idempotent `board::create_review` passing [`ReviewCreate::external_id`] as the `external_link` (source
+/// `github_pr`), so the board de-dupes + links atomically and advances the review's [`status`](ReviewCreate::status)
+/// idempotently on each poll (open → approved/closed). Mirrors [`TaskCreate`] for the issue path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCreate {
+    /// The idempotency/link key (`owner/repo#<number>`) passed as the create's `external_link` external_id.
+    pub external_id: String,
+    /// The GitHub PR number (for logging / the back-reference).
+    pub pr_number: i64,
+    /// The board review title (the PR title).
+    pub title: String,
+    /// The board review description (PR body + a GitHub back-reference footer).
+    pub description: String,
+    /// The attributed GitHub author (`github:<login>`), or `None` for a ghost (deleted) account.
+    pub external_author: Option<String>,
+    /// The concluding review status for this poll — advanced idempotently board-side on each re-poll.
+    pub status: PrReviewStatus,
+}
+
+/// The plan for a batch of ingested pull requests: the code-reviews to create/advance (in input order).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrReviewIngestPlan {
+    pub creates: Vec<ReviewCreate>,
+}
+
+/// Render the board review description for a mirrored PR: the PR body, then a footer back-referencing the
+/// GitHub pull request (number, author, state, URL) so a board reader can trace it to source. Labels it a
+/// pull request (vs [`render_task_description`]'s issue) so a code review is distinguishable. Pure.
+pub fn render_pr_review_description(repo: &str, pr: &Issue) -> String {
+    let author = if pr.author.is_empty() { "(unknown)" } else { pr.author.as_str() };
+    let body = if pr.body.is_empty() { "_(no description)_" } else { pr.body.as_str() };
+    format!(
+        "{body}\n\n---\nMirrored from GitHub pull request {repo}#{number} · by @{author} · state: {state}\n{url}",
+        number = pr.number,
+        state = pr.state,
+        url = pr.html_url,
+    )
+}
+
+/// Plan the board code-reviews to create/advance from a batch of GitHub issue rows.
+///
+/// - Only pull requests (rows flagged [`Issue::is_pull_request`]) become reviews; real issues are handled by
+///   [`plan_issue_ingest`] (the issues-list endpoint returns both, mixed).
+/// - Each PR becomes a [`ReviewCreate`] carrying its current [`pr_review_status`]; the board create is
+///   idempotent on the link (#372) and advances the status, so re-polling a known PR just re-asserts (open)
+///   or advances (→approved/closed) its status — no duplicate, no create→link race.
+/// - Order is preserved (oldest-updated first, matching the `?sort=updated&asc` poll).
+pub fn plan_pr_review_ingest(issues: &[Issue], repo: &str) -> PrReviewIngestPlan {
+    let mut creates = Vec::new();
+    for issue in issues {
+        if !issue.is_pull_request {
+            continue;
+        }
+        creates.push(ReviewCreate {
+            external_id: issue_ref(repo, issue.number),
+            pr_number: issue.number,
+            title: issue.title.clone(),
+            description: render_pr_review_description(repo, issue),
+            external_author: attribution(&issue.author),
+            status: pr_review_status(issue),
+        });
+    }
+    PrReviewIngestPlan { creates }
+}
+
 // ── OUT direction (board → GitHub): reflect an authorized task comment onto its linked issue ──────────
 
 /// A resolved OUT action: post [`body`](OutboundComment::body) as a comment on the GitHub issue identified
@@ -395,6 +461,45 @@ mod tests {
         // Defensive: an empty-string merged_at must not read as merged (only a real timestamp does).
         assert_eq!(pr_review_status(&pr(4, "closed", Some(""))), PrReviewStatus::Closed);
         assert_eq!(pr_review_status(&pr(5, "open", Some(""))), PrReviewStatus::Open);
+    }
+
+    #[test]
+    fn plan_pr_review_ingest_makes_a_review_per_pr_with_status() {
+        let issues = [
+            pr(10, "closed", Some("2026-09-30T00:00:00Z")), // merged → approved
+            issue(11, "a real issue", "octocat"),           // not a PR → skipped
+            pr(12, "open", None),                           // open
+            pr(13, "closed", None),                         // closed-unmerged
+        ];
+        let plan = plan_pr_review_ingest(&issues, "o/r");
+        assert_eq!(plan.creates.len(), 3, "only the 3 PRs become reviews; the issue is skipped");
+        assert_eq!(plan.creates[0].external_id, "o/r#10");
+        assert_eq!(plan.creates[0].pr_number, 10);
+        assert_eq!(plan.creates[0].status, PrReviewStatus::Approved);
+        assert_eq!(plan.creates[0].external_author.as_deref(), Some("github:dev"));
+        assert!(plan.creates[0].description.contains("pull request o/r#10"), "PR back-ref footer");
+        assert_eq!(plan.creates[1].status, PrReviewStatus::Open);
+        assert_eq!(plan.creates[1].external_id, "o/r#12");
+        assert_eq!(plan.creates[2].status, PrReviewStatus::Closed);
+    }
+
+    #[test]
+    fn plan_pr_review_ingest_ghost_author_is_unattributed() {
+        let mut p = pr(20, "open", None);
+        p.author = String::new();
+        let plan = plan_pr_review_ingest(&[p], "o/r");
+        assert_eq!(plan.creates[0].external_author, None, "no fabricated identity for a ghost");
+    }
+
+    #[test]
+    fn render_pr_review_description_labels_it_a_pull_request() {
+        let mut p = pr(7, "open", None);
+        p.body = String::new();
+        let d = render_pr_review_description("o/r", &p);
+        assert!(d.contains("_(no description)_"), "empty body placeholder");
+        assert!(d.contains("pull request o/r#7"), "labeled a pull request, not an issue");
+        assert!(d.contains("by @dev"));
+        assert!(d.contains("state: open"));
     }
 
     // ── plan_outbound (board → GitHub) ─────────────────────────────────────────────────────────────
