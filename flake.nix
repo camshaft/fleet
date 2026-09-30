@@ -196,6 +196,57 @@
           };
         };
 
+      # Prebuilt libpdfium.so, pinned to bblanchon pdfium-binaries build 7881 — the EXACT Pdfium release the
+      # `kb` crate's pdfium-render 0.9.4 targets (its `pdfium_latest` = `pdfium_7881`). pdfium-render binds
+      # every FPDF* symbol EAGERLY at `bind_to_system_library()` time, so a libpdfium older than 7881 fails the
+      # WHOLE bind on one missing symbol — e.g. nixpkgs' current `pdfium-binaries` (build 7749) lacks
+      # `FPDFTextObj_SetFontSize`, which aborts the KB inbox worker's PDF path entirely (found via #444's smoke
+      # test; it is NOT host-specific — dev-dsk's nixpkgs is 7749 too). Shipping the matching build as a fleet
+      # output keeps the kb binary + its libpdfium in lockstep on every host, independent of the consuming
+      # host's nixpkgs pin (the sherpaOnnxLib pattern). The kb-inbox/uploader roles put `${pdfiumLib pkgs}/lib`
+      # on LD_LIBRARY_PATH; pdfium-render dlopens `libpdfium.so` off the loader path. Prebuilt + autoPatchelf'd,
+      # so it's hermetic and CUDA-free; bump the build + both hashes in lockstep with the pdfium-render bump.
+      pdfiumLib =
+        pkgs:
+        let
+          # bblanchon publishes one archive per platform; pick by the build system's arch (green = x64).
+          archive =
+            {
+              x86_64-linux = {
+                suffix = "x64";
+                hash = "sha256-FHDiG4tKO0rX+FaE4toR2U87aahtgd7hG5tnCdknrB0=";
+              };
+              aarch64-linux = {
+                suffix = "arm64";
+                hash = "sha256-7n97fVRolYM2qBjBzVgL3SCXKEa3N3sT+akj2S0dRnQ=";
+              };
+            }
+            .${pkgs.stdenv.hostPlatform.system}
+              or (throw "pdfiumLib: unsupported system ${pkgs.stdenv.hostPlatform.system}");
+        in
+        pkgs.stdenvNoCC.mkDerivation rec {
+          pname = "pdfium";
+          version = "7881";
+          src = pkgs.fetchurl {
+            url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F${version}/pdfium-linux-${archive.suffix}.tgz";
+            hash = archive.hash;
+          };
+          # The tarball extracts files at the top level (lib/, LICENSE, VERSION) with no wrapping dir.
+          sourceRoot = ".";
+          nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+          buildInputs = [ pkgs.stdenv.cc.cc.lib ]; # libstdc++/libgcc_s for libpdfium.so; glibc is implicit
+          dontConfigure = true;
+          dontBuild = true;
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r lib $out/lib
+            install -Dm644 LICENSE $out/share/licenses/pdfium/LICENSE
+            runHook postInstall
+          '';
+          meta.description = "Prebuilt Pdfium build ${version} shared lib (bblanchon), patched for NixOS; matches pdfium-render's pdfium_${version}";
+        };
+
       # The knowledge-base server (crates/kb): Qdrant vector search + local ONNX embeddings + an MCP tool
       # surface (Python→Rust port, board task #157). Built with the `load-dynamic` feature so ort/onnxruntime
       # is dlopen'd at RUNTIME (via LD_LIBRARY_PATH) rather than downloaded at build time — the default
@@ -232,6 +283,9 @@
         # CUDA-free at build (CUDA is runtime-only). Builds on any x86_64-linux.
         voice-assistant = voiceAssistantPackage pkgs;
         kb = kbPackage pkgs;
+        # Version-locked libpdfium (build 7881) for the KB ingest workers' PDF path — see pdfiumLib above.
+        # The kb-inbox/uploader roles consume this as inputs.fleet.packages.${system}.pdfium on LD_LIBRARY_PATH.
+        pdfium = pdfiumLib pkgs;
         default = fleet;
       });
 
