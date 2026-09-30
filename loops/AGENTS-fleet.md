@@ -51,6 +51,15 @@ Your worktree is a linked checkout of your target repo, cut from its declared ba
 tmux window runs unattended with the human-question tool disabled (except the interactive `design` role) —
 which is why routing human-shaped decisions to the concierge is mandatory, not optional.
 
+## Environment capabilities (off-LAN / green-resident hosts)
+
+Off-LAN or green-resident? Point clients at the **local Caddy** `http://127.0.0.1:8880/<path>` — it injects
+the CF Access service-token headers on every path, so a task is **never** blocked on minting a CF Access
+token. The board is `http://127.0.0.1:8880/board/...` and the knowledge base is
+`http://127.0.0.1:8880/kb/mcp` through that same proxy. If a client 401s or hits an OAuth challenge, repoint
+it at the local Caddy path rather than escalating a token request. (This is a recurring miss — see KB note
+416cd23e; the real fix has always been a one-line client repoint, never an operator token mint.)
+
 ## Memory (if the fleet has a shared memory)
 
 Write learnings to YOUR OWN log/sub-index, never to a shared root index directly — request root-index
