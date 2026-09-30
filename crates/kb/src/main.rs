@@ -15,8 +15,10 @@ mod embed;
 // Phase-2 ingest infra: file discovery + text/PDF extraction the inbox/pipeline workers build on. Its own
 // `allow(dead_code)` (see the module) covers being landed ahead of its callers.
 mod extract;
-// Phase-2 ingest infra: the Kubo IPFS client the inbox worker (#236) will use to pin ingested files. Landed
-// ahead of its consumer (#233), so `allow(dead_code)` until the worker wires it in.
+// Phase-2 drop-folder ingest worker (`kb inbox`).
+mod inbox;
+// Phase-2 ingest infra: the Kubo IPFS client the inbox worker pins ingested files with. `allow(dead_code)`
+// covers the not-yet-used surface (e.g. `cat`, used by later workers).
 #[allow(dead_code)]
 mod ipfs;
 mod mcp;
@@ -70,6 +72,8 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Drain the drop-folder inbox once: ingest + IPFS-pin each file, then delete (the Python `kb.inbox`).
+    Inbox,
 }
 
 #[tokio::main]
@@ -96,6 +100,7 @@ async fn main() {
             // search() awaits Qdrant IO and runs embed/rerank off-reactor internally (#439).
             run_search(&query, collection, limit, all).await
         }
+        Command::Inbox => inbox::run().await,
     };
 
     if let Err(e) = result {
