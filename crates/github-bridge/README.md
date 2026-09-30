@@ -110,15 +110,19 @@ so mirroring PRs as **code reviews** needs no new GitHub endpoint:
 - Each PR becomes a board review via the idempotent `create_review` (`kind=code`, `external_link
   {source:"github_pr", external_id:"owner/repo#<number>"}`) — the board de-dupes + links atomically and
   reports `created`, same as issue ingest (#270).
-- **Status** maps the PR's terminal state (2a, concluding states only): open PR → `open`; `pull_request.merged_at`
-  set → `approved`; closed-unmerged → `closed`. A PR seen open then later merged advances via the idempotent
-  `set_review_status` (re-applying the same status is a board-side no-op).
+- **Status** maps the PR's state. 2a (concluding states, from the issues-list row alone): `pull_request.merged_at`
+  set → `approved`; closed-unmerged → `closed`; otherwise `open`. **2b** refines an *open* PR via one Pulls-API
+  + one Reviews-API call (only for open PRs — closed ones are already terminal): a **draft** stays `open`; a
+  ready PR whose latest decisive review requested changes → `changes_requested`; otherwise `in_review`. A PR
+  seen open then later merged advances via the idempotent `set_review_status` (same-status re-apply is a
+  board-side no-op); a transient Pulls/Reviews fetch error falls back to `open` rather than wedging.
 - The PR's **conversation comments** (same `/issues/:n/comments` endpoint) are appended to the review as
   `comment`-type log entries via the idempotent `append_review_log`, loop-safe (skips the bridge's own
   reflected comments) and keyed on the comment ref (`owner/repo#c<id>`).
 - The `github_pr` link source is distinct from `github` (issue↔task) so PR-review links never collide with
-  issue-ingest links. **2b** (draft/in-review/changes-requested intermediate states + inline diff-review
-  findings via the Pulls + Reviews APIs) is a later slice.
+  issue-ingest links.
+- **2b-1** (the intermediate states above) is live. **2b-2** — inline diff-review-comment *findings* (the
+  `GET /pulls/:n/comments` review comments → `finding`-type review-log entries) — is the remaining slice.
 
 ## Operational notes
 
