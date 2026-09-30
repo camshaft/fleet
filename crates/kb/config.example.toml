@@ -38,6 +38,26 @@ rerank_candidates = 40
 # role points this at its systemd StateDirectory.
 cache_dir = ""
 
+# --- Phase-2 ingest workers (inbox / pipeline) ---
+# These keys are only read by the ingest subcommands (`kb inbox`, and the pipeline worker); the always-on
+# `kb serve` ignores them. Same TOML + `--config` pattern as serve: `kb --config <path> inbox`.
+#
+# Drop-folder the `kb inbox` worker drains. Every file is chunked -> embedded -> upserted -> IPFS-pinned, then
+# DELETED on success (failures move to `<inbox_dir>/_failed/`). The file's FIRST path component under this dir
+# is its collection (sanitized); a file directly in the root goes to `inbox_default_collection`. (KB_INBOX_DIR)
+inbox_dir = "/data/kb-inbox"
+# Collection for a file dropped directly in the inbox root (no subfolder); also the sanitize empty-name
+# fallback. (was KB_INBOX_DEFAULT_COLLECTION)
+inbox_default_collection = "inbox"
+# Kubo (go-ipfs) HTTP RPC base URL the inbox worker pins each ingested file to (add is CIDv1 + pinned). Points
+# at a local node's /api/v0. (was KB_IPFS_API)
+ipfs_url = "http://127.0.0.1:5001"
+# IPFS HTTP gateway base used to build a pinned file's `ipfs_url` payload as `{gateway}/ipfs/{cid}` (citation
+# URL only; not part of the deterministic point id). (was KB_IPFS_GATEWAY)
+ipfs_gateway = "http://green-machine.lan:8080"
+# Coordination-board REST base URL for the board-driven pipeline worker (#238). Unused by `kb inbox`. (TB_MCP_URL)
+board_url = "http://127.0.0.1:8079/api"
+
 # --- MCP server ---
 # Bind address for `kb serve`. (was KB_MCP_HOST / KB_MCP_PORT)
 mcp_host = "0.0.0.0"
