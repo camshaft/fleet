@@ -23,6 +23,7 @@
 //! transport crate, never here.
 
 pub mod board;
+pub mod channel_config;
 pub mod relay;
 pub mod resolver;
 pub mod sync;
@@ -32,6 +33,7 @@ pub use board::{
     BoardChannel, BoardClient, Event, OutboundReflect, LINK_KIND_CHANNEL, LINK_SOURCE,
     OUTBOUND_REFLECT,
 };
+pub use channel_config::{bridged_channels, Bridged, BridgeConfig};
 pub use relay::{relay_plan, RelayPlan, RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN};
 pub use resolver::{ChannelLink, ChannelMap};
 pub use sync::{external_author, plan_inbound, plan_outbound, InboundPost, OutboundPost};
