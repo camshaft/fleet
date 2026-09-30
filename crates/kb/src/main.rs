@@ -24,6 +24,9 @@ mod inbox;
 #[allow(dead_code)]
 mod ipfs;
 mod mcp;
+// Phase-2 board-driven ingest pipeline (`kb pipeline --role uploader|embedder`, #238). Ported incrementally;
+// its own `allow(dead_code)` covers the routing core landing ahead of the handlers + reactive runtime.
+mod pipeline;
 // Phase-2 ingest infra: the inbound webhook receiver the board-driven workers register against. Its own
 // `allow(dead_code)` (see the module) covers being landed ahead of its callers.
 mod rerank;
