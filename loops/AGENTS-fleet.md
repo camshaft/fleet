@@ -51,44 +51,23 @@ Your worktree is a linked checkout of your target repo, cut from its declared ba
 tmux window runs unattended with the human-question tool disabled (except the interactive `design` role) —
 which is why routing human-shaped decisions to the concierge is mandatory, not optional.
 
-## Environment capabilities (off-LAN / green-resident hosts)
+## Host, proxy + content-sharing specifics (internal board doc)
 
-Off-LAN or green-resident? Point clients at the **local Caddy** `http://127.0.0.1:8880/<path>` — it injects
-the CF Access service-token headers on every path, so a task is **never** blocked on minting a CF Access
-token. The board is `http://127.0.0.1:8880/board/...` and the knowledge base is
-`http://127.0.0.1:8880/kb/mcp` through that same proxy. If a client 401s or hits an OAuth challenge, repoint
-it at the local Caddy path rather than escalating a token request. (This is a recurring miss — see KB note
-416cd23e; the real fix has always been a one-line client repoint, never an operator token mint.)
+This is a general-purpose fleet library — host and deployment specifics are NOT kept here. The concrete
+off-LAN reachability (the local proxy + how CF-Access is handled), the live list of proxied service
+endpoints, the green-vs-dev-dsk deploy + wake topology, and the exact recipe for sharing content over IPFS
+live in an INTERNAL board document, reviewed and updated like any board doc. Look it up ON DEMAND — only
+when you hit an off-LAN, deploy, or content-sharing question, not every tick — via `get_document` /
+`list_documents` (project "board-native migration", title **"Fleet host + proxy topology (internal)"**,
+document id 19).
 
-## Discovering what the proxy exposes — and sharing content via IPFS
+Two general principles to carry regardless (the specifics are in that doc):
 
-The local Caddy is a TRANSPARENT catch-all to green, so `GET http://127.0.0.1:8880/` returns green's own
-plaintext service banner — the single discoverable source of truth for every proxied route. Hit it whenever
-you are unsure what is reachable; it lists (paths as of this writing):
-
-- `/kb/mcp` — knowledge-base MCP.
-- `/board/mcp` — task-board MCP.
-- `/ipfs/<cid>` — IPFS READ (GET a pinned object by its CID).
-- `POST /ipfs/api/v0/add?cid-version=1&pin=true` — IPFS ADD (multipart file upload; returns the CID).
-- `/surfaced/s/<id>` — browser surfaces.
-- `/gh/deploy`, `/gh/flake` — GitHub webhook hooks (HMAC-gated).
-
-The banner is authoritative: it is served live from green's tunnel-gateway nginx, so if it ever disagrees
-with this list, trust the banner.
-
-### Sharing content: add it to IPFS
-
-IPFS is the fleet's standard way to share content — a doc, a blob, a build artifact — across hosts: you
-publish once and hand out the CID, and anyone reads it back through their own local proxy. To ADD content
-from ANY agent, POST it multipart to the add endpoint and keep the returned `Hash` (the CID):
-
-    # add a file (or pipe stdin with @-); returns {"Name":..., "Hash":"<cid>", "Size":...}
-    curl -s -F "file=@/path/to/content" \
-      "http://127.0.0.1:8880/ipfs/api/v0/add?cid-version=1&pin=true"
-
-Read it back from ANY host with `curl http://127.0.0.1:8880/ipfs/<cid>`. `pin=true` keeps the object
-resident so it is not garbage-collected. Common gotcha: a `405` on the add means you POSTed to `/ipfs/<cid>`
-(the READ path) instead of `/ipfs/api/v0/add` — that exact confusion is why this note exists.
+- **IPFS is the fleet's standard way to share content across hosts** — publish once, hand out the CID, and
+  anyone reads it back through their own local proxy. When you need to move a doc/blob/artifact between
+  hosts, that is the mechanism; the add/read endpoints are in the board doc.
+- **Off-LAN clients reach services through a local proxy that handles auth for you** — so a `401` / OAuth
+  challenge is a one-line client repoint, never an operator token request.
 
 ## Memory (if the fleet has a shared memory)
 
