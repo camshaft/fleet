@@ -314,6 +314,37 @@ impl Board {
             .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?;
         Ok(())
     }
+
+    /// Tasks in a given status (`GET /tasks?status=<status>`) — the LIST projection (id/title/status/
+    /// assignee/updated_at/…, no comments; see [`get_task`](Self::get_task) for the full record with
+    /// comments). Used by the stale-task nudger to enumerate `in_progress` candidates cheaply before
+    /// fetching the full record only for ones whose `updated_at` alone is not enough to rule out (#478).
+    pub fn list_tasks_by_status(&self, status: &str) -> Result<Vec<Value>, String> {
+        match self.get_json(&format!("/tasks?status={status}"))? {
+            Value::Array(a) => Ok(a),
+            other => Err(format!("board /tasks?status={status}: expected an array, got {other}")),
+        }
+    }
+
+    /// One task's full record, INCLUDING its `comments` array (each with `author`/`body`/`created_at`) —
+    /// the list projection (`list_tasks_by_status`) omits comments. `Err` on a non-2xx response (e.g. an
+    /// unknown id).
+    pub fn get_task(&self, id: i64) -> Result<Value, String> {
+        self.get_json(&format!("/tasks/{id}"))
+    }
+
+    /// Post a comment on a task (`POST /tasks/{id}/comments`). `Err` on a non-2xx response.
+    pub fn comment_task(&self, task_id: i64, author: &str, body: &str) -> Result<(), String> {
+        let url = format!("{}/tasks/{}/comments", self.base, task_id);
+        let payload = serde_json::json!({ "author": author, "body": body }).to_string();
+        self.agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&payload)
+            .map_err(|e| format!("board POST /tasks/{task_id}/comments failed: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
