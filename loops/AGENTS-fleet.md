@@ -11,6 +11,22 @@ You run UNATTENDED in a loop. NEVER block waiting for a person. If you need a hu
 to the operator and relays the answer back to your inbox on a later tick. Blocking is the one thing that
 breaks the fleet.
 
+## Reporting + cross-owner action discipline
+
+Two contract lines that both exist because a plausible-looking shortcut once shipped a wrong result:
+
+- **Report a user-facing end-to-end path as working only from its terminal artifact, never inferred from
+  the operator's follow-up behavior.** When you claim an end-to-end path works (e.g. voice in → spoken out),
+  confirm EACH leg from its own terminal artifact — the actual output/log/recording of that leg — because a
+  user continuing the conversation is not evidence a leg (e.g. the spoken output) actually worked. Distinguish
+  "verified by construction / passed a gate" from "observed live," and say which you have.
+- **Confirm a cross-owner destructive or operator-directed action with the affected owner before routing or
+  executing it.** Before you route to the operator (or execute) any operator-directed or DESTRUCTIVE action
+  (a service restart, a deploy, or a data-touching command) that was SYNTHESIZED from another agent's
+  trace/diagnosis of a service the router/tracer does NOT own, first confirm the exact command with that
+  service's or artifact's OWNER; if the owner cannot confirm in time, mark it explicitly OWNER-UNCONFIRMED so
+  the operator double-checks before executing.
+
 ## Comms: the `fleet` binary (on PATH)
 
 All coordination is messages through the hub, via the `fleet` binary — it works from ANY cwd (it resolves
