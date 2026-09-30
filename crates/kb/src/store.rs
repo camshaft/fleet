@@ -1,9 +1,9 @@
-//! `store` — a thin blocking Qdrant client over its plain REST API. Port of Python `kb/store.py`.
+//! `store` — a thin async Qdrant client over its plain REST API. Port of Python `kb/store.py`.
 //!
 //! The Python used the `qdrant-client` package (gRPC/tonic). Here we talk to Qdrant's REST API directly with
-//! `ureq` — the fleet/slack-bridge house idiom for outbound HTTP to a JSON service (see `fleet/board.rs`) —
-//! which keeps the dep tree light (no tonic/gRPC) and matches the workspace. Every method maps one Python
-//! `store` function to one REST endpoint; the request/response shapes below are Qdrant's documented ones.
+//! async `reqwest` (operator directive #439: no blocking IO on the tokio runtime), which keeps the dep tree
+//! light (no tonic/gRPC) and matches the workspace's async HTTP client. Every method maps one Python `store`
+//! function to one REST endpoint; the request/response shapes below are Qdrant's documented ones.
 //!
 //! IDs are Qdrant point ids: our curated points use UUID strings (see `chunk::id`), but legacy collections
 //! may hold integer ids, so a [`Candidate`]'s `id` is kept as a raw JSON value and only stringified for
@@ -30,10 +30,11 @@ impl Candidate {
     }
 }
 
-/// A handle to a Qdrant instance over REST (stateless — each call is one request).
+/// A handle to a Qdrant instance over REST (stateless — each call is one request). IO is async `reqwest`
+/// (operator directive: no blocking IO on the tokio runtime, #439).
 pub struct Store {
     base: String,
-    agent: ureq::Agent,
+    http: reqwest::Client,
 }
 
 impl Store {
@@ -44,39 +45,53 @@ impl Store {
                 .qdrant_url
                 .trim_end_matches('/')
                 .to_string(),
-            agent: ureq::agent(),
+            http: reqwest::Client::new(),
         })
     }
 
     /// Whether a collection exists — `GET /collections/{name}` (200 → true, 404 → false). The Python
     /// `collection_exists`; guards the read paths so a missing collection is empty, not an error.
-    pub fn collection_exists(&self, name: &str) -> Result<bool, String> {
+    pub async fn collection_exists(&self, name: &str) -> Result<bool, String> {
         let url = format!("{}/collections/{}", self.base, name);
-        match self.agent.get(&url).call() {
-            Ok(_) => Ok(true),
-            Err(ureq::Error::Status(404, _)) => Ok(false),
-            Err(e) => Err(format!("qdrant GET /collections/{name} failed: {e}")),
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("qdrant GET /collections/{name} failed: {e}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(false)
+        } else if resp.status().is_success() {
+            Ok(true)
+        } else {
+            Err(format!(
+                "qdrant GET /collections/{name} failed: status {}",
+                resp.status()
+            ))
         }
     }
 
     /// Create the collection with the embedder's dim + Cosine distance if absent — the Python
     /// `ensure_collection`. `PUT /collections/{name}`.
-    pub fn ensure_collection(&self, name: &str, dim: usize) -> Result<(), String> {
-        if self.collection_exists(name)? {
+    pub async fn ensure_collection(&self, name: &str, dim: usize) -> Result<(), String> {
+        if self.collection_exists(name).await? {
             return Ok(());
         }
         let url = format!("{}/collections/{}", self.base, name);
         let body = json!({ "vectors": { "size": dim, "distance": "Cosine" } });
-        self.agent
-            .request("PUT", &url)
-            .send_json(body)
+        self.http
+            .put(&url)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant create collection {name} failed: {e}"))?;
         Ok(())
     }
 
     /// Upsert points (id, vector, payload), waiting for the write to be applied — the Python `upsert`.
     /// `PUT /collections/{name}/points?wait=true`.
-    pub fn upsert(
+    pub async fn upsert(
         &self,
         name: &str,
         points: &[(String, Vec<f32>, Map<String, Value>)],
@@ -89,23 +104,26 @@ impl Store {
             .map(|(id, vector, payload)| json!({ "id": id, "vector": vector, "payload": payload }))
             .collect();
         let url = format!("{}/collections/{}/points?wait=true", self.base, name);
-        self.agent
-            .request("PUT", &url)
-            .send_json(json!({ "points": arr }))
+        self.http
+            .put(&url)
+            .json(&json!({ "points": arr }))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant upsert into {name} failed: {e}"))?;
         Ok(())
     }
 
     /// Vector search; by default only `status == "active"` items (hides outdated/superseded) — the Python
     /// `query_candidates`. `POST /collections/{name}/points/query`. A missing collection yields no hits.
-    pub fn query_candidates(
+    pub async fn query_candidates(
         &self,
         name: &str,
         query_vector: &[f32],
         limit: usize,
         include_outdated: bool,
     ) -> Result<Vec<Candidate>, String> {
-        if !self.collection_exists(name)? {
+        if !self.collection_exists(name).await? {
             return Ok(vec![]);
         }
         let mut body = json!({
@@ -119,11 +137,15 @@ impl Store {
         }
         let url = format!("{}/collections/{}/points/query", self.base, name);
         let resp: Value = self
-            .agent
+            .http
             .post(&url)
-            .send_json(body)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant query {name} failed: {e}"))?
-            .into_json()
+            .json()
+            .await
             .map_err(|e| format!("qdrant query {name}: response was not JSON: {e}"))?;
         // Query API shape: { "result": { "points": [ { id, score, payload }, ... ] } }
         let points = resp
@@ -136,18 +158,22 @@ impl Store {
     }
 
     /// Retrieve one point by id (payload only) — the Python `get_point`. `POST /collections/{name}/points`.
-    pub fn get_point(&self, name: &str, id: &str) -> Result<Option<Candidate>, String> {
-        if !self.collection_exists(name)? {
+    pub async fn get_point(&self, name: &str, id: &str) -> Result<Option<Candidate>, String> {
+        if !self.collection_exists(name).await? {
             return Ok(None);
         }
         let url = format!("{}/collections/{}/points", self.base, name);
         let body = json!({ "ids": [id], "with_payload": true, "with_vector": false });
         let resp: Value = self
-            .agent
+            .http
             .post(&url)
-            .send_json(body)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant retrieve from {name} failed: {e}"))?
-            .into_json()
+            .json()
+            .await
             .map_err(|e| format!("qdrant retrieve from {name}: response was not JSON: {e}"))?;
         let first = resp
             .get("result")
@@ -159,7 +185,7 @@ impl Store {
 
     /// Merge `patch` into a point's payload, waiting for the write — the Python `set_payload`.
     /// `POST /collections/{name}/points/payload?wait=true`.
-    pub fn set_payload(
+    pub async fn set_payload(
         &self,
         name: &str,
         id: &str,
@@ -170,16 +196,19 @@ impl Store {
             self.base, name
         );
         let body = json!({ "payload": patch, "points": [id] });
-        self.agent
+        self.http
             .post(&url)
-            .send_json(body)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant set_payload on {name} failed: {e}"))?;
         Ok(())
     }
 
     /// One document's chunk payloads within a page range, matched on exact `path` — the Python `read_pages`.
     /// `POST /collections/{name}/points/scroll`.
-    pub fn read_pages(
+    pub async fn read_pages(
         &self,
         name: &str,
         path: &str,
@@ -191,12 +220,12 @@ impl Store {
             { "key": "path", "match": { "value": path } },
             { "key": "page", "range": { "gte": start_page, "lte": end_page } },
         ] });
-        self.scroll(name, filter, limit)
+        self.scroll(name, filter, limit).await
     }
 
     /// Every chunk payload in a page range across the whole collection — the Python `scroll_page_range`. A
     /// fallback for when the caller's `path` doesn't match exactly (a doc ingested under variant paths).
-    pub fn scroll_page_range(
+    pub async fn scroll_page_range(
         &self,
         name: &str,
         start_page: i64,
@@ -206,29 +235,33 @@ impl Store {
         let filter = json!({ "must": [
             { "key": "page", "range": { "gte": start_page, "lte": end_page } },
         ] });
-        self.scroll(name, filter, limit)
+        self.scroll(name, filter, limit).await
     }
 
     /// Shared scroll helper: returns payloads only (the Python read paths only use `p.payload`). A missing
     /// collection yields an empty list.
-    fn scroll(
+    async fn scroll(
         &self,
         name: &str,
         filter: Value,
         limit: usize,
     ) -> Result<Vec<Map<String, Value>>, String> {
-        if !self.collection_exists(name)? {
+        if !self.collection_exists(name).await? {
             return Ok(vec![]);
         }
         let url = format!("{}/collections/{}/points/scroll", self.base, name);
         let body =
             json!({ "filter": filter, "with_payload": true, "with_vector": false, "limit": limit });
         let resp: Value = self
-            .agent
+            .http
             .post(&url)
-            .send_json(body)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant scroll {name} failed: {e}"))?
-            .into_json()
+            .json()
+            .await
             .map_err(|e| format!("qdrant scroll {name}: response was not JSON: {e}"))?;
         // Scroll shape: { "result": { "points": [ { id, payload }, ... ], "next_page_offset": ... } }
         let points = resp
@@ -242,14 +275,17 @@ impl Store {
 
     /// Every collection name paired with its exact point count — the Python `collections`.
     /// `GET /collections` then `POST /collections/{name}/points/count { exact: true }`.
-    pub fn collections(&self) -> Result<Vec<(String, u64)>, String> {
+    pub async fn collections(&self) -> Result<Vec<(String, u64)>, String> {
         let url = format!("{}/collections", self.base);
         let resp: Value = self
-            .agent
+            .http
             .get(&url)
-            .call()
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant GET /collections failed: {e}"))?
-            .into_json()
+            .json()
+            .await
             .map_err(|e| format!("qdrant GET /collections: response was not JSON: {e}"))?;
         let names: Vec<String> = resp
             .get("result")
@@ -263,21 +299,25 @@ impl Store {
             .unwrap_or_default();
         let mut out = Vec::with_capacity(names.len());
         for name in names {
-            let count = self.count(&name)?;
+            let count = self.count(&name).await?;
             out.push((name, count));
         }
         Ok(out)
     }
 
     /// Exact point count for one collection — `POST /collections/{name}/points/count { exact: true }`.
-    pub fn count(&self, name: &str) -> Result<u64, String> {
+    pub async fn count(&self, name: &str) -> Result<u64, String> {
         let url = format!("{}/collections/{}/points/count", self.base, name);
         let resp: Value = self
-            .agent
+            .http
             .post(&url)
-            .send_json(json!({ "exact": true }))
+            .json(&json!({ "exact": true }))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("qdrant count {name} failed: {e}"))?
-            .into_json()
+            .json()
+            .await
             .map_err(|e| format!("qdrant count {name}: response was not JSON: {e}"))?;
         Ok(resp
             .get("result")

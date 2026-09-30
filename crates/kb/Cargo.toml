@@ -52,9 +52,6 @@ ort-sys = "=2.0.0-rc.9"
 # runtime (#439). `reqwest` is the workspace's async client (bridge-core uses the same version/features), so
 # adding it here pulls no new tree. rustls-tls matches bridge-core; localhost traffic is plain http.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# `ureq` (blocking) still backs store.rs + board.rs until they migrate to reqwest under #439; removed in the
-# final step of that migration. New code uses reqwest.
-ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: payloads round-trip through Qdrant without silently reordering an agent's fields.
 serde_json = { version = "1", features = ["preserve_order"] }

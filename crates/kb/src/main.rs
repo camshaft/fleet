@@ -93,10 +93,8 @@ async fn main() {
             limit,
             all,
         } => {
-            // Search is blocking (embed + rerank + Qdrant I/O); keep it off the reactor thread.
-            tokio::task::spawn_blocking(move || run_search(&query, collection, limit, all))
-                .await
-                .unwrap_or_else(|e| Err(format!("search task panicked: {e}")))
+            // search() awaits Qdrant IO and runs embed/rerank off-reactor internally (#439).
+            run_search(&query, collection, limit, all).await
         }
     };
 
@@ -107,7 +105,7 @@ async fn main() {
 }
 
 /// The terminal search command — a port of the Python `kb/cli.py` `main`.
-fn run_search(
+async fn run_search(
     query: &str,
     collection: Option<String>,
     limit: usize,
@@ -116,7 +114,7 @@ fn run_search(
     let cfg = config::get();
     let collection = collection.unwrap_or_else(|| cfg.default_collection.clone());
     let store = Store::connect()?;
-    let results = search::search(&store, &collection, query, limit, all, None)?;
+    let results = search::search(&store, &collection, query, limit, all, None).await?;
     if results.is_empty() {
         println!("(no results)");
         return Ok(());

@@ -14,8 +14,9 @@
 //!   kb_update        edit an item (text/status/quality/tags)
 //!   kb_collections   list collections + counts
 //!
-//! Embedding, reranking, and Qdrant I/O are all BLOCKING (fastembed/ONNX + ureq). Each tool body therefore
-//! runs inside `spawn_blocking` so it never stalls the axum/tokio reactor; the async fns are thin shells.
+//! Qdrant I/O is async (`store` over reqwest), awaited directly in each tool body. Embedding and reranking
+//! (fastembed/ONNX) are CPU-bound, so those specific calls run off the reactor via `spawn_blocking` (the
+//! [`blocking`] helper) — operator directive #439: no blocking on the tokio runtime.
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -28,8 +29,8 @@ use serde_json::{Map, Value};
 
 use crate::{config, curate, embed, search, store::Store};
 
-/// The MCP handler. Stateless — every tool opens a fresh `Store` (a Qdrant REST call is sessionless and the
-/// `ureq::Agent` is cheap), and the embedder/reranker are process-global singletons in their modules.
+/// The MCP handler. Stateless — every tool opens a fresh `Store` (a Qdrant REST call is sessionless and a
+/// `reqwest::Client` is cheap to build), and the embedder/reranker are process-global singletons in their modules.
 #[derive(Clone)]
 pub struct Kb {
     #[allow(dead_code)]
@@ -44,7 +45,7 @@ fn map_err(e: String) -> McpError {
     McpError::internal_error(e, None)
 }
 
-/// Run a blocking closure (embed/rerank/Qdrant I/O) off the reactor, flattening the join error.
+/// Run a CPU-bound blocking closure (embed/rerank) off the reactor, flattening the join error.
 async fn blocking<F, T>(f: F) -> Result<T, McpError>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -210,43 +211,40 @@ impl Kb {
         Parameters(a): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = a.limit.max(0) as usize;
-        let collection = a.collection.clone();
-        let out = blocking(move || {
-            let store = Store::connect()?;
-            let results = if collection == "all" {
-                search::search_all(&store, &a.query, limit, a.include_outdated, None)?
-            } else {
-                search::search(
-                    &store,
-                    &collection,
-                    &a.query,
-                    limit,
-                    a.include_outdated,
-                    None,
-                )?
-            };
-            if results.is_empty() {
-                return Ok(format!("No results in '{}'.", a.collection));
-            }
-            let blocks: Vec<String> = results
-                .iter()
-                .map(|r| {
-                    let p = &r.payload;
-                    let head = format!(
-                        "[id={} col={} score={:.3} kind={} status={}]",
-                        r.id,
-                        r.collection,
-                        r.final_score,
-                        ptext(p, "kind"),
-                        ptext(p, "status"),
-                    );
-                    format!("{head}\nsource: {}\n\n{}", cite(p), ptext(p, "text").trim())
-                })
-                .collect();
-            Ok(blocks.join("\n\n---\n\n"))
-        })
-        .await?;
-        text_result(out)
+        let store = Store::connect().map_err(map_err)?;
+        let results = if a.collection == "all" {
+            search::search_all(&store, &a.query, limit, a.include_outdated, None).await
+        } else {
+            search::search(
+                &store,
+                &a.collection,
+                &a.query,
+                limit,
+                a.include_outdated,
+                None,
+            )
+            .await
+        }
+        .map_err(map_err)?;
+        if results.is_empty() {
+            return text_result(format!("No results in '{}'.", a.collection));
+        }
+        let blocks: Vec<String> = results
+            .iter()
+            .map(|r| {
+                let p = &r.payload;
+                let head = format!(
+                    "[id={} col={} score={:.3} kind={} status={}]",
+                    r.id,
+                    r.collection,
+                    r.final_score,
+                    ptext(p, "kind"),
+                    ptext(p, "status"),
+                );
+                format!("{head}\nsource: {}\n\n{}", cite(p), ptext(p, "text").trim())
+            })
+            .collect();
+        text_result(blocks.join("\n\n---\n\n"))
     }
 
     #[tool(
@@ -256,61 +254,62 @@ impl Kb {
         &self,
         Parameters(a): Parameters<ReadPagesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let out = blocking(move || {
-            let store = Store::connect()?;
-            let start = a.start_page;
-            // end_page defaults to start+4, then is clamped to [start, start+24] (bound the span).
-            let mut end = a.end_page.unwrap_or(start + 4);
-            end = end.min(start + 24).max(start);
+        let store = Store::connect().map_err(map_err)?;
+        let start = a.start_page;
+        // end_page defaults to start+4, then is clamped to [start, start+24] (bound the span).
+        let mut end = a.end_page.unwrap_or(start + 4);
+        end = end.min(start + 24).max(start);
 
-            let mut rows = store.read_pages(&a.collection, &a.path, start, end, 1000)?;
-            if rows.is_empty() {
-                // Tolerate path variants (same doc ingested under different paths).
-                let want = a.path.to_lowercase();
-                if !want.is_empty() {
-                    rows = store
-                        .scroll_page_range(&a.collection, start, end, 2000)?
-                        .into_iter()
-                        .filter(|p| {
-                            let path = ptext(p, "path").to_lowercase();
-                            let title = ptext(p, "title").to_lowercase();
-                            path.ends_with(&want) || want.ends_with(&path) || title == want
-                        })
-                        .collect();
-                }
+        let mut rows = store
+            .read_pages(&a.collection, &a.path, start, end, 1000)
+            .await
+            .map_err(map_err)?;
+        if rows.is_empty() {
+            // Tolerate path variants (same doc ingested under different paths).
+            let want = a.path.to_lowercase();
+            if !want.is_empty() {
+                rows = store
+                    .scroll_page_range(&a.collection, start, end, 2000)
+                    .await
+                    .map_err(map_err)?
+                    .into_iter()
+                    .filter(|p| {
+                        let path = ptext(p, "path").to_lowercase();
+                        let title = ptext(p, "title").to_lowercase();
+                        path.ends_with(&want) || want.ends_with(&path) || title == want
+                    })
+                    .collect();
             }
-            if rows.is_empty() {
-                return Ok(format!(
-                    "No pages {start}-{end} found for '{}' in '{}'. Run kb_search first and pass the exact \
-                     `col` and source path it cites.",
-                    a.path, a.collection
-                ));
-            }
-            // Order by (page, chunk), both defaulting to 0.
-            rows.sort_by_key(|p| (pnum(p, "page"), pnum(p, "chunk")));
+        }
+        if rows.is_empty() {
+            return text_result(format!(
+                "No pages {start}-{end} found for '{}' in '{}'. Run kb_search first and pass the exact \
+                 `col` and source path it cites.",
+                a.path, a.collection
+            ));
+        }
+        // Order by (page, chunk), both defaulting to 0.
+        rows.sort_by_key(|p| (pnum(p, "page"), pnum(p, "chunk")));
 
-            let mut out = String::new();
-            let mut cur: Option<i64> = None;
-            for p in &rows {
-                let page = pnum(p, "page");
-                if Some(page) != cur {
-                    cur = Some(page);
-                    out.push_str(&format!("\n--- p.{page} ---\n"));
-                }
-                out.push_str(ptext(p, "text").trim());
-                out.push('\n');
+        let mut out = String::new();
+        let mut cur: Option<i64> = None;
+        for p in &rows {
+            let page = pnum(p, "page");
+            if Some(page) != cur {
+                cur = Some(page);
+                out.push_str(&format!("\n--- p.{page} ---\n"));
             }
-            let first = &rows[0];
-            let last = &rows[rows.len() - 1];
-            let title = ps(first, "title")
-                .or_else(|| ps(first, "path"))
-                .unwrap_or_else(|| a.path.clone());
-            let lo = pnum(first, "page");
-            let hi = pnum(last, "page");
-            Ok(format!("{title} — pages {lo}–{hi}:\n{}", out.trim_end()))
-        })
-        .await?;
-        text_result(out)
+            out.push_str(ptext(p, "text").trim());
+            out.push('\n');
+        }
+        let first = &rows[0];
+        let last = &rows[rows.len() - 1];
+        let title = ps(first, "title")
+            .or_else(|| ps(first, "path"))
+            .unwrap_or_else(|| a.path.clone());
+        let lo = pnum(first, "page");
+        let hi = pnum(last, "page");
+        text_result(format!("{title} — pages {lo}–{hi}:\n{}", out.trim_end()))
     }
 
     #[tool(
@@ -320,28 +319,36 @@ impl Kb {
         &self,
         Parameters(a): Parameters<RememberArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let out = blocking(move || {
-            let cfg = config::get();
-            let collection = a
-                .collection
-                .unwrap_or_else(|| cfg.memory_collection.clone());
-            let store = Store::connect()?;
-            store.ensure_collection(&collection, embed::dim()?)?;
-            let vec = embed::embed_docs(std::slice::from_ref(&a.text))?
+        let cfg = config::get();
+        let collection = a
+            .collection
+            .unwrap_or_else(|| cfg.memory_collection.clone());
+        let store = Store::connect().map_err(map_err)?;
+        let dim = blocking(embed::dim).await?;
+        store
+            .ensure_collection(&collection, dim)
+            .await
+            .map_err(map_err)?;
+        let text = a.text;
+        let (text, vec) = blocking(move || {
+            let vec = embed::embed_docs(std::slice::from_ref(&text))?
                 .pop()
                 .ok_or("embed produced no vector")?;
-            let pid = uuid::Uuid::new_v4().to_string();
-            let mut extra = Map::new();
-            extra.insert("text".into(), Value::from(a.text));
-            extra.insert("source".into(), Value::from("memory"));
-            put_opt_str(&mut extra, "tags", a.tags);
-            put_opt_f64(&mut extra, "confidence", a.confidence);
-            let payload = curate::base_payload(cfg, "memory", a.authority, extra);
-            store.upsert(&collection, &[(pid.clone(), vec, payload)])?;
-            Ok(format!("Stored memory {pid} in '{collection}'."))
+            Ok((text, vec))
         })
         .await?;
-        text_result(out)
+        let pid = uuid::Uuid::new_v4().to_string();
+        let mut extra = Map::new();
+        extra.insert("text".into(), Value::from(text));
+        extra.insert("source".into(), Value::from("memory"));
+        put_opt_str(&mut extra, "tags", a.tags);
+        put_opt_f64(&mut extra, "confidence", a.confidence);
+        let payload = curate::base_payload(cfg, "memory", a.authority, extra);
+        store
+            .upsert(&collection, &[(pid.clone(), vec, payload)])
+            .await
+            .map_err(map_err)?;
+        text_result(format!("Stored memory {pid} in '{collection}'."))
     }
 
     #[tool(
@@ -351,32 +358,31 @@ impl Kb {
         &self,
         Parameters(a): Parameters<FeedbackArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let out = blocking(move || {
-            let cfg = config::get();
-            let collection = a
-                .collection
-                .unwrap_or_else(|| cfg.default_collection.clone());
-            let store = Store::connect()?;
-            let Some(pt) = store.get_point(&collection, &a.id)? else {
-                return Ok(format!("No item {} in '{collection}'.", a.id));
-            };
-            let p = &pt.payload;
-            let key = if a.helpful { "helpful" } else { "unhelpful" };
-            let now = curate::now_iso();
-            let mut patch = Map::new();
-            patch.insert(key.into(), Value::from(pnum(p, key) + 1));
-            patch.insert("use_count".into(), Value::from(pnum(p, "use_count") + 1));
-            patch.insert("last_verified".into(), Value::from(now.clone()));
-            patch.insert("updated_at".into(), Value::from(now));
-            store.set_payload(&collection, &a.id, patch)?;
-            Ok(format!(
-                "Recorded {} for {}.",
-                if a.helpful { "helpful" } else { "not-helpful" },
-                a.id
-            ))
-        })
-        .await?;
-        text_result(out)
+        let cfg = config::get();
+        let collection = a
+            .collection
+            .unwrap_or_else(|| cfg.default_collection.clone());
+        let store = Store::connect().map_err(map_err)?;
+        let Some(pt) = store.get_point(&collection, &a.id).await.map_err(map_err)? else {
+            return text_result(format!("No item {} in '{collection}'.", a.id));
+        };
+        let p = &pt.payload;
+        let key = if a.helpful { "helpful" } else { "unhelpful" };
+        let now = curate::now_iso();
+        let mut patch = Map::new();
+        patch.insert(key.into(), Value::from(pnum(p, key) + 1));
+        patch.insert("use_count".into(), Value::from(pnum(p, "use_count") + 1));
+        patch.insert("last_verified".into(), Value::from(now.clone()));
+        patch.insert("updated_at".into(), Value::from(now));
+        store
+            .set_payload(&collection, &a.id, patch)
+            .await
+            .map_err(map_err)?;
+        text_result(format!(
+            "Recorded {} for {}.",
+            if a.helpful { "helpful" } else { "not-helpful" },
+            a.id
+        ))
     }
 
     #[tool(description = "Hide an item from future results (marks it 'outdated').")]
@@ -384,26 +390,30 @@ impl Kb {
         &self,
         Parameters(a): Parameters<MarkOutdatedArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let out = blocking(move || {
-            let cfg = config::get();
-            let collection = a
-                .collection
-                .unwrap_or_else(|| cfg.default_collection.clone());
-            let store = Store::connect()?;
-            if store.get_point(&collection, &a.id)?.is_none() {
-                return Ok(format!("No item {} in '{collection}'.", a.id));
-            }
-            let mut patch = Map::new();
-            patch.insert("status".into(), Value::from("outdated"));
-            patch.insert("updated_at".into(), Value::from(curate::now_iso()));
-            if !a.reason.is_empty() {
-                patch.insert("outdated_reason".into(), Value::from(a.reason));
-            }
-            store.set_payload(&collection, &a.id, patch)?;
-            Ok(format!("Marked {} outdated.", a.id))
-        })
-        .await?;
-        text_result(out)
+        let cfg = config::get();
+        let collection = a
+            .collection
+            .unwrap_or_else(|| cfg.default_collection.clone());
+        let store = Store::connect().map_err(map_err)?;
+        if store
+            .get_point(&collection, &a.id)
+            .await
+            .map_err(map_err)?
+            .is_none()
+        {
+            return text_result(format!("No item {} in '{collection}'.", a.id));
+        }
+        let mut patch = Map::new();
+        patch.insert("status".into(), Value::from("outdated"));
+        patch.insert("updated_at".into(), Value::from(curate::now_iso()));
+        if !a.reason.is_empty() {
+            patch.insert("outdated_reason".into(), Value::from(a.reason));
+        }
+        store
+            .set_payload(&collection, &a.id, patch)
+            .await
+            .map_err(map_err)?;
+        text_result(format!("Marked {} outdated.", a.id))
     }
 
     #[tool(
@@ -413,40 +423,54 @@ impl Kb {
         &self,
         Parameters(a): Parameters<SupersedeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let out = blocking(move || {
-            let cfg = config::get();
-            let collection = a
-                .collection
-                .unwrap_or_else(|| cfg.memory_collection.clone());
-            let store = Store::connect()?;
-            let old = store.get_point(&collection, &a.old_id)?;
-            let kind = old
-                .as_ref()
-                .and_then(|o| ps(&o.payload, "kind"))
-                .unwrap_or_else(|| "memory".to_string());
-            store.ensure_collection(&collection, embed::dim()?)?;
-            let vec = embed::embed_docs(std::slice::from_ref(&a.new_text))?
+        let cfg = config::get();
+        let collection = a
+            .collection
+            .unwrap_or_else(|| cfg.memory_collection.clone());
+        let store = Store::connect().map_err(map_err)?;
+        let old = store
+            .get_point(&collection, &a.old_id)
+            .await
+            .map_err(map_err)?;
+        let kind = old
+            .as_ref()
+            .and_then(|o| ps(&o.payload, "kind"))
+            .unwrap_or_else(|| "memory".to_string());
+        let dim = blocking(embed::dim).await?;
+        store
+            .ensure_collection(&collection, dim)
+            .await
+            .map_err(map_err)?;
+        let new_text = a.new_text;
+        let (new_text, vec) = blocking(move || {
+            let vec = embed::embed_docs(std::slice::from_ref(&new_text))?
                 .pop()
                 .ok_or("embed produced no vector")?;
-            let new_id = uuid::Uuid::new_v4().to_string();
-            let mut extra = Map::new();
-            extra.insert("text".into(), Value::from(a.new_text));
-            extra.insert("source".into(), Value::from("memory"));
-            extra.insert("supersedes".into(), Value::from(a.old_id.clone()));
-            put_opt_str(&mut extra, "tags", a.tags);
-            let payload = curate::base_payload(cfg, &kind, None, extra);
-            store.upsert(&collection, &[(new_id.clone(), vec, payload)])?;
-            if old.is_some() {
-                let mut patch = Map::new();
-                patch.insert("status".into(), Value::from("superseded"));
-                patch.insert("superseded_by".into(), Value::from(new_id.clone()));
-                patch.insert("updated_at".into(), Value::from(curate::now_iso()));
-                store.set_payload(&collection, &a.old_id, patch)?;
-            }
-            Ok(format!("Superseded {} -> {}.", a.old_id, new_id))
+            Ok((new_text, vec))
         })
         .await?;
-        text_result(out)
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let mut extra = Map::new();
+        extra.insert("text".into(), Value::from(new_text));
+        extra.insert("source".into(), Value::from("memory"));
+        extra.insert("supersedes".into(), Value::from(a.old_id.clone()));
+        put_opt_str(&mut extra, "tags", a.tags);
+        let payload = curate::base_payload(cfg, &kind, None, extra);
+        store
+            .upsert(&collection, &[(new_id.clone(), vec, payload)])
+            .await
+            .map_err(map_err)?;
+        if old.is_some() {
+            let mut patch = Map::new();
+            patch.insert("status".into(), Value::from("superseded"));
+            patch.insert("superseded_by".into(), Value::from(new_id.clone()));
+            patch.insert("updated_at".into(), Value::from(curate::now_iso()));
+            store
+                .set_payload(&collection, &a.old_id, patch)
+                .await
+                .map_err(map_err)?;
+        }
+        text_result(format!("Superseded {} -> {}.", a.old_id, new_id))
     }
 
     #[tool(
@@ -456,62 +480,64 @@ impl Kb {
         &self,
         Parameters(a): Parameters<UpdateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let out = blocking(move || {
-            let cfg = config::get();
-            let collection = a
-                .collection
-                .unwrap_or_else(|| cfg.memory_collection.clone());
-            let store = Store::connect()?;
-            let Some(pt) = store.get_point(&collection, &a.id)? else {
-                return Ok(format!("No item {} in '{collection}'.", a.id));
-            };
-            let mut patch = Map::new();
-            patch.insert("updated_at".into(), Value::from(curate::now_iso()));
-            if let Some(status) = a.status {
-                patch.insert("status".into(), Value::from(status));
+        let cfg = config::get();
+        let collection = a
+            .collection
+            .unwrap_or_else(|| cfg.memory_collection.clone());
+        let store = Store::connect().map_err(map_err)?;
+        let Some(pt) = store.get_point(&collection, &a.id).await.map_err(map_err)? else {
+            return text_result(format!("No item {} in '{collection}'.", a.id));
+        };
+        let mut patch = Map::new();
+        patch.insert("updated_at".into(), Value::from(curate::now_iso()));
+        if let Some(status) = a.status {
+            patch.insert("status".into(), Value::from(status));
+        }
+        if let Some(quality) = a.quality {
+            patch.insert("quality".into(), Value::from(quality));
+        }
+        if let Some(tags) = a.tags {
+            patch.insert("tags".into(), Value::from(tags));
+        }
+        if let Some(text) = a.text {
+            // Re-embed: merge existing payload + patch + new text, then upsert in place (same id).
+            let mut newp = pt.payload.clone();
+            for (k, v) in &patch {
+                newp.insert(k.clone(), v.clone());
             }
-            if let Some(quality) = a.quality {
-                patch.insert("quality".into(), Value::from(quality));
-            }
-            if let Some(tags) = a.tags {
-                patch.insert("tags".into(), Value::from(tags));
-            }
-            if let Some(text) = a.text {
-                // Re-embed: merge existing payload + patch + new text, then upsert in place (same id).
-                let mut newp = pt.payload.clone();
-                for (k, v) in &patch {
-                    newp.insert(k.clone(), v.clone());
-                }
-                newp.insert("text".into(), Value::from(text.clone()));
-                let vec = embed::embed_docs(&[text])?
+            newp.insert("text".into(), Value::from(text.clone()));
+            let vec = blocking(move || {
+                embed::embed_docs(&[text])?
                     .pop()
-                    .ok_or("embed produced no vector")?;
-                store.upsert(&collection, &[(a.id.clone(), vec, newp)])?;
-                return Ok(format!("Updated {} (re-embedded).", a.id));
-            }
-            store.set_payload(&collection, &a.id, patch)?;
-            Ok(format!("Updated {}.", a.id))
-        })
-        .await?;
-        text_result(out)
+                    .ok_or_else(|| "embed produced no vector".to_string())
+            })
+            .await?;
+            store
+                .upsert(&collection, &[(a.id.clone(), vec, newp)])
+                .await
+                .map_err(map_err)?;
+            return text_result(format!("Updated {} (re-embedded).", a.id));
+        }
+        store
+            .set_payload(&collection, &a.id, patch)
+            .await
+            .map_err(map_err)?;
+        text_result(format!("Updated {}.", a.id))
     }
 
     #[tool(description = "List all collections and their item counts.")]
     async fn kb_collections(&self) -> Result<CallToolResult, McpError> {
-        let out = blocking(move || {
-            let store = Store::connect()?;
-            let cols = store.collections()?;
-            if cols.is_empty() {
-                return Ok("No collections yet.".to_string());
-            }
-            Ok(cols
-                .iter()
+        let store = Store::connect().map_err(map_err)?;
+        let cols = store.collections().await.map_err(map_err)?;
+        if cols.is_empty() {
+            return text_result("No collections yet.".to_string());
+        }
+        text_result(
+            cols.iter()
                 .map(|(n, c)| format!("{n}: {c} items"))
                 .collect::<Vec<_>>()
-                .join("\n"))
-        })
-        .await?;
-        text_result(out)
+                .join("\n"),
+        )
     }
 }
 
