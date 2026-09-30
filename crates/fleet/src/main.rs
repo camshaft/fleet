@@ -2392,6 +2392,14 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
          another agent's trace or diagnosis of a service you do NOT own, first confirm the exact command with \
          that service's OWNER (the authority on their live unit); if the owner cannot confirm in time, mark it \
          OWNER-UNCONFIRMED so the operator double-checks — partial visibility can read a stale unit as live. \
+         SHARED-TASK COORDINATION (task_565): when an escalation (e.g. an anti-stall judgment-check) flags a \
+         dangling spin-off or follow-on on a SHARED task that has a LIVE owner, the OWNER files the spin-off — \
+         a coordinator files only if the owner is absent/stalled or has not acted within a beat; never have \
+         both owner and coordinator race-create it. And DEDUP IS SINGLE-WRITER: when duplicate tasks exist, \
+         the ONE dedup owner picks the survivor, cancels the loser, and FREEZES — declare 'I own the end-state, \
+         stop toggling'; never symmetric-cancel your OWN duplicate deferring to the other agent, which \
+         deadlocks (both cancel, then both re-toggle); if you spot a dup you do not own the dedup for, flag the \
+         dedup owner rather than cancelling your own. \
          If a task of \
          yours becomes BLOCKED ON AN EXTERNAL DEPENDENCY you cannot act on — the operator, another agent, or \
          a pending deploy/CI/cross-agent reply — do NOT sit on the SOON cadence polling for it: set the task \
@@ -5633,6 +5641,11 @@ mod tests {
         // OWNER-CONFIRM gate (#352): a trace-derived destructive/operator action against a service you don't
         // own must be owner-confirmed before executing or routing (a near-miss almost restarted a stale unit).
         assert!(k.contains("OWNER-CONFIRM gate") && k.contains("OWNER-UNCONFIRMED"), "binds the owner-confirm gate for trace-derived destructive actions");
+        // Shared-task coordination (task_565): R1 give-the-owner-a-beat (owner files a flagged spin-off; a
+        // coordinator only if the owner is absent/stalled) + R2 dedup-is-single-writer (one owner picks the
+        // survivor and FREEZES; never symmetric-cancel your own dup, which deadlocks).
+        assert!(k.contains("SHARED-TASK COORDINATION") && k.contains("the OWNER files the spin-off"), "R1: give the live owner a beat before a coordinator race-creates a flagged spin-off");
+        assert!(k.contains("DEDUP IS SINGLE-WRITER") && k.contains("symmetric-cancel"), "R2: dedup is single-writer; never symmetric-cancel your own dup (deadlock)");
         // Dynamic loop (no fixed interval arg after /loop) — the agent self-paces.
         assert!(k.contains("/loop run one tick"), "dynamic /loop, not `/loop 30m`");
         assert!(!k.contains("/loop 30m"), "must NOT pin a fixed interval on the loop");
