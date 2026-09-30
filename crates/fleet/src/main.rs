@@ -3833,11 +3833,62 @@ fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool) -> String {
     args
 }
 
+/// The runtime-config environment an observer needs to launch a fresh Claude Code session, captured from the
+/// installing process's environment. A systemd USER service starts with a stripped environment, and a window
+/// the watchdog spawns via `tmux new-window` inherits the INVOKING client's `PATH` (not the tmux server's), so
+/// under the service the observer window's `exec claude` cannot find `claude` (it lives in a user-local bin) and
+/// the window closes with status 127 the moment it opens. Bedrock model selection is likewise env-driven. So
+/// capture the exact working values at install time.
+///
+/// This is an ALLOWLIST of generic, public variable NAMES (their values are written into the LOCAL unit file,
+/// never into source): the search `PATH`, the AWS region/profile the SDK resolves file-based credentials by, the
+/// Bedrock toggle, and the default model ids. The volatile per-session identity variables (a session id, a
+/// messaging socket/token, a pid) are deliberately EXCLUDED so a spawned observer gets a clean session, never a
+/// copy of the installer's session. An unset variable is skipped.
+const OBSERVER_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+];
+
+/// Render systemd `Environment="K=V"` lines for the given (name, value) pairs, one per present value (a `None`
+/// value is skipped). Values are double-quoted per systemd syntax so a `PATH` with no spaces is safe and a value
+/// that ever gains a space stays one assignment. Pure — unit-tested.
+fn render_service_env_lines(vars: &[(&str, Option<String>)]) -> String {
+    let mut out = String::new();
+    for (name, value) in vars {
+        if let Some(v) = value {
+            out.push_str(&format!("Environment=\"{name}={v}\"\n"));
+        }
+    }
+    out
+}
+
+/// The observer runtime-config env block ([`OBSERVER_ENV_ALLOWLIST`]) read from THIS process's environment and
+/// rendered as systemd `Environment=` lines. Run at install time from the working interactive session so the
+/// captured values are the ones under which a Claude session actually launches. Reads the environment (not pure).
+fn captured_observer_env() -> String {
+    let vars: Vec<(&str, Option<String>)> =
+        OBSERVER_ENV_ALLOWLIST.iter().map(|n| (*n, std::env::var(n).ok())).collect();
+    render_service_env_lines(&vars)
+}
+
 /// The systemd USER service + timer for the watchdog cadence as `(service_text, timer_text)` — pure unit text
 /// (no display headers), so it can be written to unit files or wrapped for stdout. The service is a `oneshot`
 /// (the watchdog is single-sweep) ordered After/Wants `fleet-notify` (the wake path it complements); the timer
-/// re-fires it on `OnUnitActiveSec`. Pure — unit-tested.
-fn watchdog_unit_files(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> (String, String) {
+/// re-fires it on `OnUnitActiveSec`. `env_block` is the pre-rendered `Environment=` lines (empty when the unit
+/// spawns nothing — a rearm-only watchdog needs no launch environment). Pure — unit-tested.
+fn watchdog_unit_files(
+    fleet_bin: &str,
+    exec_args: &str,
+    interval_secs: u64,
+    env_block: &str,
+) -> (String, String) {
     let service = format!(
         "[Unit]\n\
          Description=Fleet watchdog — out-of-band /loop re-arm + observer cadence\n\
@@ -3845,6 +3896,7 @@ fn watchdog_unit_files(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> 
          Wants=fleet-notify.service\n\n\
          [Service]\n\
          Type=oneshot\n\
+         {env_block}\
          ExecStart={fleet_bin} {exec_args}\n"
     );
     let timer = format!(
@@ -3863,8 +3915,8 @@ fn watchdog_unit_files(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> 
 /// The two units concatenated with display headers, for `fleet watchdog-unit` stdout — a host installs these
 /// DECLARATIVELY (home-manager `systemd.user.services`/`timers`); the emitted text is the canonical shape to
 /// translate, not a file to write. Pure — unit-tested.
-fn render_watchdog_units(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> String {
-    let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs);
+fn render_watchdog_units(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) -> String {
+    let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs, env_block);
     format!(
         "# ---- fleet-watchdog.service (systemd USER oneshot) ----\n{service}\n\
          # ---- fleet-watchdog.timer (fires the service every {interval_secs}s) ----\n{timer}"
@@ -3901,20 +3953,23 @@ fn watchdog_unit(
             .unwrap_or_else(|| "fleet".to_string())
     });
     let exec_args = watchdog_exec_args(rearm, observe, pinned_only);
+    // Only an observer-spawning watchdog needs a launch environment (a rearm-only sweep just sends keys to an
+    // existing window). Capture it from this (working) session so the installed service can launch Claude.
+    let env_block = if observe { captured_observer_env() } else { String::new() };
     if uninstall {
         watchdog_unit_uninstall();
         return;
     }
     if install {
-        watchdog_unit_install(&fleet_bin, &exec_args, interval_secs);
+        watchdog_unit_install(&fleet_bin, &exec_args, interval_secs, &env_block);
         return;
     }
-    print!("{}", render_watchdog_units(&fleet_bin, &exec_args, interval_secs));
+    print!("{}", render_watchdog_units(&fleet_bin, &exec_args, interval_secs, &env_block));
 }
 
 /// Write the watchdog service + timer into `~/.config/systemd/user/` and print the enable command. User-level
 /// (no sudo). Idempotent (overwrites). Non-fatal guidance to stop any ad-hoc watchdog loop and to reverse.
-fn watchdog_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64) {
+fn watchdog_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) {
     let Some(dir) = user_unit_dir() else {
         eprintln!("fleet watchdog-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
         std::process::exit(1);
@@ -3923,7 +3978,7 @@ fn watchdog_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64) {
         eprintln!("fleet watchdog-unit --install: mkdir {}: {e}", dir.display());
         std::process::exit(1);
     }
-    let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs);
+    let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs, env_block);
     for (name, body) in [("fleet-watchdog.service", &service), ("fleet-watchdog.timer", &timer)] {
         let path = dir.join(name);
         if let Err(e) = std::fs::write(&path, body) {
@@ -4426,7 +4481,7 @@ mod tests {
 
     #[test]
     fn render_watchdog_units_is_a_oneshot_service_plus_timer() {
-        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true), 60);
+        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true), 60, "");
         // A oneshot service (the watchdog is single-sweep) driven by a timer — not a Restart loop.
         assert!(u.contains("Type=oneshot"), "single-sweep → oneshot, not a loop");
         assert!(u.contains("ExecStart=/run/fleet/bin/fleet watchdog --rearm --stale-only --observe --spawn --pinned-only"));
@@ -4439,7 +4494,7 @@ mod tests {
     #[test]
     fn watchdog_unit_files_splits_service_and_timer_cleanly() {
         // Observer-only exec, for the dev-desk coexistence install.
-        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false), 90);
+        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false), 90, "");
         // The service file has the oneshot + ExecStart, NO timer/header lines.
         assert!(service.contains("Type=oneshot"));
         assert!(service.contains("ExecStart=/bin/fleet watchdog --observe --spawn"));
@@ -4448,6 +4503,32 @@ mod tests {
         // The timer file drives the cadence + is enable-able.
         assert!(timer.contains("OnUnitActiveSec=90") && timer.contains("WantedBy=timers.target"));
         assert!(!timer.contains("ExecStart"), "no ExecStart in the timer");
+    }
+
+    #[test]
+    fn render_service_env_lines_emits_present_values_and_skips_unset() {
+        let block = render_service_env_lines(&[
+            ("PATH", Some("/home/u/.local/bin:/usr/bin".into())),
+            ("CLAUDE_CODE_USE_BEDROCK", Some("1".into())),
+            ("AWS_PROFILE", None), // unset → skipped, no empty assignment
+        ]);
+        assert!(block.contains("Environment=\"PATH=/home/u/.local/bin:/usr/bin\"\n"));
+        assert!(block.contains("Environment=\"CLAUDE_CODE_USE_BEDROCK=1\"\n"));
+        assert!(!block.contains("AWS_PROFILE"), "an unset var is skipped, not emitted empty");
+    }
+
+    #[test]
+    fn watchdog_unit_env_block_lands_in_the_service_before_execstart() {
+        // The captured env block sits in [Service] ahead of ExecStart so the spawned observer inherits PATH
+        // (else `exec claude` is not found under the stripped systemd env and the window closes with 127).
+        let env = render_service_env_lines(&[("PATH", Some("/home/u/.local/bin".into()))]);
+        let (service, _timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, true, false), 60, &env);
+        let env_at = service.find("Environment=\"PATH=").expect("env line present");
+        let exec_at = service.find("ExecStart=").expect("ExecStart present");
+        assert!(env_at < exec_at, "Environment= must precede ExecStart in the unit");
+        // A rearm-only unit (no observe) is emitted with an empty env block — no launch environment needed.
+        let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false), 60, "");
+        assert!(!rearm_only.contains("Environment="), "rearm-only watchdog spawns nothing → no env block");
     }
 
     #[test]
