@@ -3724,10 +3724,25 @@ fn roster_metadata_stripped(agents: &[serde_json::Value]) -> bool {
 fn inprogress_task_assignees(tasks: &[serde_json::Value]) -> std::collections::BTreeSet<String> {
     tasks
         .iter()
+        // A monitor-exempt in_progress task is a legitimate continuous monitor (#506 Phase B / #167), not an
+        // unworked deliverable — its owner is not "holding work at rest", so it never contributes here. An
+        // owner who ALSO holds a non-exempt in_progress task is still collected via that task.
+        .filter(|t| !task_is_monitor_exempt(t))
         .filter_map(|t| t.get("assignee").and_then(serde_json::Value::as_str))
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// True if a task carries the board's derived `monitor_exempt` flag (v-task-board #167): a genuinely
+/// continuous monitor, marked via `metadata.monitor_exempt = true` and surfaced as a top-level bool on both
+/// `list_tasks` and `get_task` (absent/false by default). A monitor-exempt task is meant to stay `in_progress`
+/// without per-tick progress, so it is excluded from BOTH the nudge cadence (#478) and the #506
+/// holding-work-at-rest violation — read straight from the list projection, no per-task metadata fetch. Pure.
+fn task_is_monitor_exempt(task: &serde_json::Value) -> bool {
+    task.get("monitor_exempt")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
@@ -4624,8 +4639,10 @@ fn is_tracking_parent_with_open_children(child_rollup: Option<&serde_json::Value
 /// `threshold_hours` old gets a comment pinging its assignee, at most once per `cooldown_hours` while it
 /// stays idle. Always excludes tasks assigned to `cameron` (the operator) and, by construction, anything
 /// not in `in_progress` (a `blocked` task never appears in this query — it is parked on a named
-/// dependency, not silently stalled). An unassigned task is skipped: there is no one to ping. Report-only
-/// unless `apply` — dry-run prints exactly what it WOULD do without writing anything (#478's review gate).
+/// dependency, not silently stalled). An unassigned task is skipped: there is no one to ping. A
+/// monitor-exempt task (#167) is skipped too — it is a legitimate continuous monitor, not a stalled
+/// deliverable. Report-only unless `apply` — dry-run prints exactly what it WOULD do without writing anything
+/// (#478's review gate).
 fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet nudge-stale: {e}");
@@ -4656,6 +4673,12 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
             continue;
         }
         let assignee = assignee.expect("checked Some above");
+
+        // #167/#506: a monitor-exempt task is a legitimate continuous monitor, not a stalled deliverable —
+        // never nudge it. Read from the list record's derived bool; no per-task fetch needed.
+        if task_is_monitor_exempt(t) {
+            continue;
+        }
 
         // Cheap prefilter: if the LIST record's own updated_at is already fresher than the threshold, the
         // full latest-activity (which can only be fresher still, since comments never predate it being
@@ -5809,6 +5832,32 @@ mod tests {
         assert_eq!(owners.len(), 2, "deduped, and empty/absent assignees dropped");
         // Empty task list → empty set (a board query error degrades here → no false #506 violations).
         assert!(inprogress_task_assignees(&[]).is_empty());
+    }
+
+    #[test]
+    fn inprogress_task_assignees_excludes_monitor_exempt_owners() {
+        let tasks = vec![
+            // A monitor-exempt in_progress task: its owner is a legitimate continuous monitor, not holding
+            // work at rest → excluded (#506 Phase B / #167).
+            serde_json::json!({"id":1,"assignee":"v-monitor","status":"in_progress","monitor_exempt":true}),
+            // A normal in_progress task still contributes its owner.
+            serde_json::json!({"id":2,"assignee":"v-worker","status":"in_progress","monitor_exempt":false}),
+            // An owner holding BOTH an exempt and a non-exempt task is still flagged via the non-exempt one.
+            serde_json::json!({"id":3,"assignee":"v-both","status":"in_progress","monitor_exempt":true}),
+            serde_json::json!({"id":4,"assignee":"v-both","status":"in_progress"}),
+        ];
+        let owners = inprogress_task_assignees(&tasks);
+        assert!(owners.contains("v-worker") && owners.contains("v-both"));
+        assert!(!owners.contains("v-monitor"), "a purely monitor-exempt owner is not holding work at rest");
+        assert_eq!(owners.len(), 2);
+    }
+
+    #[test]
+    fn task_is_monitor_exempt_reads_the_derived_bool_defaulting_false() {
+        assert!(task_is_monitor_exempt(&serde_json::json!({"id":1,"monitor_exempt":true})));
+        assert!(!task_is_monitor_exempt(&serde_json::json!({"id":1,"monitor_exempt":false})));
+        // Absent (pre-#167 payload or a non-exempt row) → false, so nothing is wrongly skipped.
+        assert!(!task_is_monitor_exempt(&serde_json::json!({"id":1})));
     }
 
     #[test]
