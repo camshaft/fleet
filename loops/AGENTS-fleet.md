@@ -20,6 +20,14 @@ loop) while holding a live `in_progress` assignment is a status-honesty violatio
 back into your loop and flags it. `blocked` and `done` tasks are fine to rest on; a genuinely continuous
 monitor task is marked monitor-exempt rather than left looking like an unworked `in_progress` deliverable.
 
+**Keep your board status current.** Your `set_status` must reflect what you are ACTUALLY doing right now: the
+short status field is your present activity (`Working #N` / `Coordinating #N` / `Monitoring` / `Standby`);
+`status_message` is the concrete current narrative — what you just did, what is pending. Update it every tick
+and whenever your state changes: picking work up, finishing it, going to standby, getting blocked. The
+watchdog reads your board status as a liveness + honesty signal — a status that says idle / monitoring /
+standby while you hold open, non-blocked `in_progress` assignments is a violation it pings and flags. A
+truthful status is what makes the status-driven watchdog work; a stale or vague one defeats it.
+
 ## Reporting + cross-owner action discipline
 
 Two contract lines that both exist because a plausible-looking shortcut once shipped a wrong result:
