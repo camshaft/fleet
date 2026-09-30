@@ -1694,6 +1694,30 @@ enum Cmd {
         #[arg(long)]
         uninstall: bool,
     },
+    /// Emit or install a systemd USER service that supervises a long-running fleet-host daemon (Type=simple,
+    /// Restart=on-failure), so it survives a tmux-window reap and restarts on crash — the durable replacement
+    /// for a bare keep-alive window (#359). The service captures a known-good PATH so the daemon resolves
+    /// tmux/git/curl at runtime. `--install` writes it to `~/.config/systemd/user/` (no sudo); `--uninstall`
+    /// removes it; default prints it for a declarative host to translate.
+    DaemonUnit {
+        /// Daemon name → unit `fleet-<name>.service` (e.g. `notifier`, `tunnel`).
+        name: String,
+        /// The command `ExecStart` runs. Defaults to `<bin> notify` for name `notifier`; required otherwise.
+        #[arg(long)]
+        exec: Option<String>,
+        /// Restart backoff in seconds (systemd `RestartSec`).
+        #[arg(long, default_value_t = 2)]
+        restart_sec: u64,
+        /// The fleet binary path for the built-in `notifier` default ExecStart (defaults to this binary).
+        #[arg(long)]
+        bin: Option<String>,
+        /// INSTALL into `~/.config/systemd/user/` (user-level, no sudo) instead of printing; prints the enable command.
+        #[arg(long)]
+        install: bool,
+        /// REMOVE the user unit this installed (the inverse of `--install`) and print the disable command.
+        #[arg(long)]
+        uninstall: bool,
+    },
     /// Print the build provenance — package version + the commit the binary was built from (baked at build
     /// time). Compare the rev to `origin/main` to tell whether a deployed binary is current (a stale binary
     /// silently runs old logic — the failure mode a stale watchdog binary hit).
@@ -1784,6 +1808,9 @@ fn main() {
             install,
             uninstall,
         } => watchdog_unit(!no_rearm, observe, pinned_only, interval_secs, bin, install, uninstall),
+        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, uninstall } => {
+            daemon_unit(&name, exec, restart_sec, bin, install, uninstall)
+        }
         Cmd::Version => println!("{}", version_line()),
     }
 }
@@ -4021,6 +4048,101 @@ fn watchdog_unit_uninstall() {
     println!("  then: systemctl --user daemon-reload");
 }
 
+/// A systemd USER service that supervises a long-running fleet-host daemon: `Type=simple` with
+/// `Restart=on-failure` so a crash restarts it, ordered after the network, and enabled into `default.target`
+/// so it comes up on login/boot. `env_block` seeds a known-good environment (a captured `PATH`) so the daemon
+/// resolves tmux/git/curl at runtime regardless of profile sourcing. This is the durable replacement for a bare
+/// keep-alive tmux window, which a reap silently kills (#359). Pure — unit-tested.
+fn daemon_unit_file(name: &str, exec: &str, restart_sec: u64, env_block: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Fleet {name} daemon\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         {env_block}\
+         ExecStart={exec}\n\
+         Restart=on-failure\n\
+         RestartSec={restart_sec}\n\n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
+/// A known-good `PATH` for a supervised daemon, captured from THIS process's environment at install time so the
+/// service resolves tmux/git/curl/nix on bare name even though a systemd unit starts with a stripped env. Reads
+/// the environment (not pure).
+fn captured_daemon_env() -> String {
+    render_service_env_lines(&[("PATH", std::env::var("PATH").ok())])
+}
+
+/// `fleet daemon-unit <name>` — supervise a fleet-host daemon under systemd (see [`daemon_unit_file`]). Default:
+/// PRINT the unit (a declarative host translates it). `--install`: WRITE `fleet-<name>.service` into
+/// `~/.config/systemd/user/` (no sudo). `--uninstall`: remove it. `exec` is the daemon command; the built-in
+/// `notifier` defaults to `<bin> notify`, any other name requires `--exec`.
+fn daemon_unit(
+    name: &str,
+    exec: Option<String>,
+    restart_sec: u64,
+    bin: Option<String>,
+    install: bool,
+    uninstall: bool,
+) {
+    let unit = format!("fleet-{name}.service");
+    if uninstall {
+        let Some(dir) = user_unit_dir() else {
+            eprintln!("fleet daemon-unit --uninstall: cannot resolve ~/.config/systemd/user");
+            std::process::exit(1);
+        };
+        println!("  disable FIRST: systemctl --user disable --now {unit}");
+        let path = dir.join(&unit);
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("absent (ok): {}", path.display()),
+            Err(e) => eprintln!("  WARN: remove {}: {e}", path.display()),
+        }
+        println!("  then: systemctl --user daemon-reload");
+        return;
+    }
+    let fleet_bin = bin.unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "fleet".to_string())
+    });
+    let exec = match exec {
+        Some(e) => e,
+        None if name == "notifier" => format!("{fleet_bin} notify"),
+        None => {
+            eprintln!("fleet daemon-unit {name}: --exec is required (no built-in command for '{name}'; the notifier defaults to `<bin> notify`)");
+            std::process::exit(1);
+        }
+    };
+    let body = daemon_unit_file(name, &exec, restart_sec, &captured_daemon_env());
+    if install {
+        let Some(dir) = user_unit_dir() else {
+            eprintln!("fleet daemon-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
+            std::process::exit(1);
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("fleet daemon-unit --install: mkdir {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+        let path = dir.join(&unit);
+        if let Err(e) = std::fs::write(&path, &body) {
+            eprintln!("fleet daemon-unit --install: write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+        println!("installed {}", path.display());
+        println!("  ExecStart: {exec}");
+        println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now {unit}");
+        println!("  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})");
+        return;
+    }
+    print!("# ---- {unit} (systemd USER daemon, Restart=on-failure) ----\n{body}");
+}
+
 /// The build-provenance line: package version + the revision the binary was built from (baked by `build.rs`
 /// into `FLEET_BUILD_REV`). Lets an operator or agent tell whether a deployed binary is current by comparing
 /// the rev to `origin/main` — the signal that was missing when a stale watchdog binary silently ran old logic.
@@ -4539,6 +4661,21 @@ mod tests {
         // A rearm-only unit (no observe) is emitted with an empty env block — no launch environment needed.
         let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false), 60, "");
         assert!(!rearm_only.contains("Environment="), "rearm-only watchdog spawns nothing → no env block");
+    }
+
+    #[test]
+    fn daemon_unit_file_is_a_restarting_simple_service_with_a_known_good_path() {
+        let env = render_service_env_lines(&[("PATH", Some("/usr/bin:/bin".into()))]);
+        let u = daemon_unit_file("notifier", "/run/fleet/bin/fleet notify", 2, &env);
+        // A long-running daemon that survives a crash — NOT a oneshot; this is the durable replacement for the
+        // bare keep-alive tmux window a reap silently kills (#359).
+        assert!(u.contains("Type=simple"), "long-running daemon, not oneshot");
+        assert!(u.contains("Restart=on-failure") && u.contains("RestartSec=2"), "restarts on crash");
+        assert!(u.contains("ExecStart=/run/fleet/bin/fleet notify"));
+        assert!(u.contains("WantedBy=default.target"), "enabled comes up on login/boot");
+        // The captured PATH is seeded ahead of ExecStart so the daemon resolves tmux/git/curl at runtime (#347/#359).
+        let env_at = u.find("Environment=\"PATH=/usr/bin:/bin\"").expect("PATH env line present");
+        assert!(env_at < u.find("ExecStart=").expect("ExecStart present"), "env precedes ExecStart");
     }
 
     #[test]
