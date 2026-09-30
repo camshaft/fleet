@@ -35,20 +35,11 @@ const MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// applied AFTER so an explicit local override wins (`ChannelMap` is last-wins). A board read error is
 /// fail-soft — falls back to the config links alone. Blocking board I/O runs off the runtime.
 pub async fn fetch_channel_map(cfg: &Config) -> ChannelMap {
-    let board_api = cfg.board_api.clone();
     let mut links: Vec<ChannelLink> =
-        match tokio::task::spawn_blocking(move || {
-            BoardClient::new(&board_api).list_channel_links(LINK_SOURCE)
-        })
-        .await
-        {
-            Ok(Ok(l)) => l,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "could not read board channel links — using config only");
-                Vec::new()
-            }
+        match BoardClient::new(&cfg.board_api).list_channel_links(LINK_SOURCE).await {
+            Ok(l) => l,
             Err(e) => {
-                tracing::warn!(error = %e, "channel-link fetch task join failed — using config only");
+                tracing::warn!(error = %e, "could not read board channel links — using config only");
                 Vec::new()
             }
         };
@@ -107,12 +98,9 @@ fn save_cursor(state_dir: &Path, cursor: i64) {
     }
 }
 
-/// Do one blocking firehose poll off the tokio runtime (ureq is blocking).
+/// Do one firehose poll via the async board client.
 async fn poll_events(board_api: &str, since_seq: i64) -> Result<Vec<Event>, String> {
-    let api = board_api.to_string();
-    tokio::task::spawn_blocking(move || BoardClient::new(&api).poll_events(since_seq, POLL_LIMIT))
-        .await
-        .map_err(|e| format!("poll join failed: {e}"))?
+    BoardClient::new(board_api).poll_events(since_seq, POLL_LIMIT).await
 }
 
 /// First run (no cursor file): initialize the cursor at the current firehose head WITHOUT posting, so the
@@ -386,19 +374,12 @@ async fn handle_message(state: &BridgeState, client: &SlackHyperClient, msg: Sla
         tracing::warn!(error = %e, %channel, "inbound: could not add 👀 read-receipt (bot may be missing reactions:write scope)");
     }
 
-    let board_api = cfg.board_api.clone();
     let board_channel = plan.board_channel_id;
-    let body = plan.body.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        BoardClient::new(&board_api).post_raw(board_channel, &body)
-    })
-    .await;
-    match res {
-        Ok(Ok(())) => {
+    match BoardClient::new(&cfg.board_api).post_raw(board_channel, &plan.body).await {
+        Ok(()) => {
             tracing::info!(%channel, board_channel, %user, "inbound: posted Slack message to board")
         }
-        Ok(Err(e)) => tracing::warn!(error = %e, "inbound: board post failed"),
-        Err(e) => tracing::warn!(error = %e, "inbound: post task join failed"),
+        Err(e) => tracing::warn!(error = %e, "inbound: board post failed"),
     }
 
     // Best-effort: attach the Slack user's display name to their stable external-identity so board readers
@@ -430,22 +411,19 @@ async fn maybe_register_identity(state: &BridgeState, client: &SlackHyperClient,
         return;
     };
     let external_id = external_author(LINK_SOURCE, user);
-    let board_api = state.cfg.board_api.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        BoardClient::new(&board_api).upsert_external_identity(&external_id, LINK_SOURCE, &name)
-    })
-    .await;
-    match res {
-        Ok(Ok(())) => {
+    match BoardClient::new(&state.cfg.board_api)
+        .upsert_external_identity(&external_id, LINK_SOURCE, &name)
+        .await
+    {
+        Ok(()) => {
             if let Ok(mut w) = state.registered.write() {
                 w.insert(user.to_string());
             }
             tracing::info!(%user, "inbound: registered Slack display name as board external-identity");
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::debug!(error = %e, %user, "inbound: external-identity upsert failed (retries next message)")
         }
-        Err(e) => tracing::debug!(error = %e, "inbound: external-identity upsert task join failed"),
     }
 }
 

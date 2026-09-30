@@ -25,7 +25,9 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-# Minimal blocking HTTP client for the board's token-less localhost REST surface (GET /events firehose
-# poll, POST /channels/:id/posts, /external-links, /external-identities). Blocking by design — the sync
-# core, never the transport's async tree (that lives in the per-transport crate behind its own feature).
-ureq = "2"
+# Async HTTP client for the board's token-less localhost REST surface (GET /events firehose poll,
+# POST /channels/:id/posts, /external-links, /external-identities). Async by design (operator directive
+# #370: tokio, not a thread-per-blocking-call model) — the BoardClient methods are `async fn`; the caller
+# provides the runtime. The PURE planners (plan_inbound/plan_outbound/ChannelMap/relay_plan) stay sync.
+# rustls (no OpenSSL); no default TLS backend pulled.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
