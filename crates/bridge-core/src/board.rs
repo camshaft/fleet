@@ -88,6 +88,15 @@ pub struct OutboundReflect {
     /// The external-identity id when the post was itself attributed to an external human (board-core #149).
     #[serde(default)]
     pub external_author: Option<String>,
+    /// The post's own metadata bag (board-core #429): whatever the poster attached (e.g. a bridge stamps
+    /// `{slack_ts, slack_channel, thread_ts}` when relaying an inbound external message). Opaque here.
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    /// The REPLY PARENT's metadata bag, resolved server-side when `reply_to` is set (board-core #429). Lets a
+    /// bridge thread a reply under the original external message STATELESSLY: read the parent's external
+    /// thread id off `parent_metadata` rather than keeping its own post→thread map.
+    #[serde(default)]
+    pub parent_metadata: Option<Value>,
 }
 
 /// Parse the JSON body of `GET /events` into the event list. The board returns either a bare array or an
@@ -572,6 +581,36 @@ mod tests {
         assert_eq!(r.body, "ship it");
         assert_eq!(r.reply_to, Some(40));
         assert_eq!(r.external_author.as_deref(), Some("slack:U9"));
+    }
+
+    #[test]
+    fn as_outbound_reflect_carries_metadata_and_parent_metadata() {
+        // A reply reflect (#429 threading): the board resolves the reply parent's metadata server-side.
+        let body = r#"[{"seq": 9, "type": "channel.outbound_reflect", "channel_id": 123,
+            "data": {"channel_id": 123, "post_seq": 4940, "author": "frank", "body": "on it",
+                     "reply_to": 4939,
+                     "metadata": {"note": "frank-reply"},
+                     "parent_metadata": {"slack_ts": "1727.500", "thread_ts": "1727.500", "slack_channel": "C0"}}}]"#;
+        let r = parse_events(body).unwrap()[0]
+            .as_outbound_reflect()
+            .expect("decodes");
+        assert_eq!(r.reply_to, Some(4939));
+        assert_eq!(r.parent_metadata.as_ref().unwrap()["thread_ts"], "1727.500");
+        assert_eq!(r.metadata.as_ref().unwrap()["note"], "frank-reply");
+    }
+
+    #[test]
+    fn as_outbound_reflect_defaults_metadata_absent() {
+        let body = r#"[{"seq": 3, "type": "channel.outbound_reflect",
+            "data": {"channel_id": 1, "post_seq": 8, "author": "a", "body": "b"}}]"#;
+        let r = parse_events(body).unwrap()[0]
+            .as_outbound_reflect()
+            .unwrap();
+        assert!(r.metadata.is_none());
+        assert!(
+            r.parent_metadata.is_none(),
+            "no parent_metadata when not a reply"
+        );
     }
 
     #[test]
