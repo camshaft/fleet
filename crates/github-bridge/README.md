@@ -19,7 +19,7 @@ behind a feature — GitHub is plain REST polling, so there is no heavy async tr
 | `config`      | Fail-soft config from a **single TOML file** (no env vars — operator mandate #159): GitHub token + `owner/repo` + board `project_id`, board REST base, GitHub API base. |
 | `board`       | Token-less localhost board REST client: firehose poll (`GET /events`, board-core #150/#264), create/comment mirrored tasks with GitHub-author attribution (`POST /tasks`, `POST /tasks/:id/comments`, board-core #149), and durable issue↔task + comment link read/register (`/external-links`, board-core #149 slice 2 / #151). |
 | `github`      | GitHub REST transport: `Issue`/`IssueComment` model, null/ghost-tolerant PR-flagging parsers, and a thin no-`Debug` authenticated client (issues + comments poll, `viewer_login`, `post_issue_comment`). |
-| `sync`        | Pure bidirectional planning. IN: issues → idempotent task creates + comments → attributed board comments (loop-safe, dedup'd). OUT: `task.outbound_reflect` (board-core #264) → GitHub issue comments (source-filtered, attribution-rendered). |
+| `sync`        | Pure bidirectional planning. IN: issues → idempotent task creates + comments → attributed board comments (loop-safe, dedup'd); **pull requests → board code reviews** (BUILD 2a: status open/merged→approved/closed-unmerged→closed + conversation-comment log entries). OUT: `task.outbound_reflect` (board-core #264) → GitHub issue comments (source-filtered, attribution-rendered). |
 | `state`       | The daemon's persisted cursors (firehose seq for OUT, GitHub `?since=` for IN), fail-soft load. |
 | `main`/`runner` | The daemon (feature `daemon`): a blocking poll loop — IN (GitHub → board) + OUT (board firehose → GitHub) each tick, fail-soft dormant with no token. Not unit-tested (live network); the gate is the lib's `cargo test`. |
 
@@ -102,6 +102,24 @@ state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file
   and relies on `created:false` (+ the returned id) to know it was already mirrored. No separate
   link-register call and no pre-fetch of existing links.
 
+## GitHub PR → board code review (BUILD 2a, Review entity #372/#373)
+
+The issues poll (`state=all`) already returns pull requests (a PR is an issue with a `pull_request` object),
+so mirroring PRs as **code reviews** needs no new GitHub endpoint:
+
+- Each PR becomes a board review via the idempotent `create_review` (`kind=code`, `external_link
+  {source:"github_pr", external_id:"owner/repo#<number>"}`) — the board de-dupes + links atomically and
+  reports `created`, same as issue ingest (#270).
+- **Status** maps the PR's terminal state (2a, concluding states only): open PR → `open`; `pull_request.merged_at`
+  set → `approved`; closed-unmerged → `closed`. A PR seen open then later merged advances via the idempotent
+  `set_review_status` (re-applying the same status is a board-side no-op).
+- The PR's **conversation comments** (same `/issues/:n/comments` endpoint) are appended to the review as
+  `comment`-type log entries via the idempotent `append_review_log`, loop-safe (skips the bridge's own
+  reflected comments) and keyed on the comment ref (`owner/repo#c<id>`).
+- The `github_pr` link source is distinct from `github` (issue↔task) so PR-review links never collide with
+  issue-ingest links. **2b** (draft/in-review/changes-requested intermediate states + inline diff-review
+  findings via the Pulls + Reviews APIs) is a later slice.
+
 ## Operational notes
 
 - **Persisted cursors** (`<state_dir>/github-bridge.state.json`): the board firehose `seq` (OUT) + the
@@ -113,8 +131,9 @@ state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file
   comments authored by the bridge's own GitHub account (`viewer_login`).
 - **Attribution:** ingested GitHub authors are attributed via `external_author = github:<login>` +
   `upsert_external_identity` (board-core #149), so board readers see the GitHub author, not the bridge.
-- **Delivery.** **IN (ingest) is exactly-once** — the board de-duplicates create/comment on the external link
-  atomically (#270), so a response-read-failed retry returns `created:false` rather than duplicating.
+- **Delivery.** **IN (ingest) is exactly-once** — the board de-duplicates create/comment (issues) and
+  create_review/append_review_log (PRs) on the external link atomically (#270 / #372), so a
+  response-read-failed retry returns `created:false` / `appended:false` rather than duplicating.
   **OUT (GitHub comment post) remains at-least-once**: GitHub issue comments have no idempotency key, so a
   write that succeeds while its response fails to read duplicates one comment on retry — rare + non-fatal,
   and inherent to the GitHub API. See the `runner` module doc.

@@ -3,10 +3,13 @@
 //! DECISION it calls into (`sync::*`, `state::*`, the parsers) IS tested in the lib.
 //!
 //! ## Delivery semantics
-//! - **IN (GitHub → board) is EXACTLY-ONCE.** `create_task`/`comment_task` carry the `external_link` and the
-//!   board de-duplicates atomically on `(source, external_id)` (board-core #270), returning `created:false`
-//!   for an already-mirrored issue/comment. So a response-read-failed retry re-posts the same ref and the
-//!   board returns the existing row instead of duplicating — no create→link race.
+//! - **IN (GitHub → board) is EXACTLY-ONCE.** `create_task`/`comment_task` (issues) and
+//!   `create_review`/`append_review_log` (PRs → code reviews, BUILD 2a) carry the `external_link` and the
+//!   board de-duplicates atomically on `(source, external_id)` (board-core #270 / Review entity #372),
+//!   returning `created:false` / `appended:false` for an already-mirrored issue/comment/PR/log-entry. So a
+//!   response-read-failed retry re-posts the same ref and the board returns the existing row instead of
+//!   duplicating — no create→link race. PR review-status advances via the idempotent `set_review_status`
+//!   (a same-status re-apply is a board-side no-op).
 //! - **OUT (board → GitHub) is AT-LEAST-ONCE.** GitHub issue comments have no idempotency key, so a comment
 //!   POST that succeeds while its response fails to read duplicates one comment when the reflect retries
 //!   next tick. Inherent to the GitHub API; rare + non-fatal. The firehose cursor advances per
@@ -15,8 +18,8 @@
 use github_bridge::board::{parse_issue_ref, BoardClient, LINK_SOURCE};
 use github_bridge::config::Config;
 use github_bridge::{
-    github_external_author, plan_comment_ingest, plan_issue_ingest, plan_outbound, GithubClient, Issue,
-    State, PER_PAGE,
+    github_external_author, plan_comment_ingest, plan_issue_ingest, plan_outbound, plan_pr_comment_log,
+    plan_pr_review_ingest, GithubClient, Issue, State, PER_PAGE,
 };
 use std::collections::HashSet;
 use std::thread;
@@ -150,8 +153,11 @@ fn register_author(board: &BoardClient, login: &str, seen: &mut HashSet<String>)
     }
 }
 
-/// IN, for ONE repo: poll its issues + comments, create attributed tasks for new issues and attributed board
-/// comments for new comments (idempotent via the board's external_links). Advances this repo's cursor.
+/// IN, for ONE repo: poll its issues + comments (the issues poll returns PRs too, `state=all`). Real issues
+/// become attributed board tasks + attributed board comments; pull requests become board code reviews
+/// (BUILD 2a) — a `create_review` per PR, its status advanced (open → approved/closed), and its conversation
+/// comments logged to the review. All idempotent via the board's external_links (#270 / Review entity #372).
+/// Advances this repo's cursor.
 fn in_tick_repo(
     cfg: &Config,
     gh: &GithubClient,
@@ -201,6 +207,50 @@ fn in_tick_repo(
             )?;
             if created_c {
                 tracing::info!(comment = %post.comment_ref, task_id, "ingested GitHub comment → board comment");
+            }
+        }
+    }
+
+    // PR reviews (BUILD 2a): mirror each pull request as a board code review, advance its status, and log the
+    // PR's conversation comments to the review. The issues poll already returned the PRs (`state=all`);
+    // create_review + append_review_log are idempotent board-side (#372), so a re-poll is a cheap no-op.
+    for rc in &plan_pr_review_ingest(&issues, repo).creates {
+        let status = rc.status.as_board_status();
+        let (review_id, created) = board.create_review(
+            project_id,
+            "code",
+            &rc.title,
+            &rc.description,
+            &cfg.bridge_agent,
+            rc.external_author.as_deref(),
+            status,
+            &rc.external_id,
+        )?;
+        if created {
+            tracing::info!(pr = %rc.external_id, review_id, status, "ingested GitHub PR → board code review");
+        } else {
+            // Existing review: advance its status (open → approved/closed); idempotent no-op if unchanged.
+            board.set_review_status(review_id, status)?;
+        }
+        register_author(board, author_login(rc.external_author.as_deref()), &mut seen_authors);
+
+        // Log this PR's conversation comments to the review (a PR IS an issue, so the same comments endpoint;
+        // diff/review comments are BUILD 2b). The board de-dupes each on its entry link.
+        let comments =
+            collect_pages(|page| gh.list_issue_comments(repo, rc.pr_number, since.as_deref(), page))?;
+        for c in &comments {
+            register_author(board, &c.author, &mut seen_authors);
+        }
+        for entry in &plan_pr_comment_log(&comments, repo, self_login) {
+            let appended = board.append_review_log(
+                review_id,
+                "comment",
+                &entry.body,
+                entry.external_author.as_deref(),
+                &entry.external_id,
+            )?;
+            if appended {
+                tracing::info!(comment = %entry.external_id, review_id, "logged GitHub PR comment → review log");
             }
         }
     }

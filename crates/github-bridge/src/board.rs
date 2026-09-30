@@ -43,6 +43,13 @@ pub const TASK_OUTBOUND_REFLECT: &str = "task.outbound_reflect";
 /// `(source, external_id)` and assigns the `board_kind` (task vs comment) itself.
 pub const LINK_SOURCE: &str = "github";
 
+/// The external-link `source` for a GitHub PULL REQUEST mirrored as a board code review (BUILD 2, Review
+/// entity #372). Distinct from [`LINK_SOURCE`] (`"github"`, issue↔task) so a PR's review link and its
+/// conversation-comment log entries share one namespace that never collides with the issue-ingest links —
+/// even though a PR comment's `comment_ref` string is shaped like an issue comment's. Sent as
+/// `external_link.source` on `create_review` / `append_review_log` (both idempotent on `(source, external_id)`).
+pub const REVIEW_LINK_SOURCE: &str = "github_pr";
+
 /// The canonical external id for a GitHub issue link: `owner/repo#number` (e.g. `camshaft/fleet#42`). Stable
 /// and human-legible; the board's `external_link.external_id` for the issue↔task row.
 pub fn issue_ref(repo: &str, number: i64) -> String {
@@ -198,6 +205,59 @@ pub fn build_comment_body(author: &str, body: &str, external_author: Option<&str
     m
 }
 
+/// Build the JSON body for creating a mirrored board code review from an ingested GitHub pull request
+/// (`POST /reviews`, Review entity #372). Mirrors [`build_task_body`] but for the review entity: `kind` is
+/// the review kind (`"code"`), `status` the initial review status (`open` / `approved` / `closed`), and the
+/// `external_link` uses [`REVIEW_LINK_SOURCE`] so the create is IDEMPOTENT on `(source, external_id)` (the PR
+/// ref `owner/repo#number`) — the board creates-or-returns-existing and reports `created`. Pure — unit-tested.
+/// Omits the optional `external_author` when absent so the board applies its own default.
+#[allow(clippy::too_many_arguments)]
+pub fn build_review_body(
+    project_id: i64,
+    kind: &str,
+    title: &str,
+    description: &str,
+    created_by: &str,
+    external_author: Option<&str>,
+    status: &str,
+    external_id: &str,
+) -> Value {
+    let mut m = json!({
+        "project_id": project_id,
+        "kind": kind,
+        "title": title,
+        "description": description,
+        "created_by": created_by,
+        "status": status,
+        "external_link": { "source": REVIEW_LINK_SOURCE, "external_id": external_id },
+    });
+    if let Some(ea) = external_author {
+        m["external_author"] = json!(ea);
+    }
+    m
+}
+
+/// Build the JSON body for appending an entry to a review's log (`POST /reviews/:id/log`, Review entity
+/// #372). `log_type` is the entry type (`"comment"` for a mirrored PR conversation comment); `external_id`
+/// (the comment ref `owner/repo#c<id>`) makes the append IDEMPOTENT on `(source, external_id)` under
+/// [`REVIEW_LINK_SOURCE`]. Pure — unit-tested. Omits the optional `external_author` when absent.
+pub fn build_review_log_body(
+    log_type: &str,
+    body: &str,
+    external_author: Option<&str>,
+    external_id: &str,
+) -> Value {
+    let mut m = json!({
+        "type": log_type,
+        "body": body,
+        "external_link": { "source": REVIEW_LINK_SOURCE, "external_id": external_id },
+    });
+    if let Some(ea) = external_author {
+        m["external_author"] = json!(ea);
+    }
+    m
+}
+
 /// Build the JSON body for an external-identity upsert (`POST /external-identities`, board-core #149): map a
 /// stable identity `id` (e.g. `github:octocat`) + `source` to a human `display_name`. The board resolves this
 /// to `external_author_name` alongside the stable `external_author` key on read (board-core #85), so agents
@@ -300,6 +360,83 @@ impl BoardClient {
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| format!("board POST /tasks/{task_id}/comments: response was not JSON: {e}"))?;
         Ok(v.get("created").and_then(Value::as_bool).unwrap_or(true))
+    }
+
+    /// Create a mirrored board code review from an ingested pull request (`POST /reviews`, Review entity
+    /// #372), IDEMPOTENT on the PR link: passing `external_id` (the PR ref) makes the board
+    /// create-or-return-existing in one transaction. Returns `(review_id, created)` — `created == false` means
+    /// the PR was already mirrored and the returned id is the existing review (the caller then advances its
+    /// status via [`set_review_status`](Self::set_review_status)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_review(
+        &self,
+        project_id: i64,
+        kind: &str,
+        title: &str,
+        description: &str,
+        created_by: &str,
+        external_author: Option<&str>,
+        status: &str,
+        external_id: &str,
+    ) -> Result<(i64, bool), String> {
+        let url = format!("{}/reviews", self.base);
+        let body =
+            build_review_body(project_id, kind, title, description, created_by, external_author, status, external_id)
+                .to_string();
+        let raw = self
+            .agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&body)
+            .map_err(|e| format!("board POST /reviews failed: {e}"))?
+            .into_string()
+            .map_err(|e| format!("board POST /reviews read failed: {e}"))?;
+        let v: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("board POST /reviews: response was not JSON: {e}"))?;
+        let id = v
+            .get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("board POST /reviews: no numeric id in response {v}"))?;
+        let created = v.get("created").and_then(Value::as_bool).unwrap_or(true);
+        Ok((id, created))
+    }
+
+    /// Advance a review's status (`POST /reviews/:id/status`, Review entity #372). Idempotent server-side —
+    /// re-applying the same status is a no-op — so the poll loop can call it every time a PR is re-seen to
+    /// advance `open` → `approved`/`closed` without tracking prior state itself.
+    pub fn set_review_status(&self, review_id: i64, status: &str) -> Result<(), String> {
+        let url = format!("{}/reviews/{}/status", self.base, review_id);
+        let body = json!({ "status": status }).to_string();
+        self.post_json(&url, &body, &format!("POST /reviews/{review_id}/status"))
+    }
+
+    /// Append an entry to a review's log (`POST /reviews/:id/log`, Review entity #372), IDEMPOTENT on the
+    /// entry link (`external_id` = the comment ref): a re-append of the same comment is a no-op. Used by IN
+    /// to mirror a PR's conversation comments as `comment`-type log entries. Returns `appended` (false =
+    /// already logged).
+    pub fn append_review_log(
+        &self,
+        review_id: i64,
+        log_type: &str,
+        body: &str,
+        external_author: Option<&str>,
+        external_id: &str,
+    ) -> Result<bool, String> {
+        let url = format!("{}/reviews/{}/log", self.base, review_id);
+        let payload = build_review_log_body(log_type, body, external_author, external_id).to_string();
+        let raw = self
+            .agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&payload)
+            .map_err(|e| format!("board POST /reviews/{review_id}/log failed: {e}"))?
+            .into_string()
+            .map_err(|e| format!("board POST /reviews/{review_id}/log read failed: {e}"))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST /reviews/{review_id}/log: response was not JSON: {e}"))?;
+        Ok(v.get("appended").and_then(Value::as_bool).unwrap_or(true))
     }
 
     /// Upsert (idempotent on `id`) an external identity's display name (board-core #149; live independent of
@@ -467,6 +604,49 @@ mod tests {
     fn build_comment_body_omits_external_author_but_always_links() {
         let v = build_comment_body("github-bridge", "internal note", None, "o/r#c1");
         assert!(v.get("external_author").is_none(), "no explicit null");
+        assert_eq!(v["external_link"]["external_id"], "o/r#c1");
+    }
+
+    // ── review body builders (create_review / append_review_log, Review entity #372) ────────────────
+
+    #[test]
+    fn build_review_body_shape_attribution_and_github_pr_link() {
+        let v = build_review_body(
+            16, "code", "Add gizmo", "the PR body", "github-bridge",
+            Some("github:octocat"), "approved", "camshaft/fleet#88",
+        );
+        assert_eq!(v["project_id"], 16);
+        assert_eq!(v["kind"], "code");
+        assert_eq!(v["title"], "Add gizmo");
+        assert_eq!(v["description"], "the PR body");
+        assert_eq!(v["created_by"], "github-bridge");
+        assert_eq!(v["status"], "approved");
+        assert_eq!(v["external_author"], "github:octocat");
+        assert_eq!(v["external_link"]["source"], "github_pr", "PR reviews use the github_pr link namespace");
+        assert_eq!(v["external_link"]["external_id"], "camshaft/fleet#88");
+    }
+
+    #[test]
+    fn build_review_body_omits_external_author_but_always_links() {
+        let v = build_review_body(1, "code", "t", "d", "github-bridge", None, "open", "o/r#1");
+        assert!(v.get("external_author").is_none(), "no explicit null");
+        assert_eq!(v["external_link"]["external_id"], "o/r#1", "link always present for idempotency");
+    }
+
+    #[test]
+    fn build_review_log_body_shape_and_github_pr_link() {
+        let v = build_review_log_body("comment", "a review remark", Some("github:hubot"), "o/r#c777");
+        assert_eq!(v["type"], "comment");
+        assert_eq!(v["body"], "a review remark");
+        assert_eq!(v["external_author"], "github:hubot");
+        assert_eq!(v["external_link"]["source"], "github_pr");
+        assert_eq!(v["external_link"]["external_id"], "o/r#c777");
+    }
+
+    #[test]
+    fn build_review_log_body_omits_external_author_but_always_links() {
+        let v = build_review_log_body("comment", "internal", None, "o/r#c1");
+        assert!(v.get("external_author").is_none());
         assert_eq!(v["external_link"]["external_id"], "o/r#c1");
     }
 

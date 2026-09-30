@@ -82,6 +82,14 @@ fn attribution(login: &str) -> Option<String> {
     (!login.is_empty()).then(|| github_external_author(login))
 }
 
+/// Whether a GitHub comment was authored by the bridge's own account (`self_login`) — the loop-safety check
+/// shared by comment ingest and PR review-log ingest, so a comment the bridge reflected OUT to GitHub isn't
+/// re-ingested. `None`/empty `self_login` never matches (nothing is filtered as self), and a ghost
+/// (empty-author) comment is never treated as self.
+fn is_self_comment(c: &IssueComment, self_login: Option<&str>) -> bool {
+    matches!(self_login, Some(me) if !c.author.is_empty() && c.author == me)
+}
+
 /// Plan the board tasks to create from a batch of GitHub issues.
 ///
 /// - Pull requests are skipped (the issues endpoint returns them; they are not board tasks).
@@ -125,10 +133,7 @@ pub fn plan_comment_ingest(
 ) -> CommentIngestPlan {
     let mut posts = Vec::new();
     for c in comments {
-        if let Some(me) = self_login
-            && !c.author.is_empty()
-            && c.author == me
-        {
+        if is_self_comment(c, self_login) {
             continue; // loop-safety: don't re-ingest our own reflected comment
         }
         posts.push(CommentPost {
@@ -249,6 +254,39 @@ pub fn plan_pr_review_ingest(issues: &[Issue], repo: &str) -> PrReviewIngestPlan
         });
     }
     PrReviewIngestPlan { creates }
+}
+
+/// A PR conversation comment to append to its code review's log as a `comment`-type entry (the daemon calls
+/// the idempotent `board::append_review_log` passing [`ReviewLogEntry::external_id`] as the entry link).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLogEntry {
+    /// The comment body (verbatim GitHub Markdown).
+    pub body: String,
+    /// The attributed GitHub author (`github:<login>`), or `None` for a ghost account.
+    pub external_author: Option<String>,
+    /// The dedup/link key (`owner/repo#c<id>`) — idempotency on the append.
+    pub external_id: String,
+}
+
+/// Plan the review-log entries to append from a batch of a PR's conversation comments (the same
+/// `/issues/:n/comments` endpoint the issue path uses — a PR IS an issue, so no new GitHub endpoint; the
+/// diff/review comments are BUILD 2b). Loop-safe: skips comments authored by the bridge's own account
+/// (`self_login`) via [`is_self_comment`], exactly as [`plan_comment_ingest`] does. Dedup of already-logged
+/// entries is the board's job (`append_review_log` idempotent on the entry link). Order preserved. Pure.
+pub fn plan_pr_comment_log(
+    comments: &[IssueComment],
+    repo: &str,
+    self_login: Option<&str>,
+) -> Vec<ReviewLogEntry> {
+    comments
+        .iter()
+        .filter(|c| !is_self_comment(c, self_login))
+        .map(|c| ReviewLogEntry {
+            body: c.body.clone(),
+            external_author: attribution(&c.author),
+            external_id: comment_ref(repo, c.id),
+        })
+        .collect()
 }
 
 // ── OUT direction (board → GitHub): reflect an authorized task comment onto its linked issue ──────────
@@ -500,6 +538,34 @@ mod tests {
         assert!(d.contains("pull request o/r#7"), "labeled a pull request, not an issue");
         assert!(d.contains("by @dev"));
         assert!(d.contains("state: open"));
+    }
+
+    #[test]
+    fn plan_pr_comment_log_attributes_and_keys_by_comment_ref() {
+        let comments = [comment(1, "nice work", "octocat"), comment(2, "one nit", "hubot")];
+        let entries = plan_pr_comment_log(&comments, "o/r", Some("fleet-bot"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].body, "nice work");
+        assert_eq!(entries[0].external_author.as_deref(), Some("github:octocat"));
+        assert_eq!(entries[0].external_id, "o/r#c1");
+        assert_eq!(entries[1].external_id, "o/r#c2");
+    }
+
+    #[test]
+    fn plan_pr_comment_log_skips_the_bridges_own_comments_loop_safety() {
+        // A comment the bridge reflected OUT to GitHub must not re-ingest as a review-log entry.
+        let comments = [comment(1, "reflected", "fleet-bot"), comment(2, "human", "octocat")];
+        let entries = plan_pr_comment_log(&comments, "o/r", Some("fleet-bot"));
+        assert_eq!(entries.len(), 1, "own comment filtered");
+        assert_eq!(entries[0].external_author.as_deref(), Some("github:octocat"));
+    }
+
+    #[test]
+    fn plan_pr_comment_log_ghost_author_unattributed_and_not_self() {
+        let comments = [comment(1, "ghost note", "")];
+        let entries = plan_pr_comment_log(&comments, "o/r", Some(""));
+        assert_eq!(entries.len(), 1, "empty author != self even when self_login is empty");
+        assert_eq!(entries[0].external_author, None);
     }
 
     // ── plan_outbound (board → GitHub) ─────────────────────────────────────────────────────────────
