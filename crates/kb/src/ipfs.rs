@@ -1,4 +1,4 @@
-//! `ipfs` — a thin blocking client for a Kubo (go-ipfs) node's HTTP RPC API. Port of the Python KB inbox
+//! `ipfs` — a thin async client for a Kubo (go-ipfs) node's HTTP RPC API. Port of the Python KB inbox
 //! worker's IPFS pinning, which drove the Kubo `/api/v0/*` RPC over `requests`.
 //!
 //! Phase-2 infra (#233): the inbox worker pins each ingested file into IPFS and records its CID so a
@@ -6,12 +6,11 @@
 //! payload field). Three operations mirror the Python: [`Ipfs::add`] (pin a file on disk), [`Ipfs::add_bytes`]
 //! (pin in-memory bytes), and [`Ipfs::cat`] (fetch content back by CID).
 //!
-//! The Kubo RPC is POST-only and takes uploads as `multipart/form-data`. `ureq` (the house HTTP idiom — see
-//! `store`) has no multipart helper, but an add is a single form part with a boundary we choose, so the body
-//! is built by hand in [`multipart_body`]. That keeps the dep tree light (no `multipart`/`reqwest`) and the
-//! construction unit-testable without a live node.
+//! IO is async `reqwest` — operator directive: no blocking IO on the tokio runtime (#439). The Kubo RPC is
+//! POST-only and takes uploads as `multipart/form-data`; rather than enable reqwest's `multipart` feature we
+//! hand-build the single-part body in [`multipart_body`] (a pure, unit-testable function) and send it as a
+//! raw body with the boundary Content-Type.
 
-use std::io::Read;
 use std::path::Path;
 
 use serde_json::Value;
@@ -19,7 +18,7 @@ use serde_json::Value;
 /// A handle to a Kubo node's HTTP RPC (`/api/v0`). Stateless — each call is one request, matching `store`.
 pub struct Ipfs {
     base: String,
-    agent: ureq::Agent,
+    http: reqwest::Client,
 }
 
 /// The result of pinning content: the object Kubo reports from `/api/v0/add`. `cid` is Kubo's `Hash` (the
@@ -39,58 +38,64 @@ impl Ipfs {
                 .ipfs_url
                 .trim_end_matches('/')
                 .to_string(),
-            agent: ureq::agent(),
+            http: reqwest::Client::new(),
         }
     }
 
     /// Pin a file from disk — read its bytes and delegate to [`add_bytes`](Ipfs::add_bytes), using the file's
     /// own name as the multipart filename (Kubo echoes it back as `Name`). The Python `ipfs_add(path)`.
-    pub fn add(&self, path: &Path) -> Result<Added, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("ipfs add: read {}: {e}", path.display()))?;
+    pub async fn add(&self, path: &Path) -> Result<Added, String> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("ipfs add: read {}: {e}", path.display()))?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        self.add_bytes(&name, &bytes)
+        self.add_bytes(&name, &bytes).await
     }
 
     /// Pin in-memory bytes under a logical `name` — `POST /api/v0/add`. Kubo pins added content by default,
     /// so no explicit pin call is needed. Returns the reported name/CID/size. The Python `ipfs_add_bytes`.
-    pub fn add_bytes(&self, name: &str, bytes: &[u8]) -> Result<Added, String> {
+    pub async fn add_bytes(&self, name: &str, bytes: &[u8]) -> Result<Added, String> {
         let boundary = format!("kbboundary{}", uuid::Uuid::new_v4().simple());
         let body = multipart_body(&boundary, name, bytes);
         let url = format!("{}/api/v0/add", self.base);
         let text = self
-            .agent
+            .http
             .post(&url)
-            .set(
-                "Content-Type",
-                &format!("multipart/form-data; boundary={boundary}"),
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
             )
-            .send_bytes(&body)
+            .body(body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("ipfs POST /api/v0/add failed: {e}"))?
-            .into_string()
+            .text()
+            .await
             .map_err(|e| format!("ipfs add: read response: {e}"))?;
         parse_add_response(&text)
     }
 
     /// Fetch content back by CID — `POST /api/v0/cat?arg=<cid>`, returning the raw bytes. The Python
     /// `ipfs_cat(cid)`.
-    pub fn cat(&self, cid: &str) -> Result<Vec<u8>, String> {
+    pub async fn cat(&self, cid: &str) -> Result<Vec<u8>, String> {
         let url = format!("{}/api/v0/cat", self.base);
-        let resp = self
-            .agent
+        let bytes = self
+            .http
             .post(&url)
-            .query("arg", cid)
-            .call()
-            .map_err(|e| format!("ipfs POST /api/v0/cat?arg={cid} failed: {e}"))?;
-        let mut buf = Vec::new();
-        resp.into_reader()
-            .read_to_end(&mut buf)
+            .query(&[("arg", cid)])
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("ipfs POST /api/v0/cat?arg={cid} failed: {e}"))?
+            .bytes()
+            .await
             .map_err(|e| format!("ipfs cat: read body for {cid}: {e}"))?;
-        Ok(buf)
+        Ok(bytes.to_vec())
     }
 }
 
