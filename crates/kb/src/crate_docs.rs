@@ -24,6 +24,7 @@
 // Ported ahead of its pipeline caller (#238); the CLI uses it now. Some helpers read as dead code until then.
 #![allow(dead_code)]
 
+use md5::{Digest, Md5};
 use serde_json::{Map, Value};
 
 use crate::store::Store;
@@ -54,7 +55,18 @@ pub struct DocItem {
 /// `crate.<name>.<crate_version>`, and return `(chunk_count, collection)`. `version` may be `"latest"`; the
 /// resolved `crate_version` from the JSON names the collection. A crate with no documented items yields
 /// `(0, collection)` without creating anything.
-pub async fn ingest_crate(name: &str, version: &str) -> Result<(usize, String), String> {
+///
+/// `dry_run` computes everything (ids, chunk text, payloads, and the embedding vectors) but writes NOTHING
+/// to Qdrant — no `Store` connection at all — and instead prints one NDJSON line per would-be point to
+/// stdout (see [`dry_run_json`]). This is the crate-docs parity harness (#237/#466): because crate_docs
+/// writes to the hardcoded `crate.<name>.<crate_version>` collection with no scratch override, a dry-run is
+/// the only way to diff a fresh run against the LIVE (Python-built) collection without risking an in-place
+/// overwrite of it.
+pub async fn ingest_crate(
+    name: &str,
+    version: &str,
+    dry_run: bool,
+) -> Result<(usize, String), String> {
     let raw = fetch_rustdoc(name, version).await?;
     let doc: Value = serde_json::from_slice(&raw)
         .map_err(|e| format!("crate_docs: rustdoc JSON for {name}@{version} did not parse: {e}"))?;
@@ -110,15 +122,21 @@ pub async fn ingest_crate(name: &str, version: &str) -> Result<(usize, String), 
         return Ok((0, collection));
     }
 
-    let store = Store::connect()?;
-    // Collection dimension: computed once off-reactor (model load is CPU-heavy), like the inbox worker.
-    let dim = tokio::task::spawn_blocking(embed::dim)
-        .await
-        .map_err(|e| format!("crate_docs: embed dim task panicked: {e}"))??;
-    store.ensure_collection(&collection, dim).await?;
+    // Real run connects + sizes the collection; a dry-run touches no store at all.
+    let store = if dry_run {
+        None
+    } else {
+        let store = Store::connect()?;
+        // Collection dimension: computed once off-reactor (model load is CPU-heavy), like the inbox worker.
+        let dim = tokio::task::spawn_blocking(embed::dim)
+            .await
+            .map_err(|e| format!("crate_docs: embed dim task panicked: {e}"))??;
+        store.ensure_collection(&collection, dim).await?;
+        Some(store)
+    };
 
-    // Embed + upsert in BATCH-sized groups: each group's texts are embedded off-reactor, then the aligned
-    // (id, vector, payload) points are upserted. Bounds memory + request size on big crates.
+    // Embed in BATCH-sized groups off-reactor. Real run upserts the aligned (id, vector, payload) points;
+    // dry-run prints each as NDJSON instead (no write). Bounds memory + request size on big crates.
     let n = texts.len();
     let mut start = 0usize;
     while start < n {
@@ -127,23 +145,63 @@ pub async fn ingest_crate(name: &str, version: &str) -> Result<(usize, String), 
         let vectors = tokio::task::spawn_blocking(move || embed::embed_docs(&batch_texts))
             .await
             .map_err(|e| format!("crate_docs: embed task panicked: {e}"))??;
-        let points: Vec<(String, Vec<f32>, Map<String, Value>)> = ids[start..end]
-            .iter()
-            .cloned()
-            .zip(vectors)
-            .zip(payloads[start..end].iter().cloned())
-            .map(|((id, vec), pl)| (id, vec, pl))
-            .collect();
-        store.upsert(&collection, &points).await?;
+        match &store {
+            Some(store) => {
+                let points: Vec<(String, Vec<f32>, Map<String, Value>)> = ids[start..end]
+                    .iter()
+                    .cloned()
+                    .zip(vectors)
+                    .zip(payloads[start..end].iter().cloned())
+                    .map(|((id, vec), pl)| (id, vec, pl))
+                    .collect();
+                store.upsert(&collection, &points).await?;
+            }
+            None => {
+                for ((id, vec), pl) in ids[start..end]
+                    .iter()
+                    .zip(&vectors)
+                    .zip(payloads[start..end].iter())
+                {
+                    println!("{}", dry_run_json(&collection, id, vec, pl));
+                }
+            }
+        }
         start = end;
     }
 
-    tracing::info!(
-        "crate_docs: ingested {} chunks from {} items into {collection}",
-        n,
-        items.len()
-    );
+    if dry_run {
+        tracing::info!(
+            "crate_docs: DRY-RUN {name}@{crate_version}: {n} would-be points for {collection} (nothing written)"
+        );
+    } else {
+        tracing::info!(
+            "crate_docs: ingested {} chunks from {} items into {collection}",
+            n,
+            items.len()
+        );
+    }
     Ok((n, collection))
+}
+
+/// Build the NDJSON line for one would-be point in `--dry-run` — the id + full payload (which carries the
+/// chunk text, path, kind, etc.: the byte-match gate for a parity diff against the live collection) plus a
+/// vector fingerprint: `vector_md5` (md5 of the f32 little-endian bytes, so a diff can confirm the vectors
+/// are byte-identical to the live ones) and `vector_head` (first 8 dims, for a quick eyeball). Pure so the
+/// shape is unit-tested; the caller `println!`s it. Nothing is written to Qdrant.
+fn dry_run_json(collection: &str, id: &str, vector: &[f32], payload: &Map<String, Value>) -> Value {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for f in vector {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let vector_md5 = format!("{:x}", Md5::digest(&bytes));
+    serde_json::json!({
+        "id": id,
+        "collection": collection,
+        "vector_dim": vector.len(),
+        "vector_md5": vector_md5,
+        "vector_head": vector.iter().take(8).copied().collect::<Vec<f32>>(),
+        "payload": payload,
+    })
 }
 
 /// Extract documented items from rustdoc JSON — the Python `_items`. Iterates `doc["index"]` (id -> item)
@@ -302,5 +360,26 @@ mod tests {
         assert_eq!(maybe_unzstd(&compressed), plain);
         // Non-zstd bytes pass through untouched (already-decompressed JSON).
         assert_eq!(maybe_unzstd(plain), plain);
+    }
+
+    #[test]
+    fn dry_run_json_carries_id_payload_and_vector_fingerprint() {
+        let payload = serde_json::json!({ "text": "hi", "path": "a::b", "kind": "struct" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let vector = vec![1.0f32, 2.0, 3.0];
+        let j = dry_run_json("crate.foo.1.0.0", "the-id", &vector, &payload);
+        assert_eq!(j["id"], "the-id");
+        assert_eq!(j["collection"], "crate.foo.1.0.0");
+        assert_eq!(j["vector_dim"], 3);
+        assert_eq!(j["payload"]["text"], "hi");
+        assert_eq!(j["vector_head"], serde_json::json!([1.0, 2.0, 3.0]));
+        // vector_md5 is the md5 of the f32 little-endian bytes — stable + independently reproducible.
+        let mut bytes = Vec::new();
+        for f in &vector {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(j["vector_md5"], format!("{:x}", Md5::digest(&bytes)));
     }
 }

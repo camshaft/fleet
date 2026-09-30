@@ -84,6 +84,10 @@ enum Command {
         /// collection, so `latest` and the explicit version it resolves to ingest into the same place.
         #[arg(long, default_value = "latest")]
         version: String,
+        /// Print the would-be points as NDJSON (id + payload + vector fingerprint) on stdout WITHOUT writing
+        /// to Qdrant — the crate-docs parity harness. No collection is created, nothing is upserted.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -115,10 +119,19 @@ async fn main() {
         Command::CrateDocs {
             crate_name,
             version,
-        } => crate_docs::ingest_crate(&crate_name, &version)
+            dry_run,
+        } => crate_docs::ingest_crate(&crate_name, &version, dry_run)
             .await
             .map(|(chunks, collection)| {
-                println!("ingested {chunks} chunks into {collection}");
+                if dry_run {
+                    // Points already printed as NDJSON on stdout; keep the summary on stderr so stdout stays
+                    // pure NDJSON for the parity diff.
+                    eprintln!(
+                        "dry-run: {chunks} would-be points for {collection} (NDJSON on stdout; nothing written)"
+                    );
+                } else {
+                    println!("ingested {chunks} chunks into {collection}");
+                }
             }),
     };
 
