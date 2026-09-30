@@ -353,6 +353,22 @@ impl Board {
             .map_err(|e| format!("board POST /tasks/{task_id}/comments failed: {e}"))?;
         Ok(())
     }
+
+    /// Reassign a task to a new owner (`PATCH /tasks/{id}` with `{assignee, actor}`; the route allows
+    /// GET,HEAD,PATCH). The #540 nudge uses this to ROUTE an unassigned-or-idle-owner stale task to a router
+    /// (board-pm) so it lands in the router's queue. `actor` attributes the change so the router is not
+    /// notified of its own... it is `NUDGE_AUTHOR` here, and the assignee change notifies the new owner.
+    pub fn reassign_task(&self, task_id: i64, assignee: &str, actor: &str) -> Result<(), String> {
+        let url = format!("{}/tasks/{}", self.base, task_id);
+        let payload = serde_json::json!({ "assignee": assignee, "actor": actor }).to_string();
+        self.agent
+            .request("PATCH", &url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&payload)
+            .map_err(|e| format!("board PATCH /tasks/{task_id} (reassign) failed: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

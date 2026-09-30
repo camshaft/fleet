@@ -4707,6 +4707,13 @@ fn wake_audit(verbose: bool) {
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
 /// The operator's board id — an `in_progress` task assigned here is never nudged (#478 exclusion).
 const NUDGE_EXEMPT_ASSIGNEE: &str = "cameron";
+/// #540 inc2: where an unassigned-or-idle-owner stale task is ROUTED — the router that owns assignment. It is
+/// event-woken on the reassignment (task.assigned), so this needs no polling on board-pm's side.
+const NUDGE_ROUTER: &str = "board-pm";
+/// #540 inc2: an owner not seen for at least this long reads as idle/dead for routing purposes — a generous
+/// bound so a legitimately long-cadence owner is not mistaken for dead (offline/away status catches the
+/// explicit cases sooner). Report-only-first surfaces any edge case before a reassign actually fires.
+const NUDGE_OWNER_DEAD_SECS: i64 = 3 * 3600; // 3h
 
 /// Whether a task idle for `idle_secs` should be nudged now, given `last_nudge_secs` (the age of this
 /// daemon's own most recent nudge comment on it, if any). Pure — unit-tested. First nudge fires once idle
@@ -4782,14 +4789,6 @@ fn is_tracking_parent_with_open_children(child_rollup: Option<&serde_json::Value
     total > 0 && done < total
 }
 
-/// Nudge stale `in_progress` tasks (board task #478): a task whose latest activity is at least
-/// `threshold_hours` old gets a comment pinging its assignee, at most once per `cooldown_hours` while it
-/// stays idle. Always excludes tasks assigned to `cameron` (the operator) and, by construction, anything
-/// not in `in_progress` (a `blocked` task never appears in this query — it is parked on a named
-/// dependency, not silently stalled). An unassigned task is skipped: there is no one to ping. A
-/// monitor-exempt task (#167) is skipped too — it is a legitimate continuous monitor, not a stalled
-/// deliverable. Report-only unless `apply` — dry-run prints exactly what it WOULD do without writing anything
-/// (#478's review gate).
 /// #540: whether a task shows WORKER activity — at least one comment from someone OTHER than the nudge daemon
 /// itself. A `todo` task counts as a stalled deliverable (vs untouched backlog) only once real work has been
 /// recorded on it, so the nudge widens to `todo` only when this holds. The daemon's own prior nudges never
@@ -4820,6 +4819,39 @@ fn nudge_body(threshold_hours: f64, assignee: &str, idle_secs: i64) -> String {
     )
 }
 
+/// #540 inc2: is a task's assigned OWNER idle/dead — so a stale task it holds should be ROUTED to a router
+/// rather than nudged at an owner who cannot act? True when the owner's board status is `offline`/`away` (an
+/// explicit not-working state) OR its heartbeat is older than [`NUDGE_OWNER_DEAD_SECS`] (not ticking). A live
+/// owner (`online`/recent heartbeat) returns false — it gets the normal nudge. Absent status + unknown age →
+/// false (do not route on missing data). Pure — unit-tested.
+fn owner_is_idle_or_dead(status: Option<&str>, last_seen_age_secs: Option<i64>) -> bool {
+    if matches!(status, Some("offline") | Some("away")) {
+        return true;
+    }
+    matches!(last_seen_age_secs, Some(age) if age >= NUDGE_OWNER_DEAD_SECS)
+}
+
+/// #540 inc2: the comment posted when a stale task is ROUTED to the router (board-pm) — an audit trail naming
+/// WHY it landed in the router's queue (unassigned, or its owner is idle/dead). Pure — unit-tested.
+fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
+    format!(
+        "fleet nudge: reassigned to {NUDGE_ROUTER} for routing — {reason}, and stale for over {threshold_hours}h \
+         (idle {}). {NUDGE_ROUTER}, please assign it to a capable agent or update its status (done / blocked / \
+         cancelled if obsolete).",
+        format_hm(idle_secs)
+    )
+}
+
+/// Nudge stale ASSIGNED work + ROUTE stale ownerless work (board #478 + #540). A `todo`/`in_progress` task
+/// whose latest activity is at least `threshold_hours` old is acted on, at most once per `cooldown_hours` while
+/// it stays idle: a task with a live owner gets a comment pinging that owner ([`nudge_body`]); an UNASSIGNED
+/// task, or one whose owner is idle/dead ([`owner_is_idle_or_dead`]), is REASSIGNED to the router
+/// ([`NUDGE_ROUTER`]) with an audit comment ([`route_body`]) so it lands in the router's queue for placement.
+/// Always excludes tasks assigned to `cameron` (the operator) and `monitor_exempt` tasks (#167 — a deliberate
+/// continuous monitor, and the opt-out for a task the router intentionally leaves unassigned). A `todo` task
+/// must show worker activity ([`task_has_worker_activity`]) to count — a bare backlog item is not a stall.
+/// Report-only unless `apply` — a dry run prints exactly what it WOULD do without writing (the #478/#540 review
+/// gate).
 fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet nudge-stale: {e}");
@@ -4827,6 +4859,19 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     });
     let threshold_secs = (threshold_hours * 3600.0).round() as i64;
     let cooldown_secs = (cooldown_hours * 3600.0).round() as i64;
+    // #540 inc2: owner status/heartbeat map (id → agent record) for the idle/dead-owner routing signal.
+    // Best-effort — a roster query error degrades to "no owner is known dead" (we still nudge live owners and
+    // route unassigned tasks) rather than failing the sweep.
+    let owner_status: std::collections::BTreeMap<String, serde_json::Value> = board
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|a| {
+            a.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| (id.to_string(), a.clone()))
+        })
+        .collect();
     // #540: nudge stale ASSIGNED work in in_progress AND todo. A task where work started (a plan comment) but
     // was never flipped to in_progress still stalls, and the operator wants it caught (task_512). A bare
     // untouched todo is NOT nudged — the per-task check below requires worker activity for a todo — so widening
@@ -4848,19 +4893,26 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
 
     let now = time::OffsetDateTime::now_utc();
     let mut nudged = 0usize;
+    let mut routed = 0usize;
     for t in &candidates {
         let id = match t.get("id").and_then(serde_json::Value::as_i64) {
             Some(id) => id,
             None => continue,
         };
-        let assignee = t.get("assignee").and_then(serde_json::Value::as_str);
-        if assignee == Some(NUDGE_EXEMPT_ASSIGNEE) || assignee.is_none() {
+        // #540 inc2: an UNASSIGNED task is no longer skipped — it is routed to the router below. Empty-string
+        // assignee is normalized to None (unassigned).
+        let assignee = t
+            .get("assignee")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty());
+        // The operator's own tasks are never nudged/routed (#478 exclusion).
+        if assignee == Some(NUDGE_EXEMPT_ASSIGNEE) {
             continue;
         }
-        let assignee = assignee.expect("checked Some above");
 
         // #167/#506: a monitor-exempt task is a legitimate continuous monitor, not a stalled deliverable —
-        // never nudge it. Read from the list record's derived bool; no per-task fetch needed.
+        // never nudge it. This is ALSO the #540 inc2 opt-out: a task the router DELIBERATELY leaves unassigned
+        // is marked monitor_exempt so the daemon does not re-grab it. Read from the list record's derived bool.
         if task_is_monitor_exempt(t) {
             continue;
         }
@@ -4911,30 +4963,67 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         }
 
         let title = t.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
-        let kind = if last_nudge_secs.is_some() { "re-nudge" } else { "first nudge" };
-        if apply {
-            let body = nudge_body(threshold_hours, assignee, idle_secs);
-            match board.comment_task(id, NUDGE_AUTHOR, &body) {
-                Ok(()) => {
-                    nudged += 1;
-                    println!("  nudged #{id} \"{title}\" ({kind}, assignee={assignee}, idle={})", format_hm(idle_secs));
-                }
-                Err(e) => eprintln!("  #{id} \"{title}\": nudge FAILED: {e}"),
+        // #540 inc2: decide ROUTE (reassign to the router) vs NUDGE (ping a live owner). Route an UNASSIGNED
+        // task, or one whose owner is idle/dead (but never re-route one already owned by the router itself —
+        // that would be a self-reassign loop). Otherwise nudge the live owner (inc1).
+        let route_reason: Option<String> = match assignee {
+            None => Some("unassigned".to_string()),
+            Some(owner) if owner != NUDGE_ROUTER => {
+                let rec = owner_status.get(owner);
+                let ostatus = rec.and_then(|r| r.get("status")).and_then(serde_json::Value::as_str);
+                let oage = rec
+                    .and_then(|r| r.get("last_seen"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|ls| last_seen_age_secs(ls, now));
+                owner_is_idle_or_dead(ostatus, oage).then(|| format!("owner {owner} is idle/dead"))
             }
-        } else {
-            nudged += 1;
-            println!(
-                "  would nudge #{id} \"{title}\" ({kind}, assignee={assignee}, idle={})",
-                format_hm(idle_secs)
-            );
+            Some(_) => None, // already the router → nudge it, don't self-reassign
+        };
+
+        match route_reason {
+            Some(reason) => {
+                if apply {
+                    let res = board.reassign_task(id, NUDGE_ROUTER, NUDGE_AUTHOR).and_then(|()| {
+                        board.comment_task(id, NUDGE_AUTHOR, &route_body(&reason, threshold_hours, idle_secs))
+                    });
+                    match res {
+                        Ok(()) => {
+                            routed += 1;
+                            println!("  routed #{id} \"{title}\" → {NUDGE_ROUTER} ({reason}, idle={})", format_hm(idle_secs));
+                        }
+                        Err(e) => eprintln!("  #{id} \"{title}\": route FAILED: {e}"),
+                    }
+                } else {
+                    routed += 1;
+                    println!("  would route #{id} \"{title}\" → {NUDGE_ROUTER} ({reason}, idle={})", format_hm(idle_secs));
+                }
+            }
+            None => {
+                let owner = assignee.expect("Some (a live non-router owner) when not routing");
+                let kind = if last_nudge_secs.is_some() { "re-nudge" } else { "first nudge" };
+                if apply {
+                    let body = nudge_body(threshold_hours, owner, idle_secs);
+                    match board.comment_task(id, NUDGE_AUTHOR, &body) {
+                        Ok(()) => {
+                            nudged += 1;
+                            println!("  nudged #{id} \"{title}\" ({kind}, assignee={owner}, idle={})", format_hm(idle_secs));
+                        }
+                        Err(e) => eprintln!("  #{id} \"{title}\": nudge FAILED: {e}"),
+                    }
+                } else {
+                    nudged += 1;
+                    println!("  would nudge #{id} \"{title}\" ({kind}, assignee={owner}, idle={})", format_hm(idle_secs));
+                }
+            }
         }
     }
 
     println!(
-        "\n{} {} task(s){}",
-        if apply { "nudged" } else { "would nudge" },
+        "\n{} {} nudge(s) + {} route(s) to {NUDGE_ROUTER}{}",
+        if apply { "posted" } else { "would post" },
         nudged,
-        if apply { "" } else { " — re-run with --apply to post" }
+        routed,
+        if apply { "" } else { " — re-run with --apply to act" }
     );
 }
 
@@ -7277,6 +7366,32 @@ mod tests {
         // A mix (worker + nudge) still counts — the worker comment is present.
         let mixed = serde_json::json!({"comments":[{"author":NUDGE_AUTHOR},{"author":"v-runtime"}]});
         assert!(task_has_worker_activity(&mixed));
+    }
+
+    #[test]
+    fn owner_is_idle_or_dead_flags_offline_away_or_a_stale_heartbeat() {
+        let dead = NUDGE_OWNER_DEAD_SECS;
+        // Explicit not-working states → idle/dead regardless of heartbeat.
+        assert!(owner_is_idle_or_dead(Some("offline"), Some(0)));
+        assert!(owner_is_idle_or_dead(Some("away"), None));
+        // A live owner (online) with a recent heartbeat → NOT idle/dead (it gets the normal nudge).
+        assert!(!owner_is_idle_or_dead(Some("online"), Some(60)));
+        // Online but heartbeat older than the dead bound → idle/dead (not ticking).
+        assert!(owner_is_idle_or_dead(Some("online"), Some(dead)));
+        assert!(owner_is_idle_or_dead(Some("online"), Some(dead + 1)));
+        assert!(!owner_is_idle_or_dead(Some("online"), Some(dead - 1)), "just under the bound → still live");
+        // Missing status + unknown age → NOT flagged (never route on absent data).
+        assert!(!owner_is_idle_or_dead(None, None));
+    }
+
+    #[test]
+    fn route_body_names_the_router_reason_and_actions() {
+        let b = route_body("unassigned", 1.0, 7200);
+        assert!(b.contains(NUDGE_ROUTER), "names the router (board-pm)");
+        assert!(b.contains("unassigned") && b.contains("idle 2h"), "carries the reason + idle age");
+        assert!(b.contains("assign it to a capable agent") && b.contains("update its status"), "actionable for the router");
+        // The idle-owner reason is carried verbatim too.
+        assert!(route_body("owner v-x is idle/dead", 1.0, 3600).contains("owner v-x is idle/dead"));
     }
 
     #[test]
