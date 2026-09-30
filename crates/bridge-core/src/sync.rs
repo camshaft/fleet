@@ -3,6 +3,13 @@
 //! This is where the sync *decisions* live so a transport binary stays a thin I/O shell:
 //!   - [`plan_outbound`]: given a batch of firehose [`Event`]s + the current cursor + a board-channel →
 //!     external-channel resolver, produce the posts to deliver (in `seq` order) and the new cursor.
+//!
+//! VERIFIED board contract (live firehose, board-core #427): a native agent's AUTHORIZED post in an
+//! `outbound_authors` channel emits BOTH a `channel.post` (the raw post) AND a paired
+//! `channel.outbound_reflect`. [`plan_outbound`] consumes ONLY the reflect — so the reply is delivered
+//! exactly once, and it is the reflect (not the raw post) that carries the #429 threading metadata. Matching
+//! the paired `channel.post` too would double-deliver. A bridge-daemon inbound-relay post is a bare
+//! `channel.post` with NO paired reflect (the daemon isn't an authorized outbound author) and is skipped.
 //!   - [`plan_inbound`]: given an inbound external message + an external-channel → board-channel resolver,
 //!     produce the attributed board post (`sender` = the bridge agent, `external_author` = `<source>:<id>`).
 //!
@@ -42,7 +49,9 @@ pub struct OutboundPost {
 ///
 /// - Only `channel.outbound_reflect` events (board-core #150) whose board channel resolves to an external
 ///   channel become posts; everything else is skipped. Per #150 the event's existence IS the authorization
-///   (the board already applied the outbound-author policy), so no re-checking here.
+///   (the board already applied the outbound-author policy), so no re-checking here. NOTE an authorized
+///   native post arrives as BOTH a `channel.post` and a paired `channel.outbound_reflect` (see module doc);
+///   consuming only the reflect is what makes delivery exactly-once — do not also match the raw `channel.post`.
 /// - The new cursor is the max `seq` across ALL events in the batch (even skipped ones), never less than
 ///   `cursor`, so a skipped/unmapped event is not reprocessed on the next poll.
 ///
@@ -163,6 +172,39 @@ mod tests {
         let (posts, cursor) = plan_outbound(&events, 0, |_| Some("C7".into()));
         assert_eq!(posts.len(), 1, "only the reflect event becomes a post");
         assert_eq!(cursor, 21, "cursor advances past the skipped event too");
+    }
+
+    #[test]
+    fn outbound_native_authorized_post_delivers_once_via_the_reflect_not_the_paired_post() {
+        // VERIFIED board contract (live firehose, board-core #427): a native agent's AUTHORIZED post emits
+        // BOTH a channel.post (the raw post) AND a paired channel.outbound_reflect - e.g. frank ch=139:
+        // seq 6062 channel.post + 6063 channel.outbound_reflect. plan_outbound must consume ONLY the reflect,
+        // so the reply is delivered EXACTLY ONCE; matching the paired channel.post too would double-deliver,
+        // and the reflect (not the raw post) carries the #429 threading metadata. This guards against the
+        // "also match channel.post" regression (board #490).
+        let native_post = Event {
+            seq: 6062,
+            kind: "channel.post".into(),
+            actor: Some("frank".into()),
+            channel_id: Some(139),
+            created_at: None,
+            data: serde_json::json!({ "body": "On it" }),
+        };
+        let paired_reflect = ev_reflect(6063, 139, 6062, "On it");
+        let (posts, cursor) = plan_outbound(&[native_post, paired_reflect], 6000, |cid| {
+            (cid == 139).then(|| "C139".into())
+        });
+        assert_eq!(
+            posts.len(),
+            1,
+            "delivered once - via the reflect, not the paired channel.post"
+        );
+        assert_eq!(
+            posts[0].event_seq, 6063,
+            "from the reflect (6063), not the raw channel.post (6062)"
+        );
+        assert_eq!(posts[0].external_channel, "C139");
+        assert_eq!(cursor, 6063, "cursor advances past both events");
     }
 
     #[test]
