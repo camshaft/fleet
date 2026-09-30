@@ -9,6 +9,10 @@ mod chunk;
 mod config;
 mod curate;
 mod embed;
+// Phase-2 ingest infra: the Kubo IPFS client the inbox worker (#236) will use to pin ingested files. Landed
+// ahead of its consumer (#233), so `allow(dead_code)` until the worker wires it in.
+#[allow(dead_code)]
+mod ipfs;
 mod mcp;
 mod rerank;
 mod search;

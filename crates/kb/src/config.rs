@@ -53,6 +53,10 @@ pub struct Config {
     /// preserve that. Set an explicit list to restrict, or `["*"]` to disable the check.
     pub mcp_allowed_hosts: Vec<String>,
 
+    /// Kubo (go-ipfs) HTTP RPC base URL for the phase-2 inbox worker's pinning (was `KB_IPFS_API`). Points at
+    /// a local node's `/api/v0` RPC; only the ingest workers use it, so the always-on server ignores it.
+    pub ipfs_url: String,
+
     /// Default collection for the CLI + single-collection tool calls (was `KB_DEFAULT_COLLECTION`).
     pub default_collection: String,
     /// Where `kb_remember` / `kb_supersede` write by default (was `KB_MEMORY_COLLECTION`).
@@ -88,6 +92,7 @@ impl Default for Config {
             rerank_model: "BAAI/bge-reranker-base".to_string(),
             rerank_candidates: 40,
             cache_dir: String::new(),
+            ipfs_url: "http://127.0.0.1:5001".to_string(),
             mcp_host: "0.0.0.0".to_string(),
             mcp_port: 8077,
             mcp_allowed_hosts: vec!["*".to_string()],
