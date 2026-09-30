@@ -3709,6 +3709,21 @@ fn roster_metadata_stripped(agents: &[serde_json::Value]) -> bool {
     !agents.is_empty() && agents.iter().all(|a| a.get("metadata").is_none())
 }
 
+/// The set of agent ids that OWN at least one `in_progress` task, from a `list_tasks_by_status("in_progress")`
+/// projection. `in_progress` is the status that means "actively being worked" — `blocked` (parked on a named
+/// dependency) and `done` are a DIFFERENT status and never appear in this list, so an id in this set holds a
+/// non-blocked, unfinished, assigned deliverable. This drives the #506 holding-work-while-at-rest guard: an
+/// agent that stood down (board `offline`) while its id is in this set left live work behind instead of
+/// progressing it or marking it `blocked`/`done`. Pure — unit-tested.
+fn inprogress_task_assignees(tasks: &[serde_json::Value]) -> std::collections::BTreeSet<String> {
+    tasks
+        .iter()
+        .filter_map(|t| t.get("assignee").and_then(serde_json::Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
 /// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
 #[allow(clippy::too_many_arguments)]
@@ -3751,6 +3766,14 @@ fn watchdog_board(
     // Collected observation candidates: (target agent, stood_down, decision). Displayed after the table, and
     // — with --spawn (#188) — the highest-growth few are launched as ephemeral observers (cap + cooldown).
     let mut obs: Vec<(String, bool, ObserveDecision)> = Vec::new();
+    // #506 holding-work-while-at-rest guard: the set of agents that own an `in_progress` task, read once per
+    // sweep. An agent that is `offline` (stood down) while it appears here left a live, non-blocked deliverable
+    // behind — the v-bolero case. Best-effort: a query error degrades to an empty set (no false violations)
+    // rather than failing the whole watchdog.
+    let inprogress_owners = match board.list_tasks_by_status("in_progress") {
+        Ok(tasks) => inprogress_task_assignees(&tasks),
+        Err(_) => std::collections::BTreeSet::new(),
+    };
     println!(
         "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
         "agent", "interval", "age", "open", "verdict", "action"
@@ -3758,6 +3781,7 @@ fn watchdog_board(
     let mut flagged = 0usize;
     let mut rearmed = 0usize;
     let mut never_ticked_count = 0usize;
+    let mut holding_work_count = 0usize;
     let mut native = 0usize;
     for a in agents {
         let md = a.get("metadata");
@@ -3806,6 +3830,11 @@ fn watchdog_board(
         let never_ticked = !agent_is_staged(md)
             && !stood_down
             && agent_never_ticked(created_at, ls, now, WATCHDOG_NEVER_TICKED_GRACE_SECS);
+        // #506 holding-work-while-at-rest violation: the agent stood down (offline) while it still owns a live
+        // `in_progress` task — the v-bolero case (created work, then slept). `in_progress` is actively-worked,
+        // so standing down on it (instead of progressing it or marking it `blocked`/`done`) is a status-honesty
+        // violation, not a legitimate stand-down. Flagged + re-armed below so it re-enters its loop.
+        let holding_work_at_rest = stood_down && inprogress_owners.contains(id);
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
@@ -3813,17 +3842,31 @@ fn watchdog_board(
             obs.push((id.to_string(), stood_down, d));
         }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
-        if stale_only && !retighten && !never_ticked {
+        if stale_only && !retighten && !never_ticked && !holding_work_at_rest {
             continue;
         }
         // A NEVER-TICKED agent takes priority: a wake cannot recover a loop that never started (no live pane
         // to re-arm — the #412/#420 lesson), so it is flagged for investigation + relaunch, never wake-injected.
+        // A HOLDING-WORK-AT-REST violation (#506) is next: the agent stood down with a live in_progress task, so
+        // re-arm it back into its loop (with --rearm) — it must progress the work or re-state it (blocked/done).
         // Otherwise, with --rearm, ACT on a retighten candidate: a cooldown-limited, pane-fenced wake so it
         // runs a tick now (never reaps/restarts). See [`rearm_candidate`].
         let action = if never_ticked {
             flagged += 1;
             never_ticked_count += 1;
             "NEVER-TICKED"
+        } else if holding_work_at_rest {
+            flagged += 1;
+            holding_work_count += 1;
+            if rearm {
+                let (_act, did) = rearm_candidate(&fleet, &session, id, interval_secs, now_unix);
+                if did {
+                    rearmed += 1;
+                }
+                "HOLDS-WORK@REST→woke"
+            } else {
+                "HOLDS-WORK@REST"
+            }
         } else if retighten {
             flagged += 1;
             if rearm {
@@ -3858,6 +3901,15 @@ fn watchdog_board(
         // wake — the board-triage/board-follow-up outage (#412/#417) that stayed silent for ~3.7h.
         println!(
             "-- WARNING: {never_ticked_count} agent(s) NEVER-TICKED (launched but last_seen == created_at past the {WATCHDOG_NEVER_TICKED_GRACE_SECS}s grace) — a wake will NOT help; investigate the pane + relaunch (see #417)"
+        );
+    }
+    if holding_work_count > 0 {
+        // #506: an agent that stood down (offline) while still owning a live in_progress task. in_progress means
+        // actively-worked, so this is a status-honesty violation, not a legitimate rest — surfaced loudly (and
+        // re-armed under --rearm) so it re-enters its loop and either progresses the work or re-states it as
+        // blocked/done. The prevention companion is the AGENTS-fleet status-honesty contract line (#506 Layer 1).
+        println!(
+            "-- WARNING: {holding_work_count} agent(s) STOOD DOWN while holding a live in_progress assigned task (#506 violation) — an in_progress task is actively-worked; they must progress it or mark it blocked/done. Re-armed under --rearm."
         );
     }
     if observe {
@@ -5706,6 +5758,22 @@ mod tests {
         assert!(!roster_metadata_stripped(&[serde_json::json!({"id":"a","metadata":{"native":true}})]));
         // An empty roster is a board outage / no agents, NOT a metadata-stripping bug → do not warn.
         assert!(!roster_metadata_stripped(&[]));
+    }
+
+    #[test]
+    fn inprogress_task_assignees_collects_nonempty_owners_deduped() {
+        let tasks = vec![
+            serde_json::json!({"id":1,"assignee":"v-bolero","status":"in_progress"}),
+            serde_json::json!({"id":2,"assignee":"v-bolero","status":"in_progress"}), // same owner → deduped
+            serde_json::json!({"id":3,"assignee":"librarian","status":"in_progress"}),
+            serde_json::json!({"id":4,"assignee":"","status":"in_progress"}),          // unassigned → dropped
+            serde_json::json!({"id":5,"status":"in_progress"}),                          // no assignee → dropped
+        ];
+        let owners = inprogress_task_assignees(&tasks);
+        assert!(owners.contains("v-bolero") && owners.contains("librarian"));
+        assert_eq!(owners.len(), 2, "deduped, and empty/absent assignees dropped");
+        // Empty task list → empty set (a board query error degrades here → no false #506 violations).
+        assert!(inprogress_task_assignees(&[]).is_empty());
     }
 
     #[test]
