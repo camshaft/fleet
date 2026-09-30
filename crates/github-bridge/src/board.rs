@@ -63,6 +63,14 @@ pub fn comment_ref(repo: &str, comment_id: i64) -> String {
     format!("{repo}#c{comment_id}")
 }
 
+/// The canonical external id for a PR inline diff-review comment (a *finding*): `owner/repo#rc<id>` (BUILD
+/// 2b-2). The `rc` prefix keeps it in a separate id space from a conversation [`comment_ref`] (`#c<id>`) so
+/// a review finding and a conversation comment never collide as review-log entries even if their GitHub ids
+/// coincide.
+pub fn review_comment_ref(repo: &str, comment_id: i64) -> String {
+    format!("{repo}#rc{comment_id}")
+}
+
 /// Parse an issue-link `external_id` back into `(repo, issue_number)` — the inverse of [`issue_ref`]. Used by
 /// the OUT path to turn a `task.outbound_reflect`'s `external_id` into the repo + issue number to post to.
 /// Splits on the LAST `#` (a repo name never contains `#`, the number always follows the final one) and
@@ -564,6 +572,14 @@ mod tests {
         assert_eq!(comment_ref("camshaft/fleet", 555), "camshaft/fleet#c555");
         // Distinct from an issue ref so the two link kinds never collide on external_id.
         assert_ne!(comment_ref("o/r", 5), issue_ref("o/r", 5));
+    }
+
+    #[test]
+    fn review_comment_ref_is_distinct_from_conversation_and_issue_refs() {
+        assert_eq!(review_comment_ref("camshaft/fleet", 900), "camshaft/fleet#rc900");
+        // A finding and a conversation comment with the same numeric id must not collide.
+        assert_ne!(review_comment_ref("o/r", 5), comment_ref("o/r", 5));
+        assert_ne!(review_comment_ref("o/r", 5), issue_ref("o/r", 5));
     }
 
     // ── pure body builders (idempotent create/comment, board-core #270) ─────────────────────────────

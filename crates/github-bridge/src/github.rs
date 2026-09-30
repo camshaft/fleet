@@ -97,6 +97,25 @@ pub struct PullReview {
     pub submitted_at: String,
 }
 
+/// An inline diff-review comment on a pull request from the Review Comments API
+/// (`GET /repos/{repo}/pulls/{number}/comments`, BUILD 2b-2) — a comment attached to a specific file + line
+/// of the diff, distinct from a PR *conversation* comment (which is an [`IssueComment`]). Mirrored into the
+/// review log as a `finding`-type entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    /// GitHub's globally-unique review-comment id — the dedup/link key (its own id space, `#rc<id>`).
+    pub id: i64,
+    pub body: String,
+    /// The commenter's GitHub login, or empty for a ghost account.
+    pub author: String,
+    /// The file path the inline comment targets (empty if absent).
+    pub path: String,
+    /// The diff line the comment targets, when present (`null` for an outdated/collapsed comment).
+    pub line: Option<i64>,
+    /// RFC3339 last-updated timestamp — the incremental poll cursor.
+    pub updated_at: String,
+}
+
 /// The nested `user` object on issues/comments. Login is optional (a deleted account serializes as `null`).
 #[derive(Deserialize)]
 struct RawUser {
@@ -167,6 +186,21 @@ struct RawReview {
     user: Option<RawUser>,
     #[serde(default)]
     submitted_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawReviewComment {
+    id: i64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    line: Option<i64>,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 fn login_of(user: Option<RawUser>) -> String {
@@ -262,6 +296,27 @@ pub fn parse_pull_reviews(body: &str) -> Result<Vec<PullReview>, String> {
                 state: r.state.unwrap_or_default(),
                 author: login_of(r.user),
                 submitted_at: r.submitted_at.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Parse a GitHub pull-request review-comments response (`GET /repos/{repo}/pulls/{number}/comments`) into
+/// [`ReviewComment`]s (inline diff findings, BUILD 2b-2). Same null-tolerance + bare-array/`items`-envelope
+/// handling as [`parse_issues`].
+pub fn parse_pull_review_comments(body: &str) -> Result<Vec<ReviewComment>, String> {
+    let arr = list_array(body, "comments")?;
+    arr.into_iter()
+        .map(|row| {
+            let r: RawReviewComment =
+                serde_json::from_value(row).map_err(|e| format!("github review-comments: bad row: {e}"))?;
+            Ok(ReviewComment {
+                id: r.id,
+                body: r.body.unwrap_or_default(),
+                author: login_of(r.user),
+                path: r.path.unwrap_or_default(),
+                line: r.line,
+                updated_at: r.updated_at.unwrap_or_default(),
             })
         })
         .collect()
@@ -367,6 +422,26 @@ impl GithubClient {
     pub fn list_pull_reviews(&self, repo: &str, number: i64, page: usize) -> Result<Vec<PullReview>, String> {
         let path = format!("/repos/{repo}/pulls/{number}/reviews?per_page={PER_PAGE}&page={page}");
         parse_pull_reviews(&self.get(&path)?)
+    }
+
+    /// One page of a pull request's inline diff-review comments (`GET /repos/{repo}/pulls/{number}/comments`,
+    /// BUILD 2b-2), oldest-updated first. `since` (RFC3339) filters incrementally. `page` is 1-based. NOTE:
+    /// distinct from [`list_issue_comments`](Self::list_issue_comments) — those are the PR's *conversation*
+    /// comments; these are the *diff* comments mirrored as review findings.
+    pub fn list_pull_review_comments(
+        &self,
+        repo: &str,
+        number: i64,
+        since: Option<&str>,
+        page: usize,
+    ) -> Result<Vec<ReviewComment>, String> {
+        let mut path =
+            format!("/repos/{repo}/pulls/{number}/comments?sort=updated&direction=asc&per_page={PER_PAGE}&page={page}");
+        if let Some(s) = since {
+            path.push_str("&since=");
+            path.push_str(s);
+        }
+        parse_pull_review_comments(&self.get(&path)?)
     }
 
     /// One page of an issue's comments, oldest-updated first. `since` filters incrementally. `page` 1-based.
@@ -558,6 +633,25 @@ mod tests {
         let r = &parse_pull_reviews(body).unwrap()[0];
         assert_eq!(r.author, "", "null reviewer -> empty");
         assert!(parse_pull_reviews("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_pull_review_comments_maps_path_line_author() {
+        let body = r#"[
+            {"id": 900, "body": "off-by-one here", "user": {"login": "octocat"},
+             "path": "src/lib.rs", "line": 42, "updated_at": "2026-09-30T04:00:00Z"},
+            {"id": 901, "body": "outdated", "user": null, "path": "src/x.rs", "line": null, "updated_at": "t"}
+        ]"#;
+        let cs = parse_pull_review_comments(body).unwrap();
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].id, 900);
+        assert_eq!(cs[0].body, "off-by-one here");
+        assert_eq!(cs[0].author, "octocat");
+        assert_eq!(cs[0].path, "src/lib.rs");
+        assert_eq!(cs[0].line, Some(42));
+        assert_eq!(cs[1].author, "", "null user -> empty");
+        assert_eq!(cs[1].line, None, "null line tolerated");
+        assert!(parse_pull_review_comments("[]").unwrap().is_empty());
     }
 
     #[test]

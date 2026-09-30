@@ -119,10 +119,11 @@ so mirroring PRs as **code reviews** needs no new GitHub endpoint:
 - The PR's **conversation comments** (same `/issues/:n/comments` endpoint) are appended to the review as
   `comment`-type log entries via the idempotent `append_review_log`, loop-safe (skips the bridge's own
   reflected comments) and keyed on the comment ref (`owner/repo#c<id>`).
+- The PR's **inline diff-review comments** (`GET /pulls/:n/comments`, 2b-2) are appended as `finding`-type
+  review-log entries — the body prefixed with the `file:line` location — keyed on a distinct review-comment
+  ref (`owner/repo#rc<id>`) so a finding never collides with a conversation comment (`#c<id>`).
 - The `github_pr` link source is distinct from `github` (issue↔task) so PR-review links never collide with
-  issue-ingest links.
-- **2b-1** (the intermediate states above) is live. **2b-2** — inline diff-review-comment *findings* (the
-  `GET /pulls/:n/comments` review comments → `finding`-type review-log entries) — is the remaining slice.
+  issue-ingest links. BUILD 2 (2a + 2b) is complete; every mirror is idempotent + loop-safe.
 
 ## Operational notes
 

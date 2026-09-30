@@ -18,8 +18,8 @@
 //! the idempotent `board::create_task` / `board::comment_task` (each carrying the `external_link`, board-core
 //! #270), so dedup is the board's job and this layer never tracks already-ingested state itself.
 
-use crate::board::{comment_ref, issue_ref, Event, TaskReflect, LINK_SOURCE};
-use crate::github::{github_external_author, Issue, IssueComment, PullReview};
+use crate::board::{comment_ref, issue_ref, review_comment_ref, Event, TaskReflect, LINK_SOURCE};
+use crate::github::{github_external_author, Issue, IssueComment, PullReview, ReviewComment};
 
 /// A mirrored board task to create from a GitHub issue (the daemon calls the idempotent `board::create_task`
 /// passing [`TaskCreate::issue_ref`] as the `external_link`, so the board de-dupes + links atomically).
@@ -82,12 +82,17 @@ fn attribution(login: &str) -> Option<String> {
     (!login.is_empty()).then(|| github_external_author(login))
 }
 
-/// Whether a GitHub comment was authored by the bridge's own account (`self_login`) — the loop-safety check
-/// shared by comment ingest and PR review-log ingest, so a comment the bridge reflected OUT to GitHub isn't
+/// Whether a comment `author` login is the bridge's own account (`self_login`) — the loop-safety check
+/// shared by every comment/log ingest path, so a comment the bridge reflected OUT to GitHub isn't
 /// re-ingested. `None`/empty `self_login` never matches (nothing is filtered as self), and a ghost
 /// (empty-author) comment is never treated as self.
+fn is_self_author(author: &str, self_login: Option<&str>) -> bool {
+    matches!(self_login, Some(me) if !author.is_empty() && author == me)
+}
+
+/// [`is_self_author`] for a PR/issue conversation comment.
 fn is_self_comment(c: &IssueComment, self_login: Option<&str>) -> bool {
-    matches!(self_login, Some(me) if !c.author.is_empty() && c.author == me)
+    is_self_author(&c.author, self_login)
 }
 
 /// Plan the board tasks to create from a batch of GitHub issues.
@@ -347,6 +352,37 @@ pub fn plan_pr_comment_log(
             body: c.body.clone(),
             external_author: attribution(&c.author),
             external_id: comment_ref(repo, c.id),
+        })
+        .collect()
+}
+
+/// Render a review-log FINDING body from an inline diff-review comment: prefix the `file:line` location
+/// (when known) so a board reader sees WHERE the finding is, then the comment body. Pure.
+pub fn render_finding_body(path: &str, line: Option<i64>, body: &str) -> String {
+    match (path.is_empty(), line) {
+        (false, Some(l)) => format!("`{path}:{l}`\n\n{body}"),
+        (false, None) => format!("`{path}`\n\n{body}"),
+        (true, _) => body.to_string(),
+    }
+}
+
+/// Plan the FINDING review-log entries from a PR's inline diff-review comments (BUILD 2b-2). Loop-safe (skips
+/// the bridge's own, like [`plan_pr_comment_log`]); the body carries the `file:line` location and each entry
+/// is keyed on the review-comment ref (`owner/repo#rc<id>`, distinct from conversation comments' `#c<id>`) so
+/// the two never collide in the review log. The daemon appends each as a `finding`-type entry via the
+/// idempotent `append_review_log`. Order preserved. Pure.
+pub fn plan_pr_finding_log(
+    comments: &[ReviewComment],
+    repo: &str,
+    self_login: Option<&str>,
+) -> Vec<ReviewLogEntry> {
+    comments
+        .iter()
+        .filter(|c| !is_self_author(&c.author, self_login))
+        .map(|c| ReviewLogEntry {
+            body: render_finding_body(&c.path, c.line, &c.body),
+            external_author: attribution(&c.author),
+            external_id: review_comment_ref(repo, c.id),
         })
         .collect()
 }
@@ -700,6 +736,48 @@ mod tests {
         let comments = [comment(1, "ghost note", "")];
         let entries = plan_pr_comment_log(&comments, "o/r", Some(""));
         assert_eq!(entries.len(), 1, "empty author != self even when self_login is empty");
+        assert_eq!(entries[0].external_author, None);
+    }
+
+    // ── BUILD 2b-2: inline diff-review findings ────────────────────────────────────────────────────
+
+    fn review_comment(id: i64, body: &str, author: &str, path: &str, line: Option<i64>) -> ReviewComment {
+        ReviewComment {
+            id,
+            body: body.to_string(),
+            author: author.to_string(),
+            path: path.to_string(),
+            line,
+            updated_at: "2026-09-30T04:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn render_finding_body_prefixes_file_and_line() {
+        assert_eq!(render_finding_body("src/lib.rs", Some(42), "nit"), "`src/lib.rs:42`\n\nnit");
+        assert_eq!(render_finding_body("src/lib.rs", None, "nit"), "`src/lib.rs`\n\nnit");
+        assert_eq!(render_finding_body("", None, "general"), "general", "no location -> body only");
+    }
+
+    #[test]
+    fn plan_pr_finding_log_attributes_locates_and_keys_by_rc_ref() {
+        let comments = [
+            review_comment(900, "off-by-one", "octocat", "src/lib.rs", Some(42)),
+            review_comment(901, "reflected", "fleet-bot", "src/x.rs", Some(1)),
+        ];
+        let entries = plan_pr_finding_log(&comments, "o/r", Some("fleet-bot"));
+        assert_eq!(entries.len(), 1, "own review comment filtered (loop-safety)");
+        assert_eq!(entries[0].external_author.as_deref(), Some("github:octocat"));
+        assert_eq!(entries[0].external_id, "o/r#rc900", "keyed on the review-comment ref");
+        assert!(entries[0].body.contains("src/lib.rs:42"), "location prefixed");
+        assert!(entries[0].body.contains("off-by-one"));
+    }
+
+    #[test]
+    fn plan_pr_finding_log_ghost_author_unattributed() {
+        let comments = [review_comment(1, "ghost finding", "", "src/a.rs", None)];
+        let entries = plan_pr_finding_log(&comments, "o/r", Some(""));
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].external_author, None);
     }
 
