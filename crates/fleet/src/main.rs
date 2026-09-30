@@ -1719,6 +1719,26 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Nudge stale in_progress tasks (board task #478, operator: automate what board-follow-up was missing).
+    /// A task in `in_progress` whose latest activity (its `updated_at`, or a later comment) is at least
+    /// `--threshold-hours` old gets a comment pinging its assignee for a progress update or ETA. Per-task
+    /// COOLDOWN: re-nudges the same task no more than once per `--cooldown-hours` while it stays idle, so it
+    /// never spams. EXCLUSIONS (enforced unconditionally, not flag-gated): tasks assigned to `cameron` (the
+    /// operator is never nudged) and tasks not in `in_progress` (a `blocked` task is parked on a named
+    /// dependency, not silently stalled — it is excluded by construction, since the board query is scoped to
+    /// `in_progress`). An unassigned `in_progress` task is skipped too — there is no one to ping. Report-only
+    /// by default (prints who it WOULD nudge and why); `--apply` posts the comments for real.
+    NudgeStale {
+        /// Actually post the nudge comments (default: dry-run — report the candidates, write nothing).
+        #[arg(long)]
+        apply: bool,
+        /// How many hours of no activity before a task is a candidate.
+        #[arg(long, default_value_t = 1.0)]
+        threshold_hours: f64,
+        /// Minimum hours between re-nudges of the SAME still-idle task.
+        #[arg(long, default_value_t = 2.0)]
+        cooldown_hours: f64,
+    },
     /// Print a systemd USER service + timer that runs the watchdog on a cadence (a host installs it
     /// declaratively — home-manager `systemd.user.services`/`timers`, same as fleet-notify — no imperative
     /// write path). The service is a oneshot (`fleet watchdog` is single-sweep); the timer re-fires it. Emit
@@ -1879,6 +1899,11 @@ fn main() {
         } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap),
         Cmd::ServedSet { toml } => served_set(toml),
         Cmd::WakeAudit { verbose } => wake_audit(verbose),
+        Cmd::NudgeStale {
+            apply,
+            threshold_hours,
+            cooldown_hours,
+        } => nudge_stale(apply, threshold_hours, cooldown_hours),
         Cmd::WatchdogUnit {
             observe,
             pinned_only,
@@ -4448,6 +4473,172 @@ fn wake_audit(verbose: bool) {
     }
 }
 
+/// The `author` a nudge comment is posted as — also the marker `nudge_last_secs` searches a task's prior
+/// comments for, to find this daemon's own last nudge (the cooldown clock; #478).
+const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
+/// The operator's board id — an `in_progress` task assigned here is never nudged (#478 exclusion).
+const NUDGE_EXEMPT_ASSIGNEE: &str = "cameron";
+
+/// Whether a task idle for `idle_secs` should be nudged now, given `last_nudge_secs` (the age of this
+/// daemon's own most recent nudge comment on it, if any). Pure — unit-tested. First nudge fires once idle
+/// reaches `threshold_secs`; a re-nudge additionally needs the PRIOR nudge to be at least `cooldown_secs`
+/// old, so a still-idle task is pinged at most once per cooldown window, never every sweep.
+fn stale_task_should_nudge(
+    idle_secs: i64,
+    last_nudge_secs: Option<i64>,
+    threshold_secs: i64,
+    cooldown_secs: i64,
+) -> bool {
+    if idle_secs < threshold_secs {
+        return false;
+    }
+    match last_nudge_secs {
+        None => true,
+        Some(since_last_nudge) => since_last_nudge >= cooldown_secs,
+    }
+}
+
+/// A task's latest activity age in seconds: the freshest of its `updated_at` and every comment's
+/// `created_at` (a comment does NOT bump `updated_at` on this board, so both must be checked — #478).
+/// `None` only if `updated_at` itself fails to parse (a malformed record); an unparseable comment
+/// timestamp is skipped rather than failing the whole task.
+fn task_latest_activity_age_secs(task: &serde_json::Value, now: time::OffsetDateTime) -> Option<i64> {
+    let updated_at = task.get("updated_at").and_then(serde_json::Value::as_str).unwrap_or("");
+    let mut best = last_seen_age_secs(updated_at, now)?;
+    if let Some(comments) = task.get("comments").and_then(serde_json::Value::as_array) {
+        for c in comments {
+            if let Some(age) = c
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|ts| last_seen_age_secs(ts, now))
+            {
+                best = best.min(age);
+            }
+        }
+    }
+    Some(best)
+}
+
+/// The age in seconds of this daemon's OWN most recent nudge comment on a task (author == `NUDGE_AUTHOR`),
+/// or `None` if it has never nudged this task — the cooldown clock `stale_task_should_nudge` reads.
+fn task_last_nudge_age_secs(task: &serde_json::Value, now: time::OffsetDateTime) -> Option<i64> {
+    task.get("comments")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|c| c.get("author").and_then(serde_json::Value::as_str) == Some(NUDGE_AUTHOR))
+        .filter_map(|c| c.get("created_at").and_then(serde_json::Value::as_str))
+        .filter_map(|ts| last_seen_age_secs(ts, now))
+        .min()
+}
+
+/// A compact `<N>h<M>m` rendering of a duration in seconds, for the report line (e.g. `3h12m`).
+fn format_hm(secs: i64) -> String {
+    let secs = secs.max(0);
+    format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+}
+
+/// Nudge stale `in_progress` tasks (board task #478): a task whose latest activity is at least
+/// `threshold_hours` old gets a comment pinging its assignee, at most once per `cooldown_hours` while it
+/// stays idle. Always excludes tasks assigned to `cameron` (the operator) and, by construction, anything
+/// not in `in_progress` (a `blocked` task never appears in this query — it is parked on a named
+/// dependency, not silently stalled). An unassigned task is skipped: there is no one to ping. Report-only
+/// unless `apply` — dry-run prints exactly what it WOULD do without writing anything (#478's review gate).
+fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet nudge-stale: {e}");
+        std::process::exit(1);
+    });
+    let threshold_secs = (threshold_hours * 3600.0).round() as i64;
+    let cooldown_secs = (cooldown_hours * 3600.0).round() as i64;
+    let candidates = board.list_tasks_by_status("in_progress").unwrap_or_else(|e| {
+        eprintln!("fleet nudge-stale: {e}");
+        std::process::exit(1);
+    });
+
+    println!(
+        "fleet nudge-stale: {} in_progress task(s), threshold {threshold_hours}h, cooldown {cooldown_hours}h{}",
+        candidates.len(),
+        if apply { "" } else { " (DRY RUN — no comments will be posted)" }
+    );
+
+    let now = time::OffsetDateTime::now_utc();
+    let mut nudged = 0usize;
+    for t in &candidates {
+        let id = match t.get("id").and_then(serde_json::Value::as_i64) {
+            Some(id) => id,
+            None => continue,
+        };
+        let assignee = t.get("assignee").and_then(serde_json::Value::as_str);
+        if assignee == Some(NUDGE_EXEMPT_ASSIGNEE) || assignee.is_none() {
+            continue;
+        }
+        let assignee = assignee.expect("checked Some above");
+
+        // Cheap prefilter: if the LIST record's own updated_at is already fresher than the threshold, the
+        // full latest-activity (which can only be fresher still, since comments never predate it being
+        // created) is fresher too — skip without a per-task fetch. A stale updated_at still needs the full
+        // record: a later comment can make the task fresh again without ever bumping updated_at.
+        let list_updated_age = t
+            .get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|ts| last_seen_age_secs(ts, now));
+        if matches!(list_updated_age, Some(age) if age < threshold_secs) {
+            continue;
+        }
+
+        let full = match board.get_task(id) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("fleet nudge-stale: #{id}: {e} (skipped)");
+                continue;
+            }
+        };
+        // Re-check status: it may have changed between the list query and this fetch.
+        if full.get("status").and_then(serde_json::Value::as_str) != Some("in_progress") {
+            continue;
+        }
+        let idle_secs = match task_latest_activity_age_secs(&full, now) {
+            Some(a) => a,
+            None => continue,
+        };
+        let last_nudge_secs = task_last_nudge_age_secs(&full, now);
+        if !stale_task_should_nudge(idle_secs, last_nudge_secs, threshold_secs, cooldown_secs) {
+            continue;
+        }
+
+        let title = t.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+        let kind = if last_nudge_secs.is_some() { "re-nudge" } else { "first nudge" };
+        if apply {
+            let body = format!(
+                "fleet nudge: this task has had no activity for over {threshold_hours}h (idle {}). \
+                 {assignee}, please post a progress update or ETA, or update the status if it is done or blocked.",
+                format_hm(idle_secs)
+            );
+            match board.comment_task(id, NUDGE_AUTHOR, &body) {
+                Ok(()) => {
+                    nudged += 1;
+                    println!("  nudged #{id} \"{title}\" ({kind}, assignee={assignee}, idle={})", format_hm(idle_secs));
+                }
+                Err(e) => eprintln!("  #{id} \"{title}\": nudge FAILED: {e}"),
+            }
+        } else {
+            nudged += 1;
+            println!(
+                "  would nudge #{id} \"{title}\" ({kind}, assignee={assignee}, idle={})",
+                format_hm(idle_secs)
+            );
+        }
+    }
+
+    println!(
+        "\n{} {} task(s){}",
+        if apply { "nudged" } else { "would nudge" },
+        nudged,
+        if apply { "" } else { " — re-run with --apply to post" }
+    );
+}
+
 /// The watchdog invocation a cadence unit runs: the liveness sweep (`--rearm --stale-only`) when `rearm`, plus
 /// the observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. An
 /// OBSERVER-ONLY unit (`rearm=false, observe=true` → `watchdog --observe --spawn`) can run alongside an
@@ -6565,5 +6756,86 @@ mod tests {
         assert_eq!(cfg.agents[0].model, "opus");
         assert_eq!(cfg.agents[1].model, "fable");
         assert_eq!(cfg.agents[1].effort, "high", "default effort");
+    }
+
+    #[test]
+    fn stale_task_should_nudge_gates_first_nudge_on_threshold_and_renudge_on_cooldown() {
+        let threshold = 3600; // 1h
+        let cooldown = 7200; // 2h
+        // Fresh (under threshold) → never nudge, nudged before or not.
+        assert!(!stale_task_should_nudge(threshold - 1, None, threshold, cooldown));
+        assert!(!stale_task_should_nudge(0, None, threshold, cooldown));
+        // At/over threshold with no prior nudge → first nudge fires.
+        assert!(stale_task_should_nudge(threshold, None, threshold, cooldown));
+        assert!(stale_task_should_nudge(threshold * 10, None, threshold, cooldown));
+        // Still idle, but the prior nudge is younger than the cooldown → no re-nudge (no spam).
+        assert!(!stale_task_should_nudge(threshold * 5, Some(cooldown - 1), threshold, cooldown));
+        // Prior nudge at/past the cooldown → re-nudge.
+        assert!(stale_task_should_nudge(threshold * 5, Some(cooldown), threshold, cooldown));
+        assert!(stale_task_should_nudge(threshold * 5, Some(cooldown * 3), threshold, cooldown));
+    }
+
+    #[test]
+    fn task_latest_activity_age_secs_is_the_freshest_of_updated_at_and_any_comment() {
+        use time::{format_description::well_known::Rfc3339, Duration};
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
+
+        // No comments: falls back to updated_at alone.
+        let no_comments = serde_json::json!({ "updated_at": stamp(Duration::hours(3)) });
+        let age = task_latest_activity_age_secs(&no_comments, now).unwrap();
+        assert!((age - 3 * 3600).abs() < 2, "age ~= 3h, got {age}");
+
+        // A comment newer than updated_at (comments do NOT bump updated_at on this board) makes the task
+        // fresh even though updated_at itself is old — the #478 trap this function exists to avoid.
+        let fresh_comment = serde_json::json!({
+            "updated_at": stamp(Duration::hours(10)),
+            "comments": [
+                { "author": "someone", "created_at": stamp(Duration::hours(9)) },
+                { "author": "someone", "created_at": stamp(Duration::minutes(20)) },
+            ],
+        });
+        let age = task_latest_activity_age_secs(&fresh_comment, now).unwrap();
+        assert!(age < 3600, "the 20m-old comment wins over the 10h-old updated_at, got {age}");
+
+        // Every comment older than updated_at: updated_at (the most recent real event) wins.
+        let stale_comments = serde_json::json!({
+            "updated_at": stamp(Duration::minutes(5)),
+            "comments": [{ "author": "someone", "created_at": stamp(Duration::hours(4)) }],
+        });
+        let age = task_latest_activity_age_secs(&stale_comments, now).unwrap();
+        assert!(age < 600, "updated_at (5m old) beats an older comment, got {age}");
+    }
+
+    #[test]
+    fn task_last_nudge_age_secs_only_counts_this_daemons_own_comments() {
+        use time::{format_description::well_known::Rfc3339, Duration};
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
+
+        let never_nudged = serde_json::json!({
+            "comments": [{ "author": "someone-else", "created_at": stamp(Duration::hours(1)) }],
+        });
+        assert_eq!(task_last_nudge_age_secs(&never_nudged, now), None);
+
+        let nudged_twice = serde_json::json!({
+            "comments": [
+                { "author": "someone-else", "created_at": stamp(Duration::minutes(1)) },
+                { "author": NUDGE_AUTHOR, "created_at": stamp(Duration::hours(3)) },
+                { "author": NUDGE_AUTHOR, "created_at": stamp(Duration::hours(1)) },
+            ],
+        });
+        let age = task_last_nudge_age_secs(&nudged_twice, now).unwrap();
+        assert!((age - 3600).abs() < 2, "picks the MOST RECENT own nudge (1h), not the older one, got {age}");
+    }
+
+    #[test]
+    fn format_hm_renders_hours_and_minutes() {
+        assert_eq!(format_hm(0), "0h0m");
+        assert_eq!(format_hm(59), "0h0m");
+        assert_eq!(format_hm(60), "0h1m");
+        assert_eq!(format_hm(3600), "1h0m");
+        assert_eq!(format_hm(3600 * 3 + 60 * 12), "3h12m");
+        assert_eq!(format_hm(-5), "0h0m", "never goes negative");
     }
 }
