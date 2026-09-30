@@ -277,9 +277,13 @@ impl BoardClient {
     /// [`Event::seq`]), else the event's own `seq`; the caller persists it so a reconnect resumes exactly.
     ///
     /// Returns `Ok(())` when the server closes the stream (the caller reconnects, or falls back to polling);
-    /// an `Err` on a connect/transport failure. A frame whose `data` fails to decode is skipped (logged to
-    /// stderr) rather than propagated, so one malformed event can't wedge the stream — the same fail-soft
-    /// posture as the poll loop. Between events this awaits the socket (the point of the push model).
+    /// an `Err` on a connect/transport failure **or when the server did not actually open an SSE stream** — a
+    /// board that doesn't support SSE answers `GET /events` with `application/json` (the poll body) even for an
+    /// `Accept: text/event-stream` request, so the content-type is checked and a non-`text/event-stream`
+    /// response is an `Err` (the caller then falls back to polling rather than spinning on an endless JSON
+    /// "stream"). A frame whose `data` fails to decode is skipped (logged to stderr) rather than propagated, so
+    /// one malformed event can't wedge the stream — the same fail-soft posture as the poll loop. Between events
+    /// this awaits the socket (the point of the push model).
     pub async fn stream_events<F>(&self, since_seq: i64, mut on_event: F) -> Result<(), String>
     where
         F: FnMut(i64, Event),
@@ -299,6 +303,21 @@ impl BoardClient {
             .map_err(|e| format!("board GET /events (SSE) failed: {e}"))?
             .error_for_status()
             .map_err(|e| format!("board GET /events (SSE) failed: {e}"))?;
+
+        // A real SSE endpoint responds `Content-Type: text/event-stream`. A board without SSE support returns
+        // the JSON poll body instead (200 `application/json`); treat that as "SSE unavailable" so the caller
+        // falls back to polling rather than SSE-decoding a JSON body (which yields no frames and would spin).
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !content_type.contains("text/event-stream") {
+            return Err(format!(
+                "board /events did not open an SSE stream (content-type={content_type:?}); server likely has no SSE support - falling back to polling"
+            ));
+        }
 
         let mut decoder = SseDecoder::new();
         while let Some(chunk) = resp
