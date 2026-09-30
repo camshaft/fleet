@@ -146,6 +146,8 @@ mod tests {
             body: body.into(),
             reply_to: None,
             external_author: None,
+            metadata: None,
+            parent_metadata: None,
         }
     }
 
