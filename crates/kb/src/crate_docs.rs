@@ -1,0 +1,306 @@
+//! `crate_docs` — docs.rs rustdoc-JSON ingest. Port of the Python `kb/crate_docs.py` core `ingest_crate`.
+//!
+//! Fetches a crate's rustdoc JSON from docs.rs (`GET /crate/{name}/{version}/json`, a zstd-compressed file),
+//! extracts every documented item as `(path, kind, docstring)`, and ingests each into a per-crate collection
+//! `crate.<name>.<crate_version>`: the chunk text is `"{path} \u{2014} {kind}\n\n{docs}"` (a literal em-dash,
+//! matching the Python), embedded with the shared bge-large embedder and upserted with the deterministic
+//! point id `chunk::id(["docs.rs", name, crate_version, path, chunk_idx])`.
+//!
+//! Decision #2 on epic #232 (greenlit): the rustdoc parse is a SHARED module — the standalone `crate-docs`
+//! board worker folds into the pipeline (#238) `source_type="docs.rs"` branch at parity, so this module
+//! exposes the reusable core ([`parse_items`] + [`ingest_crate`]) plus a thin one-shot `kb crate-docs` CLI
+//! (handy for manual ingest and for parity-testing the Rust path against the still-live Python worker before
+//! the cutover). IO is async `reqwest`; the CPU work (zstd decompress is tiny; embedding is heavy) keeps the
+//! embedder off the reactor via `spawn_blocking`, matching the inbox worker (#439).
+//!
+//! FIDELITY NOTES (flagged for parity verification against the Python source, which lives on green at
+//! `~/Projects/camshaft/knowledge-base` and is not reachable from this dev-dsk session):
+//! - The resolved `crate_version` from the JSON (not the requested `version`, which may be "latest") names
+//!   the collection AND is the `ver` component of the point id — so ingesting "latest" is idempotent with
+//!   ingesting the explicit version it resolves to.
+//! - The payload `url` is the crate's docs.rs root; if the Python stored a per-item URL, parity testing will
+//!   surface the difference (payload fields affect display/ranking only — never the vectors or point ids).
+
+// Ported ahead of its pipeline caller (#238); the CLI uses it now. Some helpers read as dead code until then.
+#![allow(dead_code)]
+
+use serde_json::{Map, Value};
+
+use crate::store::Store;
+use crate::{chunk, config, curate, embed};
+
+/// The payload `source` and first component of the point id — the Python `KB_*` docs.rs source tag.
+const SOURCE: &str = "docs.rs";
+/// The payload curation `kind` for crate docs (authority 0.8, static — no recency decay).
+const KIND: &str = "doc";
+/// Items' chunks embedded + upserted per batch, bounding peak memory and the Qdrant request size on large
+/// crates (`store::upsert` sends one PUT for whatever it's given) — the Python `kb.crate_docs` batch of 128.
+const BATCH: usize = 128;
+/// zstd frame magic (little-endian `0xFD2FB528`). docs.rs serves the JSON as a zstd file body; detecting the
+/// magic lets us decompress a raw body while passing through an already-decompressed one (e.g. if a proxy or
+/// reqwest's own content-encoding handling expanded it), rather than blindly decoding.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// One documented item from the rustdoc index: its `::`-joined path, its item `kind` (struct/fn/trait/...),
+/// and its docstring. Only items with a non-empty docstring AND a matching `paths` entry become a `DocItem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocItem {
+    pub path: String,
+    pub kind: String,
+    pub docs: String,
+}
+
+/// Fetch + parse a crate's rustdoc JSON from docs.rs, ingest every documented item into
+/// `crate.<name>.<crate_version>`, and return `(chunk_count, collection)`. `version` may be `"latest"`; the
+/// resolved `crate_version` from the JSON names the collection. A crate with no documented items yields
+/// `(0, collection)` without creating anything.
+pub async fn ingest_crate(name: &str, version: &str) -> Result<(usize, String), String> {
+    let raw = fetch_rustdoc(name, version).await?;
+    let doc: Value = serde_json::from_slice(&raw)
+        .map_err(|e| format!("crate_docs: rustdoc JSON for {name}@{version} did not parse: {e}"))?;
+
+    // The resolved version (authoritative — "latest" collapses onto it) names the collection and the id key.
+    let crate_version = doc
+        .get("crate_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("crate_docs: rustdoc JSON for {name}@{version} has no crate_version")
+        })?
+        .to_string();
+    let collection = format!("crate.{name}.{crate_version}");
+
+    let items = parse_items(&doc);
+    if items.is_empty() {
+        tracing::info!(
+            "crate_docs: {name}@{crate_version} has no documented items; nothing ingested"
+        );
+        return Ok((0, collection));
+    }
+
+    // Build every (id, text, payload) up front; the point id keys on the item path + chunk index, so item
+    // iteration order does not affect ids (a re-ingest updates in place regardless of order).
+    let cfg = config::get();
+    let url = format!("https://docs.rs/crate/{name}/{crate_version}");
+    let mut ids: Vec<String> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut payloads: Vec<Map<String, Value>> = Vec::new();
+    for item in &items {
+        let body = format!("{} \u{2014} {}\n\n{}", item.path, item.kind, item.docs);
+        for (idx, piece) in chunk::chunk_default(&body).into_iter().enumerate() {
+            ids.push(chunk::id(&[
+                SOURCE,
+                name,
+                &crate_version,
+                &item.path,
+                &idx.to_string(),
+            ]));
+            let mut extra = Map::new();
+            extra.insert("text".into(), Value::from(piece.clone()));
+            extra.insert("source".into(), Value::from(SOURCE));
+            extra.insert("path".into(), Value::from(item.path.clone()));
+            extra.insert("title".into(), Value::from(item.path.clone()));
+            extra.insert("url".into(), Value::from(url.clone()));
+            extra.insert("crate".into(), Value::from(name));
+            extra.insert("crate_version".into(), Value::from(crate_version.clone()));
+            payloads.push(curate::base_payload(cfg, KIND, None, extra));
+            texts.push(piece);
+        }
+    }
+    if texts.is_empty() {
+        return Ok((0, collection));
+    }
+
+    let store = Store::connect()?;
+    // Collection dimension: computed once off-reactor (model load is CPU-heavy), like the inbox worker.
+    let dim = tokio::task::spawn_blocking(embed::dim)
+        .await
+        .map_err(|e| format!("crate_docs: embed dim task panicked: {e}"))??;
+    store.ensure_collection(&collection, dim).await?;
+
+    // Embed + upsert in BATCH-sized groups: each group's texts are embedded off-reactor, then the aligned
+    // (id, vector, payload) points are upserted. Bounds memory + request size on big crates.
+    let n = texts.len();
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + BATCH).min(n);
+        let batch_texts = texts[start..end].to_vec();
+        let vectors = tokio::task::spawn_blocking(move || embed::embed_docs(&batch_texts))
+            .await
+            .map_err(|e| format!("crate_docs: embed task panicked: {e}"))??;
+        let points: Vec<(String, Vec<f32>, Map<String, Value>)> = ids[start..end]
+            .iter()
+            .cloned()
+            .zip(vectors)
+            .zip(payloads[start..end].iter().cloned())
+            .map(|((id, vec), pl)| (id, vec, pl))
+            .collect();
+        store.upsert(&collection, &points).await?;
+        start = end;
+    }
+
+    tracing::info!(
+        "crate_docs: ingested {} chunks from {} items into {collection}",
+        n,
+        items.len()
+    );
+    Ok((n, collection))
+}
+
+/// Extract documented items from rustdoc JSON — the Python `_items`. Iterates `doc["index"]` (id -> item)
+/// and keeps every entry with a NON-EMPTY `docs` string whose id also has a `doc["paths"]` entry, yielding
+/// `("::".join(paths[id]["path"]), paths[id]["kind"], item["docs"])`. Missing `index`/`paths` (or a paths
+/// entry without a `path` array) yields nothing rather than erroring. Pure — unit-tested.
+pub fn parse_items(doc: &Value) -> Vec<DocItem> {
+    let (Some(index), Some(paths)) = (
+        doc.get("index").and_then(Value::as_object),
+        doc.get("paths").and_then(Value::as_object),
+    ) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for (id, item) in index {
+        let docs = item.get("docs").and_then(Value::as_str).unwrap_or("");
+        if docs.is_empty() {
+            continue;
+        }
+        let Some(p) = paths.get(id) else { continue };
+        let Some(segments) = p.get("path").and_then(Value::as_array) else {
+            continue;
+        };
+        let path = segments
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("::");
+        let kind = p
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        out.push(DocItem {
+            path,
+            kind,
+            docs: docs.to_string(),
+        });
+    }
+    out
+}
+
+/// GET the crate's rustdoc JSON from docs.rs and return the decompressed bytes. The endpoint serves a
+/// zstd-compressed file; we decompress when the body carries the zstd magic and pass it through otherwise.
+async fn fetch_rustdoc(name: &str, version: &str) -> Result<Vec<u8>, String> {
+    let url = format!("https://docs.rs/crate/{name}/{version}/json");
+    let bytes = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("crate_docs: GET {url} failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("crate_docs: read body from {url}: {e}"))?;
+    Ok(maybe_unzstd(&bytes))
+}
+
+/// Decompress `bytes` if it is a zstd frame; otherwise return it unchanged. A zstd decode failure on
+/// magic-tagged bytes falls back to the raw bytes (so a corrupt-but-tagged body still surfaces as a JSON
+/// parse error upstream rather than being swallowed here).
+fn maybe_unzstd(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC {
+        match zstd::decode_all(bytes) {
+            Ok(v) => v,
+            Err(_) => bytes.to_vec(),
+        }
+    } else {
+        bytes.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A minimal rustdoc-JSON shape matching docs.rs format_version 61: `index` maps id -> item (with `docs`),
+    /// `paths` maps id -> `{ path: [...], kind }`.
+    fn sample() -> Value {
+        json!({
+            "crate_version": "1.2.3",
+            "index": {
+                "10": { "docs": "The Chain iterator.", "name": "Chain" },
+                "11": { "docs": "", "name": "Undocumented" },          // empty docs -> skipped
+                "12": { "docs": "A helper fn.", "name": "helper" },
+                "13": { "docs": "No paths entry.", "name": "Orphan" }    // not in paths -> skipped
+            },
+            "paths": {
+                "10": { "path": ["anyhow", "Chain"], "kind": "struct" },
+                "11": { "path": ["anyhow", "Undocumented"], "kind": "struct" },
+                "12": { "path": ["anyhow", "sub", "helper"], "kind": "function" }
+            }
+        })
+    }
+
+    #[test]
+    fn parse_items_keeps_only_documented_with_paths() {
+        let mut items = parse_items(&sample());
+        items.sort_by(|a, b| a.path.cmp(&b.path)); // iteration order is unspecified; sort for a stable assert
+        assert_eq!(
+            items,
+            vec![
+                DocItem {
+                    path: "anyhow::Chain".into(),
+                    kind: "struct".into(),
+                    docs: "The Chain iterator.".into()
+                },
+                DocItem {
+                    path: "anyhow::sub::helper".into(),
+                    kind: "function".into(),
+                    docs: "A helper fn.".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_items_missing_sections_is_empty_not_error() {
+        assert!(parse_items(&json!({})).is_empty());
+        assert!(parse_items(&json!({ "index": {} , "paths": {} })).is_empty());
+    }
+
+    #[test]
+    fn body_text_uses_em_dash_and_blank_line() {
+        // The exact chunk body the Python builds: "{path} — {kind}\n\n{docs}" with a U+2014 em-dash.
+        let item = DocItem {
+            path: "anyhow::Chain".into(),
+            kind: "struct".into(),
+            docs: "The Chain iterator.".into(),
+        };
+        let body = format!("{} \u{2014} {}\n\n{}", item.path, item.kind, item.docs);
+        assert_eq!(body, "anyhow::Chain \u{2014} struct\n\nThe Chain iterator.");
+        assert!(body.contains('\u{2014}')); // em-dash, not a hyphen-minus
+    }
+
+    #[test]
+    fn point_id_keys_on_docs_rs_parts_and_is_stable() {
+        // The id parts the ingest uses; stable across runs -> re-ingest updates in place.
+        let a = chunk::id(&["docs.rs", "anyhow", "1.2.3", "anyhow::Chain", "0"]);
+        let b = chunk::id(&["docs.rs", "anyhow", "1.2.3", "anyhow::Chain", "0"]);
+        assert_eq!(a, b);
+        // A different chunk index -> a different id.
+        assert_ne!(
+            a,
+            chunk::id(&["docs.rs", "anyhow", "1.2.3", "anyhow::Chain", "1"])
+        );
+    }
+
+    #[test]
+    fn maybe_unzstd_roundtrips_and_passes_through() {
+        let plain = b"{\"crate_version\":\"1.0.0\"}";
+        // A real zstd frame is decompressed back to the original.
+        let compressed = zstd::encode_all(&plain[..], 0).unwrap();
+        assert_eq!(compressed[..4], ZSTD_MAGIC);
+        assert_eq!(maybe_unzstd(&compressed), plain);
+        // Non-zstd bytes pass through untouched (already-decompressed JSON).
+        assert_eq!(maybe_unzstd(plain), plain);
+    }
+}
