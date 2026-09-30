@@ -42,8 +42,9 @@ pub mod state;
 pub mod sync;
 
 pub use board::{
-    build_comment_body, build_identity_body, build_task_body, comment_ref, issue_ref, parse_events,
-    parse_issue_ref, BoardClient, Event, TaskReflect, LINK_SOURCE, TASK_OUTBOUND_REFLECT,
+    build_comment_body, build_identity_body, build_review_body, build_review_log_body, build_task_body,
+    comment_ref, issue_ref, parse_events, parse_issue_ref, BoardClient, Event, TaskReflect, LINK_SOURCE,
+    REVIEW_LINK_SOURCE, TASK_OUTBOUND_REFLECT,
 };
 pub use config::{Config, DEFAULT_CONFIG_FILENAME};
 pub use github::{
@@ -51,6 +52,8 @@ pub use github::{
 };
 pub use state::State;
 pub use sync::{
-    plan_comment_ingest, plan_issue_ingest, plan_outbound, render_outbound_github_comment,
-    render_task_description, CommentIngestPlan, CommentPost, IssueIngestPlan, OutboundComment, TaskCreate,
+    plan_comment_ingest, plan_issue_ingest, plan_outbound, plan_pr_comment_log, plan_pr_review_ingest,
+    pr_review_status, render_outbound_github_comment, render_pr_review_description, render_task_description,
+    CommentIngestPlan, CommentPost, IssueIngestPlan, OutboundComment, PrReviewIngestPlan, PrReviewStatus,
+    ReviewCreate, ReviewLogEntry, TaskCreate,
 };

@@ -82,6 +82,14 @@ fn attribution(login: &str) -> Option<String> {
     (!login.is_empty()).then(|| github_external_author(login))
 }
 
+/// Whether a GitHub comment was authored by the bridge's own account (`self_login`) — the loop-safety check
+/// shared by comment ingest and PR review-log ingest, so a comment the bridge reflected OUT to GitHub isn't
+/// re-ingested. `None`/empty `self_login` never matches (nothing is filtered as self), and a ghost
+/// (empty-author) comment is never treated as self.
+fn is_self_comment(c: &IssueComment, self_login: Option<&str>) -> bool {
+    matches!(self_login, Some(me) if !c.author.is_empty() && c.author == me)
+}
+
 /// Plan the board tasks to create from a batch of GitHub issues.
 ///
 /// - Pull requests are skipped (the issues endpoint returns them; they are not board tasks).
@@ -125,10 +133,7 @@ pub fn plan_comment_ingest(
 ) -> CommentIngestPlan {
     let mut posts = Vec::new();
     for c in comments {
-        if let Some(me) = self_login
-            && !c.author.is_empty()
-            && c.author == me
-        {
+        if is_self_comment(c, self_login) {
             continue; // loop-safety: don't re-ingest our own reflected comment
         }
         posts.push(CommentPost {
@@ -139,6 +144,149 @@ pub fn plan_comment_ingest(
         });
     }
     CommentIngestPlan { posts }
+}
+
+// ── PR → review (BUILD 2a): map a GitHub pull request to a board code-review status ────────────────────
+
+/// The concluding review status for a GitHub pull request, per BUILD 2a of the Review-entity design
+/// (board Doc #5): a code review mirrors a PR with the three terminal-ish states only — intermediate
+/// states (draft / in-review / changes-requested) are BUILD 2b via the Pulls + Reviews APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReviewStatus {
+    /// The PR is still open (no verdict yet).
+    Open,
+    /// The PR was merged — the code review concluded `approved`.
+    Approved,
+    /// The PR was closed without merging — the code review concluded `closed`.
+    Closed,
+}
+
+impl PrReviewStatus {
+    /// The board review-status string. This is the status the adapter passes to the board's `create_review`
+    /// (co-designed on task #373); a stable spelling of each state so BUILD 1's status enum and the adapter
+    /// agree.
+    pub fn as_board_status(self) -> &'static str {
+        match self {
+            PrReviewStatus::Open => "open",
+            PrReviewStatus::Approved => "approved",
+            PrReviewStatus::Closed => "closed",
+        }
+    }
+}
+
+/// Map a GitHub PR row (an [`Issue`] flagged [`Issue::is_pull_request`]) to its BUILD-2a review status.
+///
+/// A merged PR is always also `state:"closed"`, so `merged_at` is checked FIRST: a non-empty
+/// `pr_merged_at` ⇒ [`PrReviewStatus::Approved`]; otherwise a `state:"closed"` PR is
+/// [`PrReviewStatus::Closed`] (closed-unmerged); anything else (open) is [`PrReviewStatus::Open`]. Pure —
+/// no extra GitHub call, since `merged_at` rides the issues-list `pull_request` object (2a: no new endpoints).
+pub fn pr_review_status(issue: &Issue) -> PrReviewStatus {
+    if issue.pr_merged_at.as_deref().is_some_and(|s| !s.is_empty()) {
+        PrReviewStatus::Approved
+    } else if issue.state == "closed" {
+        PrReviewStatus::Closed
+    } else {
+        PrReviewStatus::Open
+    }
+}
+
+/// A board code-review to create-or-advance from a GitHub pull request. The daemon calls the (BUILD-1 #372)
+/// idempotent `board::create_review` passing [`ReviewCreate::external_id`] as the `external_link` (source
+/// `github_pr`), so the board de-dupes + links atomically and advances the review's [`status`](ReviewCreate::status)
+/// idempotently on each poll (open → approved/closed). Mirrors [`TaskCreate`] for the issue path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCreate {
+    /// The idempotency/link key (`owner/repo#<number>`) passed as the create's `external_link` external_id.
+    pub external_id: String,
+    /// The GitHub PR number (for logging / the back-reference).
+    pub pr_number: i64,
+    /// The board review title (the PR title).
+    pub title: String,
+    /// The board review description (PR body + a GitHub back-reference footer).
+    pub description: String,
+    /// The attributed GitHub author (`github:<login>`), or `None` for a ghost (deleted) account.
+    pub external_author: Option<String>,
+    /// The concluding review status for this poll — advanced idempotently board-side on each re-poll.
+    pub status: PrReviewStatus,
+}
+
+/// The plan for a batch of ingested pull requests: the code-reviews to create/advance (in input order).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrReviewIngestPlan {
+    pub creates: Vec<ReviewCreate>,
+}
+
+/// Render the board review description for a mirrored PR: the PR body, then a footer back-referencing the
+/// GitHub pull request (number, author, state, URL) so a board reader can trace it to source. Labels it a
+/// pull request (vs [`render_task_description`]'s issue) so a code review is distinguishable. Pure.
+pub fn render_pr_review_description(repo: &str, pr: &Issue) -> String {
+    let author = if pr.author.is_empty() { "(unknown)" } else { pr.author.as_str() };
+    let body = if pr.body.is_empty() { "_(no description)_" } else { pr.body.as_str() };
+    format!(
+        "{body}\n\n---\nMirrored from GitHub pull request {repo}#{number} · by @{author} · state: {state}\n{url}",
+        number = pr.number,
+        state = pr.state,
+        url = pr.html_url,
+    )
+}
+
+/// Plan the board code-reviews to create/advance from a batch of GitHub issue rows.
+///
+/// - Only pull requests (rows flagged [`Issue::is_pull_request`]) become reviews; real issues are handled by
+///   [`plan_issue_ingest`] (the issues-list endpoint returns both, mixed).
+/// - Each PR becomes a [`ReviewCreate`] carrying its current [`pr_review_status`]; the board create is
+///   idempotent on the link (#372) and advances the status, so re-polling a known PR just re-asserts (open)
+///   or advances (→approved/closed) its status — no duplicate, no create→link race.
+/// - Order is preserved (oldest-updated first, matching the `?sort=updated&asc` poll).
+pub fn plan_pr_review_ingest(issues: &[Issue], repo: &str) -> PrReviewIngestPlan {
+    let mut creates = Vec::new();
+    for issue in issues {
+        if !issue.is_pull_request {
+            continue;
+        }
+        creates.push(ReviewCreate {
+            external_id: issue_ref(repo, issue.number),
+            pr_number: issue.number,
+            title: issue.title.clone(),
+            description: render_pr_review_description(repo, issue),
+            external_author: attribution(&issue.author),
+            status: pr_review_status(issue),
+        });
+    }
+    PrReviewIngestPlan { creates }
+}
+
+/// A PR conversation comment to append to its code review's log as a `comment`-type entry (the daemon calls
+/// the idempotent `board::append_review_log` passing [`ReviewLogEntry::external_id`] as the entry link).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLogEntry {
+    /// The comment body (verbatim GitHub Markdown).
+    pub body: String,
+    /// The attributed GitHub author (`github:<login>`), or `None` for a ghost account.
+    pub external_author: Option<String>,
+    /// The dedup/link key (`owner/repo#c<id>`) — idempotency on the append.
+    pub external_id: String,
+}
+
+/// Plan the review-log entries to append from a batch of a PR's conversation comments (the same
+/// `/issues/:n/comments` endpoint the issue path uses — a PR IS an issue, so no new GitHub endpoint; the
+/// diff/review comments are BUILD 2b). Loop-safe: skips comments authored by the bridge's own account
+/// (`self_login`) via [`is_self_comment`], exactly as [`plan_comment_ingest`] does. Dedup of already-logged
+/// entries is the board's job (`append_review_log` idempotent on the entry link). Order preserved. Pure.
+pub fn plan_pr_comment_log(
+    comments: &[IssueComment],
+    repo: &str,
+    self_login: Option<&str>,
+) -> Vec<ReviewLogEntry> {
+    comments
+        .iter()
+        .filter(|c| !is_self_comment(c, self_login))
+        .map(|c| ReviewLogEntry {
+            body: c.body.clone(),
+            external_author: attribution(&c.author),
+            external_id: comment_ref(repo, c.id),
+        })
+        .collect()
 }
 
 // ── OUT direction (board → GitHub): reflect an authorized task comment onto its linked issue ──────────
@@ -214,6 +362,7 @@ mod tests {
             updated_at: "2026-09-29T10:00:00Z".to_string(),
             html_url: format!("https://github.com/o/r/issues/{number}"),
             is_pull_request: false,
+            pr_merged_at: None,
         }
     }
 
@@ -312,6 +461,111 @@ mod tests {
         let plan = plan_comment_ingest(&comments, "o/r", 100, Some(""));
         assert_eq!(plan.posts.len(), 1, "empty author != self even when self_login is empty");
         assert_eq!(plan.posts[0].external_author, None);
+    }
+
+    // ── pr_review_status (BUILD 2a: PR → code-review status) ───────────────────────────────────────
+
+    fn pr(number: i64, state: &str, merged_at: Option<&str>) -> Issue {
+        let mut i = issue(number, "a PR", "dev");
+        i.is_pull_request = true;
+        i.state = state.to_string();
+        i.pr_merged_at = merged_at.map(str::to_string);
+        i
+    }
+
+    #[test]
+    fn pr_status_open_pr_is_open() {
+        assert_eq!(pr_review_status(&pr(1, "open", None)), PrReviewStatus::Open);
+        assert_eq!(pr_review_status(&pr(1, "open", None)).as_board_status(), "open");
+    }
+
+    #[test]
+    fn pr_status_merged_pr_is_approved() {
+        // A merged PR is state:"closed" AND has merged_at — merged_at wins over the closed state.
+        let s = pr_review_status(&pr(2, "closed", Some("2026-09-30T00:00:00Z")));
+        assert_eq!(s, PrReviewStatus::Approved);
+        assert_eq!(s.as_board_status(), "approved");
+    }
+
+    #[test]
+    fn pr_status_closed_unmerged_pr_is_closed() {
+        let s = pr_review_status(&pr(3, "closed", None));
+        assert_eq!(s, PrReviewStatus::Closed);
+        assert_eq!(s.as_board_status(), "closed");
+    }
+
+    #[test]
+    fn pr_status_empty_merged_at_is_not_treated_as_merged() {
+        // Defensive: an empty-string merged_at must not read as merged (only a real timestamp does).
+        assert_eq!(pr_review_status(&pr(4, "closed", Some(""))), PrReviewStatus::Closed);
+        assert_eq!(pr_review_status(&pr(5, "open", Some(""))), PrReviewStatus::Open);
+    }
+
+    #[test]
+    fn plan_pr_review_ingest_makes_a_review_per_pr_with_status() {
+        let issues = [
+            pr(10, "closed", Some("2026-09-30T00:00:00Z")), // merged → approved
+            issue(11, "a real issue", "octocat"),           // not a PR → skipped
+            pr(12, "open", None),                           // open
+            pr(13, "closed", None),                         // closed-unmerged
+        ];
+        let plan = plan_pr_review_ingest(&issues, "o/r");
+        assert_eq!(plan.creates.len(), 3, "only the 3 PRs become reviews; the issue is skipped");
+        assert_eq!(plan.creates[0].external_id, "o/r#10");
+        assert_eq!(plan.creates[0].pr_number, 10);
+        assert_eq!(plan.creates[0].status, PrReviewStatus::Approved);
+        assert_eq!(plan.creates[0].external_author.as_deref(), Some("github:dev"));
+        assert!(plan.creates[0].description.contains("pull request o/r#10"), "PR back-ref footer");
+        assert_eq!(plan.creates[1].status, PrReviewStatus::Open);
+        assert_eq!(plan.creates[1].external_id, "o/r#12");
+        assert_eq!(plan.creates[2].status, PrReviewStatus::Closed);
+    }
+
+    #[test]
+    fn plan_pr_review_ingest_ghost_author_is_unattributed() {
+        let mut p = pr(20, "open", None);
+        p.author = String::new();
+        let plan = plan_pr_review_ingest(&[p], "o/r");
+        assert_eq!(plan.creates[0].external_author, None, "no fabricated identity for a ghost");
+    }
+
+    #[test]
+    fn render_pr_review_description_labels_it_a_pull_request() {
+        let mut p = pr(7, "open", None);
+        p.body = String::new();
+        let d = render_pr_review_description("o/r", &p);
+        assert!(d.contains("_(no description)_"), "empty body placeholder");
+        assert!(d.contains("pull request o/r#7"), "labeled a pull request, not an issue");
+        assert!(d.contains("by @dev"));
+        assert!(d.contains("state: open"));
+    }
+
+    #[test]
+    fn plan_pr_comment_log_attributes_and_keys_by_comment_ref() {
+        let comments = [comment(1, "nice work", "octocat"), comment(2, "one nit", "hubot")];
+        let entries = plan_pr_comment_log(&comments, "o/r", Some("fleet-bot"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].body, "nice work");
+        assert_eq!(entries[0].external_author.as_deref(), Some("github:octocat"));
+        assert_eq!(entries[0].external_id, "o/r#c1");
+        assert_eq!(entries[1].external_id, "o/r#c2");
+    }
+
+    #[test]
+    fn plan_pr_comment_log_skips_the_bridges_own_comments_loop_safety() {
+        // A comment the bridge reflected OUT to GitHub must not re-ingest as a review-log entry.
+        let comments = [comment(1, "reflected", "fleet-bot"), comment(2, "human", "octocat")];
+        let entries = plan_pr_comment_log(&comments, "o/r", Some("fleet-bot"));
+        assert_eq!(entries.len(), 1, "own comment filtered");
+        assert_eq!(entries[0].external_author.as_deref(), Some("github:octocat"));
+    }
+
+    #[test]
+    fn plan_pr_comment_log_ghost_author_unattributed_and_not_self() {
+        let comments = [comment(1, "ghost note", "")];
+        let entries = plan_pr_comment_log(&comments, "o/r", Some(""));
+        assert_eq!(entries.len(), 1, "empty author != self even when self_login is empty");
+        assert_eq!(entries[0].external_author, None);
     }
 
     // ── plan_outbound (board → GitHub) ─────────────────────────────────────────────────────────────
