@@ -2947,22 +2947,27 @@ fn work_driven_rearm(open_tasks: usize, age_secs: Option<i64>, stood_down: bool)
 /// work should drop to a long registry cadence + event-wake, but a running `/loop` never picks up a
 /// `build_kickoff` edit (it re-passes its spawn-time prompt), so the watchdog injects the instruction
 /// ([`WATCHDOG_LENGTHEN_WAKE`]). Candidate = not stood down, not `reactive` (a mention-paced responder is not
-/// this), not a `deliberate_monitor` (holds a monitor_exempt task — it is MEANT to poll), 0 actionable tasks, a
-/// live heartbeat (`verdict != "STALE"` — a stale loop is a re-arm/relaunch case, not an over-eager poller),
-/// and a SHORT registered interval (`< WATCHDOG_LONG_INTERVAL_SECS` — a 1h+ agent is already at a long
-/// cadence). Once it lengthens past that bound it stops qualifying, so the inject fires about once per agent.
-/// Pure — unit-tested.
+/// this), not a `deliberate_monitor` (holds a monitor_exempt task — it is MEANT to poll), not a `patrol` agent
+/// (a proactive event-less SWEEP — board-follow-up / board-triage — whose 0-assigned-tasks + short cadence IS
+/// its charter, not idle self-polling: lengthening it to event-wake-only would silence the anti-stall /
+/// reconciliation / intake layer, since its catches never arrive as events), 0 actionable tasks, a live
+/// heartbeat (`verdict != "STALE"` — a stale loop is a re-arm/relaunch case, not an over-eager poller), and a
+/// SHORT registered interval (`< WATCHDOG_LONG_INTERVAL_SECS` — a 1h+ agent is already at a long cadence). Once
+/// it lengthens past that bound it stops qualifying, so the inject fires about once per agent. Pure —
+/// unit-tested.
 fn drained_idle_candidate(
     open_tasks: usize,
     interval_secs: u64,
     stood_down: bool,
     reactive: bool,
     deliberate_monitor: bool,
+    patrol: bool,
     verdict: &str,
 ) -> bool {
     !stood_down
         && !reactive
         && !deliberate_monitor
+        && !patrol
         && open_tasks == 0
         && verdict != "STALE"
         && interval_secs > 0
@@ -3956,12 +3961,20 @@ fn watchdog_board(
             .and_then(|m| m.get("reactive"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        // #544: a patrol/sweep agent (board-follow-up / board-triage) runs 0 assigned tasks at a short cadence
+        // BY DESIGN — its charter is proactive event-less patrol, so it must never be lengthened to
+        // event-wake-only. Opt-out via agent-level metadata.patrol.
+        let patrol = md
+            .and_then(|m| m.get("patrol"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let drained_idle = drained_idle_candidate(
             open_tasks,
             interval_secs,
             stood_down,
             reactive,
             monitor_exempt_owners.contains(id),
+            patrol,
             verdict,
         );
         if stale_only && !retighten && !work_driven && !drained_idle && !never_ticked && !holding_work_at_rest {
@@ -5917,23 +5930,28 @@ mod tests {
     fn drained_idle_candidate_catches_a_short_interval_at_rest_self_poller() {
         let short = WATCHDOG_LONG_INTERVAL_SECS - 1; // e.g. 30m, under the 1h long bound
         let long = WATCHDOG_LONG_INTERVAL_SECS; // already at a long cadence
-        // Live, drained (0 actionable), short interval, not reactive, not a deliberate monitor → lengthen it.
-        assert!(drained_idle_candidate(0, short, false, false, false, "ok"));
-        assert!(drained_idle_candidate(0, short, false, false, false, "late"), "late still counts (ticking)");
+        // Args: (open_tasks, interval, stood_down, reactive, deliberate_monitor, patrol, verdict).
+        // Live, drained (0 actionable), short interval, none of the exclusions → lengthen it.
+        assert!(drained_idle_candidate(0, short, false, false, false, false, "ok"));
+        assert!(drained_idle_candidate(0, short, false, false, false, false, "late"), "late still counts (ticking)");
         // Has actionable work → not this path (the work-driven/retighten paths own that).
-        assert!(!drained_idle_candidate(1, short, false, false, false, "ok"));
+        assert!(!drained_idle_candidate(1, short, false, false, false, false, "ok"));
         // Already at a long interval → nothing to lengthen (this is what convergence looks like).
-        assert!(!drained_idle_candidate(0, long, false, false, false, "ok"));
+        assert!(!drained_idle_candidate(0, long, false, false, false, false, "ok"));
         // Stood down → a spun-down agent is left alone, not lengthened.
-        assert!(!drained_idle_candidate(0, short, true, false, false, "ok"));
+        assert!(!drained_idle_candidate(0, short, true, false, false, false, "ok"));
         // Reactive responder paces on mentions, not on an idle interval → excluded.
-        assert!(!drained_idle_candidate(0, short, false, true, false, "ok"));
+        assert!(!drained_idle_candidate(0, short, false, true, false, false, "ok"));
         // Deliberate continuous monitor (holds a monitor_exempt task) is MEANT to poll → never lengthened.
-        assert!(!drained_idle_candidate(0, short, false, false, true, "ok"));
+        assert!(!drained_idle_candidate(0, short, false, false, true, false, "ok"));
+        // #544 fix: a PATROL/sweep agent (board-follow-up / board-triage) runs 0 tasks at a short cadence BY
+        // DESIGN — lengthening it would blind the anti-stall layer, so it is excluded even though every other
+        // signal says "drained self-poller".
+        assert!(!drained_idle_candidate(0, short, false, false, false, true, "ok"), "patrol agent is never lengthened");
         // STALE = a stopped loop (a re-arm/relaunch case), not an over-eager poller → not this path.
-        assert!(!drained_idle_candidate(0, short, false, false, false, "STALE"));
+        assert!(!drained_idle_candidate(0, short, false, false, false, false, "STALE"));
         // Unknown/zero interval → can't call it a short self-poller.
-        assert!(!drained_idle_candidate(0, 0, false, false, false, "ok"));
+        assert!(!drained_idle_candidate(0, 0, false, false, false, false, "ok"));
     }
 
     #[test]
