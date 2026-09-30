@@ -2691,6 +2691,38 @@ fn is_retighten_candidate(verdict: &str, open_tasks: usize, interval_secs: u64) 
     verdict == "STALE" || interval_secs >= WATCHDOG_LONG_INTERVAL_SECS
 }
 
+/// Grace window before an agent whose heartbeat never advanced past registration is called "never-ticked":
+/// below this, an agent legitimately still shows `last_seen == created_at` because its first loop tick has
+/// not landed yet (cold boot + charter fetch + first sweep). Comfortably longer than that for any interval.
+const WATCHDOG_NEVER_TICKED_GRACE_SECS: i64 = 600; // 10m
+
+/// A board-native agent that LAUNCHED but never completed a single loop tick: its `last_seen` never advanced
+/// past its `created_at` (the board stamps them equal at registration and only a real tick moves `last_seen`),
+/// yet it registered well over the grace window ago. This is the launch-time-crash signature (#417) — a bad
+/// model id 400-looping, a bad charter, a harness crash — the board-triage / board-follow-up outage where both
+/// sat `online` but dead for ~3.7h until an operator noticed. It is DISTINCT from a live-but-idle loop (which
+/// ticked at least once, so `last_seen` > `created_at`) and from an ordinary `STALE` heartbeat (which ticked,
+/// then lapsed while holding work): those older signals require open tasks or bucket on age, so a freshly
+/// crash-looping agent with an empty queue slips past both — exactly why the outage went unflagged. A wake
+/// cannot recover it (there is no live loop to re-arm — the #412/#420 lesson), so the watchdog surfaces it for
+/// investigation + relaunch, not a no-op wake. Timestamps are compared within a 2s epsilon so a precision
+/// difference between the two board columns does not mask the equality. Pure — unit-tested.
+fn agent_never_ticked(created_at: &str, last_seen: &str, now: time::OffsetDateTime, grace_secs: i64) -> bool {
+    use time::format_description::well_known::Rfc3339;
+    let (Ok(created), Ok(seen)) = (
+        time::OffsetDateTime::parse(created_at, &Rfc3339),
+        time::OffsetDateTime::parse(last_seen, &Rfc3339),
+    ) else {
+        return false;
+    };
+    // last_seen never advanced past created_at (within a small epsilon for column-precision drift) ...
+    if (seen - created).whole_seconds().abs() > 2 {
+        return false;
+    }
+    // ... and old enough that a first tick should have landed by now.
+    (now - created).whole_seconds() >= grace_secs
+}
+
 /// Parse a fleet loop interval into seconds: a bare number is seconds; a trailing `s`/`m`/`h`/`d` scales.
 /// Returns `None` for an empty or unrecognized value. Pure — unit-tested.
 fn parse_interval_secs(spec: &str) -> Option<u64> {
@@ -3455,6 +3487,7 @@ fn watchdog_board(
     );
     let mut flagged = 0usize;
     let mut rearmed = 0usize;
+    let mut never_ticked_count = 0usize;
     let mut native = 0usize;
     for a in agents {
         let md = a.get("metadata");
@@ -3494,6 +3527,15 @@ fn watchdog_board(
         // (a zero queue is never a candidate), so no separate presence gate is needed here.
         let status = a.get("status").and_then(serde_json::Value::as_str);
         let stood_down = status == Some("offline");
+        // Launch-crash signal (#417): an EXPECTED-RUNNING agent (not staged, not deliberately offline) whose
+        // last_seen never advanced past created_at is dead-on-arrival, not idle. It is surfaced below
+        // regardless of the open-task / stale gates the older signals apply — a crash-looping agent with an
+        // empty queue slips past both, which is exactly how the board-triage/board-follow-up outage went
+        // unflagged. Staged (registered-but-unlaunched) and offline agents have legitimately not ticked.
+        let created_at = a.get("created_at").and_then(serde_json::Value::as_str).unwrap_or("");
+        let never_ticked = !agent_is_staged(md)
+            && !stood_down
+            && agent_never_ticked(created_at, ls, now, WATCHDOG_NEVER_TICKED_GRACE_SECS);
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
@@ -3501,12 +3543,18 @@ fn watchdog_board(
             obs.push((id.to_string(), stood_down, d));
         }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
-        if stale_only && !retighten {
+        if stale_only && !retighten && !never_ticked {
             continue;
         }
-        // With --rearm, ACT on each candidate: a cooldown-limited, pane-fenced wake so it runs a tick now
-        // (never reaps/restarts). See [`rearm_candidate`].
-        let action = if retighten {
+        // A NEVER-TICKED agent takes priority: a wake cannot recover a loop that never started (no live pane
+        // to re-arm — the #412/#420 lesson), so it is flagged for investigation + relaunch, never wake-injected.
+        // Otherwise, with --rearm, ACT on a retighten candidate: a cooldown-limited, pane-fenced wake so it
+        // runs a tick now (never reaps/restarts). See [`rearm_candidate`].
+        let action = if never_ticked {
+            flagged += 1;
+            never_ticked_count += 1;
+            "NEVER-TICKED"
+        } else if retighten {
             flagged += 1;
             if rearm {
                 let (act, did) = rearm_candidate(&fleet, &session, id, interval_secs, now_unix);
@@ -3532,6 +3580,14 @@ fn watchdog_board(
     } else {
         println!(
             "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval); pass --rearm to wake them"
+        );
+    }
+    if never_ticked_count > 0 {
+        // A never-ticked agent is a launch-time crash, not a lapsed loop: a wake cannot fix it. Surface it
+        // loudly (even in --stale-only / --rearm runs) so it routes to investigation + relaunch, not a no-op
+        // wake — the board-triage/board-follow-up outage (#412/#417) that stayed silent for ~3.7h.
+        println!(
+            "-- WARNING: {never_ticked_count} agent(s) NEVER-TICKED (launched but last_seen == created_at past the {WATCHDOG_NEVER_TICKED_GRACE_SECS}s grace) — a wake will NOT help; investigate the pane + relaunch (see #417)"
         );
     }
     if observe {
@@ -4622,6 +4678,42 @@ mod tests {
         // Open work on a SHORT interval that is cycling (ok/late) is fine — it's already tight.
         assert!(!is_retighten_candidate("ok", 3, 600), "10m with tasks is already tight");
         assert!(!is_retighten_candidate("late", 3, 600), "short-interval late is the normal cycling band");
+    }
+
+    #[test]
+    fn agent_never_ticked_flags_a_launched_but_dead_on_arrival_loop() {
+        use time::{format_description::well_known::Rfc3339, Duration};
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
+        let grace = 600; // 10m
+
+        // last_seen never advanced past created_at, and it registered well before the grace window → the
+        // #417 launch-crash signature (board-triage/board-follow-up: online but never ticked).
+        let old = stamp(Duration::minutes(20));
+        assert!(agent_never_ticked(&old, &old, now, grace), "equal stamps past the grace window → never-ticked");
+
+        // Still inside the grace window: a just-registered agent legitimately has last_seen == created_at
+        // until its first tick lands — must NOT flag.
+        let fresh = stamp(Duration::minutes(2));
+        assert!(!agent_never_ticked(&fresh, &fresh, now, grace), "within grace → still booting, not a crash");
+
+        // Ticked at least once (last_seen advanced past created_at) → live/idle, never a never-ticked flag,
+        // however old the heartbeat is.
+        let created = stamp(Duration::hours(4));
+        let seen = stamp(Duration::minutes(30));
+        assert!(!agent_never_ticked(&created, &seen, now, grace), "advanced last_seen → it ticked, not dead-on-arrival");
+
+        // Epsilon: a sub-2s precision difference between the two columns still counts as equal ...
+        let created_eps = stamp(Duration::minutes(20));
+        let seen_eps = stamp(Duration::minutes(20) - Duration::seconds(1));
+        assert!(agent_never_ticked(&created_eps, &seen_eps, now, grace), "1s column drift is within epsilon");
+        // ... but a real multi-second advance is a genuine tick.
+        let seen_ticked = stamp(Duration::minutes(20) - Duration::seconds(5));
+        assert!(!agent_never_ticked(&created_eps, &seen_ticked, now, grace), "5s advance is a real tick");
+
+        // Unparseable stamps never flag (degrade safe).
+        assert!(!agent_never_ticked("", "", now, grace));
+        assert!(!agent_never_ticked("garbage", "garbage", now, grace));
     }
 
     #[test]
