@@ -2151,7 +2151,12 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
          ANY board doc OR comment, self-check your wording against the banned-phrases list \
          (wiki guides/banned-phrases) and rephrase anything it flags — that list is maintained/data-driven, so \
          read it rather than a fixed set here; until the pre-submit scanner (#308) lands this self-check is \
-         yours. If any task of \
+         yours. OWNER-CONFIRM gate: before you EXECUTE, or route to the operator, any DESTRUCTIVE or \
+         operator-directed action (service restart, deploy, data-touching command) that you SYNTHESIZED from \
+         another agent's trace or diagnosis of a service you do NOT own, first confirm the exact command with \
+         that service's OWNER (the authority on their live unit); if the owner cannot confirm in time, mark it \
+         OWNER-UNCONFIRMED so the operator double-checks — partial visibility can read a stale unit as live. \
+         If any task of \
          yours becomes BLOCKED ON THE \
          OPERATOR, do not idle on it: set the task status=blocked with blocked_on {{kind:operator, note}}, \
          assign it to 'cameron', and stash your own id in metadata.blocked_owner — so list_tasks(assignee \
@@ -4076,6 +4081,9 @@ mod tests {
         assert!(k.contains("EVERY board call"), "explicit ids on every call, not a fallback");
         assert!(k.contains("from_agent") && k.contains("created_by") && k.contains("actor"), "names the explicit-id params incl. send_message's from_agent");
         assert!(k.contains("'v-x'") && k.contains("/wt/v-x"));
+        // OWNER-CONFIRM gate (#352): a trace-derived destructive/operator action against a service you don't
+        // own must be owner-confirmed before executing or routing (a near-miss almost restarted a stale unit).
+        assert!(k.contains("OWNER-CONFIRM gate") && k.contains("OWNER-UNCONFIRMED"), "binds the owner-confirm gate for trace-derived destructive actions");
         // Dynamic loop (no fixed interval arg after /loop) — the agent self-paces.
         assert!(k.contains("/loop run one tick"), "dynamic /loop, not `/loop 30m`");
         assert!(!k.contains("/loop 30m"), "must NOT pin a fixed interval on the loop");
