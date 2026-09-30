@@ -2557,6 +2557,15 @@ const WATCHDOG_OVERDUE_INTERVALS: u64 = 3;
 /// cycling faster to drain its queue (the work-conserving principle), not idling on a long cadence.
 const WATCHDOG_LONG_INTERVAL_SECS: u64 = 3600; // 1h
 
+/// Whether an agent's board presence means it is NOT expected to be looping, so its lapsing heartbeat is by
+/// design, not a stall: `away` / `offline` (deliberately idle or spun down) and `done` (retired / at-rest — a
+/// worker parked until revived by a trigger). Re-arming such an agent with a drained queue just burns a tick,
+/// or worse wakes an agent meant to stay at-rest. `online` (or an unset status) is a live looping agent. Pure
+/// — unit-tested.
+fn presence_suppresses_rearm(status: Option<&str>) -> bool {
+    matches!(status, Some("away") | Some("offline") | Some("done"))
+}
+
 /// A watchdog re-arm/retighten candidate: either the heartbeat is `STALE` (lapsed several intervals — the loop
 /// isn't cycling), OR the agent holds open assigned work while sitting on a long idle interval (work-conserving
 /// — it should loop tighter until its queue drains).
@@ -3310,13 +3319,14 @@ fn watchdog_board(
             Err(_) => (0, "?".to_string()),
         };
         // Presence-derived idleness. `stood_down` (board `offline`) = a RETIRED/spun-down agent → drives the
-        // observe spin-down trigger. `idle_presence` (`away` OR `offline`) = deliberately idle (a completed
-        // agent parked on a scheduled wakeup) → suppresses the re-arm when its queue is drained, so a healthy
-        // idle vertical isn't poked every interval (the v-slack-bridge report). Kept separate: an `away` agent
-        // is idle but NOT spun down, so it must not trigger a spin-down observation.
+        // observe spin-down trigger. `idle_presence` = a presence that is NOT expected to loop (`away` /
+        // `offline` / `done` at-rest, see [`presence_suppresses_rearm`]) → suppresses the re-arm when its queue
+        // is drained, so a healthy idle vertical OR a deliberately at-rest worker (e.g. a `done` agent parked
+        // until revived) isn't flagged STALE and poked every interval. Kept separate from `stood_down`: an
+        // `away`/`done` agent is idle/at-rest but NOT spun down, so it must not trigger a spin-down observation.
         let status = a.get("status").and_then(serde_json::Value::as_str);
         let stood_down = status == Some("offline");
-        let idle_presence = matches!(status, Some("away") | Some("offline"));
+        let idle_presence = presence_suppresses_rearm(status);
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
@@ -4143,6 +4153,19 @@ mod tests {
         // …but an idle-presence agent that STILL holds open work IS a candidate (it shouldn't have parked).
         assert!(is_retighten_candidate("ok", 1, 6 * 3600, true), "idle with open work → still nudge");
         assert!(is_retighten_candidate("STALE", 2, 600, true));
+    }
+
+    #[test]
+    fn presence_suppresses_rearm_covers_at_rest_states_incl_done() {
+        // Deliberately-not-looping presences: away/offline (idle/spun-down) + done (retired/at-rest, revive on
+        // trigger). A `done` at-rest worker (the real v-bach case: 26h stale, no window) must NOT read as a
+        // STALE re-arm candidate — that's the bug this fixes.
+        assert!(presence_suppresses_rearm(Some("done")), "at-rest/done → not a re-arm target");
+        assert!(presence_suppresses_rearm(Some("offline")));
+        assert!(presence_suppresses_rearm(Some("away")));
+        // A live/looping agent (or unset status) IS eligible — a genuine stall must still flag.
+        assert!(!presence_suppresses_rearm(Some("online")));
+        assert!(!presence_suppresses_rearm(None));
     }
 
     #[test]
