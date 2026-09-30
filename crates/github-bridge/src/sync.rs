@@ -141,6 +141,50 @@ pub fn plan_comment_ingest(
     CommentIngestPlan { posts }
 }
 
+// ── PR → review (BUILD 2a): map a GitHub pull request to a board code-review status ────────────────────
+
+/// The concluding review status for a GitHub pull request, per BUILD 2a of the Review-entity design
+/// (board Doc #5): a code review mirrors a PR with the three terminal-ish states only — intermediate
+/// states (draft / in-review / changes-requested) are BUILD 2b via the Pulls + Reviews APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReviewStatus {
+    /// The PR is still open (no verdict yet).
+    Open,
+    /// The PR was merged — the code review concluded `approved`.
+    Approved,
+    /// The PR was closed without merging — the code review concluded `closed`.
+    Closed,
+}
+
+impl PrReviewStatus {
+    /// The board review-status string. This is the status the adapter passes to the board's `create_review`
+    /// (co-designed on task #373); a stable spelling of each state so BUILD 1's status enum and the adapter
+    /// agree.
+    pub fn as_board_status(self) -> &'static str {
+        match self {
+            PrReviewStatus::Open => "open",
+            PrReviewStatus::Approved => "approved",
+            PrReviewStatus::Closed => "closed",
+        }
+    }
+}
+
+/// Map a GitHub PR row (an [`Issue`] flagged [`Issue::is_pull_request`]) to its BUILD-2a review status.
+///
+/// A merged PR is always also `state:"closed"`, so `merged_at` is checked FIRST: a non-empty
+/// `pr_merged_at` ⇒ [`PrReviewStatus::Approved`]; otherwise a `state:"closed"` PR is
+/// [`PrReviewStatus::Closed`] (closed-unmerged); anything else (open) is [`PrReviewStatus::Open`]. Pure —
+/// no extra GitHub call, since `merged_at` rides the issues-list `pull_request` object (2a: no new endpoints).
+pub fn pr_review_status(issue: &Issue) -> PrReviewStatus {
+    if issue.pr_merged_at.as_deref().is_some_and(|s| !s.is_empty()) {
+        PrReviewStatus::Approved
+    } else if issue.state == "closed" {
+        PrReviewStatus::Closed
+    } else {
+        PrReviewStatus::Open
+    }
+}
+
 // ── OUT direction (board → GitHub): reflect an authorized task comment onto its linked issue ──────────
 
 /// A resolved OUT action: post [`body`](OutboundComment::body) as a comment on the GitHub issue identified
@@ -214,6 +258,7 @@ mod tests {
             updated_at: "2026-09-29T10:00:00Z".to_string(),
             html_url: format!("https://github.com/o/r/issues/{number}"),
             is_pull_request: false,
+            pr_merged_at: None,
         }
     }
 
@@ -312,6 +357,44 @@ mod tests {
         let plan = plan_comment_ingest(&comments, "o/r", 100, Some(""));
         assert_eq!(plan.posts.len(), 1, "empty author != self even when self_login is empty");
         assert_eq!(plan.posts[0].external_author, None);
+    }
+
+    // ── pr_review_status (BUILD 2a: PR → code-review status) ───────────────────────────────────────
+
+    fn pr(number: i64, state: &str, merged_at: Option<&str>) -> Issue {
+        let mut i = issue(number, "a PR", "dev");
+        i.is_pull_request = true;
+        i.state = state.to_string();
+        i.pr_merged_at = merged_at.map(str::to_string);
+        i
+    }
+
+    #[test]
+    fn pr_status_open_pr_is_open() {
+        assert_eq!(pr_review_status(&pr(1, "open", None)), PrReviewStatus::Open);
+        assert_eq!(pr_review_status(&pr(1, "open", None)).as_board_status(), "open");
+    }
+
+    #[test]
+    fn pr_status_merged_pr_is_approved() {
+        // A merged PR is state:"closed" AND has merged_at — merged_at wins over the closed state.
+        let s = pr_review_status(&pr(2, "closed", Some("2026-09-30T00:00:00Z")));
+        assert_eq!(s, PrReviewStatus::Approved);
+        assert_eq!(s.as_board_status(), "approved");
+    }
+
+    #[test]
+    fn pr_status_closed_unmerged_pr_is_closed() {
+        let s = pr_review_status(&pr(3, "closed", None));
+        assert_eq!(s, PrReviewStatus::Closed);
+        assert_eq!(s.as_board_status(), "closed");
+    }
+
+    #[test]
+    fn pr_status_empty_merged_at_is_not_treated_as_merged() {
+        // Defensive: an empty-string merged_at must not read as merged (only a real timestamp does).
+        assert_eq!(pr_review_status(&pr(4, "closed", Some(""))), PrReviewStatus::Closed);
+        assert_eq!(pr_review_status(&pr(5, "open", Some(""))), PrReviewStatus::Open);
     }
 
     // ── plan_outbound (board → GitHub) ─────────────────────────────────────────────────────────────

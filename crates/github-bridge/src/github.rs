@@ -46,8 +46,14 @@ pub struct Issue {
     pub updated_at: String,
     /// The issue's web URL (for a human-legible back-reference on the mirrored task).
     pub html_url: String,
-    /// True when this "issue" is actually a pull request (has a `pull_request` object). Ingest skips these.
+    /// True when this "issue" is actually a pull request (has a `pull_request` object). Issue ingest skips
+    /// these; the PR-review sync (BUILD 2) mirrors them instead.
     pub is_pull_request: bool,
+    /// For a PR row, the `pull_request.merged_at` RFC3339 timestamp — `Some` iff the PR was merged, `None`
+    /// for an open or closed-unmerged PR (and always `None` for a real issue). The issues-list endpoint
+    /// includes this on the nested `pull_request` object, so the merged/closed distinction needs no extra
+    /// GitHub call (BUILD 2a: "no new endpoints"). See [`crate::sync::pr_review_status`].
+    pub pr_merged_at: Option<String>,
 }
 
 /// A comment on a GitHub issue, reduced to the fields the attributed-comment sync needs.
@@ -86,9 +92,18 @@ struct RawIssue {
     updated_at: Option<String>,
     #[serde(default)]
     html_url: Option<String>,
-    /// Present iff this row is a pull request; the value's shape is irrelevant, only its presence.
+    /// Present iff this row is a pull request. Presence flags a PR; `merged_at` (nested) distinguishes a
+    /// merged PR from an open/closed-unmerged one.
     #[serde(default)]
-    pull_request: Option<Value>,
+    pull_request: Option<RawPullRequest>,
+}
+
+/// The nested `pull_request` object on a PR row of the issues-list response. Only `merged_at` matters here
+/// (its presence is the PR flag; the timestamp is the merged/unmerged distinction).
+#[derive(Deserialize)]
+struct RawPullRequest {
+    #[serde(default)]
+    merged_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +150,7 @@ pub fn parse_issues(body: &str) -> Result<Vec<Issue>, String> {
         .map(|row| {
             let r: RawIssue =
                 serde_json::from_value(row).map_err(|e| format!("github issues: bad row: {e}"))?;
+            let pr_merged_at = r.pull_request.as_ref().and_then(|pr| pr.merged_at.clone());
             Ok(Issue {
                 number: r.number,
                 title: r.title.unwrap_or_default(),
@@ -144,6 +160,7 @@ pub fn parse_issues(body: &str) -> Result<Vec<Issue>, String> {
                 updated_at: r.updated_at.unwrap_or_default(),
                 html_url: r.html_url.unwrap_or_default(),
                 is_pull_request: r.pull_request.is_some(),
+                pr_merged_at,
             })
         })
         .collect()
@@ -319,6 +336,25 @@ mod tests {
         let issues = parse_issues(body).unwrap();
         assert!(issues[0].is_pull_request, "row with pull_request is flagged");
         assert!(!issues[1].is_pull_request, "row without is a real issue");
+        assert_eq!(issues[1].pr_merged_at, None, "a real issue has no merged_at");
+    }
+
+    #[test]
+    fn parse_issues_reads_pull_request_merged_at() {
+        // The issues-list `pull_request` object carries merged_at (null until merged) — 2a needs no extra
+        // fetch to tell a merged PR from a closed-unmerged one.
+        let body = r#"[
+            {"number": 10, "title": "merged PR", "state": "closed", "user": {"login": "dev"},
+             "updated_at": "t", "html_url": "u",
+             "pull_request": {"url": "...", "merged_at": "2026-09-30T00:00:00Z"}},
+            {"number": 11, "title": "open PR", "state": "open", "user": {"login": "dev"},
+             "updated_at": "t", "html_url": "u", "pull_request": {"url": "...", "merged_at": null}}
+        ]"#;
+        let issues = parse_issues(body).unwrap();
+        assert!(issues[0].is_pull_request);
+        assert_eq!(issues[0].pr_merged_at.as_deref(), Some("2026-09-30T00:00:00Z"));
+        assert!(issues[1].is_pull_request);
+        assert_eq!(issues[1].pr_merged_at, None, "null merged_at → None (open/unmerged PR)");
     }
 
     #[test]
