@@ -8,7 +8,9 @@
 //! Playback mirrors the Python TTS: write a temp WAV and hand it to an external player (`paplay`/`pw-play`/
 //! `aplay`) — `sounddevice.play()` hung on the box, and cpal output has the same class of driver trouble,
 //! so the external-player path is the validated one. Playback is exposed blocking ([`play_wav`]) and async
-//! ([`Playback`]) so the loop can barge-in and kill it.
+//! ([`Playback`]) so the loop can barge-in and kill it. With `[audio].output_device` set, playback pins to
+//! a single deterministic `aplay -D <device>` (bypassing player auto-selection + the ALSA `default` PCM,
+//! which is a dead PipeWire sink for a session-less system service — #296).
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -24,6 +26,25 @@ use crate::retry::next_backoff;
 
 /// The external players tried in order (first that exists wins), matching the Python `_PLAYERS`.
 const PLAYERS: &[&[&str]] = &[&["paplay"], &["pw-play"], &["aplay", "-q"]];
+
+/// The player invocations to try, in order. With an explicit `output_device`, use ONE deterministic
+/// `aplay -q -D <device>` — this bypasses player auto-selection, PATH ordering, and the ALSA `default`
+/// PCM (a dead PipeWire sink for a session-less service, #296). Empty → the best-effort default list.
+fn players(output_device: &str) -> Vec<Vec<String>> {
+    if output_device.is_empty() {
+        PLAYERS
+            .iter()
+            .map(|p| p.iter().map(|s| s.to_string()).collect())
+            .collect()
+    } else {
+        vec![vec![
+            "aplay".to_string(),
+            "-q".to_string(),
+            "-D".to_string(),
+            output_device.to_string(),
+        ]]
+    }
+}
 
 /// Open the configured input device (name-substring match, else the host default) and start an int16 mono
 /// capture stream at `sample_rate`, delivering `frame`-sized chunks over the returned channel. The stream
@@ -253,22 +274,28 @@ fn wav_nonce() -> u64 {
     std::process::id() as u64 * 1_000_000 + N.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Play a WAV file, blocking until done, via the first available external player. Best-effort (a box with
-/// no player just stays silent). Mirrors the Python `_play_blocking`.
-pub fn play_wav(path: &std::path::Path) {
-    for player in PLAYERS {
-        let mut cmd = Command::new(player[0]);
+/// Play a WAV file, blocking until done. With `output_device` set, uses `aplay -D <device>`; else the
+/// best-effort player list. Best-effort (a box with no working player just stays silent). Mirrors the
+/// Python `_play_blocking`.
+pub fn play_wav(path: &std::path::Path, output_device: &str) {
+    let list = players(output_device);
+    for player in &list {
+        let mut cmd = Command::new(&player[0]);
         cmd.args(&player[1..])
             .arg(path)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match cmd.status() {
             Ok(s) if s.success() => return,
-            Ok(_) => return, // player ran (nonzero is usually a device quirk, not "try the next one")
+            // A player that RAN but exited nonzero (e.g. paplay into a dead PipeWire sink) falls through
+            // to the next candidate rather than giving up (#296). With an explicit output_device there's
+            // only the one aplay entry, so this simply ends the loop.
+            Ok(_) => continue,
             Err(_) => continue, // not installed → try the next player
         }
     }
-    eprintln!("[audio] no audio player found (paplay/pw-play/aplay)");
+    let tried: Vec<&str> = list.iter().map(|p| p[0].as_str()).collect();
+    eprintln!("[audio] no working audio player (tried: {})", tried.join(", "));
 }
 
 /// A killable background playback (for barge-in). Mirrors the Python `play_async` + terminate/kill.
@@ -277,11 +304,12 @@ pub struct Playback {
 }
 
 impl Playback {
-    /// Start playing `path` in the background. Returns a handle even if no player is found (then
+    /// Start playing `path` in the background. With `output_device` set, uses `aplay -D <device>`; else
+    /// the best-effort player list. Returns a handle even if no player is found (then
     /// [`finished`](Self::finished) is immediately true).
-    pub fn start(path: &std::path::Path) -> Self {
-        for player in PLAYERS {
-            let child = Command::new(player[0])
+    pub fn start(path: &std::path::Path, output_device: &str) -> Self {
+        for player in players(output_device) {
+            let child = Command::new(&player[0])
                 .args(&player[1..])
                 .arg(path)
                 .stdout(Stdio::null())
