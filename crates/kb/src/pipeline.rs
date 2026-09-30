@@ -8,21 +8,21 @@
 //! chunks + embeds into the resolved collection, and marks the task done. The embedder is a single agent,
 //! so GPU work is serial by construction.
 //!
-//! This module is being ported incrementally (decision #2 / board #238); this first piece is the PURE
-//! routing/parse core — [`content_type_for`] (PDF detection) and [`collection_for`] (where a ticket's points
-//! land) — which is the correctness-critical part (a wrong collection puts points in the wrong place), so it
-//! is pinned to the Python behavior by unit tests. The IO layer (fetch_source, ipfs, the two handlers, and
-//! the reactive webhook runtime) lands on top of the existing infra (board.rs/webhook.rs/ipfs.rs/extract.rs)
-//! in follow-ups. Landed ahead of its callers, so it reads as dead code until then.
-#![allow(dead_code)]
+//! The correctness-critical routing/parse core — [`content_type_for`] (PDF detection) and [`collection_for`]
+//! (where a ticket's points land, a wrong answer puts points in the wrong place) — is pinned to the Python
+//! behavior by unit tests. The IO layer (fetch_source + the two stage handlers) and the reactive webhook
+//! runtime ([`run_role`]) build on the existing infra (board.rs / webhook.rs / ipfs.rs / extract.rs). Run one
+//! role per process: `kb pipeline --role uploader` / `kb pipeline --role embedder`.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
 use crate::board::{Board, Task};
 use crate::ipfs::Ipfs;
 use crate::store::Store;
+use crate::webhook::{self, BusySet};
 use crate::{chunk, config, crate_docs, curate, embed, extract};
 
 /// Content-type tag the uploader stamps on a ticket and the embedder dispatches on — the Python string
@@ -557,6 +557,124 @@ pub async fn handle_embed(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<(),
         task.id
     );
     Ok(())
+}
+
+// ---- reactive agent runtime ----
+
+/// The reserved webhook port for each role — the Python `KB_UPLOADER_PORT` / `KB_EMBEDDER_PORT` defaults. The
+/// board POSTs task events to `http://127.0.0.1:<port>/` (loopback: the board and the workers are co-resident
+/// on green).
+const UPLOADER_PORT: u16 = 8075;
+const EMBEDDER_PORT: u16 = 8074;
+
+/// Run one pipeline stage-agent reactively — the Python `run()`. Registers `role` (also the board agent id)
+/// with its webhook, catches up on any `todo` task already assigned to it, then serves the webhook forever,
+/// dispatching each actionable (deduped) task to [`process`]. `role` is `uploader` or `embedder`; anything
+/// else is an error. The role names match the Python pipeline's assignees, so this is a drop-in swap: existing
+/// producers keep filing to `uploader` and in-flight tickets keep their `uploader`/`embedder` assignees.
+pub async fn run_role(role: &str) -> Result<(), String> {
+    let port = match role {
+        UPLOADER => UPLOADER_PORT,
+        EMBEDDER => EMBEDDER_PORT,
+        other => {
+            return Err(format!(
+                "pipeline: unknown role {other:?} (want uploader|embedder)"
+            ));
+        }
+    };
+    let board = Arc::new(Board::connect(role));
+    let ipfs = Arc::new(Ipfs::connect());
+    let busy = BusySet::new();
+
+    let hook = format!("http://127.0.0.1:{port}/");
+    board
+        .register(
+            Some(&hook),
+            &serde_json::json!({ "kind": "worker", "display_name": role }),
+        )
+        .await?;
+
+    // Catch-up: dispatch any todo task already assigned to me (e.g. filed while I was down). Claim each so a
+    // racing webhook redelivery does not double-dispatch it — the guard is released when processing ends.
+    match board.list_tasks(Some(role), Some("todo")).await {
+        Ok(tasks) => {
+            for t in tasks {
+                if let Some(guard) = busy.claim(t.id) {
+                    spawn_process(&board, &ipfs, role, t.id, guard);
+                }
+            }
+        }
+        Err(e) => tracing::warn!("pipeline {role}: catch-up list_tasks failed: {e}"),
+    }
+
+    // Serve the webhook; the receiver parses + classifies + dedups and hands (task_id, guard) over the channel.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(i64, webhook::BusyGuard)>(64);
+    let receiver = tokio::spawn(webhook::run_receiver(
+        port,
+        role.to_string(),
+        Arc::clone(&busy),
+        tx,
+    ));
+    tracing::info!("pipeline {role}: reactive on {hook}");
+    while let Some((id, guard)) = rx.recv().await {
+        spawn_process(&board, &ipfs, role, id, guard);
+    }
+    // The channel only closes once the receiver ends (bind failure / shutdown); surface its result.
+    receiver
+        .await
+        .map_err(|e| format!("pipeline {role}: receiver task panicked: {e}"))?
+}
+
+/// Spawn the processing of one claimed task, releasing its busy-claim (`guard`) when done — the Python
+/// per-event `threading.Thread(target=_process, ...)`. The guard is held for the whole processing and dropped
+/// at the end, so a task is never dispatched twice concurrently.
+fn spawn_process(
+    board: &Arc<Board>,
+    ipfs: &Arc<Ipfs>,
+    role: &str,
+    task_id: i64,
+    guard: webhook::BusyGuard,
+) {
+    let board = Arc::clone(board);
+    let ipfs = Arc::clone(ipfs);
+    let role = role.to_string();
+    tokio::spawn(async move {
+        process(&board, &ipfs, &role, task_id).await;
+        drop(guard);
+    });
+}
+
+/// Process one task id for `role` — the Python `_process` body (dedup is the caller's busy claim). Re-reads
+/// the task and verifies it is still `todo` and assigned to this role (an event can race a reassignment or a
+/// peer claim), marks it `in_progress`, runs the role's handler, and on error comments the failure + moves it
+/// to `blocked`. A get_task / mark failure is logged and abandoned (a later redelivery retries).
+async fn process(board: &Board, ipfs: &Ipfs, role: &str, task_id: i64) {
+    let task = match board.get_task(task_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("pipeline {role}: get_task {task_id} failed: {e}");
+            return;
+        }
+    };
+    if task.assignee.as_deref() != Some(role) || task.status != "todo" {
+        return; // not mine / already claimed or moved on
+    }
+    if let Err(e) = board.update_task(task_id, Some("in_progress"), None).await {
+        tracing::warn!("pipeline {role}: mark {task_id} in_progress failed: {e}");
+        return;
+    }
+    let result = match role {
+        UPLOADER => handle_upload(board, ipfs, &task).await,
+        EMBEDDER => handle_embed(board, ipfs, &task).await,
+        other => Err(format!("unknown role {other}")),
+    };
+    if let Err(e) = result {
+        let _ = board
+            .comment_task(task_id, &format!("{role} failed: {e}"))
+            .await;
+        let _ = board.update_task(task_id, Some("blocked"), None).await;
+        tracing::error!("pipeline {role}: task {task_id} FAILED: {e}");
+    }
 }
 
 #[cfg(test)]

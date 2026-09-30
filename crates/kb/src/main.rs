@@ -24,8 +24,8 @@ mod inbox;
 #[allow(dead_code)]
 mod ipfs;
 mod mcp;
-// Phase-2 board-driven ingest pipeline (`kb pipeline --role uploader|embedder`, #238). Ported incrementally;
-// its own `allow(dead_code)` covers the routing core landing ahead of the handlers + reactive runtime.
+// Phase-2 board-driven ingest pipeline (`kb pipeline --role uploader|embedder`, #238): two reactive
+// stage-agents (uploader -> IPFS pin; embedder -> chunk + embed) behind the board task queue.
 mod pipeline;
 // Phase-2 ingest infra: the inbound webhook receiver the board-driven workers register against. Its own
 // `allow(dead_code)` (see the module) covers being landed ahead of its callers.
@@ -92,6 +92,13 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run a board-driven ingest pipeline stage-agent reactively (the Python `kb.pipeline --role`). One role
+    /// per process: `uploader` fetches a source + pins it to IPFS; `embedder` cats it back, chunks + embeds.
+    Pipeline {
+        /// Which stage to run: `uploader` or `embedder`.
+        #[arg(long)]
+        role: String,
+    },
 }
 
 #[tokio::main]
@@ -136,6 +143,7 @@ async fn main() {
                     println!("ingested {chunks} chunks into {collection}");
                 }
             }),
+        Command::Pipeline { role } => pipeline::run_role(&role).await,
     };
 
     if let Err(e) = result {
