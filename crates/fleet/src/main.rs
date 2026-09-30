@@ -4685,6 +4685,36 @@ fn is_tracking_parent_with_open_children(child_rollup: Option<&serde_json::Value
 /// monitor-exempt task (#167) is skipped too — it is a legitimate continuous monitor, not a stalled
 /// deliverable. Report-only unless `apply` — dry-run prints exactly what it WOULD do without writing anything
 /// (#478's review gate).
+/// #540: whether a task shows WORKER activity — at least one comment from someone OTHER than the nudge daemon
+/// itself. A `todo` task counts as a stalled deliverable (vs untouched backlog) only once real work has been
+/// recorded on it, so the nudge widens to `todo` only when this holds. The daemon's own prior nudges never
+/// bootstrap this (they are `NUDGE_AUTHOR`), so a bare todo is never self-qualified. Pure — unit-tested.
+fn task_has_worker_activity(task: &serde_json::Value) -> bool {
+    task.get("comments")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|cs| {
+            cs.iter().any(|c| {
+                c.get("author")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|a| a != NUDGE_AUTHOR)
+            })
+        })
+}
+
+/// #540: the ACTIONABLE nudge body. Beyond "post an update", it spells out the concrete choices the operator
+/// asked for — reassign if you cannot progress it, or update the status (done / blocked-with-a-note, and say
+/// so if you are unsure whether it is blocked) — so a nudge drives a resolution rather than just a ping. Pure
+/// — unit-tested.
+fn nudge_body(threshold_hours: f64, assignee: &str, idle_secs: i64) -> String {
+    format!(
+        "fleet nudge: this task has had no activity for over {threshold_hours}h (idle {}). {assignee}, please \
+         do ONE of: post a progress update or ETA; if you cannot progress it now, reassign it to an available \
+         agent; or update the status — mark it done, or blocked with a blocked_on note if it is waiting on \
+         something (if you are unsure whether it is blocked, say that).",
+        format_hm(idle_secs)
+    )
+}
+
 fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet nudge-stale: {e}");
@@ -4692,13 +4722,21 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     });
     let threshold_secs = (threshold_hours * 3600.0).round() as i64;
     let cooldown_secs = (cooldown_hours * 3600.0).round() as i64;
-    let candidates = board.list_tasks_by_status("in_progress").unwrap_or_else(|e| {
+    // #540: nudge stale ASSIGNED work in in_progress AND todo. A task where work started (a plan comment) but
+    // was never flipped to in_progress still stalls, and the operator wants it caught (task_512). A bare
+    // untouched todo is NOT nudged — the per-task check below requires worker activity for a todo — so widening
+    // to todo stays high-signal (real stalls only, not unstarted backlog).
+    let mut candidates = board.list_tasks_by_status("in_progress").unwrap_or_else(|e| {
         eprintln!("fleet nudge-stale: {e}");
         std::process::exit(1);
     });
+    match board.list_tasks_by_status("todo") {
+        Ok(mut todo) => candidates.append(&mut todo),
+        Err(e) => eprintln!("fleet nudge-stale: listing todo tasks failed ({e}); nudging in_progress only"),
+    }
 
     println!(
-        "fleet nudge-stale: {} in_progress task(s), threshold {threshold_hours}h, cooldown {cooldown_hours}h{}",
+        "fleet nudge-stale: {} assigned in_progress/todo task(s), threshold {threshold_hours}h, cooldown {cooldown_hours}h{}",
         candidates.len(),
         if apply { "" } else { " (DRY RUN — no comments will be posted)" }
     );
@@ -4741,8 +4779,16 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                 continue;
             }
         };
-        // Re-check status: it may have changed between the list query and this fetch.
-        if full.get("status").and_then(serde_json::Value::as_str) != Some("in_progress") {
+        // Re-check status: it may have changed between the list query and this fetch. #540: in_progress OR
+        // todo now qualify.
+        let status = full.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+        if status != "in_progress" && status != "todo" {
+            continue;
+        }
+        // #540(b): a todo is only a stall once work actually STARTED on it (a real comment) — a bare untouched
+        // todo is backlog waiting to be picked up, not a stalled deliverable, so it is never nudged. in_progress
+        // needs no such guard (being in_progress IS the work-started signal).
+        if status == "todo" && !task_has_worker_activity(&full) {
             continue;
         }
         // #294 false-positive class: a tracking/epic parent whose progress is in its still-open children is
@@ -4762,11 +4808,7 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         let title = t.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
         let kind = if last_nudge_secs.is_some() { "re-nudge" } else { "first nudge" };
         if apply {
-            let body = format!(
-                "fleet nudge: this task has had no activity for over {threshold_hours}h (idle {}). \
-                 {assignee}, please post a progress update or ETA, or update the status if it is done or blocked.",
-                format_hm(idle_secs)
-            );
+            let body = nudge_body(threshold_hours, assignee, idle_secs);
             match board.comment_task(id, NUDGE_AUTHOR, &body) {
                 Ok(()) => {
                     nudged += 1;
@@ -7072,5 +7114,34 @@ mod tests {
         assert!(!is_tracking_parent_with_open_children(leaf.get("child_rollup")));
         // Missing child_rollup → not exempted.
         assert!(!is_tracking_parent_with_open_children(None));
+    }
+
+    #[test]
+    fn task_has_worker_activity_needs_a_non_nudge_comment() {
+        // A real (non-daemon) comment = work started → a todo with this qualifies for a nudge.
+        let planned = serde_json::json!({"comments":[{"author":"board-pm","body":"plan: ..."}]});
+        assert!(task_has_worker_activity(&planned));
+        // Only the nudge daemon's own comments do NOT count — a bare todo the daemon has never legitimately
+        // nudged can't self-qualify (and this avoids a self-sustaining nudge loop).
+        let only_nudges = serde_json::json!({"comments":[{"author":NUDGE_AUTHOR,"body":"fleet nudge: ..."}]});
+        assert!(!task_has_worker_activity(&only_nudges));
+        // No comments at all → untouched backlog, not a stall.
+        assert!(!task_has_worker_activity(&serde_json::json!({"comments":[]})));
+        assert!(!task_has_worker_activity(&serde_json::json!({})));
+        // A mix (worker + nudge) still counts — the worker comment is present.
+        let mixed = serde_json::json!({"comments":[{"author":NUDGE_AUTHOR},{"author":"v-runtime"}]});
+        assert!(task_has_worker_activity(&mixed));
+    }
+
+    #[test]
+    fn nudge_body_is_actionable_reassign_or_status() {
+        let b = nudge_body(1.0, "v-runtime", 7200);
+        // Names the assignee and the idle duration.
+        assert!(b.contains("v-runtime") && b.contains("idle 2h"));
+        // Spells out the actionable choices the operator asked for (#540), not just "post an update".
+        assert!(b.contains("progress update or ETA"), "keeps the update/ETA option");
+        assert!(b.contains("reassign"), "offers reassignment when the owner can't progress it");
+        assert!(b.contains("done") && b.contains("blocked with a blocked_on note"), "offers the status transitions");
+        assert!(b.contains("unsure whether it is blocked"), "covers the maybe-blocked case");
     }
 }
