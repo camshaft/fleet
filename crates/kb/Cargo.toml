@@ -63,6 +63,12 @@ uuid = { version = "1", features = ["v4"] }
 # RFC3339 UTC timestamps (created_at/updated_at/last_verified) + recency-decay math input.
 time = { version = "0.3", features = ["formatting", "parsing"] }
 clap = { version = "4", features = ["derive"] }
+# Phase-2 ingest file discovery: recursive directory walk with sane hidden-file skipping. Already in the
+# workspace lock (shared with sibling crates), so no new tree.
+walkdir = "2"
+# Phase-2 PDF text extraction — pure Rust (lopdf-based), so no build-time network / native toolchain, which
+# keeps the Nix sandbox build happy. Text/markdown files need no extractor (read as UTF-8).
+pdf-extract = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
