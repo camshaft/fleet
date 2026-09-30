@@ -25,7 +25,10 @@ pub struct Hit {
 }
 
 /// Search one collection — the Python `search`. `use_rerank = None` defers to `rerank_enabled`.
-pub fn search(
+///
+/// Async: the Qdrant IO is awaited, while the CPU-bound embed/rerank (ONNX) run off the reactor via
+/// `spawn_blocking` — operator directive #439 (no blocking IO on the runtime; CPU work stays off it too).
+pub async fn search(
     store: &Store,
     collection: &str,
     query: &str,
@@ -35,21 +38,23 @@ pub fn search(
 ) -> Result<Vec<Hit>, String> {
     let cfg = config::get();
     let use_rerank = use_rerank.unwrap_or(cfg.rerank_enabled);
-    let qv = embed::embed_query(query)?;
+    let qv = embed_query_off_reactor(query).await?;
     // Rerank needs a wider candidate pool than the caller's `limit` so the cross-encoder can reorder.
     let n = if use_rerank {
         limit.max(cfg.rerank_candidates)
     } else {
         limit
     };
-    let cands = store.query_candidates(collection, &qv, n, include_outdated)?;
+    let cands = store
+        .query_candidates(collection, &qv, n, include_outdated)
+        .await?;
     if cands.is_empty() {
         return Ok(vec![]);
     }
 
     let texts: Vec<String> = cands.iter().map(|c| text_of(&c.payload)).collect();
     let relevances: Vec<f64> = if use_rerank {
-        rerank::rerank(query, &texts)?
+        rerank_off_reactor(query, texts).await?
     } else {
         cands.iter().map(|c| c.score).collect()
     };
@@ -72,7 +77,7 @@ pub fn search(
 /// Search every collection and return one globally-ranked list — the Python `search_all`. Rerank work is
 /// bounded: gather `rerank_candidates` per collection, keep the globally best that many by VECTOR score,
 /// then rerank/blend only those.
-pub fn search_all(
+pub async fn search_all(
     store: &Store,
     query: &str,
     limit: usize,
@@ -81,12 +86,15 @@ pub fn search_all(
 ) -> Result<Vec<Hit>, String> {
     let cfg = config::get();
     let use_rerank = use_rerank.unwrap_or(cfg.rerank_enabled);
-    let qv = embed::embed_query(query)?;
+    let qv = embed_query_off_reactor(query).await?;
 
     // (collection, candidate) across all collections.
     let mut pool: Vec<(String, crate::store::Candidate)> = Vec::new();
-    for (name, _count) in store.collections()? {
-        for c in store.query_candidates(&name, &qv, cfg.rerank_candidates, include_outdated)? {
+    for (name, _count) in store.collections().await? {
+        for c in store
+            .query_candidates(&name, &qv, cfg.rerank_candidates, include_outdated)
+            .await?
+        {
             pool.push((name.clone(), c));
         }
     }
@@ -103,7 +111,7 @@ pub fn search_all(
     let relevances: Vec<f64> = if use_rerank {
         pool.truncate(cfg.rerank_candidates);
         let texts: Vec<String> = pool.iter().map(|(_, c)| text_of(&c.payload)).collect();
-        rerank::rerank(query, &texts)?
+        rerank_off_reactor(query, texts).await?
     } else {
         pool.truncate(limit);
         pool.iter().map(|(_, c)| c.score).collect()
@@ -122,6 +130,22 @@ pub fn search_all(
         .collect();
     sort_and_truncate(&mut scored, limit);
     Ok(scored)
+}
+
+/// Embed the query on the blocking pool — ONNX inference is CPU-bound and must not run on the reactor.
+async fn embed_query_off_reactor(query: &str) -> Result<Vec<f32>, String> {
+    let q = query.to_string();
+    tokio::task::spawn_blocking(move || embed::embed_query(&q))
+        .await
+        .map_err(|e| format!("embed task panicked: {e}"))?
+}
+
+/// Rerank `texts` against the query on the blocking pool (cross-encoder inference is CPU-bound).
+async fn rerank_off_reactor(query: &str, texts: Vec<String>) -> Result<Vec<f64>, String> {
+    let q = query.to_string();
+    tokio::task::spawn_blocking(move || rerank::rerank(&q, &texts))
+        .await
+        .map_err(|e| format!("rerank task panicked: {e}"))?
 }
 
 /// The payload `text` field, or "" — the Python `(c.payload or {}).get("text", "")`.
