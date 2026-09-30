@@ -234,6 +234,12 @@ fn resolve_model(alias: &str) -> String {
     match alias {
         "opus" => "us.anthropic.claude-opus-4-8[1m]".to_string(),
         "fable" => "us.anthropic.claude-fable-5[1m]".to_string(),
+        "sonnet" => "us.anthropic.claude-sonnet-5".to_string(),
+        // Self-heal a stale/mis-registered id: the bare Anthropic-API sonnet id (`claude-sonnet-5-5`) is
+        // rejected by this fleet's Bedrock endpoint (400 "invalid model identifier"), so an agent registered
+        // with it 400s every turn and never ticks (the board-triage / board-follow-up outage). Map the bad
+        // literal to the valid Bedrock id so a launch survives the misregistration instead of dying silently.
+        "claude-sonnet-5-5" | "sonnet-5-5" => "us.anthropic.claude-sonnet-5".to_string(),
         other => other.to_string(),
     }
 }
@@ -5190,6 +5196,11 @@ mod tests {
     fn resolve_model_expands_aliases_and_passes_through_unknown() {
         assert_eq!(resolve_model("opus"), "us.anthropic.claude-opus-4-8[1m]");
         assert_eq!(resolve_model("fable"), "us.anthropic.claude-fable-5[1m]");
+        assert_eq!(resolve_model("sonnet"), "us.anthropic.claude-sonnet-5");
+        // The bare Anthropic-API id is remapped to the valid Bedrock id (the board-triage/-follow-up outage:
+        // `claude-sonnet-5-5` 400s on this fleet's endpoint), so a mis-registered agent self-heals on launch.
+        assert_eq!(resolve_model("claude-sonnet-5-5"), "us.anthropic.claude-sonnet-5");
+        assert_eq!(resolve_model("sonnet-5-5"), "us.anthropic.claude-sonnet-5");
         assert_eq!(
             resolve_model("some.custom.model-id"),
             "some.custom.model-id",
