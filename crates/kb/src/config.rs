@@ -71,6 +71,13 @@ pub struct Config {
     /// (was `KB_IPFS_GATEWAY`). Citation URL only; not part of the point id.
     pub ipfs_gateway: String,
 
+    /// OCR-fallback threshold for image-only PDF pages (task_40). A PDF page whose extracted text has FEWER
+    /// than this many non-whitespace chars is treated as image-only and rendered + OCR'd (via the `tesseract`
+    /// binary on PATH). 0 DISABLES OCR entirely — the default, so there is no behavior change and no new
+    /// runtime dependency unless a role opts in. OCR text is net-new (image-only pages yield ~nothing today),
+    /// so enabling it never drifts existing vectors — it only adds text where there was none.
+    pub pdf_ocr_min_chars: usize,
+
     /// Default collection for the CLI + single-collection tool calls (was `KB_DEFAULT_COLLECTION`).
     pub default_collection: String,
     /// Where `kb_remember` / `kb_supersede` write by default (was `KB_MEMORY_COLLECTION`).
@@ -115,6 +122,7 @@ impl Default for Config {
             inbox_dir: "/data/kb-inbox".to_string(),
             inbox_default_collection: "inbox".to_string(),
             ipfs_gateway: "http://green-machine.lan:8080".to_string(),
+            pdf_ocr_min_chars: 0, // OCR disabled by default (opt-in per role)
             mcp_host: "0.0.0.0".to_string(),
             mcp_port: 8077,
             mcp_allowed_hosts: vec!["*".to_string()],
@@ -200,6 +208,7 @@ mod tests {
         assert_eq!(c.authority_for("memory"), 0.5);
         assert_eq!(c.authority_for("tenet"), 1.0); // operator tenets: top authority, non-decaying
         assert_eq!(c.authority_for("unknown"), 0.5);
+        assert_eq!(c.pdf_ocr_min_chars, 0); // OCR off by default (task_40)
     }
 
     #[test]
@@ -209,11 +218,13 @@ mod tests {
             embed_device = "gpu"
             embed_gpu_mem_limit = 4294967296
             mcp_port = 8076
+            pdf_ocr_min_chars = 12
             "#,
         );
         assert_eq!(c.embed_device, "gpu");
         assert_eq!(c.embed_gpu_mem_limit, 4294967296);
         assert_eq!(c.mcp_port, 8076);
+        assert_eq!(c.pdf_ocr_min_chars, 12); // parses when set (opt-in)
         // untouched keys keep the Python defaults
         assert_eq!(c.embed_model, "BAAI/bge-large-en-v1.5");
         assert_eq!(c.w_quality, 0.15);
