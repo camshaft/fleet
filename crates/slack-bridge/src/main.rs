@@ -1,5 +1,6 @@
-//! slack-bridge daemon — the async Socket Mode transport that wires the pure core (`config` + `board` +
-//! `sync` + `format` + `resolver`) into a live board↔Slack sync. Behind the `transport` feature.
+//! slack-bridge daemon — the async Socket Mode transport that wires the pure core (this crate's `config` +
+//! `format`, plus `bridge_core`'s board client / sync planning / channel map) into a live board↔Slack sync.
+//! Behind the `transport` feature.
 //!
 //! Two concurrent jobs on one tokio runtime:
 //!   1. OUTBOUND (board → Slack): poll the firehose, reflect authorized `channel.outbound_reflect` posts

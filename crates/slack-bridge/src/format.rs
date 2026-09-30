@@ -2,18 +2,18 @@
 //! cadenza reference `format.rs` (which shaped the file-hub inbox protocol) to the board's post model.
 //!
 //! Two directions:
-//!   board → Slack:  a `channel.outbound_reflect` event ([`crate::board::OutboundReflect`]) is rendered as
+//!   board → Slack:  a `channel.outbound_reflect` event ([`bridge_core::OutboundReflect`]) is rendered as
 //!                   a readable Slack-mrkdwn line — author (+ external-author attribution) then body,
 //!                   with the content HTML-escaped and length-capped so a large/awkward body can't make
-//!                   the Slack post fail. A degraded plain variant + [`relay_plan`] escalation keep the
-//!                   outbound relay from head-of-line-blocking on a message Slack deterministically rejects.
+//!                   the Slack post fail. A degraded plain variant + the `bridge_core::relay` escalation
+//!                   keep the outbound relay from head-of-line-blocking on a message Slack rejects.
 //!   Slack → board:  an operator's Slack line is parsed into an [`Intent`] — a leading `@agent` retargets
 //!                   the recipient (strict, traversal-safe slug), otherwise it routes to the default agent.
 //!
 //! All rendering/parsing here is transport-agnostic and network-free; the async Slack transport and the
 //! board client call into it.
 
-use crate::board::OutboundReflect;
+use bridge_core::OutboundReflect;
 
 // ── Slack text limits + escaping ─────────────────────────────────────────────────────────────────
 
@@ -67,56 +67,16 @@ pub fn render_outbound_reflect(r: &OutboundReflect) -> String {
     cap_for_slack(out)
 }
 
-// ── OUTBOUND-RELAY RESILIENCE (board → Slack) ──────────────────────────────────────────────────────
+// ── DEGRADED render (board → Slack) ──────────────────────────────────────────────────────────────
 //
-// A message that DETERMINISTICALLY fails to post must never head-of-line-block the outbound relay. In the
-// reference bridge this once wedged the whole queue (~11h): the pump posted in order and stopped on the
-// first post error, and a single message that reliably returned Slack `internal_error` (a content/mrkdwn
-// parse quirk — a shorter truncation of the SAME message posted fine) blocked everything behind it, and
-// re-blocked identically after a restart. The relay's contract: (1) retry a transport/transient fault in
-// place (order preserved); (2) past [`RELAY_DEGRADE_AFTER`] CONTENT-class failures, post a degraded plain
-// variant ([`render_outbound_reflect_plain`]); (3) past [`RELAY_QUARANTINE_AFTER`], give up (preserve the
-// message out of band) and keep draining. The queue-never-wedges guarantee comes from SKIPPING PAST a
-// failing message, so quarantine can afford to be very patient (thresholds are in polls, ~2s each) — a
-// too-eager quarantine false-drops a good message during a brief Slack blip.
-
-/// CONTENT-class post failures after which the relay drops the rich render and falls back to the degraded
-/// plain variant. A handful of full-fidelity retries first, so a SHORT transient blip is ridden out.
-pub const RELAY_DEGRADE_AFTER: u32 = 5;
-/// CONTENT-class post failures after which the relay gives up and dead-letters the message (preserved out
-/// of band). ~5 minutes of SUSTAINED failure — far longer than any normal transient Slack window — so only
-/// a genuinely-undeliverable message is dropped, never a good one caught in a blip.
-pub const RELAY_QUARANTINE_AFTER: u32 = 155;
-/// Relay queue depth at/above which the pump logs a backlog warning, so a wedge/backlog is VISIBLE.
-pub const RELAY_QUEUE_WARN: usize = 25;
+// The relay-resilience ESCALATION policy (when to retry / degrade / quarantine) is transport-agnostic and
+// lives in `bridge_core::relay` (`relay_plan` / `RelayPlan` / the thresholds). This module supplies only the
+// Slack-specific degraded RENDER the relay falls back to once the rich render keeps failing on content.
 
 /// The proven-safe length for the degraded post: Slack rejected a ~2KB rendered mrkdwn message with
 /// `internal_error` while a 400-char truncation of the same posted fine — so the degraded variant
 /// truncates to this. A message the operator still SEES (with a pointer to the board) beats one dropped.
 const PLAIN_TEXT_CAP: usize = 400;
-
-/// What the relay should do with a message given how many CONTENT-class post failures it has had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelayPlan {
-    /// Post the normal (rich mrkdwn) render.
-    Normal,
-    /// Post the degraded plain variant — the rich render keeps failing on content.
-    Degraded,
-    /// Give up: dead-letter the message and move on.
-    Quarantine,
-}
-
-/// Decide the relay plan from the count of CONTENT-class failures so far (transient/transport failures are
-/// retried in place and do NOT advance this count). Pure.
-pub fn relay_plan(content_failures: u32) -> RelayPlan {
-    if content_failures >= RELAY_QUARANTINE_AFTER {
-        RelayPlan::Quarantine
-    } else if content_failures >= RELAY_DEGRADE_AFTER {
-        RelayPlan::Degraded
-    } else {
-        RelayPlan::Normal
-    }
-}
 
 /// Replace every character Slack's mrkdwn/entity parser treats as control (formatting `*_~`` `, entity/link
 /// markup `<>&|`) with a space and collapse whitespace runs. Neutralizing the trigger in the CONTENT (vs a
@@ -328,17 +288,7 @@ mod tests {
         assert!(!s.contains("&amp;lt;"), "no double-escape: {s}");
     }
 
-    // ── OUTBOUND-RELAY RESILIENCE ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn relay_plan_escalates_normal_then_degraded_then_quarantine() {
-        assert_eq!(relay_plan(0), RelayPlan::Normal);
-        assert_eq!(relay_plan(RELAY_DEGRADE_AFTER - 1), RelayPlan::Normal);
-        assert_eq!(relay_plan(RELAY_DEGRADE_AFTER), RelayPlan::Degraded);
-        assert_eq!(relay_plan(RELAY_QUARANTINE_AFTER - 1), RelayPlan::Degraded);
-        assert_eq!(relay_plan(RELAY_QUARANTINE_AFTER), RelayPlan::Quarantine);
-        assert_eq!(relay_plan(RELAY_QUARANTINE_AFTER + 100), RelayPlan::Quarantine);
-    }
+    // ── DEGRADED plain render ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn plain_render_strips_mrkdwn_and_is_bounded() {
