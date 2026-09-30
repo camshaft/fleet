@@ -1,0 +1,46 @@
+name: checks
+
+# The automated gate for camshaft/fleet. Agents self-merge PRs here with --admin, so a human/CI reviewer
+# is NOT in the loop -- this workflow is the safety net that catches a cross-crate compile/lint break
+# (e.g. a bridge-core struct field added without updating its slack-bridge/voice-assistant consumers -- a
+# real trunk-red that reached main uncaught before this existed) BEFORE it lands. It runs the SAME
+# workspace gate the self-merge flow runs locally, so "green locally" and "green in CI" agree.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# One in-flight run per ref; a new push cancels the stale one.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace:
+    name: clippy + test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # tmux is not preinstalled on the runner; a few crates' tests shell it (git is already present).
+      - name: Install tmux (some tests shell it)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      # The whole-workspace lint gate. --all-targets compiles every crate's lib + bins + TESTS, so a
+      # consumer that no longer matches a changed shared type fails here. Default features only: no native
+      # audio/ML deps are pulled (voice-assistant's sherpa/cpal shell is behind its `runtime` feature), so
+      # the runner needs no cmake/alsa. -D warnings matches the fleet self-merge gate (rustfmt is NOT gated).
+      - name: clippy (workspace, all targets, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test (workspace)
+        run: cargo test --workspace
