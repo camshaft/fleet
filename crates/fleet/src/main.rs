@@ -3160,6 +3160,12 @@ fn watchdog(
     spawn_dry_run: bool,
     pinned_only: bool,
 ) {
+    // Self-surface a stale binary: the watchdog is long-running (a timer/loop re-execs this binary), so if its
+    // source checkout advanced past the built rev it would silently run old logic (a merged fix not effective
+    // until rebuilt). Warn rather than act — rebuilding is out of band. No-op for a deployed binary (no .git).
+    if let Some(w) = build_freshness_warning(env!("FLEET_BUILD_REV"), checkout_head_short().as_deref()) {
+        eprintln!("{w}");
+    }
     // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
     // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
     // is unreachable — the file-hub scan then covers everything as a best-effort outage fallback.
@@ -3846,6 +3852,44 @@ fn version_line() -> String {
     format!("fleet {} (rev {})", env!("CARGO_PKG_VERSION"), env!("FLEET_BUILD_REV"))
 }
 
+/// Whether the running binary is STALE relative to its source checkout — the baked build rev differs from the
+/// checkout's current HEAD (the failure mode a stale watchdog binary hit: the checkout was pulled to main but
+/// the binary not rebuilt, so it silently ran old logic). Returns a warning, or `None` when it can't tell: an
+/// `unknown` baked rev, or no local checkout (a hermetic/deployed binary, which tracks its flake input). A
+/// `-dirty` baked rev compares by its base sha — a dirty build of the same commit is not stale. Pure — unit-tested.
+fn build_freshness_warning(baked_rev: &str, checkout_head: Option<&str>) -> Option<String> {
+    let head = checkout_head?;
+    if baked_rev.is_empty() || baked_rev == "unknown" {
+        return None;
+    }
+    let base = baked_rev.strip_suffix("-dirty").unwrap_or(baked_rev);
+    (base != head).then(|| {
+        format!(
+            "⚠ fleet binary is STALE: built at {baked_rev} but the checkout HEAD is {head} — \
+             rebuild (cargo build --release) so the running process uses current logic"
+        )
+    })
+}
+
+/// The short HEAD sha of the git checkout the running binary was built from — walk up from the binary's path
+/// to a dir containing `.git`, then `git rev-parse`. `None` when there is no source tree (a deployed binary)
+/// or git is unavailable. Best-effort — only used to warn about a stale binary.
+fn checkout_head_short() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let root = exe.ancestors().find(|p| p.join(".git").exists())?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4226,6 +4270,19 @@ mod tests {
         assert!(v.ends_with(")"), "wraps the rev");
         // build.rs always bakes a non-empty rev (a real short-sha, or the "unknown" fallback).
         assert!(!env!("FLEET_BUILD_REV").is_empty(), "the build rev is always baked");
+    }
+
+    #[test]
+    fn build_freshness_warning_flags_only_a_binary_behind_its_checkout() {
+        assert!(build_freshness_warning("abc123", Some("def456")).is_some(), "baked != head → stale");
+        assert!(build_freshness_warning("abc123", Some("abc123")).is_none(), "baked == head → current");
+        assert!(
+            build_freshness_warning("abc123-dirty", Some("abc123")).is_none(),
+            "a dirty build of the same commit is not stale"
+        );
+        assert!(build_freshness_warning("unknown", Some("abc123")).is_none(), "unknown baked rev → can't tell");
+        assert!(build_freshness_warning("", Some("abc123")).is_none(), "empty baked rev → can't tell");
+        assert!(build_freshness_warning("abc123", None).is_none(), "no checkout (deployed binary) → not applicable");
     }
 
     #[test]
