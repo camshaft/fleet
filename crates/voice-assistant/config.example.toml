@@ -5,16 +5,9 @@
 # key falls back to the built-in default shown below, so a host with no config file at all
 # runs on these exact defaults. `deny_unknown_fields` is on: a typo'd key is a hard error.
 
-# ── Identity + spoken persona ──────────────────────────────────────────────
-[assistant]
-# The assistant's spoken name (used as the board display name).
-name = "assistant"
-# The system prompt shaping every reply. Replies are SPOKEN, so the default asks for
-# brevity. De-personalized by default — tailor it to your world here (this is the one place
-# the persona lives). The loop depends on a few behaviors encoded in it: a spoken reply is
-# short; ending on a question reopens the mic; the knowledge-base / task-board / surfaces MCP
-# tools are reachable. Keep those if you rewrite it.
-# system_prompt = "You are a personal voice assistant. Your replies are spoken aloud, so ..."
+# The assistant is a transport BRIDGE: it posts what you say to a board voice channel and speaks the
+# reply from "George", a board-native voice agent. There is no in-process brain here — George's model
+# and persona are configured on the board (as any board agent's are), not in this file. See [board].
 
 # ── Wake phrase (sherpa-onnx keyword spotting) ─────────────────────────────
 # Unlike a fixed wake-word model, KWS matches an arbitrary phrase from `keywords_file`, so
@@ -67,44 +60,26 @@ num_threads = 2
 # espeak-ng language for Kokoro G2P (e.g. "en-us") — an alternative to lexicon for a multi-lingual model.
 # lang = ""
 
-# ── Brain (the `claude` CLI + MCP servers) ─────────────────────────────────
-[brain]
-# The `claude` CLI binary (on PATH by name, or an absolute path).
-claude_bin = "claude"
-# Model override; empty → the CLI/account default.
-model = ""
-# The three MCP servers the brain wires (HTTP). Names must stay in sync with the
-# `mcp__<server>` prefixes in allowed_tools below.
-kb_mcp_url = "http://localhost:8077/mcp"
-task_board_mcp_url = "http://localhost:8079/mcp"
-surfaced_mcp_url = "http://localhost:8787/surfaced/mcp"
-# Allowed tools: MCP server wildcards auto-enable new tools without editing this list.
-allowed_tools = [
-    "mcp__knowledge-base",
-    "mcp__task-board",
-    "mcp__surfaced",
-    "WebSearch",
-    "WebFetch",
-    "Read",
-    "Glob",
-    "Grep",
-]
-# Filesystem reads (Read/Glob/Grep) are confined to this tree by the PreToolUse scope guard.
-projects_dir = "~/Projects"
-# Max agent turns per query (bounds a runaway tool loop).
-max_turns = 8
-# Hard timeout for one brain turn, in seconds — a hung tool/API call must not wedge the loop.
-ask_timeout_secs = 90.0
-
-# ── Task board identity + proactive webhook ────────────────────────────────
+# ── Board bridge (voice ↔ board over bridge-core) ──────────────────────────
 [board]
-# This assistant's agent id on the board.
-agent = "assistant"
-# The local webhook receiver bind host/port (the board POSTs task-status events here).
-webhook_host = "127.0.0.1"
-webhook_port = 8076
-# The webhook URL registered with the board; omit to default to http://<host>:<port>/hook.
-# webhook_url = "http://127.0.0.1:8076/hook"
+# The board's token-less localhost REST base (firehose poll + attributed post).
+board_api = "http://127.0.0.1:8079/api"
+# This bridge's own board agent id — the sender of your transcripts. It is deliberately NOT an outbound
+# author on the voice channel, so its own posts don't reflect back out as speech.
+bridge_agent = "voice-bridge"
+# Your external id: transcripts are attributed to external_author = "voice:<speaker>" on the board.
+speaker = "operator"
+# The external voice channel id your transcripts post into; mapped to a board channel via channel_map
+# (and any board-registered `voice` links).
+voice_channel = "voice:local"
+# Where the firehose cursor is persisted (so a restart resumes without re-speaking or gapping). Defaults
+# to ~/.local/share/voice-assistant.
+# state_dir = "~/.local/share/voice-assistant"
+# Static board↔voice channel links. Merged with board-registered `voice` links at runtime; empty is
+# valid (dormant until a link exists). One row per channel:
+# [[board.channel_map]]
+# board_channel_id = 50
+# external_channel = "voice:local"
 
 # ── Audio capture + energy VAD ─────────────────────────────────────────────
 [audio]

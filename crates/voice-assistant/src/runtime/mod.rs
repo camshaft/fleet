@@ -1,60 +1,71 @@
 //! `runtime` — the live voice loop, behind the `runtime` feature so the pure core builds/tests without a
 //! native ONNX backend or audio device. It wires the sherpa-onnx wake/STT/TTS engines and cpal capture to
-//! the main loop, and drives the `claude` CLI for the brain.
+//! the main loop, and bridges the loop to the board over `bridge-core` (#316 / Doc #18).
 //!
-//! The loop is deliberately blocking and single-threaded (audio and brain never overlap), a faithful port
-//! of the Python `loop.run`: the only concurrency is the brain subprocess (its own process) and the board
-//! webhook receiver (its own thread), which hand results back over channels. This avoids pulling in an
-//! async runtime.
+//! The assistant is a transport BRIDGE, not an in-process brain: a finalized transcript is posted to a
+//! board voice channel (INBOUND), and a board-native voice agent ("George") replies there; the loop polls
+//! the firehose and speaks those replies (OUTBOUND) — George's turn answers and any proactive posts share
+//! one path. The board contract is all `bridge-core`; the only voice-specific work here is audio.
+//!
+//! The loop stays deliberately blocking and single-threaded (audio and board I/O never overlap): the
+//! board client is async (operator directive #370), so the loop drives it with `rt.block_on` on a
+//! current-thread tokio runtime at the two points it needs — posting a transcript and polling replies.
+//! No background task, no shared-state locking; the audio work (cpal callback, sherpa STT/TTS) runs on its
+//! own threads as before.
 
 mod audio;
-mod brain;
 mod stt;
 mod tts;
 mod wake;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::bridge::{SpokenReply, VoiceBridge};
+use crate::chime;
 use crate::config::Config;
-use crate::{chime, events};
 
 use audio::{Capture, Playback};
-use brain::BrainRunner;
 use stt::Transcriber;
 use tts::Synthesizer;
 use wake::WakeSpotter;
 
-/// The assembled engines + config for one running assistant.
+/// How long to wait for George's reply after posting a transcript before giving up on this turn.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Poll cadence for proactive replies (George posting unprompted) while idle-waiting for the wake phrase.
+const PROACTIVE_POLL_EVERY: Duration = Duration::from_secs(2);
+/// Sleep between reply polls while awaiting a turn's answer (keeps the poll from busy-spinning the board).
+const REPLY_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// The assembled engines + config + board session for one running assistant.
 struct Assistant {
     cfg: Config,
     cap: Capture,
     wake: WakeSpotter,
     stt: Transcriber,
     tts: Synthesizer,
-    brain: BrainRunner,
-    webhook: Option<events::WebhookReceiver>,
-    /// Events drained while waiting for wake, held until [`Assistant::drain_proactive`] handles them (the
-    /// channel is consume-on-read, so we can't peek — we buffer instead).
-    pending_events: Vec<events::ProactiveEvent>,
+    /// The async board session (INBOUND post / OUTBOUND poll) driven via [`Assistant::rt`].
+    bridge: VoiceBridge,
+    /// The current-thread tokio runtime the loop uses to drive the async [`bridge`](Self::bridge) calls.
+    rt: tokio::runtime::Runtime,
     /// Set true by the SIGTERM/SIGINT handler. The loop polls it and returns so the [`Assistant`] (and its
     /// [`Capture`] cpal stream) drops normally, releasing the ALSA device before the process exits.
     shutdown: Arc<AtomicBool>,
+    /// Replies drained while idle-waiting for wake, held until [`speak_pending_replies`](Self::speak_pending_replies)
+    /// speaks them (poll is consume-on-read, so we buffer instead of peeking).
+    pending_replies: Vec<SpokenReply>,
 }
 
-/// Build every engine from config. `scope_guard_command` is how to re-invoke this binary as the FS-scope
-/// hook (passed to the brain). Returns an error if any engine fails to initialize.
-pub fn run(cfg: Config, scope_guard_command: String) -> Result<(), String> {
-    // Register on the board + start the webhook receiver BEFORE the loop (best-effort — a down board
-    // just means no proactive events; the assistant still works as a plain voice loop).
-    let webhook = events::WebhookReceiver::start(&cfg.board.webhook_host, cfg.board.webhook_port);
-    events::register(
-        &cfg.brain.task_board_mcp_url,
-        &cfg.board.agent,
-        &cfg.assistant.name,
-        &cfg.board.effective_webhook_url(),
-    );
+/// Build every engine + the board session from config, then run the loop. Returns an error only if an
+/// engine fails to initialize; the loop itself never returns except on a shutdown signal.
+pub fn run(cfg: Config) -> Result<(), String> {
+    // A current-thread runtime is enough: the loop drives async board I/O sequentially via block_on, with
+    // no spawned tasks. `enable_all` turns on the IO + time drivers reqwest needs.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
 
     // Open capture with retry-until-present rather than a fatal `?`: the daemon must stay up and wait for
     // the mic (operator requirement #239), never crash-loop when it's absent at startup.
@@ -62,18 +73,29 @@ pub fn run(cfg: Config, scope_guard_command: String) -> Result<(), String> {
     let wake = WakeSpotter::new(&cfg.wake, cfg.audio.sample_rate)?;
     let stt = Transcriber::new(&cfg.stt, cfg.audio.sample_rate)?;
     let tts = Synthesizer::new(&cfg.tts)?;
-    let brain = BrainRunner::new(
-        cfg.brain.clone(),
-        cfg.assistant.system_prompt.clone(),
-        scope_guard_command,
-    );
 
-    // Install a graceful-shutdown flag. The default action for SIGTERM (which systemd sends on stop, and
-    // a deploy sends on restart) terminates the process abruptly, so the cpal capture stream never closes
-    // and the ALSA device release is left to the kernel's fd cleanup — which, under deploy load, can lag
-    // long enough that the *next* instance opens the device while this one still holds it and hits an
-    // errno -32 poll-descriptor storm (#239, green-machine-ops). Catching the signal lets the loop return
-    // so the Assistant (and its Capture stream) drops normally, calling snd_pcm_close before we exit.
+    // Build the board session INSIDE the runtime so reqwest's client binds to this runtime; then merge
+    // board-registered voice links with the static config (best-effort), and on a first run advance the
+    // cursor to the firehose head so we don't replay the whole board backlog as speech.
+    let bridge = rt.block_on(async {
+        let mut b = VoiceBridge::new(
+            &cfg.board.board_api,
+            cfg.board.voice_channel.clone(),
+            cfg.board.bridge_agent.clone(),
+            cfg.board.speaker.clone(),
+            cfg.board.state_dir.clone(),
+            &cfg.board.channel_map,
+        );
+        b.refresh_map(&cfg.board.channel_map).await;
+        if b.is_fresh() {
+            b.initialize_cursor_at_head().await;
+        }
+        b
+    });
+
+    // Install a graceful-shutdown flag. The default SIGTERM action (systemd stop / deploy restart) would
+    // terminate abruptly with no snd_pcm_close, so the ALSA device release lags and the next instance can
+    // storm errno -32 on open (#239). Catching it lets the loop return so the Capture stream drops cleanly.
     let shutdown = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         if let Err(e) = signal_hook::flag::register(sig, shutdown.clone()) {
@@ -90,14 +112,14 @@ pub fn run(cfg: Config, scope_guard_command: String) -> Result<(), String> {
         wake,
         stt,
         tts,
-        brain,
-        webhook,
-        pending_events: Vec::new(),
+        bridge,
+        rt,
         shutdown,
+        pending_replies: Vec::new(),
     };
     a.main_loop();
-    // main_loop returns on a shutdown signal (or never, on Ctrl-C without a handler). Returning here drops
-    // `a`, and with it the Capture stream, releasing the ALSA device before the process exits.
+    // main_loop returns on a shutdown signal. Returning here drops `a`, and with it the Capture stream,
+    // releasing the ALSA device before the process exits.
     Ok(())
 }
 
@@ -111,8 +133,8 @@ impl Assistant {
     }
 
     /// Speak `text`; if the wake phrase is heard during playback, kill it and return `true` (a barge-in).
-    /// Port of the Python `speak_interruptible`, including the "arm only after a low streak" debounce so
-    /// the wake that opened this turn (or stale activation) can't count as a barge-in.
+    /// Includes the "arm only after a low streak" debounce so the wake that opened this turn (or stale
+    /// activation) can't count as a barge-in.
     fn speak_interruptible(&mut self, text: &str) -> bool {
         let samples = self.tts.synth(text);
         if samples.is_empty() {
@@ -156,37 +178,52 @@ impl Assistant {
         interrupted
     }
 
-    /// Handle a queued board event: a task the user waited on just finished — chime and proactively answer
-    /// from the (resumed) brain session. Port of the Python `_handle_proactive`.
-    fn handle_proactive(&mut self, ev: &events::ProactiveEvent) {
-        eprintln!("[proactive] task {:?} done: {}", ev.task_id, ev.title);
-        self.play_cue(&chime::ready()); // "I have something for you" cue
-        let prompt = format!(
-            "The '{}' docs you queued on the board just finished ingesting and are now searchable in \
-             the knowledge base. Search them and briefly answer the question the user was waiting on. \
-             If nothing relevant is found, say the ingest may not have worked.",
-            ev.title
-        );
-        let reply = self.brain.ask(&prompt);
-        eprintln!("[assistant/proactive] {reply}");
-        self.speak_interruptible(&reply);
+    /// Speak the replies that came in a batch (a turn's answer or a proactive drain). Returns `true` if a
+    /// barge-in interrupted playback (the caller reopens the mic). Speaks them in firehose order.
+    fn speak_replies(&mut self, replies: Vec<SpokenReply>) -> bool {
+        for r in replies {
+            eprintln!("[assistant] {}", r.text);
+            if self.speak_interruptible(&r.text) {
+                return true;
+            }
+        }
+        false
     }
 
-    /// Handle every queued proactive event: first those buffered while waiting for wake, then any that
-    /// arrived since. Called at idle moments.
-    fn drain_proactive(&mut self) {
-        let mut events = std::mem::take(&mut self.pending_events);
-        if let Some(w) = self.webhook.as_ref() {
-            events.extend(w.drain());
+    /// Speak everything buffered from the idle proactive poll (George posted unprompted). A "ready" cue
+    /// precedes the batch so the operator knows the assistant has something to say.
+    fn speak_pending_replies(&mut self) {
+        let replies = std::mem::take(&mut self.pending_replies);
+        if replies.is_empty() {
+            return;
         }
-        for ev in events {
-            self.handle_proactive(&ev);
+        self.play_cue(&chime::ready());
+        self.speak_replies(replies);
+    }
+
+    /// After posting a transcript, poll the firehose for George's reply until something arrives or
+    /// [`REPLY_TIMEOUT`] elapses. Returns the replies (empty on timeout / shutdown).
+    fn await_reply(&mut self) -> Vec<SpokenReply> {
+        let deadline = Instant::now() + REPLY_TIMEOUT;
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            match self.rt.block_on(self.bridge.poll_replies()) {
+                Ok(r) if !r.is_empty() => return r,
+                Ok(_) => {}
+                Err(e) => eprintln!("[voice-bridge] reply poll failed: {e}"),
+            }
+            if Instant::now() >= deadline {
+                eprintln!("[voice-bridge] no reply within {REPLY_TIMEOUT:?}");
+                return Vec::new();
+            }
+            std::thread::sleep(REPLY_POLL_INTERVAL);
         }
     }
 
-    /// The main loop: wake → chime → record → STT → brain → speak, with barge-in and follow-up. A direct
-    /// port of the Python `loop.run`, minus its per-iteration try/except (each stage here already returns
-    /// gracefully; a panic would be caught by the process supervisor).
+    /// The main loop: wake → chime → record → STT → post transcript → await reply → speak, with barge-in
+    /// and follow-up. Proactive board replies are drained + spoken at idle.
     fn main_loop(&mut self) {
         self.play_cue(&chime::ready());
         eprintln!("[voice-assistant] ready — waiting for the wake phrase (Ctrl-C to quit)");
@@ -194,16 +231,13 @@ impl Assistant {
         let mut pending = false; // right after a barge-in: record immediately, skip the wake wait
         let mut conversing = false; // follow-up: keep the mic open, no wake phrase needed
         loop {
-            // A shutdown signal between turns exits the loop so we drop the capture stream and release the
-            // device cleanly (a barge-in/follow-up turn checks this next iteration; the common idle wait
-            // below also honors it).
             if self.shutdown.load(Ordering::Relaxed) {
                 eprintln!("[voice-assistant] shutdown signal — releasing the capture device and exiting");
                 return;
             }
             let following = conversing; // this turn's record is a reopened follow-up mic
             if !(pending || conversing) {
-                // Wait for the wake phrase, but wake early to service a queued board event or a shutdown.
+                // Wait for the wake phrase, but wake early to speak a proactive board reply or to shut down.
                 match self.wait_for_wake_or_event() {
                     Woke::Shutdown => {
                         eprintln!(
@@ -212,7 +246,7 @@ impl Assistant {
                         return;
                     }
                     Woke::Event => {
-                        self.drain_proactive();
+                        self.speak_pending_replies();
                         continue;
                     }
                     Woke::Wake => {}
@@ -240,14 +274,23 @@ impl Assistant {
                 continue;
             }
 
-            let reply = self.brain.ask(&text);
-            eprintln!("[assistant] {reply}");
-            if self.speak_interruptible(&reply) {
+            // INBOUND: post the transcript to the board voice channel for George to answer.
+            if let Err(e) = self.rt.block_on(self.bridge.post_transcript(&text)) {
+                eprintln!("[voice-bridge] transcript post failed: {e}");
+                continue;
+            }
+            // OUTBOUND: wait for George's reply on the firehose, then speak it.
+            let replies = self.await_reply();
+            if replies.is_empty() {
+                continue;
+            }
+            let last = replies.last().map(|r| r.text.clone()).unwrap_or_default();
+            if self.speak_replies(replies) {
                 eprintln!("[barge-in]");
                 self.play_cue(&chime::listening());
                 pending = true;
-            } else if reply.trim_end().ends_with('?') {
-                // The assistant asked something → keep the floor open for a natural reply.
+            } else if last.trim_end().ends_with('?') {
+                // The reply asked something → keep the mic open for a natural follow-up.
                 eprintln!("[listening for follow-up]");
                 self.play_cue(&chime::listening());
                 conversing = true;
@@ -255,10 +298,11 @@ impl Assistant {
         }
     }
 
-    /// Block on wake frames until the wake phrase fires OR a board event is queued. Port of the Python
-    /// `listen_for_wake` (which returns `"wake"`/`"event"`).
+    /// Block on wake frames until the wake phrase fires OR a proactive board reply is available. Polls the
+    /// firehose on a cadence while listening, so George posting unprompted wakes the loop.
     fn wait_for_wake_or_event(&mut self) -> Woke {
         let per_frame = Duration::from_millis(500);
+        let mut next_poll = Instant::now(); // poll immediately on entry, then every PROACTIVE_POLL_EVERY
         loop {
             // A shutdown signal ends the idle wait promptly (this is where the daemon sits almost all the
             // time, so it is the state a deploy stop lands in) — return so the loop can drop the stream.
@@ -266,22 +310,25 @@ impl Assistant {
                 return Woke::Shutdown;
             }
             // If the capture device faulted (e.g. the mic was unplugged mid-run), don't spin on a dead
-            // stream — rebuild it, blocking until the device returns, then carry on (operator req #239:
-            // survive hot-unplug, never crash). Reset the wake stream so stale pre-unplug state can't
-            // linger into the reconnected stream.
+            // stream — rebuild it, blocking until the device returns (operator req #239: survive hot-unplug,
+            // never crash). Reset the wake stream so stale pre-unplug state can't linger.
             if !self.cap.healthy() {
                 eprintln!("[audio] capture device lost; reconnecting…");
                 self.cap = Capture::open_with_retry(&self.cfg.audio);
                 self.wake.reset();
                 eprintln!("[audio] capture device reconnected");
             }
-            // A queued board event wakes the loop even without the wake phrase. The channel is
-            // consume-on-read, so buffer what we drain for `drain_proactive` to handle.
-            if let Some(w) = self.webhook.as_ref() {
-                let drained = w.drain();
-                if !drained.is_empty() {
-                    self.pending_events.extend(drained);
-                    return Woke::Event;
+            // A proactive board reply wakes the loop even without the wake phrase. Buffer what we drain for
+            // speak_pending_replies to handle.
+            if Instant::now() >= next_poll {
+                next_poll = Instant::now() + PROACTIVE_POLL_EVERY;
+                match self.rt.block_on(self.bridge.poll_replies()) {
+                    Ok(r) if !r.is_empty() => {
+                        self.pending_replies.extend(r);
+                        return Woke::Event;
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[voice-bridge] proactive poll failed: {e}"),
                 }
             }
             if let Some(frame) = self.cap.next_frame(per_frame)

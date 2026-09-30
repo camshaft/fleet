@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use bridge_core::ChannelLink;
 use serde::Deserialize;
 
 /// The whole config: one table per subsystem. Each is `#[serde(default)]` so an omitted table is the
@@ -19,61 +20,11 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    pub assistant: Assistant,
     pub wake: Wake,
     pub stt: Stt,
     pub tts: Tts,
-    pub brain: Brain,
     pub board: Board,
     pub audio: Audio,
-}
-
-// ─────────────────────────────── [assistant] ───────────────────────────────
-
-/// Identity + the spoken persona's system prompt. The name is a plain knob (the Python original
-/// hard-coded a single assistant name throughout — here it is data, not code).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Assistant {
-    /// The assistant's spoken name — used in the board identity default and available to the prompt.
-    pub name: String,
-    /// The system prompt that shapes every reply. Replies are spoken, so the default asks for brevity.
-    /// De-personalized: no owner/shop specifics baked in — edit this key to tailor the persona.
-    pub system_prompt: String,
-}
-
-impl Default for Assistant {
-    fn default() -> Self {
-        Self {
-            name: "assistant".to_string(),
-            system_prompt: default_system_prompt(),
-        }
-    }
-}
-
-/// The default spoken-assistant prompt. Kept generic (the Python original's owner/shop framing is gone);
-/// tailor it in `[assistant].system_prompt`. It still encodes the *behaviors* the loop depends on: a
-/// spoken reply is short, ending on a question reopens the mic, and the knowledge base / task board /
-/// surfaces are reachable via their MCP tools.
-fn default_system_prompt() -> String {
-    "You are a personal voice assistant. Your replies are spoken aloud, so be extremely brief: at most \
-     two short sentences. Give the direct answer, then offer to go deeper (like 'Want the specifics?') \
-     rather than dumping details that weren't asked for. No markdown, no lists, no preamble, and don't \
-     repeat the question back. For anything the user asks that your knowledge base might cover, search \
-     it (a single kb_search with no collection spans every collection) and answer from what you find; \
-     don't ask to clarify a term, just look it up. To walk through a procedure or answer 'what's next', \
-     find the starting page, then use kb_read_pages (with that result's col and path) to read the \
-     following pages in order. You can also search the web for current events or general knowledge that \
-     isn't the user's own work — prefer the knowledge base for their stuff, the web for the wider \
-     world. Never invent or assume; if you're unsure or find nothing, say so. Only use the remember \
-     tool for a fact the user has clearly and directly stated. You also manage a task board (projects \
-     and tasks with status, comments, and assignments); when asked to capture, track, update, or \
-     review tasks, use the task-board tools. When something is better seen than spoken — a link, a PDF, \
-     an image, a snippet, or a longer answer — push it to a surface with send_item (list_surfaces to \
-     see what's registered) and say briefly you've put it up. When you end with a question, the mic \
-     reopens automatically so the user can reply without the wake word — natural for a quick \
-     back-and-forth. Don't be chatty and don't over-confirm; just answer."
-        .to_string()
 }
 
 // ─────────────────────────────── [wake] ───────────────────────────────
@@ -222,93 +173,44 @@ impl Tts {
     }
 }
 
-// ─────────────────────────────── [brain] ───────────────────────────────
-
-/// The Claude brain: the `claude` CLI driven with the three MCP servers, an allowed-tool set, and a
-/// filesystem-scope guard. Mirrors the Python Agent-SDK wiring (same MCP URLs, same tool policy).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Brain {
-    /// The `claude` CLI binary (on `PATH` by name, or an absolute path).
-    pub claude_bin: String,
-    /// Model override; empty → the CLI/account default.
-    pub model: String,
-    /// Knowledge-base MCP server URL (HTTP).
-    pub kb_mcp_url: String,
-    /// Task-board MCP server URL (HTTP).
-    pub task_board_mcp_url: String,
-    /// Surfaced (browser-surface) MCP server URL (HTTP).
-    pub surfaced_mcp_url: String,
-    /// Allowed tool patterns (MCP server wildcards + built-in tools). Server wildcards auto-enable new
-    /// tools without editing this list — matches the Python `ALLOWED_TOOLS`.
-    pub allowed_tools: Vec<String>,
-    /// Filesystem reads are confined to this tree by the PreToolUse scope guard (Read/Glob/Grep).
-    pub projects_dir: PathBuf,
-    /// Max agent turns per query (bounds a runaway tool loop).
-    pub max_turns: u32,
-    /// Hard timeout for one brain turn, in seconds — a hung tool/API call must not wedge the loop.
-    pub ask_timeout_secs: f64,
-}
-
-impl Default for Brain {
-    fn default() -> Self {
-        Self {
-            claude_bin: "claude".to_string(),
-            model: String::new(),
-            kb_mcp_url: "http://localhost:8077/mcp".to_string(),
-            task_board_mcp_url: "http://localhost:8079/mcp".to_string(),
-            surfaced_mcp_url: "http://localhost:8787/surfaced/mcp".to_string(),
-            allowed_tools: vec![
-                "mcp__knowledge-base".to_string(),
-                "mcp__task-board".to_string(),
-                "mcp__surfaced".to_string(),
-                "WebSearch".to_string(),
-                "WebFetch".to_string(),
-                "Read".to_string(),
-                "Glob".to_string(),
-                "Grep".to_string(),
-            ],
-            projects_dir: home_dir().join("Projects"),
-            max_turns: 8,
-            ask_timeout_secs: 90.0,
-        }
-    }
-}
-
 // ─────────────────────────────── [board] ───────────────────────────────
 
-/// The task board identity + the webhook the board pushes events to (so a queued task finishing can
-/// trigger a proactive spoken answer). Mirrors the Python `BOARD_*` knobs.
+/// The voice bridge's board wiring (#316 / Doc #18). The daemon is a transport bridge: a finalized
+/// transcript is posted to a board voice channel, and George (a board-native voice agent) replies there;
+/// the daemon polls the firehose and speaks those replies. All of this is the shared `bridge-core`
+/// contract — this table is just the voice-side config for it. No in-process brain, no MCP, no webhook.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Board {
-    /// This assistant's agent id on the board.
-    pub agent: String,
-    /// Host the local webhook receiver binds.
-    pub webhook_host: String,
-    /// Port the local webhook receiver binds.
-    pub webhook_port: u16,
-    /// The webhook URL registered with the board (defaults to `http://<host>:<port>/hook`).
-    pub webhook_url: Option<String>,
+    /// The board's token-less localhost REST base (the firehose poll + attributed post live here).
+    pub board_api: String,
+    /// This bridge's own board agent id — the INBOUND `sender`. Deliberately NOT an outbound author on the
+    /// voice channel, so its own posted transcripts don't reflect back out as speech.
+    pub bridge_agent: String,
+    /// The speaker's external id: transcripts are attributed `external_author = "voice:<speaker>"`.
+    pub speaker: String,
+    /// The external voice channel id (e.g. `voice:green`) the speaker's transcripts post into; mapped to a
+    /// board channel via `channel_map` (and any board-registered `voice` links).
+    pub voice_channel: String,
+    /// The bridge's local state dir — the firehose cursor is persisted here so a restart resumes without
+    /// re-speaking or gapping.
+    pub state_dir: PathBuf,
+    /// Static board↔voice channel links (`[[board.channel_map]]`). Merged with board-registered `voice`
+    /// links at runtime; empty is valid (dormant until a link is registered).
+    #[serde(default)]
+    pub channel_map: Vec<ChannelLink>,
 }
 
 impl Default for Board {
     fn default() -> Self {
         Self {
-            agent: "assistant".to_string(),
-            webhook_host: "127.0.0.1".to_string(),
-            webhook_port: 8076,
-            webhook_url: None,
+            board_api: "http://127.0.0.1:8079/api".to_string(),
+            bridge_agent: "voice-bridge".to_string(),
+            speaker: "operator".to_string(),
+            voice_channel: "voice:local".to_string(),
+            state_dir: home_share("voice-assistant"),
+            channel_map: Vec::new(),
         }
-    }
-}
-
-impl Board {
-    /// The effective webhook URL: the explicit `webhook_url`, else `http://<host>:<port>/hook`.
-    pub fn effective_webhook_url(&self) -> String {
-        self.webhook_url
-            .clone()
-            .unwrap_or_else(|| format!("http://{}:{}/hook", self.webhook_host, self.webhook_port))
     }
 }
 
@@ -426,34 +328,34 @@ mod tests {
     #[test]
     fn empty_config_is_all_defaults() {
         let cfg = parse("").unwrap();
-        assert_eq!(cfg.assistant.name, "assistant");
         assert_eq!(cfg.audio.sample_rate, 16000);
         assert_eq!(cfg.audio.frame, 1280);
         assert_eq!(cfg.audio.output_device, "");
         assert_eq!(cfg.stt.provider, "cpu");
         assert_eq!(cfg.wake.threshold, 0.25);
-        assert_eq!(cfg.brain.max_turns, 8);
-        assert!(
-            cfg.brain
-                .allowed_tools
-                .contains(&"mcp__knowledge-base".to_string())
-        );
+        // The board bridge defaults: local REST, the voice-bridge agent, an empty (dormant) channel map.
+        assert_eq!(cfg.board.board_api, "http://127.0.0.1:8079/api");
+        assert_eq!(cfg.board.bridge_agent, "voice-bridge");
+        assert_eq!(cfg.board.speaker, "operator");
+        assert_eq!(cfg.board.voice_channel, "voice:local");
+        assert!(cfg.board.channel_map.is_empty());
     }
 
     #[test]
     fn partial_tables_default_the_rest() {
         let cfg = parse(
             r#"
-            [assistant]
-            name = "Jarvis"
+            [board]
+            speaker = "cameron"
 
             [audio]
             vad_rms = 700.0
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.assistant.name, "Jarvis");
+        assert_eq!(cfg.board.speaker, "cameron");
         // untouched keys in a present table keep their defaults
+        assert_eq!(cfg.board.bridge_agent, "voice-bridge");
         assert_eq!(cfg.audio.vad_rms, 700.0);
         assert_eq!(cfg.audio.sample_rate, 16000);
         // an absent table is all-defaults
@@ -464,9 +366,6 @@ mod tests {
     fn every_table_round_trips() {
         let cfg = parse(
             r#"
-            [assistant]
-            name = "V"
-            system_prompt = "Be brief."
             [wake]
             threshold = 0.4
             provider = "cuda"
@@ -478,31 +377,49 @@ mod tests {
             [tts]
             speaker_id = 24
             speed = 1.1
-            [brain]
-            model = "opus"
-            max_turns = 12
-            ask_timeout_secs = 120.0
-            allowed_tools = ["mcp__knowledge-base", "WebSearch"]
             [board]
-            agent = "v"
-            webhook_port = 9000
+            board_api = "http://board.local/api"
+            bridge_agent = "vb"
+            speaker = "cameron"
+            voice_channel = "voice:green"
+            state_dir = "/var/lib/voice-assistant"
+            [[board.channel_map]]
+            board_channel_id = 50
+            external_channel = "voice:green"
             [audio]
             input_device = "Jabra"
             silence_secs = 3.0
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.assistant.system_prompt, "Be brief.");
         assert_eq!(cfg.wake.threshold, 0.4);
         assert_eq!(cfg.stt.model, "medium.en");
         assert_eq!(cfg.stt.provider, "cpu");
         assert_eq!(cfg.tts.speaker_id, 24);
-        assert_eq!(cfg.brain.model, "opus");
-        assert_eq!(cfg.brain.max_turns, 12);
-        assert_eq!(cfg.brain.allowed_tools.len(), 2);
-        assert_eq!(cfg.board.agent, "v");
-        assert_eq!(cfg.board.webhook_port, 9000);
+        assert_eq!(cfg.board.board_api, "http://board.local/api");
+        assert_eq!(cfg.board.bridge_agent, "vb");
+        assert_eq!(cfg.board.speaker, "cameron");
+        assert_eq!(cfg.board.voice_channel, "voice:green");
+        assert_eq!(cfg.board.state_dir, PathBuf::from("/var/lib/voice-assistant"));
+        assert_eq!(cfg.board.channel_map.len(), 1);
+        assert_eq!(cfg.board.channel_map[0].board_channel_id, 50);
+        assert_eq!(cfg.board.channel_map[0].external_channel, "voice:green");
         assert_eq!(cfg.audio.input_device, "Jabra");
+    }
+
+    #[test]
+    fn board_channel_map_accepts_the_bridge_core_link_shape() {
+        // The link rows parse via bridge_core::ChannelLink (external_channel, or the slack_channel alias).
+        let cfg = parse(
+            r#"
+            [[board.channel_map]]
+            board_channel_id = 7
+            external_channel = "voice:green"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.board.channel_map.len(), 1);
+        assert_eq!(cfg.board.channel_map[0].board_channel_id, 7);
     }
 
     #[test]
@@ -543,16 +460,5 @@ mod tests {
         assert_eq!(parse("").unwrap().audio.output_device, "");
         let cfg = parse("[audio]\noutput_device = \"plughw:CARD=USB\"\n").unwrap();
         assert_eq!(cfg.audio.output_device, "plughw:CARD=USB");
-    }
-
-    #[test]
-    fn webhook_url_defaults_from_host_and_port() {
-        let cfg = parse("[board]\nwebhook_host = \"127.0.0.1\"\nwebhook_port = 8076\n").unwrap();
-        assert_eq!(
-            cfg.board.effective_webhook_url(),
-            "http://127.0.0.1:8076/hook"
-        );
-        let explicit = parse("[board]\nwebhook_url = \"http://x/y\"\n").unwrap();
-        assert_eq!(explicit.board.effective_webhook_url(), "http://x/y");
     }
 }
