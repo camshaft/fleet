@@ -8,9 +8,11 @@
 # on the board.
 #
 # The crate is a workspace member so `cargo test` at the workspace root gates its pure core (config
-# resolution, attribution formatting, mapping, dedup). The heavy async Slack transport tree
-# (slack-morphism/tokio/hyper/rustls) is deferred behind a `transport` feature (added with the daemon
-# binary in a later slice) so it never enters the shared lockfile or the default `cargo test`.
+# resolution, attribution formatting, mapping, dedup). The heavy SLACK transport tree (slack-morphism +
+# the Socket Mode WebSocket stack) is deferred behind a `transport` feature so it never enters the default
+# `cargo test`. NOTE: bridge-core's async board client (reqwest, operator directive #370) does bring an
+# async HTTP tree (reqwest/tokio/hyper/rustls) into the default build — the board I/O is async now, so the
+# runner `.await`s it directly (no spawn_blocking); only the Slack-specific transport stays feature-gated.
 [package]
 name = "slack-bridge"
 version = "0.0.0"

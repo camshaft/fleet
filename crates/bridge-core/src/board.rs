@@ -13,11 +13,13 @@
 //!   #149). Because the bridge agent isn't in the channel's `outbound_authors`, its own inbound posts don't
 //!   echo back out as `channel.outbound_reflect` events (no loop).
 //!
-//! The HTTP methods are thin wrappers over ureq; all PARSING/SHAPING is factored into pure functions
-//! ([`parse_events`], [`Event::as_outbound_reflect`], [`build_post_body`], [`build_identity_body`],
-//! [`parse_channel_links`]) that are unit-tested without a network.
+//! The HTTP methods are thin **async** wrappers over reqwest (operator directive #370: async I/O on tokio,
+//! not a thread-per-blocking-call model — the caller provides the runtime); all PARSING/SHAPING is factored
+//! into pure, sync functions ([`parse_events`], [`Event::as_outbound_reflect`], [`build_post_body`],
+//! [`build_identity_body`], [`parse_channel_links`]) that are unit-tested without a network or a runtime.
 
 use crate::resolver::ChannelLink;
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -183,38 +185,42 @@ pub fn parse_channel_links(body: &str, source: &str) -> Result<Vec<ChannelLink>,
 /// firehose cursor (`since_seq`) is owned by the caller (the transport loop), not this client.
 pub struct BoardClient {
     base: String,
-    agent: ureq::Agent,
+    http: Client,
 }
 
 impl BoardClient {
     /// Build a client against the board REST base (e.g. `http://127.0.0.1:8079/api`). No network round-trip
-    /// — the REST API is sessionless. A trailing slash on `base_api` is trimmed so path joins don't double.
+    /// — the REST API is sessionless, and the reqwest `Client` is constructed without a runtime. A trailing
+    /// slash on `base_api` is trimmed so path joins don't double.
     pub fn new(base_api: &str) -> Self {
         BoardClient {
             base: base_api.trim_end_matches('/').to_string(),
-            agent: ureq::agent(),
+            http: Client::new(),
         }
     }
 
     /// Poll the firehose for events after `since_seq` (exclusive), up to `limit`. Returns them in ascending
     /// `seq` order; an empty vec when nothing is newer.
-    pub fn poll_events(&self, since_seq: i64, limit: usize) -> Result<Vec<Event>, String> {
+    pub async fn poll_events(&self, since_seq: i64, limit: usize) -> Result<Vec<Event>, String> {
         let url = format!("{}/events?since_seq={}&limit={}", self.base, since_seq, limit);
-        let resp = self
-            .agent
+        let raw = self
+            .http
             .get(&url)
-            .set("accept", "application/json")
-            .call()
-            .map_err(|e| format!("board GET /events failed: {e}"))?;
-        let raw = resp
-            .into_string()
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("board GET /events failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("board GET /events failed: {e}"))?
+            .text()
+            .await
             .map_err(|e| format!("board GET /events read failed: {e}"))?;
         parse_events(&raw)
     }
 
     /// Post an inbound (external → board) message into board channel `channel_id`, attributed to
     /// `external_author` (the external identity) with the bridge as `sender`. `reply_to` threads a parent.
-    pub fn post_message(
+    pub async fn post_message(
         &self,
         channel_id: i64,
         sender: &str,
@@ -223,42 +229,50 @@ impl BoardClient {
         reply_to: Option<i64>,
     ) -> Result<(), String> {
         self.post_raw(channel_id, &build_post_body(sender, body, external_author, reply_to))
+            .await
     }
 
     /// Post a pre-built post body (as produced by [`build_post_body`] / [`crate::sync::plan_inbound`]) to
     /// board channel `channel_id`. The transport uses this so it posts exactly the tested planner output.
-    pub fn post_raw(&self, channel_id: i64, body: &Value) -> Result<(), String> {
+    pub async fn post_raw(&self, channel_id: i64, body: &Value) -> Result<(), String> {
         let url = format!("{}/channels/{}/posts", self.base, channel_id);
-        self.agent
+        self.http
             .post(&url)
-            .set("content-type", "application/json")
-            .send_string(&body.to_string())
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?
+            .error_for_status()
             .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?;
         Ok(())
     }
 
     /// Read the board-registered channel links for `source` (board-core #149 slice 2). The transport merges
     /// these with any static config links to build the live [`crate::resolver::ChannelMap`].
-    pub fn list_channel_links(&self, source: &str) -> Result<Vec<ChannelLink>, String> {
+    pub async fn list_channel_links(&self, source: &str) -> Result<Vec<ChannelLink>, String> {
         let url = format!(
             "{}/external-links?source={source}&board_kind={LINK_KIND_CHANNEL}",
             self.base
         );
-        let resp = self
-            .agent
+        let raw = self
+            .http
             .get(&url)
-            .set("accept", "application/json")
-            .call()
-            .map_err(|e| format!("board GET /external-links failed: {e}"))?;
-        let raw = resp
-            .into_string()
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("board GET /external-links failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("board GET /external-links failed: {e}"))?
+            .text()
+            .await
             .map_err(|e| format!("board GET /external-links read failed: {e}"))?;
         parse_channel_links(&raw, source)
     }
 
     /// Register (idempotent on `(source, external_id)`) a board channel ↔ external channel link (board-core
     /// #149 slice 2).
-    pub fn register_channel_link(
+    pub async fn register_channel_link(
         &self,
         board_channel_id: i64,
         source: &str,
@@ -272,10 +286,14 @@ impl BoardClient {
             "board_id": board_channel_id,
         })
         .to_string();
-        self.agent
+        self.http
             .post(&url)
-            .set("content-type", "application/json")
-            .send_string(&body)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| format!("board POST /external-links failed: {e}"))?
+            .error_for_status()
             .map_err(|e| format!("board POST /external-links failed: {e}"))?;
         Ok(())
     }
@@ -283,17 +301,21 @@ impl BoardClient {
     /// Upsert (idempotent on `id`) an external identity's display name (board-core #149; live independent of
     /// the #85 rendering redeploy). Attaches a resolved display name to the stable `<source>:<id>` key so
     /// board readers see `external_author_name` instead of a bare id. Best-effort at the call site.
-    pub fn upsert_external_identity(
+    pub async fn upsert_external_identity(
         &self,
         id: &str,
         source: &str,
         display_name: &str,
     ) -> Result<(), String> {
         let url = format!("{}/external-identities", self.base);
-        self.agent
+        self.http
             .post(&url)
-            .set("content-type", "application/json")
-            .send_string(&build_identity_body(id, source, display_name).to_string())
+            .header("content-type", "application/json")
+            .body(build_identity_body(id, source, display_name).to_string())
+            .send()
+            .await
+            .map_err(|e| format!("board POST /external-identities failed: {e}"))?
+            .error_for_status()
             .map_err(|e| format!("board POST /external-identities failed: {e}"))?;
         Ok(())
     }
