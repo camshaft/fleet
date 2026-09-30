@@ -57,6 +57,10 @@ pub struct Config {
     /// a local node's `/api/v0` RPC; only the ingest workers use it, so the always-on server ignores it.
     pub ipfs_url: String,
 
+    /// Coordination-board REST base URL for the phase-2 board-driven workers (was `TB_MCP_URL`, now the REST
+    /// API not MCP). The green-resident workers reach the board on green; only the workers use it.
+    pub board_url: String,
+
     /// Default collection for the CLI + single-collection tool calls (was `KB_DEFAULT_COLLECTION`).
     pub default_collection: String,
     /// Where `kb_remember` / `kb_supersede` write by default (was `KB_MEMORY_COLLECTION`).
@@ -93,6 +97,7 @@ impl Default for Config {
             rerank_candidates: 40,
             cache_dir: String::new(),
             ipfs_url: "http://127.0.0.1:5001".to_string(),
+            board_url: "http://127.0.0.1:8079/api".to_string(),
             mcp_host: "0.0.0.0".to_string(),
             mcp_port: 8077,
             mcp_allowed_hosts: vec!["*".to_string()],
