@@ -3674,6 +3674,16 @@ fn native_agent_ids(agents: &[serde_json::Value]) -> std::collections::BTreeSet<
         .collect()
 }
 
+/// True iff the roster is non-empty but EVERY agent row lacks a `metadata` object — the signature of a board
+/// `/agents` LIST response that dropped per-agent metadata (the by-id endpoint still carries it). In that
+/// state the native filter reads `native == false` for every agent, so the whole board-native watchdog scan
+/// (re-arm AND observe) silently sees zero agents and prints a benign "all 0 ok" instead of flagging that it
+/// is blind. The watchdog must warn loudly on this shape rather than mistake it for an idle-but-healthy
+/// board. Pure — unit-tested.
+fn roster_metadata_stripped(agents: &[serde_json::Value]) -> bool {
+    !agents.is_empty() && agents.iter().all(|a| a.get("metadata").is_none())
+}
+
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
 /// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
 #[allow(clippy::too_many_arguments)]
@@ -3694,6 +3704,19 @@ fn watchdog_board(
     let host = this_host(); // host-affinity: this box only manages agents pinned here (or unpinned)
     if pinned_only {
         println!("(--pinned-only: managing only agents EXPLICITLY pinned to {host}; unpinned run-anywhere agents skipped)");
+    }
+    // Resilience: a roster where NO agent carries metadata means the board /agents LIST endpoint dropped
+    // per-agent metadata (the by-id endpoint still has it). Every agent then reads native == false and the
+    // whole board-native scan (re-arm AND observe) is silently blind — it would otherwise print a benign
+    // "all 0 board-native agents ok". Warn loudly so this failure mode can never hide again.
+    if roster_metadata_stripped(agents) {
+        eprintln!(
+            "-- WARNING: board /agents returned {} agent(s) but NONE carry metadata — the board-native scan \
+             (re-arm + observe) sees zero native agents and is effectively DISABLED. The by-id endpoint has \
+             metadata; the LIST endpoint is omitting it. No observer will spawn and no board agent will be \
+             re-armed until the /agents list includes per-agent metadata.",
+            agents.len()
+        );
     }
     // Observation (#187): per-agent transcript-growth threshold (lines/records). Read once per sweep.
     let observe_threshold = std::env::var("CDZ_OBSERVE_LINES")
@@ -5471,6 +5494,27 @@ mod tests {
         assert!(ids.contains("v-slack-bridge") && ids.contains("v-board-pm"));
         assert!(!ids.contains("v-file-hub-only") && !ids.contains("v-no-flag"));
         assert_eq!(ids.len(), 2, "only native:true rows with an id");
+    }
+
+    #[test]
+    fn roster_metadata_stripped_fires_only_when_every_row_lacks_metadata() {
+        // The failure shape: a non-empty roster where NO agent carries a metadata object (the /agents LIST
+        // endpoint dropped it) → warn.
+        let stripped = vec![
+            serde_json::json!({"id":"a","status":"online"}),
+            serde_json::json!({"id":"b","status":"online"}),
+        ];
+        assert!(roster_metadata_stripped(&stripped));
+        // Any row WITH metadata (even `false`/empty) means the endpoint is serving metadata → not this failure.
+        let has_some = vec![
+            serde_json::json!({"id":"a"}),
+            serde_json::json!({"id":"b","metadata":{"native":false}}),
+        ];
+        assert!(!roster_metadata_stripped(&has_some));
+        // A normal roster with metadata is fine.
+        assert!(!roster_metadata_stripped(&[serde_json::json!({"id":"a","metadata":{"native":true}})]));
+        // An empty roster is a board outage / no agents, NOT a metadata-stripping bug → do not warn.
+        assert!(!roster_metadata_stripped(&[]));
     }
 
     #[test]
