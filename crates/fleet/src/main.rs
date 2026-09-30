@@ -4820,7 +4820,7 @@ fn nudge_body(threshold_hours: f64, assignee: &str, idle_secs: i64) -> String {
     format!(
         "fleet nudge: this task has had no activity for over {threshold_hours}h (idle {}). {assignee}, please \
          do ONE of: post a progress update or ETA; if you cannot progress it now, reassign it to an available \
-         agent; or update the status — mark it done, or blocked with a blocked_on note if it is waiting on \
+         agent; or update the status - mark it done, or blocked with a blocked_on note if it is waiting on \
          something (if you are unsure whether it is blocked, say that).",
         format_hm(idle_secs)
     )
@@ -4842,7 +4842,7 @@ fn owner_is_gone(owner: &str, roster_ids: &std::collections::BTreeSet<String>) -
 /// WHY it landed in the router's queue (unassigned, or its owner is gone from the roster). Pure — unit-tested.
 fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
     format!(
-        "fleet nudge: reassigned to {NUDGE_ROUTER} for routing — {reason}, and stale for over {threshold_hours}h \
+        "fleet nudge: reassigned to {NUDGE_ROUTER} for routing - {reason}, and stale for over {threshold_hours}h \
          (idle {}). {NUDGE_ROUTER}, please assign it to a capable agent or update its status (done / blocked / \
          cancelled if obsolete).",
         format_hm(idle_secs)
@@ -4955,6 +4955,14 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         // todo now qualify.
         let status = full.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
         if status != "in_progress" && status != "todo" {
+            continue;
+        }
+        // board-pm race-hardening (#540 inc2): re-read the AUTHORITATIVE assignee from the FRESH get_task
+        // record, not the older list snapshot — a task reassigned or unassigned between the list query and now
+        // must route/nudge on its LIVE owner, closing the read-vs-act race. Re-apply the operator exclusion on
+        // the fresh value too (a task just handed to the operator must not be nudged).
+        let assignee = full.get("assignee").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
+        if assignee == Some(NUDGE_EXEMPT_ASSIGNEE) {
             continue;
         }
         // #540(b): a todo is only a stall once work actually STARTED on it (a real comment) — a bare untouched
