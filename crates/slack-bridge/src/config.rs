@@ -12,7 +12,7 @@
 //! has written the config / created the Slack app. A [`Config`] whose [`Config::tokens`] returns `None`
 //! is valid: the caller logs "tokens absent, idle" and the transport loop stays dormant, retrying.
 
-use crate::resolver::ChannelLink;
+use bridge_core::ChannelLink;
 use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -266,7 +266,8 @@ mod tests {
         let cfg = Config::from_toml_str(toml, &base()).unwrap();
         assert_eq!(cfg.channel_map.len(), 2);
         assert_eq!(cfg.channel_map[0].board_channel_id, 7);
-        assert_eq!(cfg.channel_map[0].slack_channel, "C7");
+        // The deployed TOML uses the legacy `slack_channel` key (parsed via the bridge_core serde alias).
+        assert_eq!(cfg.channel_map[0].external_channel, "C7");
         assert_eq!(cfg.channel_map[1].board_channel_id, 8);
     }
 

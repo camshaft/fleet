@@ -2,13 +2,12 @@
 //! `main.rs` so `main` reads as a wiring diagram. Not unit-tested (live WebSocket + blocking board I/O
 //! moved off the runtime via `spawn_blocking`); the pure decisions it calls into ARE tested in the lib.
 
-use slack_bridge::board::{BoardClient, LINK_SOURCE};
-use slack_bridge::config::Config;
-use slack_bridge::format::{render_outbound_reflect, render_outbound_reflect_plain};
-use slack_bridge::{
-    plan_inbound, plan_outbound, relay_plan, slack_external_author, ChannelLink, ChannelMap, Event,
-    RelayPlan, SlackTokens, RELAY_QUEUE_WARN,
+use bridge_core::{
+    external_author, plan_inbound, plan_outbound, relay_plan, BoardClient, ChannelLink, ChannelMap,
+    Event, OutboundPost, RelayPlan, LINK_SOURCE, RELAY_QUEUE_WARN,
 };
+use slack_bridge::config::{Config, SlackTokens};
+use slack_bridge::format::{render_outbound_reflect, render_outbound_reflect_plain};
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -38,8 +37,10 @@ const MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub async fn fetch_channel_map(cfg: &Config) -> ChannelMap {
     let board_api = cfg.board_api.clone();
     let mut links: Vec<ChannelLink> =
-        match tokio::task::spawn_blocking(move || BoardClient::new(&board_api).list_channel_links())
-            .await
+        match tokio::task::spawn_blocking(move || {
+            BoardClient::new(&board_api).list_channel_links(LINK_SOURCE)
+        })
+        .await
         {
             Ok(Ok(l)) => l,
             Ok(Err(e)) => {
@@ -178,9 +179,9 @@ fn plan_outbound_locked(
     map: &SharedMap,
     events: &[Event],
     cursor: i64,
-) -> Result<(Vec<slack_bridge::OutboundPost>, i64), BoxErr> {
+) -> Result<(Vec<OutboundPost>, i64), BoxErr> {
     let guard = map.read().map_err(|_| "channel map lock poisoned")?;
-    Ok(plan_outbound(events, cursor, |cid| guard.board_to_slack(cid)))
+    Ok(plan_outbound(events, cursor, |cid| guard.board_to_external(cid)))
 }
 
 /// Classify a Slack post error: CONTENT (the message itself is un-postable — an API error like
@@ -230,7 +231,7 @@ async fn outbound_tick(
             render_outbound_reflect(&post.reflect)
         };
         let req = SlackApiChatPostMessageRequest::new(
-            post.slack_channel.clone().into(),
+            post.external_channel.clone().into(),
             SlackMessageContent::new().with_text(text),
         );
         match session.chat_post_message(&req).await {
@@ -363,8 +364,8 @@ async fn handle_message(state: &BridgeState, client: &SlackHyperClient, msg: Sla
             tracing::warn!("inbound: channel map lock poisoned — dropping message");
             return;
         };
-        plan_inbound(&channel, &user, text, None, &cfg.bridge_agent, |ch| {
-            guard.slack_to_board(ch)
+        plan_inbound(&channel, LINK_SOURCE, &user, text, None, &cfg.bridge_agent, |ch| {
+            guard.external_to_board(ch)
         })
     };
     let Some(plan) = planned else {
@@ -428,7 +429,7 @@ async fn maybe_register_identity(state: &BridgeState, client: &SlackHyperClient,
         tracing::debug!(%user, "inbound: no display name on the Slack profile — leaving identity name absent");
         return;
     };
-    let external_id = slack_external_author(user);
+    let external_id = external_author(LINK_SOURCE, user);
     let board_api = state.cfg.board_api.clone();
     let res = tokio::task::spawn_blocking(move || {
         BoardClient::new(&board_api).upsert_external_identity(&external_id, LINK_SOURCE, &name)

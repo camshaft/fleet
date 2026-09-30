@@ -5,40 +5,35 @@
 //! board owns the bridge CORE (channel-map, external-identity, outbound-authz — board tasks #149/#150/#151);
 //! this crate is TRANSPORT + SYNC only (Slack Socket Mode) and consumes those board primitives.
 //!
-//! The pure, transport-agnostic core (unit-tested here, wired to the live Slack async transport by the
-//! daemon binary in a later slice behind the `transport` feature):
+//! The transport-agnostic core (board REST client, sync planning, channel map, relay-resilience) now lives
+//! in the shared [`bridge_core`] crate, reused by every board↔external bridge (Slack here; the voice bridge
+//! in #316). This crate is the Slack-SPECIFIC layer over it: TOML config, Slack-mrkdwn shaping, and the
+//! async Socket Mode transport binary (behind the `transport` feature). The core types are re-exported here
+//! for convenience so the daemon and the tests can use `slack_bridge::…` uniformly.
+//!
 //! - [`config`] — fail-soft config from a single **TOML file** (operator mandate #159: no env vars;
 //!   only the file path is a `--config` CLI flag), including the localhost board REST base the firehose
-//!   subscriber reads.
-//! - [`board`] — the token-less localhost board REST client: poll the event firehose (`GET /events`) and
-//!   act on `channel.outbound_reflect` events (board-core #150), and post attributed inbound messages
-//!   (`POST /channels/:id/posts`, board-core #149). Pure parsers unit-tested without a network.
+//!   subscriber reads. Slack-specific (holds the Slack credentials + `[[channel_map]]`).
 //! - [`format`] — board ↔ Slack message shaping: render an outbound-reflect as Slack mrkdwn (with
-//!   external-author attribution, HTML-escaping, length-capping + a degraded plain variant / relay-plan
-//!   resilience), and parse an operator's Slack line into a routed [`format::Intent`].
-//! - [`sync`] — the pure bidirectional-sync planning (firehose events → Slack posts + cursor advance;
-//!   inbound Slack → attributed board post), with the board↔Slack channel MAP injected as a resolver so
-//!   the adapter stays decoupled from board-core #149 slice-2 and generic across external sources.
-//! - [`resolver`] — the concrete board↔Slack channel MAP built from the TOML config (`[[channel_map]]`),
-//!   providing the bidirectional lookups the sync planner takes; swappable for a board-backed map later.
-//!
-//! Later slices add the async transport binary (Socket Mode) that wires these together, behind the
-//! `transport` feature.
+//!   external-author attribution, HTML-escaping, length-capping + a degraded plain variant that pairs with
+//!   [`bridge_core::relay`]), and parse an operator's Slack line into a routed [`format::Intent`].
+//! - re-exported from [`bridge_core`]: [`BoardClient`], the [`Event`]/[`OutboundReflect`] firehose types,
+//!   the [`ChannelMap`]/[`ChannelLink`] map, the [`plan_outbound`]/[`plan_inbound`] sync planners, and the
+//!   [`relay_plan`] escalation.
 //!
 //! Kept generic on purpose: Slack-specifics live in this adapter; a second external-source adapter
-//! (GitHub, #136) drops in over the same board core.
+//! (the voice bridge #316, GitHub #136) drops in over the same [`bridge_core`].
 
-pub mod board;
 pub mod config;
 pub mod format;
-pub mod resolver;
-pub mod sync;
 
-pub use board::{parse_channel_links, BoardClient, Event, OutboundReflect, OUTBOUND_REFLECT};
+pub use bridge_core::{
+    external_author, parse_channel_links, plan_inbound, plan_outbound, relay_plan, BoardClient,
+    ChannelLink, ChannelMap, Event, InboundPost, OutboundPost, OutboundReflect, RelayPlan,
+    LINK_SOURCE, OUTBOUND_REFLECT, RELAY_QUEUE_WARN,
+};
 pub use config::{Config, SlackTokens};
 pub use format::{
-    help_text, is_valid_agent_name, parse_operator_message, relay_plan, render_outbound_reflect,
-    render_outbound_reflect_plain, Intent, RelayPlan, RELAY_QUEUE_WARN,
+    help_text, is_valid_agent_name, parse_operator_message, render_outbound_reflect,
+    render_outbound_reflect_plain, Intent,
 };
-pub use resolver::{ChannelLink, ChannelMap};
-pub use sync::{plan_inbound, plan_outbound, slack_external_author, InboundPost, OutboundPost};

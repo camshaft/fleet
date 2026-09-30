@@ -35,6 +35,9 @@ required-features = ["transport"]
 transport = ["dep:slack-morphism", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:clap"]
 
 [dependencies]
+# The transport-agnostic bridge core (board REST client, sync planning, channel map, relay resilience),
+# shared with the voice bridge (#316). Slack-specifics (mrkdwn shaping, Socket Mode) stay in this crate.
+bridge-core = { path = "../bridge-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # The daemon's config format: a single TOML file (operator mandate #159 — no env-var config). Holds
