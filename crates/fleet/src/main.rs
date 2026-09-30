@@ -2327,11 +2327,13 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
 /// are harness-agnostic, only this command differs. The kickoff rides in `$CDZ_KICKOFF` (set on the window),
 /// so the command references that env var rather than interpolating the prompt. Pure so it is unit-tested.
 ///
-/// `claude` is fully wired. `codex` is a recognized-but-not-yet-wired harness: it returns an actionable
-/// error rather than a guessed command, because Codex needs both its own CLI launch flags (model /
-/// unattended-approval / initial-prompt) AND its own kickoff/loop/wake semantics — the Claude `/loop` +
-/// in-session-MCP self-discovery model is Claude-specific and does not carry over unchanged. An unknown
-/// harness is rejected so a typo'd `metadata.harness` fails loudly at spin-up instead of launching nothing.
+/// `claude` and `codex` are both wired. Each takes a persistent-TUI launch that reads its initial prompt
+/// from `$CDZ_KICKOFF`; the kickoff prose itself drives the recurring loop, so the two share one kickoff and
+/// wake path and differ only in the CLI's own launch flags. `codex` reaches its model through whatever the
+/// agent's `metadata.model` names, which for a codex agent is an OpenAI-wire model name (the codex CLI speaks
+/// the OpenAI wire protocol) rather than a Claude model id — this arm passes it through unchanged, so the
+/// concrete name lives in board data, not here. An unknown harness is rejected so a typo'd `metadata.harness`
+/// fails loudly at spin-up instead of launching nothing.
 /// `devshell` (opt-in, `metadata.devshell = true`): when `Some(workdir)`, launch INSIDE that workdir's flake
 /// devShell (`nix develop "path:<workdir>" --command …`) so the flake-pinned toolchain (node/cargo/python/…)
 /// is on PATH instead of the host's — the host PATH drifts (e.g. host node v18 breaks a flake-pinned build,
@@ -2358,13 +2360,20 @@ fn build_launch_cmd(
                 None => format!("exec {claude}"),
             })
         }
-        "codex" => Err(
-            "harness 'codex' is recognized but its launch is not wired yet — fill in the codex arm of \
-             build_launch_cmd (the codex CLI's model flag + unattended/no-approval flags + initial-prompt \
-             from $CDZ_KICKOFF) AND give codex its own kickoff/loop/wake semantics (the Claude /loop + \
-             in-session-MCP self-discovery model does not carry over). Validate against a live codex install."
-                .to_string(),
-        ),
+        "codex" => {
+            // The bypass flag runs unattended (no per-action approval, no sandbox); the model is
+            // single-quoted so nothing in it can glob; the kickoff rides in $CDZ_KICKOFF (set literally via
+            // `-e`, expanded double-quoted) so its spaces/quotes are safe. codex still gates a first-run
+            // launch on per-workspace folder trust, which the bypass flag does NOT skip — spin-up pre-trusts
+            // the workdir out of band, so the launch itself does not carry it.
+            let codex = format!(
+                "codex --dangerously-bypass-approvals-and-sandbox --model '{model}' \"$CDZ_KICKOFF\""
+            );
+            Ok(match devshell {
+                Some(dir) => format!("exec nix develop \"path:{dir}\" --command {codex}"),
+                None => format!("exec {codex}"),
+            })
+        }
         other => Err(format!(
             "unknown harness '{other}' (known: claude, codex) — set metadata.harness on the agent's board record"
         )),
@@ -4928,7 +4937,7 @@ mod tests {
     }
 
     #[test]
-    fn build_launch_cmd_wires_claude_and_stages_codex_and_rejects_unknown() {
+    fn build_launch_cmd_wires_claude_and_codex_and_rejects_unknown() {
         // claude is fully wired: the exec line carries the model/effort and reads the kickoff from the env.
         let c = build_launch_cmd("claude", "claude-x", "high", None).expect("claude wired");
         assert!(c.starts_with("exec claude "));
@@ -4938,9 +4947,16 @@ mod tests {
         let d = build_launch_cmd("claude", "claude-x", "high", Some("/wt/v-x")).expect("claude wired");
         assert!(d.starts_with("exec nix develop \"path:/wt/v-x\" --command claude "), "wrapped in nix develop");
         assert!(d.contains("--model 'claude-x'") && d.contains("\"$CDZ_KICKOFF\""), "same claude args inside the devShell");
-        // codex is recognized but not yet wired — an actionable error, never a guessed command.
-        let e = build_launch_cmd("codex", "m", "high", None).unwrap_err();
-        assert!(e.contains("codex") && e.contains("not wired"));
+        // codex is wired: bypass flag for unattended run, model passed through single-quoted, kickoff from env.
+        let x = build_launch_cmd("codex", "codex-m", "high", None).expect("codex wired");
+        assert!(x.starts_with("exec codex "));
+        assert!(x.contains("--dangerously-bypass-approvals-and-sandbox"), "unattended: no approval/sandbox gate");
+        assert!(x.contains("--model 'codex-m'"), "model passed through (board data supplies the concrete name)");
+        assert!(x.contains("\"$CDZ_KICKOFF\""), "codex reads the same kickoff env var, not an interpolated prompt");
+        assert!(!x.contains("--effort"), "codex takes no --effort flag (claude-only)");
+        // codex honors the same devShell wrapping as claude.
+        let xd = build_launch_cmd("codex", "codex-m", "high", Some("/wt/v-x")).expect("codex wired");
+        assert!(xd.starts_with("exec nix develop \"path:/wt/v-x\" --command codex "), "codex wrapped in nix develop too");
         // an unknown/typo'd harness fails loudly.
         let u = build_launch_cmd("gpt5", "m", "high", None).unwrap_err();
         assert!(u.contains("unknown harness 'gpt5'"));
