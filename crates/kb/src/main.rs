@@ -5,6 +5,9 @@
 //! and `kb search <query>` mirrors the Python `kb.cli`. The board-driven ingest workers stay Python until
 //! phase 2. Config is a single TOML file (`--config`), never env vars (operator mandate seq-1377).
 
+// Phase-2 ingest infra: the coordination-board REST client the board-driven workers (#238) use. Its own
+// `allow(dead_code)` (see the module) covers being landed ahead of its callers.
+mod board;
 mod chunk;
 mod config;
 mod curate;
