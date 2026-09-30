@@ -20,9 +20,12 @@ mod extract;
 #[allow(dead_code)]
 mod ipfs;
 mod mcp;
+// Phase-2 ingest infra: the inbound webhook receiver the board-driven workers register against. Its own
+// `allow(dead_code)` (see the module) covers being landed ahead of its callers.
 mod rerank;
 mod search;
 mod store;
+mod webhook;
 
 use std::path::PathBuf;
 use std::process;
