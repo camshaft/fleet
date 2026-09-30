@@ -116,10 +116,35 @@ impl Capture {
     /// begin the loop the moment a device appears, instead of exiting and letting the supervisor
     /// crash-loop. Blocks until a device is open.
     pub fn open_with_retry(audio: &Audio) -> Self {
+        // A freshly-opened stream must stay fault-free for this window before we trust it. An ALSA open
+        // race — e.g. the Jabra's intermittent errno -32 `snd_pcm_poll_descriptors` storm seen on a
+        // service restart — makes `open` return Ok, then delivers a flood of faults to the error callback
+        // within milliseconds. So `open` succeeding is NOT enough: without this settle check the reconnect
+        // path respins instantly (open ok -> immediate storm -> reopen -> storm), spamming ~10k errors/min
+        // and starving the wake engine so no wake fires, while the process still looks healthy to its
+        // supervisor. A stream that survives the window is genuinely up; one that faults inside it is an
+        // open race we back off from, giving the device time to settle (which is why a manual restart
+        // clears it today).
+        const SETTLE: Duration = Duration::from_millis(300);
         let mut backoff = Duration::ZERO;
         loop {
             match Self::open(audio) {
-                Ok(c) => return c,
+                Ok(c) => {
+                    std::thread::sleep(SETTLE);
+                    if c.healthy() {
+                        return c;
+                    }
+                    // Opened but faulted within the grace window: an open race, not a settled device.
+                    // Close the faulting stream, then back off before retrying rather than reopening in a
+                    // tight storm.
+                    drop(c);
+                    backoff = next_backoff(backoff);
+                    eprintln!(
+                        "[audio] capture opened but faulted within {SETTLE:?} (device not ready); \
+                         retrying in {backoff:?}"
+                    );
+                    std::thread::sleep(backoff);
+                }
                 Err(e) => {
                     backoff = next_backoff(backoff);
                     eprintln!(
