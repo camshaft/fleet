@@ -18,8 +18,9 @@
 //! - The resolved `crate_version` from the JSON (not the requested `version`, which may be "latest") names
 //!   the collection AND is the `ver` component of the point id — so ingesting "latest" is idempotent with
 //!   ingesting the explicit version it resolves to.
-//! - The payload `url` is the crate's docs.rs root; if the Python stored a per-item URL, parity testing will
-//!   surface the difference (payload fields affect display/ranking only — never the vectors or point ids).
+//! - The payload `url` is the rendered-docs root `https://docs.rs/<name>/<ver>/<name>/` — the form the live
+//!   Python crate_docs.py stored (confirmed by the task_237 green parity byte-match: ids + vectors + all
+//!   content fields incl. url match the live crate.tokio.1.53.1) and the same form pipeline.rs uses.
 
 // Ported ahead of its pipeline caller (#238); the CLI uses it now. Some helpers read as dead code until then.
 #![allow(dead_code)]
@@ -92,7 +93,7 @@ pub async fn ingest_crate(
     // Build every (id, text, payload) up front; the point id keys on the item path + chunk index, so item
     // iteration order does not affect ids (a re-ingest updates in place regardless of order).
     let cfg = config::get();
-    let url = format!("https://docs.rs/crate/{name}/{crate_version}");
+    let url = docs_url(name, &crate_version);
     let mut ids: Vec<String> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
     let mut payloads: Vec<Map<String, Value>> = Vec::new();
@@ -202,6 +203,15 @@ fn dry_run_json(collection: &str, id: &str, vector: &[f32], payload: &Map<String
         "vector_head": vector.iter().take(8).copied().collect::<Vec<f32>>(),
         "payload": payload,
     })
+}
+
+/// The payload citation `url` for a crate's items: the rendered-docs root `https://docs.rs/<name>/<ver>/<name>/`,
+/// NOT the `/crate/<name>/<ver>` JSON-fetch form. This is the form the live Python crate_docs.py stored AND the
+/// form pipeline.rs's rustdoc branch uses — green-side parity (task_237) confirmed all 599 live tokio points
+/// carry it, so matching it makes crate-docs byte-identical to live (a re-ingest updates the url in place
+/// rather than clobbering it) and aligns the two docs.rs paths for the #238 reconciliation. Pure; unit-tested.
+fn docs_url(name: &str, crate_version: &str) -> String {
+    format!("https://docs.rs/{name}/{crate_version}/{name}/")
 }
 
 /// Extract documented items from rustdoc JSON — the Python `_items`. Iterates `doc["index"]` (id -> item)
@@ -348,6 +358,20 @@ mod tests {
         assert_ne!(
             a,
             chunk::id(&["docs.rs", "anyhow", "1.2.3", "anyhow::Chain", "1"])
+        );
+    }
+
+    #[test]
+    fn docs_url_is_the_rendered_docs_root_form() {
+        // The LIVE form (matches Python crate_docs.py + pipeline.rs), proven byte-identical by the task_237
+        // green parity run. NOT the `/crate/<name>/<ver>` JSON-fetch form.
+        assert_eq!(
+            docs_url("tokio", "1.53.1"),
+            "https://docs.rs/tokio/1.53.1/tokio/"
+        );
+        assert_eq!(
+            docs_url("anyhow", "1.0.104"),
+            "https://docs.rs/anyhow/1.0.104/anyhow/"
         );
     }
 
