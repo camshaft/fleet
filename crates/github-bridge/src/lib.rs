@@ -43,19 +43,19 @@ pub mod sync;
 
 pub use board::{
     build_comment_body, build_identity_body, build_review_body, build_review_log_body, build_task_body,
-    comment_ref, issue_ref, parse_events, parse_issue_ref, BoardClient, Event, TaskReflect, LINK_SOURCE,
-    REVIEW_LINK_SOURCE, TASK_OUTBOUND_REFLECT,
+    comment_ref, issue_ref, parse_events, parse_issue_ref, review_comment_ref, BoardClient, Event,
+    TaskReflect, LINK_SOURCE, REVIEW_LINK_SOURCE, TASK_OUTBOUND_REFLECT,
 };
 pub use config::{Config, DEFAULT_CONFIG_FILENAME};
 pub use github::{
-    github_external_author, parse_issue_comments, parse_issues, parse_pull_request, parse_pull_reviews,
-    GithubClient, Issue, IssueComment, PullRequest, PullReview, PER_PAGE,
+    github_external_author, parse_issue_comments, parse_issues, parse_pull_request, parse_pull_review_comments,
+    parse_pull_reviews, GithubClient, Issue, IssueComment, PullRequest, PullReview, ReviewComment, PER_PAGE,
 };
 pub use state::State;
 pub use sync::{
     latest_review_decision, plan_comment_ingest, plan_issue_ingest, plan_outbound, plan_pr_comment_log,
-    plan_pr_review_ingest, pr_review_status, refine_open_status, render_outbound_github_comment,
-    render_pr_review_description, render_task_description, CommentIngestPlan, CommentPost, IssueIngestPlan,
-    OutboundComment, PrReviewIngestPlan, PrReviewStatus, ReviewCreate, ReviewDecision, ReviewLogEntry,
-    TaskCreate,
+    plan_pr_finding_log, plan_pr_review_ingest, pr_review_status, refine_open_status, render_finding_body,
+    render_outbound_github_comment, render_pr_review_description, render_task_description, CommentIngestPlan,
+    CommentPost, IssueIngestPlan, OutboundComment, PrReviewIngestPlan, PrReviewStatus, ReviewCreate,
+    ReviewDecision, ReviewLogEntry, TaskCreate,
 };

@@ -19,8 +19,8 @@ use github_bridge::board::{parse_issue_ref, BoardClient, LINK_SOURCE};
 use github_bridge::config::Config;
 use github_bridge::{
     github_external_author, latest_review_decision, plan_comment_ingest, plan_issue_ingest, plan_outbound,
-    plan_pr_comment_log, plan_pr_review_ingest, refine_open_status, GithubClient, Issue, PrReviewStatus,
-    State, PER_PAGE,
+    plan_pr_comment_log, plan_pr_finding_log, plan_pr_review_ingest, refine_open_status, GithubClient, Issue,
+    PrReviewStatus, State, PER_PAGE,
 };
 use std::collections::HashSet;
 use std::thread;
@@ -173,9 +173,9 @@ fn refine_pr_open_status(gh: &GithubClient, repo: &str, number: i64) -> PrReview
 /// IN, for ONE repo: poll its issues + comments (the issues poll returns PRs too, `state=all`). Real issues
 /// become attributed board tasks + attributed board comments; pull requests become board code reviews
 /// (BUILD 2a/2b) — a `create_review` per PR, its status advanced (an open PR refined via the Pulls + Reviews
-/// APIs into open/in_review/changes_requested, a merged PR → approved, a closed-unmerged PR → closed), and its
-/// conversation comments logged to the review. All idempotent via the board's external_links (#270 / Review
-/// entity #372). Advances this repo's cursor.
+/// APIs into open/in_review/changes_requested, a merged PR → approved, a closed-unmerged PR → closed), its
+/// conversation comments logged to the review, and its inline diff-review comments logged as findings (2b-2).
+/// All idempotent via the board's external_links (#270 / Review entity #372). Advances this repo's cursor.
 fn in_tick_repo(
     cfg: &Config,
     gh: &GithubClient,
@@ -277,6 +277,26 @@ fn in_tick_repo(
             )?;
             if appended {
                 tracing::info!(comment = %entry.external_id, review_id, "logged GitHub PR comment → review log");
+            }
+        }
+
+        // Inline diff-review comments → finding-type review-log entries (BUILD 2b-2). Distinct endpoint +
+        // ref namespace (owner/repo#rc<id>) from the conversation comments above; board de-dupes each.
+        let findings =
+            collect_pages(|page| gh.list_pull_review_comments(repo, rc.pr_number, since.as_deref(), page))?;
+        for c in &findings {
+            register_author(board, &c.author, &mut seen_authors);
+        }
+        for entry in &plan_pr_finding_log(&findings, repo, self_login) {
+            let appended = board.append_review_log(
+                review_id,
+                "finding",
+                &entry.body,
+                entry.external_author.as_deref(),
+                &entry.external_id,
+            )?;
+            if appended {
+                tracing::info!(finding = %entry.external_id, review_id, "logged GitHub PR review finding → review log");
             }
         }
     }
