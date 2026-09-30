@@ -131,7 +131,44 @@ fn find_from(chars: &[char], from: usize, target: char) -> Option<usize> {
 /// Remove the residual inline-markup characters (emphasis, inline code, strikethrough) that carry no
 /// spoken meaning. Conservative: only these four, so ordinary punctuation and words are untouched.
 fn strip_marks(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '*' | '_' | '`' | '~')).collect()
+    s.chars()
+        .filter(|c| !matches!(c, '*' | '_' | '`' | '~'))
+        .collect()
+}
+
+/// Split already-cleaned speakable text into sentence-sized chunks for INCREMENTAL synthesis, so the
+/// first chunk can start playing while later chunks are still synthesized — the batch Kokoro synth of a
+/// whole reply is the dominant reply→speaker latency (#454), and this drops time-to-first-audio to the
+/// first sentence. Splits after a sentence terminator (`.`/`!`/`?`) that is followed by whitespace or the
+/// end of the text, so decimals ("3.14") and most inline dots don't split mid-token; a run of terminators
+/// ("?!") stays with its sentence. Whitespace-only pieces are dropped; text with no terminator returns as
+/// a single chunk. Pure.
+pub fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            let next = chars.get(i + 1);
+            // End the sentence only when the terminator is the LAST of any run ("?!") and what follows is
+            // whitespace or the end — so "3.14" and "e.g.x" don't split, but "Here. Now" does.
+            let next_is_terminator = matches!(next, Some('.' | '!' | '?'));
+            let ends = next.is_none_or(|n| n.is_whitespace());
+            if ends && !next_is_terminator {
+                let s = cur.trim();
+                if !s.is_empty() {
+                    out.push(s.to_string());
+                }
+                cur.clear();
+            }
+        }
+    }
+    let tail = cur.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -153,7 +190,10 @@ mod tests {
 
     #[test]
     fn plain_text_passes_through() {
-        assert_eq!(render_reply(&reflect("The build is green.")), "The build is green.");
+        assert_eq!(
+            render_reply(&reflect("The build is green.")),
+            "The build is green."
+        );
     }
 
     #[test]
@@ -174,13 +214,58 @@ mod tests {
 
     #[test]
     fn images_become_their_alt_text() {
-        assert_eq!(strip_markdown("![a diagram](x.png) shows it"), "a diagram shows it");
+        assert_eq!(
+            strip_markdown("![a diagram](x.png) shows it"),
+            "a diagram shows it"
+        );
     }
 
     #[test]
     fn reference_style_brackets_are_left_alone() {
         // No `(...)` follows, so it isn't a link — keep the literal text (minus the stripped marks).
         assert_eq!(strip_markdown("the array[0] value"), "the array[0] value");
+    }
+
+    #[test]
+    fn split_sentences_breaks_on_terminators() {
+        assert_eq!(
+            split_sentences("Yes, I'm here. What do you need?"),
+            vec!["Yes, I'm here.", "What do you need?"]
+        );
+    }
+
+    #[test]
+    fn split_sentences_single_chunk_when_no_terminator() {
+        assert_eq!(split_sentences("Salt Lake City"), vec!["Salt Lake City"]);
+    }
+
+    #[test]
+    fn split_sentences_keeps_a_terminator_run_together() {
+        assert_eq!(split_sentences("Really?! Okay."), vec!["Really?!", "Okay."]);
+    }
+
+    #[test]
+    fn split_sentences_does_not_split_decimals_or_inline_dots() {
+        // A dot not followed by whitespace (a decimal) must not split.
+        assert_eq!(
+            split_sentences("It is 3.14 today."),
+            vec!["It is 3.14 today."]
+        );
+    }
+
+    #[test]
+    fn split_sentences_drops_empty_and_whitespace_pieces() {
+        assert!(split_sentences("").is_empty());
+        assert!(split_sentences("   ").is_empty());
+        assert_eq!(split_sentences("Done.   "), vec!["Done."]);
+    }
+
+    #[test]
+    fn split_sentences_trailing_text_without_terminator_is_kept() {
+        assert_eq!(
+            split_sentences("First. Then a tail"),
+            vec!["First.", "Then a tail"]
+        );
     }
 
     #[test]
