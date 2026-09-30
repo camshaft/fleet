@@ -26,6 +26,7 @@
 
 pub mod board;
 pub mod channel_config;
+pub mod mention;
 pub mod relay;
 pub mod resolver;
 pub mod sse;
@@ -38,6 +39,7 @@ pub use board::{
 };
 pub use sse::{SseDecoder, SseFrame};
 pub use channel_config::{bridged_channels, Bridged, BridgeConfig};
+pub use mention::{is_mentioned, mentioned_agent};
 pub use relay::{relay_plan, RelayPlan, RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN};
 pub use resolver::{ChannelLink, ChannelMap};
 pub use sync::{external_author, plan_inbound, plan_outbound, InboundPost, OutboundPost};
