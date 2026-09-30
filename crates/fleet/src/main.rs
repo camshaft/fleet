@@ -2254,22 +2254,29 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
     // REACTIVE responders (mention-only bots like a Slack channel participant) invert the pacing: the generic
     // work-conserving loop treats ANY unread notification as a reason to re-poll SOON, but a silence-default
     // responder must treat ambient channel chatter as NON-work and only act when EXPLICITLY addressed — else
-    // it self-schedules short re-polls on coordination noise while (correctly) staying silent (#438). Its only
-    // actionable trigger is being addressed; otherwise it goes idle and waits for a live event-wake.
+    // it self-schedules short re-polls on coordination noise while (correctly) staying silent (#438). Its
+    // actionable triggers are being addressed OR an in-thread follow-up on a conversation it is already part
+    // of (a reply under a thread root it is subscribed to — the notifier wakes it on that delivery, and the
+    // prompt must count it as addressed so it CONTINUES the exchange rather than ignoring it as ambient);
+    // otherwise it goes idle and waits for a live event-wake.
     let tick = if reactive {
         format!(
-            "run one tick as a REACTIVE responder. Your ONLY actionable trigger is being EXPLICITLY \
+            "run one tick as a REACTIVE responder. Your ONLY actionable triggers are being EXPLICITLY \
              ADDRESSED — a mention or @mention of you in a channel you belong to, a direct message to you, or \
-             a task assigned to you. Ambient channel chatter and unread coordination posts that do NOT \
-             address you are NOT work — read them for context if useful, but they NEVER make you act or \
-             re-poll. Each wake: check whether anything ADDRESSES you (check_notifications with agent_id \
-             '{agent}'); if so, handle it per your charter (respond / act), then re-check. If NOTHING \
-             addresses you, you are DONE for this wake — update presence (set_status) if useful, then go idle \
-             and WAIT TO BE WOKEN. Do NOT schedule a soon next tick just because coordination chatter is \
-             unread — silence is your default and a live event-wake re-tickets you the instant you are \
-             addressed, so short-cadence polling on ambient activity buys nothing and risks a wrong ambient \
-             interjection. Fall straight to the long idle cadence (about {interval}) whenever nothing \
-             addresses you."
+             a task assigned to you — OR an in-thread FOLLOW-UP on a conversation you are already engaged in: \
+             a post whose reply_to is a thread root you are subscribed to (check_notifications surfaces \
+             data.reply_to and a per-recipient thread_subscribed marker). A threaded reply to a message you \
+             are handling continues that exchange and IS addressed to you, even without a fresh @mention — \
+             stay in the thread until it resolves. Ambient channel chatter and unread coordination posts that \
+             do NOT address you and are NOT under a thread you are engaged in are NOT work — read them for \
+             context if useful, but they NEVER make you act or re-poll. Each wake: check whether anything \
+             ADDRESSES you or continues a thread you are in (check_notifications with agent_id '{agent}'); if \
+             so, handle it per your charter (respond / act), then re-check. If NOTHING addresses you, you are \
+             DONE for this wake — update presence (set_status) if useful, then go idle and WAIT TO BE WOKEN. \
+             Do NOT schedule a soon next tick just because coordination chatter is unread — silence is your \
+             default and a live event-wake re-tickets you the instant you are addressed, so short-cadence \
+             polling on ambient activity buys nothing and risks a wrong ambient interjection. Fall straight to \
+             the long idle cadence (about {interval}) whenever nothing addresses you."
         )
     } else {
         format!(
@@ -5006,7 +5013,12 @@ mod tests {
         assert!(r.contains("/loop run one tick"), "still a dynamic /loop");
         // The reactive discipline (#438): only being ADDRESSED is actionable; ambient chatter is NOT work.
         assert!(r.contains("REACTIVE responder"), "declares reactive mode");
-        assert!(r.contains("EXPLICITLY") && r.contains("ADDRESSED"), "only an explicit address is a trigger");
+        assert!(r.contains("EXPLICITLY") && r.contains("ADDRESSED"), "an explicit address is a trigger");
+        // #438 thread-engagement: an in-thread follow-up on a conversation it is already in ALSO triggers it —
+        // the live thread-subscription delivery wakes it on a reply_to=subscribed-root post, and the prompt
+        // must count that as addressed so it continues the exchange instead of treating it as ambient chatter.
+        assert!(r.contains("reply_to") && r.contains("thread_subscribed"), "an in-thread follow-up is a trigger");
+        assert!(r.contains("FOLLOW-UP"), "names the thread follow-up trigger");
         assert!(r.contains("WAIT TO BE WOKEN"), "goes idle and waits for an event-wake when unaddressed");
         // CRITICAL: it must NOT carry the work-conserving 'unread => keep going SOON' pacing that mis-fires on
         // ambient channel chatter (the exact anti-pattern the observer caught in Frank's boot).
