@@ -140,6 +140,23 @@ fn extract_pdf(path: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Extract a PDF's text per page from in-memory bytes — the bytes analogue of [`extract_pdf`], for the
+/// pipeline embedder which cats a PDF's bytes back from IPFS (it has no file path). Same PDFium bind, per-page
+/// text, and CRLF->LF normalization. A missing libpdfium or an unreadable byte stream is an error.
+pub fn extract_pdf_bytes(data: &[u8]) -> Result<Vec<String>, String> {
+    let pdfium = Pdfium::new(Pdfium::bind_to_system_library().map_err(|e| {
+        format!("extract: pdfium bind failed (is libpdfium on the library path?): {e}")
+    })?);
+    let doc = pdfium
+        .load_pdf_from_byte_slice(data, None)
+        .map_err(|e| format!("extract: pdf from bytes ({} bytes): {e}", data.len()))?;
+    Ok(doc
+        .pages()
+        .iter()
+        .map(|page| normalize_newlines(&page.text().map(|t| t.all()).unwrap_or_default()))
+        .collect())
+}
+
 /// Normalize line endings to `\n` — PDFium's text extraction emits `\r\n` (and can emit lone `\r`), whereas
 /// the rest of the KB corpus (and the Python pymupdf path) uses `\n`. Normalizing keeps ingested PDF text
 /// consistent with every other source and removes one source of pdfium-vs-pymupdf drift if an existing
@@ -266,5 +283,11 @@ mod tests {
         assert_eq!(normalize_newlines("trailing\r\n"), "trailing\n");
         // A bare \r\n does not become \n\n.
         assert_eq!(normalize_newlines("x\r\ny"), "x\ny");
+    }
+
+    #[test]
+    fn extract_pdf_bytes_errors_gracefully_on_non_pdf() {
+        // Non-PDF bytes must surface an Err (bad load or missing libpdfium), never panic.
+        assert!(extract_pdf_bytes(b"this is not a pdf").is_err());
     }
 }

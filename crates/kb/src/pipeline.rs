@@ -18,6 +18,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::extract;
+
 /// Content-type tag the uploader stamps on a ticket and the embedder dispatches on — the Python string
 /// constants. `rustdoc-json` is set by the docs.rs fetch path; `pdf`/`text` come from [`content_type_for`].
 pub const RUSTDOC_JSON: &str = "rustdoc-json";
@@ -127,6 +129,151 @@ fn slugify(base: &str) -> String {
     }
 }
 
+/// A ticket metadata string field with a default when the key is ABSENT (empty-but-present is kept) —
+/// mirrors Python `meta.get(key, default)`, distinct from [`truthy_str`]'s `or`-chain semantics.
+fn str_or<'a>(meta: &'a Map<String, Value>, key: &str, default: &'a str) -> &'a str {
+    meta.get(key).and_then(Value::as_str).unwrap_or(default)
+}
+
+/// One unit to embed — the Python `_items_from` yield: `key` seeds the point id (`_id(collection, key,
+/// chunk_idx)`), `body` is chunked + embedded, `extra` is merged into each chunk's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    pub key: String,
+    pub body: String,
+    pub extra: Map<String, Value>,
+}
+
+/// Turn a ticket's fetched bytes into embeddable [`Item`]s, dispatching on content-type — the Python
+/// `_items_from`. `rustdoc-json` walks the index/paths; `pdf` extracts per non-empty page; everything else is
+/// one UTF-8 text unit. The `extra` map carries the payload fields the embedder merges (including `kind`,
+/// which the caller lifts into `base_payload`).
+pub fn items_from(
+    content_type: &str,
+    data: &[u8],
+    meta: &Map<String, Value>,
+) -> Result<Vec<Item>, String> {
+    match content_type {
+        RUSTDOC_JSON => items_from_rustdoc(data, meta),
+        PDF => items_from_pdf(data, meta),
+        _ => Ok(items_from_text(data, meta)),
+    }
+}
+
+/// rustdoc-JSON: one item per documented index entry with a matching `paths` entry. `path` is the joined
+/// `paths[id].path` (present-but-empty array -> ""), else `item.name` else the raw id; `kind` defaults to
+/// `"item"` when absent. body = `"{path} \u{2014} {kind}\n\n{docs}"`. Faithful to pipeline.py (which differs
+/// from crate_docs.rs's parse: different fallbacks + a different point-id formula — see decision #2).
+fn items_from_rustdoc(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item>, String> {
+    let doc: Value = serde_json::from_slice(data)
+        .map_err(|e| format!("pipeline: rustdoc JSON did not parse: {e}"))?;
+    let crate_name = truthy_str(meta, "crate")
+        .or_else(|| truthy_str(meta, "source"))
+        .unwrap_or("None")
+        .to_string();
+    let ver = doc
+        .get("crate_version")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| truthy_str(meta, "version"))
+        .unwrap_or("latest")
+        .to_string();
+    let src_url = format!("https://docs.rs/{crate_name}/{ver}/{crate_name}/");
+    let (Some(index), Some(paths)) = (
+        doc.get("index").and_then(Value::as_object),
+        doc.get("paths").and_then(Value::as_object),
+    ) else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for (iid, item) in index {
+        let docs = item.get("docs").and_then(Value::as_str).unwrap_or("");
+        if docs.trim().is_empty() {
+            continue;
+        }
+        let Some(p) = paths.get(iid) else { continue };
+        // path = "::".join(p.path) when a "path" array is present (empty -> ""), else item.name, else id.
+        let path = match p.get("path") {
+            Some(Value::Array(segs)) => segs
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("::"),
+            _ => item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(iid)
+                .to_string(),
+        };
+        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("item");
+        let body = format!("{path} \u{2014} {kind}\n\n{docs}");
+        let mut extra = Map::new();
+        extra.insert("kind".into(), Value::from("doc"));
+        extra.insert("source".into(), Value::from("docs.rs"));
+        extra.insert("path".into(), Value::from(path.clone()));
+        extra.insert("title".into(), Value::from(path.clone()));
+        extra.insert("url".into(), Value::from(src_url.clone()));
+        extra.insert("crate".into(), Value::from(crate_name.clone()));
+        extra.insert("crate_version".into(), Value::from(ver.clone()));
+        out.push(Item {
+            key: path,
+            body,
+            extra,
+        });
+    }
+    Ok(out)
+}
+
+/// PDF: one item per non-empty page (1-based), body = the page's trimmed text. `key = "p{n}"`, payload
+/// carries `page`. Extraction is bytes-based (the embedder has no file path) + CRLF-normalized.
+fn items_from_pdf(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item>, String> {
+    let title = truthy_str(meta, "filename")
+        .or_else(|| truthy_str(meta, "source"))
+        .unwrap_or("doc")
+        .to_string();
+    let source = str_or(meta, "source_type", "ipfs").to_string();
+    let mut out = Vec::new();
+    for (i, page) in extract::extract_pdf_bytes(data)?.into_iter().enumerate() {
+        let t = page.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut extra = Map::new();
+        extra.insert("kind".into(), Value::from("doc"));
+        extra.insert("source".into(), Value::from(source.clone()));
+        extra.insert("path".into(), Value::from(title.clone()));
+        extra.insert("title".into(), Value::from(title.clone()));
+        extra.insert("page".into(), Value::from((i + 1) as i64));
+        out.push(Item {
+            key: format!("p{}", i + 1),
+            body: t.to_string(),
+            extra,
+        });
+    }
+    Ok(out)
+}
+
+/// Plain text / markdown: a single item, the whole UTF-8 decoded body. `key = title`.
+fn items_from_text(data: &[u8], meta: &Map<String, Value>) -> Vec<Item> {
+    let title = truthy_str(meta, "filename")
+        .or_else(|| truthy_str(meta, "source"))
+        .unwrap_or("doc")
+        .to_string();
+    let mut extra = Map::new();
+    extra.insert("kind".into(), Value::from(str_or(meta, "kind", "doc")));
+    extra.insert(
+        "source".into(),
+        Value::from(str_or(meta, "source_type", "ipfs")),
+    );
+    extra.insert("path".into(), Value::from(title.clone()));
+    extra.insert("title".into(), Value::from(title.clone()));
+    vec![Item {
+        key: title,
+        body: String::from_utf8_lossy(data).into_owned(),
+        extra,
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +373,63 @@ mod tests {
         // Nothing usable -> docs.misc.
         let m4 = meta(json!({ "source_type": "url" }));
         assert_eq!(collection_for(TEXT, b"", &m4).unwrap(), "docs.misc");
+    }
+
+    #[test]
+    fn items_from_rustdoc_yields_documented_items_with_body_and_payload() {
+        let m = meta(json!({ "source": "anyhow", "version": "1.0.104" }));
+        let data = br#"{
+            "crate_version": "1.0.104",
+            "index": {
+                "10": { "docs": "The Chain iterator.", "name": "Chain" },
+                "11": { "docs": "   ", "name": "Blank" },
+                "12": { "docs": "No paths entry.", "name": "Orphan" }
+            },
+            "paths": {
+                "10": { "path": ["anyhow", "Chain"], "kind": "struct" },
+                "11": { "path": ["anyhow", "Blank"], "kind": "struct" }
+            }
+        }"#;
+        let items = items_from(RUSTDOC_JSON, data, &m).unwrap();
+        // Only id 10 survives: 11 has whitespace-only docs, 12 has no paths entry.
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.key, "anyhow::Chain");
+        assert_eq!(
+            it.body,
+            "anyhow::Chain \u{2014} struct\n\nThe Chain iterator."
+        );
+        assert_eq!(it.extra["kind"], "doc");
+        assert_eq!(it.extra["source"], "docs.rs");
+        assert_eq!(it.extra["path"], "anyhow::Chain");
+        assert_eq!(it.extra["crate"], "anyhow");
+        assert_eq!(it.extra["crate_version"], "1.0.104");
+        assert_eq!(it.extra["url"], "https://docs.rs/anyhow/1.0.104/anyhow/");
+    }
+
+    #[test]
+    fn items_from_rustdoc_kind_defaults_to_item_and_path_falls_back_to_name() {
+        // No "path" array on the paths entry, and no "kind": path falls back to item.name, kind -> "item".
+        let m = meta(json!({ "crate": "c", "version": "0.1.0" }));
+        let data = br#"{
+            "index": { "7": { "docs": "d", "name": "Widget" } },
+            "paths": { "7": {} }
+        }"#;
+        let items = items_from(RUSTDOC_JSON, data, &m).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "Widget");
+        assert_eq!(items[0].body, "Widget \u{2014} item\n\nd");
+    }
+
+    #[test]
+    fn items_from_text_is_single_utf8_unit() {
+        let m = meta(json!({ "filename": "note.md", "source_type": "url", "kind": "manual" }));
+        let items = items_from(TEXT, b"# hello\nworld", &m).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "note.md");
+        assert_eq!(items[0].body, "# hello\nworld");
+        assert_eq!(items[0].extra["kind"], "manual"); // meta.kind honored
+        assert_eq!(items[0].extra["source"], "url");
+        assert_eq!(items[0].extra["title"], "note.md");
     }
 }
