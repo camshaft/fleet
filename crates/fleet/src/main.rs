@@ -2135,12 +2135,14 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
     );
     format!(
         "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
-         this session. FIRST call register_agent with agent_id '{agent}' (idempotent) to BIND this session \
-         to your identity — get_agent ALONE does NOT bind it, so a board write before register_agent fails \
-         with 'no identity for this session'. THEN call get_agent '{agent}' to read your OWN charter + \
-         metadata from the board, and follow that charter as your role. On every board write pass your \
-         identity EXPLICITLY as a fallback (agent_id / created_by / author / actor = '{agent}') — the board \
-         defaults these to null. Coordinate through the board (send_message / check_notifications / \
+         this session. Call register_agent with agent_id '{agent}' once (idempotent) so your board record \
+         exists, then get_agent '{agent}' to read your OWN charter + metadata from the board and follow that \
+         charter as your role. IMPORTANT — the board does NOT bind your session: each call may reach a fresh, \
+         unbound board, so register_agent does NOT make later id-less calls work. Pass your identity \
+         EXPLICITLY on EVERY board call — agent_id on check_notifications / set_status / get_messages / \
+         list_tasks, from_agent on send_message, created_by / author / actor on writes (all = '{agent}'); the \
+         board defaults these to null and any call that omits them fails with 'no identity for this session'. \
+         Coordinate through the board (send_message / check_notifications / \
          comment_task / set_status) — there is no file inbox. Any board Document you author (design / \
          proposal / plan) MUST follow the Fleet Doc-Writing Style Guide — wiki guides/doc-writing-style-guide \
          (Background then Problem Statement then Requirements/Goals/Non-Goals (measurable) then Solutions, \
@@ -4065,11 +4067,14 @@ mod tests {
     #[test]
     fn build_kickoff_is_work_conserving_and_self_discovering() {
         let k = build_kickoff("v-x", "/wt/v-x", "30m");
-        // Identity binding (#216): register_agent FIRST binds the session; get_agent alone does not, so the
-        // kickoff must register before any write + name the explicit-identity fallback (board defaults null).
-        assert!(k.contains("register_agent"), "binds identity before writing");
-        assert!(k.contains("get_agent ALONE does NOT bind") || k.contains("get_agent"), "still self-discovers charter");
-        assert!(k.contains("created_by") && k.contains("actor"), "names the explicit-identity fallback params");
+        // Identity (#336): the board does NOT bind the session (a fresh unbound board per call), so
+        // register_agent can't make later id-less calls work — the kickoff must say pass ids EXPLICITLY on
+        // EVERY call, and still register once + self-discover the charter via get_agent.
+        assert!(k.contains("register_agent"), "registers the record once (idempotent)");
+        assert!(k.contains("get_agent"), "self-discovers its charter");
+        assert!(k.contains("does NOT bind your session"), "states the board never binds the session (#336)");
+        assert!(k.contains("EVERY board call"), "explicit ids on every call, not a fallback");
+        assert!(k.contains("from_agent") && k.contains("created_by") && k.contains("actor"), "names the explicit-id params incl. send_message's from_agent");
         assert!(k.contains("'v-x'") && k.contains("/wt/v-x"));
         // Dynamic loop (no fixed interval arg after /loop) — the agent self-paces.
         assert!(k.contains("/loop run one tick"), "dynamic /loop, not `/loop 30m`");
