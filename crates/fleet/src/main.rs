@@ -2041,8 +2041,8 @@ fn spin_up_workspace_kind(
         }
     }
 
-    match pre_trust_dirs(&plan.pre_trust) {
-        Ok(true) => println!("  pre-trusted {} path(s) (launch cwd + fleet root + config pre_trust)", plan.pre_trust.len()),
+    match pre_trust_for_harness(harness, &plan.pre_trust) {
+        Ok(true) => println!("  pre-trusted {} path(s) (launch cwd + fleet root + config pre_trust) in the {harness} config", plan.pre_trust.len()),
         Ok(false) => {}
         Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
@@ -2194,22 +2194,28 @@ fn spin_up(agent: &str, apply: bool) {
         eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
         std::process::exit(1);
     }
-    // Pre-trust so claude does not stall on the one-time folder-trust prompt (an interactive agent can't
-    // answer it, and --dangerously-skip-permissions does NOT bypass it). A worktree workspace is trusted by
-    // its git common dir (the shared MIRROR), which claude does not inherit from the fleet root — so trust
-    // each repo's mirror; a repo-less workspace (a plain dir) is trusted by the dir itself. Plus the fleet
-    // root. Non-fatal on error.
-    let mut trust: Vec<String> = vec![fleet_root.clone()];
-    for r in &repos {
-        if let Some(repo) = r.get("repo").and_then(|v| v.as_str()) {
-            trust.push(workspace::mirror_dir(&fleet_root, repo));
+    // Pre-trust so the harness does not stall on the one-time folder-trust prompt (an interactive agent can't
+    // answer it, and neither claude's --dangerously-skip-permissions nor codex's bypass flag skips it). The
+    // trust TARGET differs by harness: claude resolves a worktree workspace to its git common dir (the shared
+    // MIRROR), which it does not inherit from the fleet root — so trust each repo's mirror (a repo-less
+    // workspace is trusted by its own dir) plus the fleet root; codex trusts the folder it launches in, i.e.
+    // the workdir. Non-fatal on error.
+    let trust: Vec<String> = if harness == "codex" {
+        vec![workdir.clone()]
+    } else {
+        let mut t = vec![fleet_root.clone()];
+        for r in &repos {
+            if let Some(repo) = r.get("repo").and_then(|v| v.as_str()) {
+                t.push(workspace::mirror_dir(&fleet_root, repo));
+            }
         }
-    }
-    if repo_less {
-        trust.push(workdir.clone());
-    }
-    match pre_trust_dirs(&trust) {
-        Ok(true) => println!("  pre-trusted {} path(s) (fleet root + repo mirror(s))", trust.len()),
+        if repo_less {
+            t.push(workdir.clone());
+        }
+        t
+    };
+    match pre_trust_for_harness(&harness, &trust) {
+        Ok(true) => println!("  pre-trusted {} path(s) in the {harness} config", trust.len()),
         Ok(false) => {}
         Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
@@ -2666,6 +2672,81 @@ fn pre_trust_dirs(dirs: &[String]) -> Result<bool, String> {
     std::fs::write(&tmp, body).map_err(|e| format!("write {tmp}: {e}"))?;
     std::fs::rename(&tmp, &cfg).map_err(|e| format!("rename {tmp} -> {cfg}: {e}"))?;
     Ok(true)
+}
+
+/// Whether `dir` still needs a codex trust entry — `true` unless `projects.<dir>.trust_level` is already
+/// `"trusted"`. codex records first-run folder trust as a `[projects."<dir>"]` table with
+/// `trust_level = "trusted"`, and `--dangerously-bypass-approvals-and-sandbox` runs unattended but does NOT
+/// skip that gate, so spin-up must pre-trust the workdir the way it does for claude. Pure — unit-tested.
+fn codex_trust_missing(config: &toml::Value, dir: &str) -> bool {
+    config
+        .get("projects")
+        .and_then(|p| p.get(dir))
+        .and_then(|e| e.get("trust_level"))
+        .and_then(toml::Value::as_str)
+        != Some("trusted")
+}
+
+/// Render the `[projects."<dir>"]` trust table to append to a codex config. `dir` is a TOML basic-string
+/// key, so `\` and `"` are escaped (a filesystem path rarely holds either, but the key must encode exactly).
+/// Pure — unit-tested.
+fn codex_trust_table(dir: &str) -> String {
+    let key = dir.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\n[projects.\"{key}\"]\ntrust_level = \"trusted\"\n")
+}
+
+/// Idempotently mark each of `dirs` (and its symlink-canonical form) trusted in `~/.codex/config.toml`, so a
+/// spun-up codex agent never stalls on the one-time folder-trust prompt. For any dir not already trusted it
+/// APPENDS a `[projects."<dir>"]` table: an append preserves the operator's existing config and comments
+/// verbatim, whereas a parse-then-reserialize would strip them (`toml` 0.8 does not round-trip comments), and
+/// those host-local specifics must not be disturbed. The file must already exist (the operator configures
+/// codex's model provider there); a missing file is an error the caller warns on. Returns true if it appended.
+fn pre_trust_dirs_codex(dirs: &[String]) -> Result<bool, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let cfg = format!("{home}/.codex/config.toml");
+    let raw = std::fs::read_to_string(&cfg).map_err(|e| format!("read {cfg}: {e}"))?;
+    let v: toml::Value = raw.parse().map_err(|e| format!("parse {cfg}: {e}"))?;
+    // The literal and canonical (symlink-resolved) forms that still need an entry, de-duplicated — same
+    // both-forms care as the claude path (an agent may launch under a literal path but be checked canonical).
+    let mut want: Vec<String> = Vec::new();
+    for dir in dirs {
+        let mut forms = vec![dir.clone()];
+        if let Ok(canon) = std::fs::canonicalize(dir) {
+            let c = canon.to_string_lossy().into_owned();
+            if &c != dir {
+                forms.push(c);
+            }
+        }
+        for form in forms {
+            if codex_trust_missing(&v, &form) && !want.contains(&form) {
+                want.push(form);
+            }
+        }
+    }
+    if want.is_empty() {
+        return Ok(false);
+    }
+    let mut body = raw;
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    for form in &want {
+        body.push_str(&codex_trust_table(form));
+    }
+    let tmp = format!("{cfg}.fleet-tmp-{}", std::process::id());
+    std::fs::write(&tmp, &body).map_err(|e| format!("write {tmp}: {e}"))?;
+    std::fs::rename(&tmp, &cfg).map_err(|e| format!("rename {tmp} -> {cfg}: {e}"))?;
+    Ok(true)
+}
+
+/// Pre-trust `dirs` in the folder-trust store of the given `harness`, so a spun-up agent never stalls on the
+/// one-time folder-trust prompt: `codex` → `~/.codex/config.toml`; every other harness (claude, the default)
+/// → `~/.claude.json`. Returns whether it wrote a change.
+fn pre_trust_for_harness(harness: &str, dirs: &[String]) -> Result<bool, String> {
+    match harness {
+        "codex" => pre_trust_dirs_codex(dirs),
+        _ => pre_trust_dirs(dirs),
+    }
 }
 
 /// How stale a board `last_seen` is allowed to get before the watchdog cares. An agent heartbeats far more
@@ -4960,6 +5041,41 @@ mod tests {
         // an unknown/typo'd harness fails loudly.
         let u = build_launch_cmd("gpt5", "m", "high", None).unwrap_err();
         assert!(u.contains("unknown harness 'gpt5'"));
+    }
+
+    #[test]
+    fn codex_trust_missing_only_when_not_already_trusted() {
+        let cfg: toml::Value = r#"
+            model = "codex-bedrock"
+            [projects."/wt/v-yes"]
+            trust_level = "trusted"
+            [projects."/wt/v-partial"]
+            trust_level = "untrusted"
+        "#
+        .parse()
+        .expect("valid toml");
+        // Already trusted → no entry needed.
+        assert!(!codex_trust_missing(&cfg, "/wt/v-yes"));
+        // Present but a different trust_level → still needs the trusted entry.
+        assert!(codex_trust_missing(&cfg, "/wt/v-partial"));
+        // Absent entirely → needs the entry.
+        assert!(codex_trust_missing(&cfg, "/wt/v-absent"));
+        // A config with no projects table at all → needs the entry.
+        let bare: toml::Value = "model = \"x\"".parse().expect("valid toml");
+        assert!(codex_trust_missing(&bare, "/wt/v-x"));
+    }
+
+    #[test]
+    fn codex_trust_table_is_a_valid_appendable_projects_entry() {
+        let t = codex_trust_table("/wt/v-x");
+        assert_eq!(t, "\n[projects.\"/wt/v-x\"]\ntrust_level = \"trusted\"\n");
+        // The appended table must parse, and it must read back as trusted (round-trips through the check).
+        let v: toml::Value = t.parse().expect("appended table is valid toml");
+        assert!(!codex_trust_missing(&v, "/wt/v-x"), "the rendered table marks the dir trusted");
+        // A key with TOML-special chars is escaped so the table still parses and round-trips.
+        let weird = codex_trust_table(r#"/wt/a"b\c"#);
+        let vw: toml::Value = weird.parse().expect("escaped key is valid toml");
+        assert!(!codex_trust_missing(&vw, r#"/wt/a"b\c"#), "escaped key round-trips to the same dir");
     }
 
     #[test]
