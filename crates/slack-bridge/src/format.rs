@@ -208,6 +208,8 @@ mod tests {
             body: body.to_string(),
             reply_to: None,
             external_author: None,
+            metadata: None,
+            parent_metadata: None,
         }
     }
 
