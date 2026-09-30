@@ -3,8 +3,14 @@
 use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:8899";
+
+/// Default cadence for re-deriving the served-agent set on a live connection (#449): often enough that a
+/// newly-spun/relocated agent starts receiving event-wakes within ~1.5min without a manual tunnel restart,
+/// rare enough that the `fleet served-set` subprocess is negligible.
+const DEFAULT_SERVED_REFRESH_SECS: u64 = 90;
 
 /// Parsed daemon config. Keys mirror the original Python daemon 1:1.
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +48,11 @@ pub struct Config {
     /// Unset = probe disabled and the daemon binds no inbound port (its default posture).
     #[serde(default)]
     pub health_addr: Option<String>,
+    /// How often (seconds) to re-derive the served-agent set on a LIVE connection and, if it changed,
+    /// reconnect to re-register (#449). Only meaningful with `agents_cmd` (a static list never changes).
+    /// Unset = the built-in default; `0` disables the periodic refresh (fall back to refresh-only-on-reconnect).
+    #[serde(default)]
+    pub served_refresh_secs: Option<u64>,
 }
 
 fn default_upstream() -> String {
@@ -100,6 +111,16 @@ impl Config {
             .filter(|s| !s.is_empty())
     }
 
+    /// How often to re-derive the served set on a live connection and reconnect if it changed (#449).
+    /// Only when `agents_cmd` derives the set dynamically — a static `agents` list never changes under us,
+    /// so there is nothing to refresh. Default [`DEFAULT_SERVED_REFRESH_SECS`] when `agents_cmd` is set;
+    /// `served_refresh_secs = 0` disables it. `None` = disabled (static list, or explicitly off). Pure.
+    pub fn served_refresh_interval(&self) -> Option<Duration> {
+        self.agents_cmd_argv()?; // no dynamic derivation → the set can't change under us → nothing to poll
+        let secs = self.served_refresh_secs.unwrap_or(DEFAULT_SERVED_REFRESH_SECS);
+        (secs > 0).then(|| Duration::from_secs(secs))
+    }
+
     /// The Cloudflare Access service-token pair, if both are present + non-empty.
     pub fn cf_credentials(&self) -> Option<(String, String)> {
         match (&self.cf_client_id, &self.cf_client_secret) {
@@ -132,6 +153,15 @@ pub fn parse_agent_lines(stdout: &str) -> Vec<String> {
         .filter(|l| seen.insert(l.to_string()))
         .map(str::to_string)
         .collect()
+}
+
+/// Whether two served-agent lists differ as SETS (order-insensitive) — the trigger to reconnect and
+/// re-register the fresh set (#449). `parse_agent_lines` already de-dups + preserves order, but comparing
+/// as sets is robust to any ordering difference between two derivations, so a mere re-order never forces a
+/// needless reconnect. Pure — unit-tested.
+pub fn served_set_differs(a: &[String], b: &[String]) -> bool {
+    use std::collections::BTreeSet;
+    a.iter().collect::<BTreeSet<_>>() != b.iter().collect::<BTreeSet<_>>()
 }
 
 /// Config load errors.
@@ -265,6 +295,66 @@ mod tests {
             parse_agent_lines("   \n\n").is_empty(),
             "no ids → empty (caller falls back to static)"
         );
+    }
+
+    #[test]
+    fn served_set_differs_is_order_insensitive_and_detects_membership_change() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Same members, different order → NOT different (no needless reconnect).
+        assert!(!served_set_differs(&s(&["a", "b", "c"]), &s(&["c", "a", "b"])));
+        assert!(!served_set_differs(&s(&["a"]), &s(&["a"])));
+        // A NEW agent (the #449 case: george just appeared) → different → reconnect.
+        assert!(served_set_differs(&s(&["a", "b"]), &s(&["a", "b", "george"])));
+        // A removed agent → different.
+        assert!(served_set_differs(&s(&["a", "b"]), &s(&["a"])));
+        // Empty vs non-empty.
+        assert!(served_set_differs(&[], &s(&["a"])));
+    }
+
+    #[test]
+    fn served_refresh_interval_only_with_agents_cmd_and_respects_disable() {
+        // Static list (no agents_cmd) → nothing to refresh, even if a value is set.
+        let static_list = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            agents = ["a"]
+            served_refresh_secs = 30
+            "#,
+        )
+        .unwrap();
+        assert_eq!(static_list.served_refresh_interval(), None, "no agents_cmd → static set never changes");
+        // agents_cmd set, no explicit secs → the built-in default.
+        let dyn_default = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            agents_cmd = "fleet served-set"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            dyn_default.served_refresh_interval(),
+            Some(Duration::from_secs(DEFAULT_SERVED_REFRESH_SECS))
+        );
+        // agents_cmd set, explicit override.
+        let dyn_override = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            agents_cmd = "fleet served-set"
+            served_refresh_secs = 45
+            "#,
+        )
+        .unwrap();
+        assert_eq!(dyn_override.served_refresh_interval(), Some(Duration::from_secs(45)));
+        // 0 disables the periodic refresh (back to refresh-only-on-reconnect).
+        let disabled = Config::from_toml_str(
+            r#"
+            board_ws = "ws://x/tunnel/ws"
+            agents_cmd = "fleet served-set"
+            served_refresh_secs = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(disabled.served_refresh_interval(), None, "0 → disabled");
     }
 
     #[test]
