@@ -1758,6 +1758,16 @@ enum Cmd {
     /// time). Compare the rev to `origin/main` to tell whether a deployed binary is current (a stale binary
     /// silently runs old logic — the failure mode a stale watchdog binary hit).
     Version,
+    /// Bring the host's fleet daemons up to `origin/main`: when the built binary's rev is behind the remote,
+    /// fast-forward the checkout, rebuild the release binary, and restart the daemon services — the manual
+    /// rebuild+restart step a merged fleet PR otherwise needs before its fix goes live (#388). Default: REPORT
+    /// only (safe dry-run); `--apply` acts. Refuses to act on a dirty or non-`main` checkout (never clobbers
+    /// local work).
+    Redeploy {
+        /// Actually fast-forward + rebuild + restart. Without it, only report whether a redeploy is needed.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn main() {
@@ -1848,6 +1858,7 @@ fn main() {
             daemon_unit(&name, exec, restart_sec, bin, install, uninstall)
         }
         Cmd::Version => println!("{}", version_line()),
+        Cmd::Redeploy { apply } => redeploy(apply),
     }
 }
 
@@ -4403,23 +4414,149 @@ fn build_freshness_warning(baked_rev: &str, checkout_head: Option<&str>) -> Opti
     })
 }
 
-/// The short HEAD sha of the git checkout the running binary was built from — walk up from the binary's path
-/// to a dir containing `.git`, then `git rev-parse`. `None` when there is no source tree (a deployed binary)
-/// or git is unavailable. Best-effort — only used to warn about a stale binary.
-fn checkout_head_short() -> Option<String> {
+/// The git checkout root the running binary was built from — walk up from the binary's path to a dir
+/// containing `.git`. `None` when there is no source tree (a deployed/hermetic binary). Best-effort.
+fn checkout_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let root = exe.ancestors().find(|p| p.join(".git").exists())?;
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
+    exe.ancestors().find(|p| p.join(".git").exists()).map(Path::to_path_buf)
+}
+
+/// Run `git -C <root> <args...>` and return trimmed stdout on success, else `None`. Best-effort git helper.
+fn git_capture(root: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
     (!s.is_empty()).then_some(s)
+}
+
+/// The short HEAD sha of the git checkout the running binary was built from. `None` when there is no source
+/// tree (a deployed binary) or git is unavailable. Best-effort — only used to warn about a stale binary.
+fn checkout_head_short() -> Option<String> {
+    git_capture(&checkout_root()?, &["rev-parse", "--short", "HEAD"])
+}
+
+/// The default systemd USER units `fleet redeploy` restarts (the long-running fleet daemons) when the config
+/// does not override `redeploy_services`. A unit not present on this host is skipped, not an error.
+const DEFAULT_REDEPLOY_SERVICES: &[&str] =
+    &["fleet-watchdog.timer", "fleet-notify.service", "fleet-tunnel.service"];
+
+/// What `fleet redeploy` should do, decided purely from the build/repo state. Pure — unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum RedeployAction {
+    /// The built binary already matches `origin/main` — nothing to do.
+    UpToDate,
+    /// The binary is behind `origin/main` and the checkout is safe to fast-forward + rebuild.
+    Rebuild,
+    /// Behind, but the checkout is dirty or not on `main` — refuse to act (never clobber local work).
+    NeedsManual(String),
+}
+
+/// Decide the redeploy action from the baked build rev, the resolved `origin/main` sha, and the checkout
+/// state. `UpToDate` when the built base sha equals `origin/main` (a `-dirty` suffix compares by base — a
+/// dirty build of the same commit is current). Otherwise a rebuild is needed, but only SAFE when the tree is
+/// clean AND on `main` (a fast-forward can't clobber); a dirty or off-`main` checkout returns `NeedsManual`
+/// so an automated redeploy never discards a sibling's in-progress work. Pure — unit-tested.
+fn redeploy_action(baked_rev: &str, remote_sha: &str, dirty: bool, on_main: bool) -> RedeployAction {
+    let base = baked_rev.strip_suffix("-dirty").unwrap_or(baked_rev);
+    if base == remote_sha {
+        return RedeployAction::UpToDate;
+    }
+    if dirty {
+        return RedeployAction::NeedsManual("the checkout has uncommitted changes".to_string());
+    }
+    if !on_main {
+        return RedeployAction::NeedsManual("the checkout is not on the `main` branch".to_string());
+    }
+    RedeployAction::Rebuild
+}
+
+/// `fleet redeploy [--apply]` (#388): bring the host's fleet daemons up to `origin/main`. A merged fleet PR
+/// does not rebuild/restart the running daemons, so a landed fix stays dormant (the watchdog silently runs
+/// old logic) until a manual `cargo build --release` + `systemctl --user restart`. This collapses that dance
+/// into one command: fetch `origin/main`, and when the built binary is behind it, fast-forward + rebuild +
+/// restart the daemon services. SAFE: reports by default (acts only with `--apply`) and refuses a dirty or
+/// off-`main` checkout so it never clobbers a sibling's in-progress work.
+fn redeploy(apply: bool) {
+    let Some(root) = checkout_root() else {
+        eprintln!("fleet redeploy: no source checkout (a deployed/hermetic binary tracks its flake input, not git) — nothing to redeploy");
+        std::process::exit(1);
+    };
+    // Refresh the remote ref so the comparison is against the current origin/main.
+    if git_capture(&root, &["fetch", "--quiet", "origin", "main"]).is_none() {
+        // fetch prints nothing on success, so None here can be a clean fetch OR a failure; probe the ref next.
+    }
+    let Some(remote_sha) = git_capture(&root, &["rev-parse", "--short", "origin/main"]) else {
+        eprintln!("fleet redeploy: cannot resolve origin/main (fetch failed or no such remote) in {}", root.display());
+        std::process::exit(1);
+    };
+    let dirty = git_capture(&root, &["status", "--porcelain"]).is_some();
+    let on_main = git_capture(&root, &["symbolic-ref", "--short", "HEAD"]).as_deref() == Some("main");
+    let baked = env!("FLEET_BUILD_REV");
+    let action = redeploy_action(baked, &remote_sha, dirty, on_main);
+
+    println!("fleet redeploy ({}): built rev {baked}, origin/main {remote_sha} — {}",
+        if apply { "APPLY" } else { "report" },
+        match &action {
+            RedeployAction::UpToDate => "UP TO DATE".to_string(),
+            RedeployAction::Rebuild => "REBUILD NEEDED (clean, on main)".to_string(),
+            RedeployAction::NeedsManual(why) => format!("BEHIND but MANUAL redeploy needed ({why})"),
+        }
+    );
+    match action {
+        RedeployAction::UpToDate => return,
+        RedeployAction::NeedsManual(why) => {
+            eprintln!("fleet redeploy: not acting — {why}. Resolve it, then re-run (or rebuild by hand).");
+            std::process::exit(1);
+        }
+        RedeployAction::Rebuild => {}
+    }
+    if !apply {
+        println!("  (report only — re-run with --apply to fast-forward, rebuild, and restart the daemons)");
+        return;
+    }
+    // Fast-forward to origin/main (guaranteed possible: clean + on main + behind).
+    println!("  fast-forwarding to origin/main…");
+    if git_capture(&root, &["merge", "--ff-only", "origin/main"]).is_none()
+        && git_capture(&root, &["rev-parse", "--short", "HEAD"]).as_deref() != Some(remote_sha.as_str())
+    {
+        eprintln!("fleet redeploy: fast-forward to origin/main failed; aborting before rebuild");
+        std::process::exit(1);
+    }
+    println!("  building release binary (cargo build --release --bin fleet)…");
+    let build = std::process::Command::new("cargo")
+        .current_dir(&root)
+        .args(["build", "--release", "--bin", "fleet"])
+        .status();
+    match build {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("fleet redeploy: cargo build failed (exit {:?}); daemons NOT restarted (they keep the old, working binary)", s.code());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("fleet redeploy: could not run cargo ({e}); daemons NOT restarted");
+            std::process::exit(1);
+        }
+    }
+    let services: Vec<String> = config::get()
+        .redeploy_services
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REDEPLOY_SERVICES.iter().map(|s| s.to_string()).collect());
+    println!("  restarting {} daemon service(s)…", services.len());
+    for svc in &services {
+        let st = std::process::Command::new("systemctl")
+            .args(["--user", "restart", svc])
+            .status();
+        match st {
+            Ok(s) if s.success() => println!("    restarted {svc}"),
+            // A unit not installed on this host is not an error — the default set is a superset across hosts.
+            Ok(_) => println!("    skipped {svc} (not present on this host, or restart returned non-zero)"),
+            Err(e) => println!("    could not restart {svc} ({e})"),
+        }
+    }
+    println!("fleet redeploy: now at {remote_sha}, binary rebuilt, daemons restarted.");
 }
 
 #[cfg(test)]
@@ -4486,6 +4623,21 @@ mod tests {
         assert!(k.contains("DONE / at-rest"), "routes a drained/done cluster to the rest-cadence path (#383)");
         assert!(k.contains("fleet set-interval"), "names the registry cadence lever (set-interval), not a raw reschedule");
         assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the registry watchdog");
+    }
+
+    #[test]
+    fn redeploy_action_rebuilds_only_when_behind_clean_and_on_main() {
+        // Built rev already matches origin/main -> nothing to do (even if dirty / off main).
+        assert_eq!(redeploy_action("abc123", "abc123", false, true), RedeployAction::UpToDate);
+        assert_eq!(redeploy_action("abc123", "abc123", true, false), RedeployAction::UpToDate);
+        // A -dirty build of the SAME commit is current (compares by base sha).
+        assert_eq!(redeploy_action("abc123-dirty", "abc123", false, true), RedeployAction::UpToDate);
+        // Behind + clean + on main -> safe to fast-forward + rebuild.
+        assert_eq!(redeploy_action("old111", "new222", false, true), RedeployAction::Rebuild);
+        // Behind but DIRTY -> refuse (never clobber uncommitted work).
+        assert!(matches!(redeploy_action("old111", "new222", true, true), RedeployAction::NeedsManual(_)));
+        // Behind but OFF main (a feature branch) -> refuse (a ff-only would fail / clobber intent).
+        assert!(matches!(redeploy_action("old111", "new222", false, false), RedeployAction::NeedsManual(_)));
     }
 
     #[test]

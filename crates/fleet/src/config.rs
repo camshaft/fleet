@@ -36,6 +36,10 @@ pub struct Config {
     /// tunnel (event-wakes are silently not being delivered). Absent → the tunnel-health check is skipped
     /// (a host with no tunnel, e.g. the board host itself).
     pub tunnel_health_url: Option<String>,
+    /// The systemd USER units `fleet redeploy` restarts after rebuilding a stale binary (the long-running
+    /// fleet daemons on this host). Absent → the built-in default set (see `redeploy`). A host with a
+    /// different daemon set overrides it here.
+    pub redeploy_services: Option<Vec<String>>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
