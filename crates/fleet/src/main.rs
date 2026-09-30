@@ -4442,6 +4442,15 @@ fn checkout_head_short() -> Option<String> {
 const DEFAULT_REDEPLOY_SERVICES: &[&str] =
     &["fleet-watchdog.timer", "fleet-notify.service", "fleet-tunnel.service"];
 
+/// The release builds `fleet redeploy` runs before restarting the daemons — one per binary that BACKS a
+/// service in [`DEFAULT_REDEPLOY_SERVICES`]. `fleet-watchdog`/`fleet-notify` are the `fleet` binary
+/// (`fleet watchdog` / `fleet notify`); `fleet-tunnel` is its OWN crate + binary, built only with
+/// `--features transport`. Each entry is the cargo args AFTER `build --release`. Keep in sync with the
+/// restarted services: a daemon binary missing here would be restarted STALE — the #451 gap, where a
+/// fleet-tunnel change did not go live via redeploy because only `--bin fleet` was rebuilt.
+const REDEPLOY_BUILDS: &[&[&str]] =
+    &[&["--bin", "fleet"], &["-p", "fleet-tunnel", "--features", "transport"]];
+
 /// What `fleet redeploy` should do, decided purely from the build/repo state. Pure — unit-tested.
 #[derive(Debug, PartialEq, Eq)]
 enum RedeployAction {
@@ -4524,20 +4533,28 @@ fn redeploy(apply: bool) {
         eprintln!("fleet redeploy: fast-forward to origin/main failed; aborting before rebuild");
         std::process::exit(1);
     }
-    println!("  building release binary (cargo build --release --bin fleet)…");
-    let build = std::process::Command::new("cargo")
-        .current_dir(&root)
-        .args(["build", "--release", "--bin", "fleet"])
-        .status();
-    match build {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            eprintln!("fleet redeploy: cargo build failed (exit {:?}); daemons NOT restarted (they keep the old, working binary)", s.code());
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("fleet redeploy: could not run cargo ({e}); daemons NOT restarted");
-            std::process::exit(1);
+    // Rebuild EVERY daemon binary before restarting anything (#451): the fleet binary AND the separate
+    // fleet-tunnel binary. If any build fails, abort before restarting so the daemons keep their old, working
+    // binaries rather than being restarted onto a half-rebuilt tree.
+    for &extra in REDEPLOY_BUILDS {
+        println!("  building release (cargo build --release {})…", extra.join(" "));
+        let mut args = vec!["build", "--release"];
+        args.extend_from_slice(extra);
+        let build = std::process::Command::new("cargo").current_dir(&root).args(&args).status();
+        match build {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!(
+                    "fleet redeploy: `cargo build --release {}` failed (exit {:?}); daemons NOT restarted (they keep the old, working binaries)",
+                    extra.join(" "),
+                    s.code()
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fleet redeploy: could not run cargo ({e}); daemons NOT restarted");
+                std::process::exit(1);
+            }
         }
     }
     let services: Vec<String> = config::get()
@@ -4638,6 +4655,20 @@ mod tests {
         assert!(matches!(redeploy_action("old111", "new222", true, true), RedeployAction::NeedsManual(_)));
         // Behind but OFF main (a feature branch) -> refuse (a ff-only would fail / clobber intent).
         assert!(matches!(redeploy_action("old111", "new222", false, false), RedeployAction::NeedsManual(_)));
+    }
+
+    #[test]
+    fn redeploy_builds_cover_every_daemon_binary() {
+        // Each build is non-empty cargo args, and the set covers BOTH daemon binaries: the `fleet` bin
+        // (fleet-watchdog + fleet-notify) and the separate fleet-tunnel bin (its own crate + transport
+        // feature). The #451 regression guard: dropping fleet-tunnel here restarts it stale.
+        assert!(REDEPLOY_BUILDS.iter().all(|b| !b.is_empty()), "no empty build arg-set");
+        let flat: Vec<&str> = REDEPLOY_BUILDS.iter().flat_map(|b| b.iter().copied()).collect();
+        assert!(flat.contains(&"fleet") && flat.windows(2).any(|w| w == ["--bin", "fleet"]), "builds --bin fleet");
+        assert!(flat.contains(&"fleet-tunnel"), "builds the fleet-tunnel crate");
+        assert!(flat.contains(&"transport"), "fleet-tunnel needs its transport feature");
+        // Every service backed by a binary that must exist has a build (both counts stay aligned).
+        assert!(!REDEPLOY_BUILDS.is_empty() && !DEFAULT_REDEPLOY_SERVICES.is_empty());
     }
 
     #[test]
