@@ -81,6 +81,136 @@ impl Harness for ClaudeCode {
     }
 }
 
+/// The Codex CLI rollout JSONL harness: each line is a rollout record `{"type": "response_item" | "event_msg"
+/// | "session_meta" | "turn_context" | "world_state" | "token_usage_record", "payload": {…}, "timestamp": …}`.
+/// The conversational stream is the `response_item` records — the exact items replayed to the model — whose
+/// `payload.type` is `message` (a `role` plus `input_text`/`output_text` content blocks), `reasoning`,
+/// `function_call` (a tool call, `arguments` is a JSON string), or `function_call_output` (its result). Every
+/// other top-level record is harness bookkeeping (turn/session/token accounting) and is counted, not rendered
+/// — the same render/omit split as [`ClaudeCode`], so both harnesses produce the same normalized text (#129).
+pub struct Codex;
+
+impl Harness for Codex {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn render_record(&self, rec: &Value) -> Option<String> {
+        // Only `response_item` records carry conversation; every other top-level type is bookkeeping (counted).
+        if rec.get("type").and_then(Value::as_str) != Some("response_item") {
+            return None;
+        }
+        let payload = rec.get("payload")?;
+        let pt = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts = rec.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        match pt {
+            "message" => {
+                let role = payload.get("role").and_then(Value::as_str).unwrap_or("message");
+                let mut out = if ts.is_empty() {
+                    format!("── {role} ──\n")
+                } else {
+                    format!("── {role} · {ts} ──\n")
+                };
+                match payload.get("content") {
+                    Some(Value::String(s)) => {
+                        out.push_str(s);
+                        out.push('\n');
+                    }
+                    Some(Value::Array(blocks)) => {
+                        for b in blocks {
+                            out.push_str(&render_codex_content_block(b));
+                        }
+                    }
+                    _ => out.push_str("(no content)\n"),
+                }
+                Some(out)
+            }
+            "reasoning" => {
+                // Reasoning carries a `summary` (and/or `content`) list of `{type, text}` blocks.
+                let mut out = String::from("[reasoning]\n");
+                let mut wrote = false;
+                for key in ["summary", "content"] {
+                    if let Some(Value::Array(parts)) = payload.get(key) {
+                        for p in parts {
+                            if let Some(t) = p.get("text").and_then(Value::as_str) {
+                                out.push_str(t);
+                                out.push('\n');
+                                wrote = true;
+                            }
+                        }
+                    }
+                }
+                if !wrote {
+                    // Unknown reasoning shape — dump the payload rather than drop it.
+                    out.push_str(&format!("{payload}\n"));
+                }
+                Some(out)
+            }
+            "function_call" | "custom_tool_call" | "local_shell_call" => {
+                let name = payload.get("name").and_then(Value::as_str).unwrap_or("?");
+                let call_id = payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                // `arguments` is a JSON STRING on Codex; render it verbatim (pretty-printed if it parses).
+                let args = payload
+                    .get("arguments")
+                    .or_else(|| payload.get("input"))
+                    .map(render_codex_args)
+                    .unwrap_or_default();
+                Some(format!("[tool_use {name} (call_id {call_id})]\n{args}\n"))
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("?");
+                let output = render_codex_output(payload.get("output"));
+                Some(format!("[tool_result for {call_id}]\n{output}\n"))
+            }
+            // A response_item with an unfamiliar payload type — labeled and dumped, never dropped.
+            other => Some(format!("[response_item {other}]\n{payload}\n")),
+        }
+    }
+}
+
+/// Render one Codex message content block: `input_text`/`output_text`/`text`/`summary_text` carry a `text`
+/// field; an unknown block is dumped as JSON rather than dropped, so an unfamiliar shape is never lost.
+fn render_codex_content_block(b: &Value) -> String {
+    let bt = b.get("type").and_then(Value::as_str).unwrap_or("");
+    match bt {
+        "input_text" | "output_text" | "text" | "summary_text" => {
+            format!("{}\n", b.get("text").and_then(Value::as_str).unwrap_or(""))
+        }
+        _ => format!("{b}\n"),
+    }
+}
+
+/// Render a Codex tool-call `arguments`/`input`: a JSON STRING is pretty-printed if it parses (else shown
+/// as-is), and a JSON value is pretty-printed. Verbatim — no interpretation.
+fn render_codex_args(v: &Value) -> String {
+    match v {
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|parsed| serde_json::to_string_pretty(&parsed).ok())
+            .unwrap_or_else(|| s.clone()),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// Render a `function_call_output.output`: a plain string verbatim, or an object's `output`/`content` string,
+/// else the raw JSON. Never dropped.
+fn render_codex_output(output: Option<&Value>) -> String {
+    match output {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v
+            .get("output")
+            .or_else(|| v.get("content"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string()),
+        None => String::new(),
+    }
+}
+
 /// Render one Claude Code content block verbatim. Unknown block types are labeled and dumped as JSON rather
 /// than dropped, so an unfamiliar shape is never silently lost.
 fn render_block(b: &Value) -> String {
@@ -377,6 +507,55 @@ mod tests {
         // the two bookkeeping records are omitted but ACCOUNTED for (not silently dropped)
         assert!(out.contains("2 non-conversational records omitted"));
         assert!(out.contains("ai-title×1") && out.contains("mode×1"));
+    }
+
+    /// A Codex rollout sample built from real observed record shapes (session_meta / event_msg / token
+    /// bookkeeping + response_item messages with input_text/output_text) plus the Responses-API reasoning and
+    /// function_call/function_call_output items the conversation stream carries.
+    fn codex_sample() -> Vec<Value> {
+        vec![
+            serde_json::json!({"type":"session_meta","ordinal":0,"payload":{"session_id":"s1","cwd":"/tmp"}}),
+            serde_json::json!({"type":"response_item","timestamp":"t1","payload":{
+                "type":"message","role":"user","content":[{"type":"input_text","text":"reply with CODEX-OK"}]}}),
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"reasoning","summary":[{"type":"summary_text","text":"thinking about it"}]}}),
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"function_call","name":"shell","call_id":"c1","arguments":"{\"cmd\":\"ls\"}"}}),
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"function_call_output","call_id":"c1","output":"file1\nfile2"}}),
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"message","role":"assistant","content":[{"type":"output_text","text":"CODEX-OK"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"CODEX-OK"}}),
+            serde_json::json!({"type":"token_usage_record","payload":{"usage":{"total_tokens":42}}}),
+        ]
+    }
+
+    #[test]
+    fn codex_render_is_faithful_and_reports_omissions() {
+        let out = render(&codex_sample(), &Codex);
+        // user input_text and assistant output_text render verbatim with role headers.
+        assert!(out.contains("── user · t1 ──") && out.contains("reply with CODEX-OK"));
+        assert!(out.contains("── assistant ──") && out.contains("CODEX-OK"));
+        // reasoning renders under a [reasoning] label.
+        assert!(out.contains("[reasoning]") && out.contains("thinking about it"));
+        // a function_call renders as a tool_use with its call_id and pretty-printed JSON-string arguments.
+        assert!(out.contains("[tool_use shell (call_id c1)]") && out.contains("\"cmd\": \"ls\""));
+        // its output renders as a tool_result verbatim.
+        assert!(out.contains("[tool_result for c1]") && out.contains("file1\nfile2"));
+        // the three non-conversational records (session_meta/event_msg/token_usage_record) are omitted but
+        // ACCOUNTED for in the footer, keyed by their top-level type — nothing silently dropped.
+        assert!(out.contains("3 non-conversational records omitted"));
+        assert!(out.contains("session_meta×1") && out.contains("event_msg×1") && out.contains("token_usage_record×1"));
+    }
+
+    #[test]
+    fn codex_unknown_payload_type_is_dumped_not_dropped() {
+        // A response_item with an unfamiliar payload type is labeled and dumped, so a future Codex item shape
+        // is never lost even before this renderer learns it.
+        let recs = vec![serde_json::json!({"type":"response_item","payload":{
+            "type":"web_search_call","query":"rust jsonl"}})];
+        let out = render(&recs, &Codex);
+        assert!(out.contains("[response_item web_search_call]") && out.contains("rust jsonl"));
     }
 
     #[test]

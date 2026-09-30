@@ -21,7 +21,6 @@ mod notify;
 mod transcripts;
 mod workspace;
 
-use transcripts::Harness as _; // bring the harness-seam methods (`.id()`) into scope for rendering
 
 /// The tmux session board-native agents run in (their windows are opened here by `launch_board_agent`, and
 /// the notifier injects wakes here). From `config.session`, else `main`.
@@ -1696,6 +1695,12 @@ enum Cmd {
         /// Lines of prior context to re-include before the `--since` offset, so no boundary is lost.
         #[arg(long, default_value_t = 40)]
         overlap: usize,
+        /// Which harness transcript format to render: `claude` (Claude Code JSONL, the default) or `codex`
+        /// (Codex CLI rollout JSONL). Codex rollouts are dated files, not per-agent project dirs, so for
+        /// `codex` pass the rollout file explicitly with `--session <path>` — agent auto-location is
+        /// claude-only for now.
+        #[arg(long, default_value = "claude")]
+        harness: String,
     },
     /// Print the set of agents THIS host should serve on the reverse tunnel — the board agents that have a
     /// live tmux window in this session AND aren't pinned to another host. Replaces a hand-maintained static
@@ -1896,7 +1901,8 @@ fn main() {
             session,
             since,
             overlap,
-        } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap),
+            harness,
+        } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap, &harness),
         Cmd::ServedSet { toml } => served_set(toml),
         Cmd::WakeAudit { verbose } => wake_audit(verbose),
         Cmd::NudgeStale {
@@ -4275,7 +4281,16 @@ fn resolve_session_arg(session: &Path, agent: &str) -> Option<PathBuf> {
 /// `--since` record offset backed up by `--overlap`, renders + scrubs, and prints the advancing watermark.
 /// The watermark offset is a RECORD index (parsed JSONL records already observed), printed as
 /// `<session-id>:<record-count>` in the footer.
-fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, overlap: usize) {
+fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, overlap: usize, harness: &str) {
+    // Select the harness renderer up front so an unknown value fails before we touch the filesystem.
+    let harness: Box<dyn transcripts::Harness> = match harness {
+        "codex" => Box::new(transcripts::Codex),
+        "claude" | "claude-code" => Box::new(transcripts::ClaudeCode),
+        other => {
+            eprintln!("fleet transcripts: unknown --harness '{other}' (expected 'claude' or 'codex')");
+            std::process::exit(1);
+        }
+    };
     let (path, want_offset) = match session {
         Some(p) => {
             let off = since.map(|s| transcripts::parse_watermark(s).1).unwrap_or(0);
@@ -4319,9 +4334,9 @@ fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, ove
     println!(
         "=== transcript: {agent} · session {sid} · records {start}..{} (overlap {overlap}) · harness {} ===",
         records.len(),
-        transcripts::ClaudeCode.id()
+        harness.id()
     );
-    print!("{}", transcripts::render(windowed, &transcripts::ClaudeCode));
+    print!("{}", transcripts::render(windowed, harness.as_ref()));
     // The advancing watermark: feed back as `--since <this>` next observation.
     println!("=== watermark: {sid}:{} ===", records.len());
 }
