@@ -2070,6 +2070,34 @@ fn spin_up_workspace_kind(
     }
 }
 
+/// Normalize a board record's `metadata.repos` into the canonical list of `{repo, …}` entries, tolerating
+/// the looser shapes a HAND-authored registration writes instead of the structured form `fleet set-meta`
+/// produces (the off-tree membrain-cdk was minted with a CSV string, #472 / operator seq-6269):
+/// - an array of `{repo: …}` objects → kept as-is (the canonical form);
+/// - an array of bare strings `["A","B"]` → each wrapped as `{repo: "A"}`;
+/// - a single comma-separated string `"A, B, C"` → split + trimmed into `{repo}` entries.
+///
+/// Without this, `as_array()` alone silently drops a CSV-string `repos` to "none declared" and the agent's
+/// worktrees never materialize. Any other shape yields no entries. Pure — unit-tested.
+fn normalize_repos(v: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    match v {
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .map(|e| match e {
+                serde_json::Value::String(s) => serde_json::json!({ "repo": s }),
+                other => other.clone(),
+            })
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| serde_json::json!({ "repo": p }))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Spin up one board-declared agent into its `~/.fleet` workspace. Reads the board record (orchestrator
 /// read — agents coordinate via their own MCP), then reports the materialize + launch plan; `--apply`
 /// materializes each repo's worktree off a shared bare mirror and launches a tmux window running `claude`
@@ -2102,11 +2130,12 @@ fn spin_up(agent: &str, apply: bool) {
     // kickoff whose only actionable trigger is being explicitly addressed, so it does not self-poll on ambient
     // chatter. Off by default — a normal work-conserving worker is unchanged.
     let reactive = md.get("reactive").and_then(|v| v.as_bool()).unwrap_or(false);
-    let repos = md
-        .get("repos")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // Accept the canonical structured list AND the looser hand-authored shapes (bare-string array, CSV
+    // string) so a repos written by hand is never silently dropped (#472 / operator seq-6269).
+    if md.get("repos").is_some_and(serde_json::Value::is_string) {
+        eprintln!("  note: metadata.repos is a comma-separated STRING — normalized to a structured list; prefer writing repos as [{{\"repo\":\"…\"}}] (the form `fleet set-meta --repo` produces)");
+    }
+    let repos = normalize_repos(md.get("repos"));
     let fleet_root = config::get()
         .root
         .clone()
@@ -5479,6 +5508,34 @@ mod tests {
         assert_eq!(parse_repo_spec("camshaft/bolero@master"), serde_json::json!({"repo":"camshaft/bolero","branch":"master"}));
         assert_eq!(parse_repo_spec("camshaft/backbeat"), serde_json::json!({"repo":"camshaft/backbeat","branch":"main"}));
         assert_eq!(parse_repo_spec("camshaft/x@"), serde_json::json!({"repo":"camshaft/x","branch":"main"}), "empty branch → main");
+    }
+
+    #[test]
+    fn normalize_repos_accepts_structured_bare_string_and_csv_shapes() {
+        // Canonical structured form (what `fleet set-meta --repo` writes) → kept as-is.
+        let structured = serde_json::json!([{"repo":"camshaft/fleet"},{"repo":"camshaft/cadenza","branch":"main"}]);
+        assert_eq!(normalize_repos(Some(&structured)), vec![
+            serde_json::json!({"repo":"camshaft/fleet"}),
+            serde_json::json!({"repo":"camshaft/cadenza","branch":"main"}),
+        ]);
+        // A CSV STRING (the hand-mint shape, #472) → split + trimmed into {repo} entries, NOT silently dropped.
+        let csv = serde_json::json!("Membrain, MembrainCDK, ElasticShuffleCDK");
+        assert_eq!(normalize_repos(Some(&csv)), vec![
+            serde_json::json!({"repo":"Membrain"}),
+            serde_json::json!({"repo":"MembrainCDK"}),
+            serde_json::json!({"repo":"ElasticShuffleCDK"}),
+        ]);
+        // A bare-string array → each wrapped as {repo}.
+        let bare = serde_json::json!(["Membrain","MembrainCDK"]);
+        assert_eq!(normalize_repos(Some(&bare)), vec![
+            serde_json::json!({"repo":"Membrain"}),
+            serde_json::json!({"repo":"MembrainCDK"}),
+        ]);
+        // Absent / empty / other shapes → no entries (the workspace_kind path handles off-tree agents).
+        assert!(normalize_repos(None).is_empty());
+        assert!(normalize_repos(Some(&serde_json::json!(""))).is_empty(), "empty string → no entries");
+        assert!(normalize_repos(Some(&serde_json::json!("  ,  , "))).is_empty(), "blank CSV parts filtered out");
+        assert!(normalize_repos(Some(&serde_json::json!(42))).is_empty());
     }
 
     #[test]
