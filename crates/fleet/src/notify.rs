@@ -13,37 +13,46 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// Map a board webhook event to the wake prompt to inject, or `None` to ignore the event. Only ACTIONABLE
-/// events inject a live-session loop-wake: a `task.assigned` (new work for the recipient) and a
-/// `message.direct` (someone is asking). INFORMATIONAL events — `task.commented`, `task.status_changed`, and
-/// the like — do NOT wake: the board still delivers them to the recipient's durable inbox, where they accrue
-/// for the agent's next poll (poll is the primary channel). Presence churn and the agent's own actions never
-/// wake either. Pure — unit-tested.
+/// Map a board webhook event to the wake prompt to inject, or `None` to ignore the event. The wake model is
+/// SUBSCRIPTION = NOTIFICATION (operator directive, #386): if an agent is subscribed to a target it is woken
+/// on that target's activity — comments included — and unsubscribe is the opt-out. So an event wakes the
+/// recipient's live session when either (a) it is a direct-delivery type they cannot be a passive bystander
+/// of — a `task.assigned` (new work), a `message.direct` (addressed to them), a `channel.post` (a channel
+/// they are a member of) — or (b) it is a `task.commented` on a target the recipient has a DIRECT
+/// subscription to (`subscribed == true`). A firehose-only recipient (present via a whole-board subscription,
+/// not a direct one) is NOT woken on a comment — it accrues in the durable inbox for the next poll, so a
+/// board-wide coordinator isn't woken on every ticket. Presence churn and the agent's own actions never wake.
+/// Pure — unit-tested.
 ///
-/// This gates on event TYPE (#215). The board delivers `task.commented` to a task's subscribers/assignee/
-/// CREATOR (minus the actor), and a creator can't leave that fan-out — so waking on every comment meant a
-/// stood-down/idle agent was loop-woken by pure FYI comments on tasks it merely opened (an observed drain of
-/// opus ticks). Superseding the earlier #145 "wake a subscriber on any comment" behavior: a comment now
-/// accrues for the next poll, and a genuinely actionable ask arrives as a `message.direct` (which still
-/// wakes) or via the per-task mute opt-out (board `mute_task`, #90). A per-recipient "this comment is a
-/// question/mention" wake would need a board-side actionability hint on the event — a DEFERRED enhancement,
-/// not needed for the type-based gate.
+/// `subscribed` is the board's per-recipient hint (#384, superseding the earlier `actionable` field): `true`
+/// when the recipient has a DIRECT subscription to this event's target, `false` when they are present only
+/// via the whole-board firehose. It is what lets `task.commented` wake a collaborator — two agents conversing
+/// on a task must not wait out each other's poll interval (the operator's zero-polling mandate) — while a
+/// firehose bystander still drops to poll. This deliberately retires the #215 anti-FYI-drain gate (the
+/// operator accepts the noise trade, with unsubscribe + auto-subscribe as the noise control). `task.assigned`
+/// / `message.direct` / `channel.post` stay wake-on-type: their delivery already IS the subscription (a DM in
+/// particular has no subscribable target), and keeping them type-gated also preserves their wake for a
+/// pre-#384 payload that carries no `subscribed` field yet.
 pub fn notification_prompt(
     event_type: &str,
     task_id: Option<i64>,
     event_seq: Option<i64>,
     channel_id: Option<i64>,
+    subscribed: bool,
 ) -> Option<String> {
     match event_type {
         "task.assigned" => task_id.map(|id| format!("[notification] task #{id}")),
         "message.direct" => event_seq.map(|seq| format!("[notification] message #{seq}")),
-        // A post to a channel the agent SUBSCRIBED to is actionable: the board only delivers `channel.post`
-        // to a channel's subscribers/members (minus the actor), so delivery IS the subscription filter — the
-        // agent opted in because it cares (e.g. a `deploys`-channel waiter, #171). Same "opt-in = actionable"
-        // principle as the #215 gating, so it wakes (unlike an un-opted-in task.commented FYI).
+        // A post to a channel the agent is a member of: the board only delivers `channel.post` to a channel's
+        // subscribers/members (minus the actor), so delivery IS the subscription filter — the agent joined
+        // because it cares (e.g. a `deploys`-channel waiter, #171). Wake-on-type for the same reason as above.
         "channel.post" => channel_id.map(|id| format!("[notification] channel #{id}")),
-        // task.commented / task.status_changed / task.updated / presence.updated and every other type are
-        // INFORMATIONAL — they accrue for the next poll and never inject a wake.
+        // A comment wakes when the recipient has a DIRECT subscription to the target (#384, subscription =
+        // notification): the collaboration case the zero-polling mandate targets. A firehose-only recipient
+        // stays `subscribed=false` and accrues for poll (so a board-wide coordinator isn't woken per ticket).
+        "task.commented" if subscribed => task_id.map(|id| format!("[notification] comment on task #{id}")),
+        // A firehose-only task.commented, plus task.status_changed / task.updated / presence.updated and
+        // every other type, are INFORMATIONAL here — they accrue for the next poll and never inject a wake.
         _ => None,
     }
 }
@@ -56,7 +65,11 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
     let task_id = v.get("task_id").and_then(Value::as_i64);
     let event_seq = v.get("event_seq").and_then(Value::as_i64);
     let channel_id = v.get("channel_id").and_then(Value::as_i64);
-    let prompt = notification_prompt(event_type, task_id, event_seq, channel_id)?;
+    // #384: the board's per-recipient subscription hint (true = direct subscription to the target). Absent on
+    // a pre-#384 payload -> `false`, which leaves every type-gated wake (assign/dm/channel) intact and simply
+    // keeps a comment dropping-to-poll.
+    let subscribed = v.get("subscribed").and_then(Value::as_bool).unwrap_or(false);
+    let prompt = notification_prompt(event_type, task_id, event_seq, channel_id, subscribed)?;
     Some((recipient.to_string(), prompt))
 }
 
@@ -157,23 +170,30 @@ mod tests {
     }
 
     #[test]
-    fn prompt_wakes_only_on_actionable_assignment_and_dm_not_informational() {
-        // ACTIONABLE → wake: a new assignment, and a direct message.
-        assert_eq!(notification_prompt("task.assigned", Some(42), None, None).as_deref(), Some("[notification] task #42"));
-        assert_eq!(notification_prompt("message.direct", None, Some(438), None).as_deref(), Some("[notification] message #438"));
-        // ACTIONABLE → wake: a post to a channel the agent subscribed to (delivery = subscription; #171).
-        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7)).as_deref(), Some("[notification] channel #7"));
-        assert_eq!(notification_prompt("channel.post", None, Some(9), None), None, "no channel_id → can't form a prompt");
-        // INFORMATIONAL → NO wake (accrues for the next poll): a comment or a status change on a task the
-        // agent merely created/subscribes to must not loop-wake a stood-down/idle session (#215).
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None), None, "a comment accrues for poll, never wakes");
-        assert_eq!(notification_prompt("task.status_changed", Some(42), Some(9), None), None);
+    fn prompt_wakes_direct_delivery_types_and_subscribed_comments_not_firehose() {
+        // Direct-delivery types wake on TYPE — the recipient can't be a passive bystander of them — so they
+        // wake regardless of the `subscribed` hint (here `false`). A DM in particular has no subscribable
+        // target, so it MUST stay type-gated.
+        assert_eq!(notification_prompt("task.assigned", Some(42), None, None, false).as_deref(), Some("[notification] task #42"));
+        assert_eq!(notification_prompt("message.direct", None, Some(438), None, false).as_deref(), Some("[notification] message #438"));
+        // A post to a channel the agent is a member of (delivery = membership; #171) wakes on type.
+        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false).as_deref(), Some("[notification] channel #7"));
+        assert_eq!(notification_prompt("channel.post", None, Some(9), None, false), None, "no channel_id → can't form a prompt");
+        // A comment on a target the recipient DIRECTLY subscribes to wakes (#384, subscription = notification)
+        // — the collaboration case the zero-polling mandate targets.
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true).as_deref(), Some("[notification] comment on task #42"));
+        assert_eq!(notification_prompt("task.commented", None, Some(9), None, true), None, "no task_id → can't form a prompt even when subscribed");
+        // NO wake (accrues for the next poll): a comment from a FIREHOSE-only recipient (no direct
+        // subscription) must not loop-wake a board-wide coordinator on every ticket; a status change never
+        // wakes at all.
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, false), None, "a firehose-only comment accrues for poll, never wakes");
+        assert_eq!(notification_prompt("task.status_changed", Some(42), Some(9), None, true), None, "status change never wakes, even when subscribed");
         // an assignment without a task_id, or a DM without a seq, can't form a prompt
-        assert_eq!(notification_prompt("task.assigned", None, Some(1), None), None);
-        assert_eq!(notification_prompt("message.direct", Some(1), None, None), None);
-        // presence churn and other non-actionable event types are ignored
-        assert_eq!(notification_prompt("presence.updated", None, Some(3), None), None);
-        assert_eq!(notification_prompt("task.updated", Some(5), None, None), None);
+        assert_eq!(notification_prompt("task.assigned", None, Some(1), None, false), None);
+        assert_eq!(notification_prompt("message.direct", Some(1), None, None, false), None);
+        // presence churn and other event types are ignored
+        assert_eq!(notification_prompt("presence.updated", None, Some(3), None, true), None);
+        assert_eq!(notification_prompt("task.updated", Some(5), None, None, true), None);
     }
 
     #[test]
@@ -185,8 +205,13 @@ mod tests {
         // missing recipient / informational type / missing ids -> None (no wake)
         assert_eq!(payload_to_wake(&serde_json::json!({"type":"task.assigned","task_id":7})), None);
         assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"presence.updated"})), None);
-        // an FYI comment delivered to a subscriber/creator does NOT wake (it accrues for poll) — #215
+        // a comment to a FIREHOSE-only recipient does NOT wake (it accrues for poll). A pre-#384 payload has
+        // no `subscribed` field → defaults false → drops-to-poll.
         assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"task.commented","task_id":7,"event_seq":9})), None);
+        assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"task.commented","task_id":7,"event_seq":9,"subscribed":false})), None);
+        // a comment to a recipient with a DIRECT subscription to the task (#384) DOES wake.
+        let subbed = serde_json::json!({"recipient":"v-effects","type":"task.commented","task_id":7,"event_seq":9,"subscribed":true});
+        assert_eq!(payload_to_wake(&subbed), Some(("v-effects".into(), "[notification] comment on task #7".into())));
         // a channel.post (tunnel payload carries recipient + channel_id) wakes the subscriber — #171
         let post = serde_json::json!({"recipient":"waiter","type":"channel.post","channel_id":7,"event_seq":51,"data":{"body":"deploy…","from":"deployer"}});
         assert_eq!(payload_to_wake(&post), Some(("waiter".into(), "[notification] channel #7".into())));
