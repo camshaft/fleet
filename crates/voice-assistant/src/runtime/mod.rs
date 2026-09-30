@@ -117,19 +117,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
         shutdown,
         pending_replies: Vec::new(),
     };
-    let outcome = a.main_loop();
-    // Drop the Assistant (and with it the Capture cpal stream = snd_pcm_close) to release the ALSA
-    // device BEFORE the process exits — whether we're stopping cleanly or bailing on a storm.
-    drop(a);
-    match outcome {
-        Outcome::Shutdown => Ok(()),
-        // A running-stream -32 storm an in-process reopen can't clear (#448): return an error so `main`
-        // exits nonzero and systemd's `Restart=on-failure` relaunches a fresh process, which reopens the
-        // now-released device clean.
-        Outcome::Storm => {
-            Err("capture stream error storm; exiting for a clean systemd restart".to_string())
-        }
-    }
+    a.main_loop();
+    // main_loop returns only on a shutdown signal. A running-stream -32 storm instead hard-exits the
+    // process directly from the capture error callback (a graceful drop deadlocks on the faulted fd — #448).
+    // Returning here drops `a`, and with it the Capture stream, releasing the ALSA device before exit.
+    Ok(())
 }
 
 impl Assistant {
@@ -260,7 +252,7 @@ impl Assistant {
 
     /// The main loop: wake → chime → record → STT → post transcript → await reply → speak, with barge-in
     /// and follow-up. Proactive board replies are drained + spoken at idle.
-    fn main_loop(&mut self) -> Outcome {
+    fn main_loop(&mut self) {
         self.play_cue(&chime::ready());
         eprintln!("[voice-assistant] ready — waiting for the wake phrase (Ctrl-C to quit)");
 
@@ -271,10 +263,7 @@ impl Assistant {
                 eprintln!(
                     "[voice-assistant] shutdown signal — releasing the capture device and exiting"
                 );
-                return Outcome::Shutdown;
-            }
-            if self.cap.stormed() {
-                return Outcome::Storm;
+                return;
             }
             let following = conversing; // this turn's record is a reopened follow-up mic
             if !(pending || conversing) {
@@ -284,9 +273,8 @@ impl Assistant {
                         eprintln!(
                             "[voice-assistant] shutdown signal — releasing the capture device and exiting"
                         );
-                        return Outcome::Shutdown;
+                        return;
                     }
-                    Woke::Storm => return Outcome::Storm,
                     Woke::Event => {
                         self.speak_pending_replies();
                         continue;
@@ -351,11 +339,6 @@ impl Assistant {
             if self.shutdown.load(Ordering::Relaxed) {
                 return Woke::Shutdown;
             }
-            // A running-stream error storm can't be cleared by an in-process reopen — bail so the caller
-            // exits for a clean systemd restart (#448).
-            if self.cap.stormed() {
-                return Woke::Storm;
-            }
             // If the capture device faulted (e.g. the mic was unplugged mid-run), don't spin on a dead
             // stream — rebuild it, blocking until the device returns (operator req #239: survive hot-unplug,
             // never crash). Reset the wake stream so stale pre-unplug state can't linger.
@@ -394,16 +377,4 @@ enum Woke {
     Event,
     /// A SIGTERM/SIGINT arrived while waiting; the caller should return and let the stream drop.
     Shutdown,
-    /// The capture stream is storming (running-stream -32 flood); the caller should exit for a clean
-    /// systemd restart, since an in-process reopen can't clear it (#448).
-    Storm,
-}
-
-/// Why [`Assistant::main_loop`] returned — decides the process exit code.
-enum Outcome {
-    /// A shutdown signal (SIGTERM/SIGINT): stop cleanly, exit 0.
-    Shutdown,
-    /// A capture-stream error storm an in-process reopen can't clear: exit NONZERO so systemd's
-    /// `Restart=on-failure` relaunches a fresh process (which reopens the device clean) — #448.
-    Storm,
 }

@@ -57,12 +57,6 @@ pub struct Capture {
     /// Set by cpal's error callback when the stream faults (typically `StreamError::DeviceNotAvailable`
     /// on a hot-unplug). The loop polls [`healthy`](Self::healthy) and rebuilds the capture when it flips.
     dead: Arc<AtomicBool>,
-    /// Set by the error callback when errors arrive as a STORM (a burst within a short window): the Jabra's
-    /// intermittent `POLLERR` -> errno `-32` `snd_pcm_poll_descriptors` flood on a long-running stream. An
-    /// in-process reopen does NOT clear it (the USB/ALSA state stays faulted; only a fresh process recovers),
-    /// so the loop polls [`stormed`](Self::stormed) and exits for a clean systemd auto-restart instead of
-    /// tight-looping a dead fd (#448).
-    stormed: Arc<AtomicBool>,
 }
 
 impl Capture {
@@ -89,13 +83,16 @@ impl Capture {
         // A device fault (unplug) is delivered to the error callback, not the data callback, so record it
         // on a shared flag the main loop can see and act on (reconnect) rather than crashing.
         let dead = Arc::new(AtomicBool::new(false));
-        let stormed = Arc::new(AtomicBool::new(false));
         let dead_cb = dead.clone();
-        let stormed_cb = stormed.clone();
         // Storm detection: once a long-running stream faults, the Jabra floods errors (~70k/s POLLERR/-32),
-        // and an in-process reopen does not clear it (#448). Count errors in a sliding window; a burst is a
-        // storm -> flag it so the loop exits for a clean restart. Also SUPPRESS the per-error log (only the
-        // first-in-window + the storm trigger) so a storm doesn't spam millions of journal lines.
+        // and this fault does NOT clear in-process — worse, `snd_pcm_close` on the faulted fd HANGS, so a
+        // graceful "drop the stream and exit" deadlocks (observed on the running #163 binary: the detector
+        // fired every 500ms for minutes but the process never wound down, and even a SIGTERM then timed out
+        // into a SIGKILL). Only the kernel reclaiming the fd on process death reliably clears it. So count
+        // errors in a sliding window and, on a burst, HARD-EXIT immediately from here (this cpal callback
+        // thread) — skip all teardown and let systemd's Restart=on-failure relaunch a fresh process that
+        // reopens the device clean (#448). Also SUPPRESS the per-error log (only the first-in-window + the
+        // storm line) so the storm doesn't spam millions of journal lines before we exit.
         const STORM_WINDOW: Duration = Duration::from_millis(500);
         const STORM_THRESHOLD: u32 = 20;
         let mut win_start = Instant::now();
@@ -113,9 +110,12 @@ impl Capture {
             } else if win_count == STORM_THRESHOLD {
                 eprintln!(
                     "[audio] capture stream error STORM (>= {STORM_THRESHOLD} in {STORM_WINDOW:?}); \
-                     releasing the device and exiting for a clean auto-restart"
+                     hard-exiting for a clean systemd restart (in-process device release deadlocks on the \
+                     faulted fd)"
                 );
-                stormed_cb.store(true, Ordering::Relaxed);
+                // Hard exit, NOT a graceful drop: snd_pcm_close on the storming fd hangs. process::exit skips
+                // destructors; the kernel reclaims the fd on death, which is the only thing that clears this.
+                std::process::exit(1);
             }
         };
         let stream = device
@@ -139,7 +139,6 @@ impl Capture {
             frames: rx,
             frame,
             dead,
-            stormed,
         })
     }
 
@@ -154,9 +153,8 @@ impl Capture {
         // NOT enough: without this settle check the retry respins instantly (open ok -> immediate storm ->
         // reopen -> storm). A stream that survives the window is genuinely up; one that faults inside it is
         // an open race we back off from, giving the device time to settle. (The far more common LATER
-        // running-stream -32 storm is handled separately — the error callback flags a storm via
-        // `stormed()` and the loop exits for a clean systemd restart, since an in-process reopen can't
-        // clear that fault — #448.)
+        // running-stream -32 storm is handled separately — the error callback hard-exits the process on a
+        // storm, since an in-process reopen can't clear that fault and closing the faulted fd hangs — #448.)
         const SETTLE: Duration = Duration::from_millis(300);
         let mut backoff = Duration::ZERO;
         loop {
@@ -192,13 +190,6 @@ impl Capture {
     /// device was unplugged). The loop uses this to trigger a reconnect.
     pub fn healthy(&self) -> bool {
         !self.dead.load(Ordering::Relaxed)
-    }
-
-    /// True once the error callback has seen a STORM (a burst of stream errors within a short window) — the
-    /// running-stream `-32` flood that an in-process reopen can't clear. The loop exits on this for a clean
-    /// systemd auto-restart rather than reconnecting in place (#448).
-    pub fn stormed(&self) -> bool {
-        self.stormed.load(Ordering::Relaxed)
     }
 
     /// Block for the next frame, up to `timeout`. `None` on timeout or if the stream has ended.
