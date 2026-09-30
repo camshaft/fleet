@@ -22,7 +22,7 @@ use crate::resolver::ChannelLink;
 use crate::sse::{SseDecoder, SseFrame};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The firehose event type the bridge reflects OUT to the external channel (board-core #150).
 pub const OUTBOUND_REFLECT: &str = "channel.outbound_reflect";
@@ -99,12 +99,23 @@ pub fn parse_events(body: &str) -> Result<Vec<Event>, String> {
         Value::Array(a) => a,
         Value::Object(ref o) => match o.get("events") {
             Some(Value::Array(a)) => a.clone(),
-            _ => return Err(format!("board /events: object without an `events` array: {v}")),
+            _ => {
+                return Err(format!(
+                    "board /events: object without an `events` array: {v}"
+                ));
+            }
         },
-        other => return Err(format!("board /events: expected an array or {{events:[…]}}, got {other}")),
+        other => {
+            return Err(format!(
+                "board /events: expected an array or {{events:[…]}}, got {other}"
+            ));
+        }
     };
     arr.into_iter()
-        .map(|e| serde_json::from_value::<Event>(e).map_err(|err| format!("board /events: bad event: {err}")))
+        .map(|e| {
+            serde_json::from_value::<Event>(e)
+                .map_err(|err| format!("board /events: bad event: {err}"))
+        })
         .collect()
 }
 
@@ -177,7 +188,11 @@ pub fn parse_channel_links(body: &str, source: &str) -> Result<Vec<ChannelLink>,
         Value::Array(a) => a,
         Value::Object(ref o) => match o.get("external_links").or_else(|| o.get("links")) {
             Some(Value::Array(a)) => a.clone(),
-            _ => return Err(format!("board /external-links: object without a links array: {v}")),
+            _ => {
+                return Err(format!(
+                    "board /external-links: object without a links array: {v}"
+                ));
+            }
         },
         other => {
             return Err(format!(
@@ -218,18 +233,29 @@ pub struct BoardChannel {
 /// `{ "channels": [...] }` envelope. Pure — unit-tested without a network. A bridge reads its per-channel
 /// config out of each channel's `metadata` (see e.g. the membrain bridge's `slack_bridge_config`).
 pub fn parse_channels(body: &str) -> Result<Vec<BoardChannel>, String> {
-    let v: Value =
-        serde_json::from_str(body).map_err(|e| format!("board /channels: response was not JSON: {e}"))?;
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("board /channels: response was not JSON: {e}"))?;
     let arr = match v {
         Value::Array(a) => a,
         Value::Object(ref o) => match o.get("channels") {
             Some(Value::Array(a)) => a.clone(),
-            _ => return Err(format!("board /channels: object without a `channels` array: {v}")),
+            _ => {
+                return Err(format!(
+                    "board /channels: object without a `channels` array: {v}"
+                ));
+            }
         },
-        other => return Err(format!("board /channels: expected an array or {{channels:[…]}}, got {other}")),
+        other => {
+            return Err(format!(
+                "board /channels: expected an array or {{channels:[…]}}, got {other}"
+            ));
+        }
     };
     arr.into_iter()
-        .map(|c| serde_json::from_value::<BoardChannel>(c).map_err(|e| format!("board /channels: bad channel: {e}")))
+        .map(|c| {
+            serde_json::from_value::<BoardChannel>(c)
+                .map_err(|e| format!("board /channels: bad channel: {e}"))
+        })
         .collect()
 }
 
@@ -254,7 +280,10 @@ impl BoardClient {
     /// Poll the firehose for events after `since_seq` (exclusive), up to `limit`. Returns them in ascending
     /// `seq` order; an empty vec when nothing is newer.
     pub async fn poll_events(&self, since_seq: i64, limit: usize) -> Result<Vec<Event>, String> {
-        let url = format!("{}/events?since_seq={}&limit={}", self.base, since_seq, limit);
+        let url = format!(
+            "{}/events?since_seq={}&limit={}",
+            self.base, since_seq, limit
+        );
         let raw = self
             .http
             .get(&url)
@@ -289,10 +318,7 @@ impl BoardClient {
         F: FnMut(i64, Event),
     {
         let url = format!("{}/events", self.base);
-        let mut req = self
-            .http
-            .get(&url)
-            .header("accept", "text/event-stream");
+        let mut req = self.http.get(&url).header("accept", "text/event-stream");
         // Resume from the last seq the caller durably saw (0 = from the current head, no Last-Event-ID).
         if since_seq > 0 {
             req = req.header("last-event-id", since_seq.to_string());
@@ -338,7 +364,10 @@ impl BoardClient {
                     Err(e) => {
                         // Skip a malformed frame but still advance the cursor past it (fail-soft — one bad
                         // event never wedges the stream), matching the poll loop's batch-advance behavior.
-                        eprintln!("board /events (SSE): skipping undecodable frame (id={:?}): {e}", frame.id);
+                        eprintln!(
+                            "board /events (SSE): skipping undecodable frame (id={:?}): {e}",
+                            frame.id
+                        );
                     }
                 }
             }
@@ -356,8 +385,11 @@ impl BoardClient {
         external_author: Option<&str>,
         reply_to: Option<i64>,
     ) -> Result<(), String> {
-        self.post_raw(channel_id, &build_post_body(sender, body, external_author, reply_to))
-            .await
+        self.post_raw(
+            channel_id,
+            &build_post_body(sender, body, external_author, reply_to),
+        )
+        .await
     }
 
     /// Post a pre-built post body (as produced by [`build_post_body`] / [`crate::sync::plan_inbound`]) to
@@ -527,20 +559,30 @@ mod tests {
     #[test]
     fn as_outbound_reflect_none_for_other_types() {
         let body = r#"[{"seq": 1, "type": "channel.post", "data": {"body": "x"}}]"#;
-        assert!(parse_events(body).unwrap()[0].as_outbound_reflect().is_none());
+        assert!(
+            parse_events(body).unwrap()[0]
+                .as_outbound_reflect()
+                .is_none()
+        );
     }
 
     #[test]
     fn as_outbound_reflect_none_for_malformed_payload() {
         let body = r#"[{"seq": 1, "type": "channel.outbound_reflect", "data": {"body": "x"}}]"#;
-        assert!(parse_events(body).unwrap()[0].as_outbound_reflect().is_none());
+        assert!(
+            parse_events(body).unwrap()[0]
+                .as_outbound_reflect()
+                .is_none()
+        );
     }
 
     #[test]
     fn as_outbound_reflect_defaults_optional_fields() {
         let body = r#"[{"seq": 3, "type": "channel.outbound_reflect",
             "data": {"channel_id": 1, "post_seq": 8, "author": "a", "body": "b"}}]"#;
-        let r = parse_events(body).unwrap()[0].as_outbound_reflect().unwrap();
+        let r = parse_events(body).unwrap()[0]
+            .as_outbound_reflect()
+            .unwrap();
         assert_eq!(r.reply_to, None);
         assert_eq!(r.external_author, None);
     }
@@ -613,7 +655,11 @@ mod tests {
             {"source": "voice",  "external_id": "V1",   "board_kind": "channel", "board_id": 5}
         ]"#;
         let links = parse_channel_links(body, "slack").unwrap();
-        assert_eq!(links.len(), 1, "only the slack/channel row survives the slack filter");
+        assert_eq!(
+            links.len(),
+            1,
+            "only the slack/channel row survives the slack filter"
+        );
         assert_eq!(links[0].external_channel, "C7");
         // A voice bridge filtering source="voice" gets its own row, not slack's.
         let vlinks = parse_channel_links(body, "voice").unwrap();
@@ -675,10 +721,17 @@ mod tests {
     #[test]
     fn frame_events_empty_data_yields_nothing() {
         // A keepalive / id-only cursor frame carries no event.
-        let frame = SseFrame { id: Some("12".into()), event: None, data: String::new() };
+        let frame = SseFrame {
+            id: Some("12".into()),
+            event: None,
+            data: String::new(),
+        };
         assert!(frame_events(&frame).unwrap().is_empty());
         // Whitespace-only data is also treated as empty.
-        let ws = SseFrame { data: "   \n ".into(), ..Default::default() };
+        let ws = SseFrame {
+            data: "   \n ".into(),
+            ..Default::default()
+        };
         assert!(frame_events(&ws).unwrap().is_empty());
     }
 
@@ -693,13 +746,19 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[1].seq, 2);
         // And the {events:[...]} envelope.
-        let env = SseFrame { data: r#"{"events":[{"seq":5,"type":"x","data":null}]}"#.into(), ..Default::default() };
+        let env = SseFrame {
+            data: r#"{"events":[{"seq":5,"type":"x","data":null}]}"#.into(),
+            ..Default::default()
+        };
         assert_eq!(frame_events(&env).unwrap()[0].seq, 5);
     }
 
     #[test]
     fn frame_events_surfaces_a_bad_payload() {
-        let bad = SseFrame { data: "not json".into(), ..Default::default() };
+        let bad = SseFrame {
+            data: "not json".into(),
+            ..Default::default()
+        };
         assert!(frame_events(&bad).is_err());
     }
 }

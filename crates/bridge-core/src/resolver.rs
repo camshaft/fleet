@@ -112,11 +112,19 @@ mod tests {
     fn last_link_wins_on_duplicate_key() {
         // A later entry overrides an earlier one, in both directions.
         let m = ChannelMap::from_links(&[link(7, "C7"), link(7, "C7b")]);
-        assert_eq!(m.board_to_external(7).as_deref(), Some("C7b"), "last board link wins");
+        assert_eq!(
+            m.board_to_external(7).as_deref(),
+            Some("C7b"),
+            "last board link wins"
+        );
         assert_eq!(m.external_to_board("C7b"), Some(7));
 
         let m2 = ChannelMap::from_links(&[link(1, "Cdup"), link(2, "Cdup")]);
-        assert_eq!(m2.external_to_board("Cdup"), Some(2), "last external link wins");
+        assert_eq!(
+            m2.external_to_board("Cdup"),
+            Some(2),
+            "last external link wins"
+        );
     }
 
     #[test]
@@ -134,7 +142,8 @@ mod tests {
         // The deployed Slack config (agenix secret) uses `slack_channel`; the genericized field accepts it
         // via #[serde(alias)] so the cutover to bridge-core doesn't break the live daemon's config.
         let link: ChannelLink =
-            serde_json::from_str(r#"{"board_channel_id": 30, "slack_channel": "D0BDKL68Z46"}"#).unwrap();
+            serde_json::from_str(r#"{"board_channel_id": 30, "slack_channel": "D0BDKL68Z46"}"#)
+                .unwrap();
         assert_eq!(link.board_channel_id, 30);
         assert_eq!(link.external_channel, "D0BDKL68Z46");
         // The genericized key also works.

@@ -14,10 +14,18 @@
 //!
 //! Detection is CONSERVATIVE: it matches the *structured* leading `(<name> <emoji>)` marker, not a bare emoji,
 //! so a human message that merely happens to contain the emoji is never dropped. Pure + unit-tested.
+//!
+//! ROUND-TRIP NOTE (verified live against Slack, #430): Slack normalizes a posted unicode emoji to its
+//! `:shortcode:` on read-back — a message posted as `(Frank 🤖) ... 🤖` comes back on `conversations.history`
+//! as `(Frank :robot_face:) ... :robot_face:`. So detection must recognize BOTH forms: we POST the unicode
+//! emoji (so it renders as a badge) but must DETECT the shortcode (what the inbound poller actually reads).
 
-/// The reserved bridge-origin marker emoji (emoji-ban carve-out for the #430 bot-identity marker). A human
-/// essentially never opens a message with the exact `(<name> <emoji>)` structure, so this is a safe sentinel.
+/// The reserved bridge-origin marker emoji, as POSTED (renders as the visible bot badge in the channel). A
+/// human essentially never opens a message with the exact `(<name> <emoji>)` structure, so it's a safe sentinel.
 pub const MARK_EMOJI: &str = "\u{1F916}"; // robot face
+/// The same marker as Slack returns it on read-back: it normalizes the unicode emoji to this `:shortcode:`.
+/// Detection matches either form so the bridge recognizes its own reflected posts coming back in.
+pub const MARK_EMOJI_SHORTCODE: &str = ":robot_face:";
 
 /// Stamp a board-origin outbound body with the bot-identity marker: `"(<bot> 🤖) <body> 🤖"`. The inbound
 /// poller recognizes this via [`is_board_origin`] and drops it, so the message never loops back into the board.
@@ -35,8 +43,12 @@ pub fn is_board_origin(text: &str) -> bool {
         return false;
     };
     match rest.find(')') {
-        // The parenthesized marker group at the very start must carry the reserved emoji.
-        Some(close) => rest[..close].contains(MARK_EMOJI),
+        // The parenthesized marker group at the very start must carry the reserved marker, in EITHER the
+        // unicode-emoji form (as posted) or the `:shortcode:` form (as Slack returns it on read-back).
+        Some(close) => {
+            let marker = &rest[..close];
+            marker.contains(MARK_EMOJI) || marker.contains(MARK_EMOJI_SHORTCODE)
+        }
         None => false,
     }
 }
@@ -49,7 +61,10 @@ mod tests {
     fn marks_and_detects_round_trip() {
         let marked = mark_board_origin("Frank", "what do you think?");
         assert_eq!(marked, "(Frank \u{1F916}) what do you think? \u{1F916}");
-        assert!(is_board_origin(&marked), "the bridge recognizes its own marked message");
+        assert!(
+            is_board_origin(&marked),
+            "the bridge recognizes its own marked message"
+        );
     }
 
     #[test]
@@ -61,6 +76,17 @@ mod tests {
         assert!(!is_board_origin("i love robots \u{1F916} they are cool"));
         // A leading paren group WITHOUT the reserved emoji is not a marker.
         assert!(!is_board_origin("(just a parenthetical) then text"));
+    }
+
+    #[test]
+    fn detects_slack_shortcode_readback_form() {
+        // Verified live: Slack returns a posted "(Frank 🤖) ... 🤖" as "(Frank :robot_face:) ... :robot_face:"
+        // on conversations.history. The inbound poller must recognize this shortcode form to drop the echo.
+        let readback = "(Frank :robot_face:) echo test :robot_face:";
+        assert!(
+            is_board_origin(readback),
+            "the :robot_face: shortcode marker must be detected on read-back"
+        );
     }
 
     #[test]
