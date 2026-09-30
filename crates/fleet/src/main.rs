@@ -4186,8 +4186,10 @@ fn classify_wake_path(webhook_url: Option<&str>, has_live_tunnel: bool) -> WakeP
 /// Whether an agent is a PERSISTENT LOOP agent EXPECTED to be running (and so subject to the no-poll rule).
 /// Excludes, because none has an event loop a missing wake path would strand: a not-running status (`offline`
 /// stood down, `done` finished, or `cancelled`); a pending/acted stand-down request (winding down before the
-/// status flips); and a non-loop `kind` — an `assistant` is an interactive human-driven session and an
-/// `observer` is spawned per watchdog sweep and exits, so neither waits on events. Pure — unit-tested.
+/// status flips); a STAGED reserve helper (`metadata.staged == true`, #392 — minted ahead of need, its wake
+/// wired at launch, so the watchdog already skips it per PR #122 and the audit mirrors that); and a non-loop
+/// `kind` — an `assistant` is an interactive human-driven session and an `observer` is spawned per watchdog
+/// sweep and exits, so neither waits on events. Pure — unit-tested.
 fn agent_expected_running(agent: &serde_json::Value) -> bool {
     let status = agent.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
     if matches!(status.to_ascii_lowercase().as_str(), "offline" | "done" | "cancelled") {
@@ -4198,6 +4200,9 @@ fn agent_expected_running(agent: &serde_json::Value) -> bool {
         .map(|v| !v.is_null())
         .unwrap_or(false);
     if standing_down {
+        return false;
+    }
+    if agent_is_staged(agent.get("metadata")) {
         return false;
     }
     let kind = agent.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -5424,6 +5429,10 @@ mod tests {
         // Non-loop kinds have no event loop to strand: an interactive assistant session, an ephemeral observer.
         assert!(!agent_expected_running(&json!({"status": "online", "kind": "assistant"})));
         assert!(!agent_expected_running(&json!({"status": "online", "kind": "observer"})));
+        // A STAGED reserve helper (#392) is expected-dormant — wake wired at launch — so not a poll-only gap,
+        // mirroring the watchdog's own staged skip (PR #122).
+        assert!(!agent_expected_running(&json!({"status": "online", "kind": "vertical", "metadata": {"staged": true}})));
+        assert!(agent_expected_running(&json!({"status": "online", "kind": "vertical", "metadata": {"staged": false}})));
     }
 
     #[test]
