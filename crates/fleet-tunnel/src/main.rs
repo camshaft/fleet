@@ -197,7 +197,7 @@ async fn resolve_served_agents(cfg: &Config) -> Vec<String> {
 }
 
 /// One connection lifetime: dial, handshake, then serve frames until the socket closes.
-async fn run_once(cfg: &Config, health: &Arc<HealthState>) -> Result<(), BoxError> {
+async fn run_once(cfg: &Arc<Config>, health: &Arc<HealthState>) -> Result<(), BoxError> {
     let request = build_request(cfg)?;
     let agents = resolve_served_agents(cfg).await;
     tracing::info!(
@@ -209,11 +209,12 @@ async fn run_once(cfg: &Config, health: &Arc<HealthState>) -> Result<(), BoxErro
     let (ws, _resp) = tokio_tungstenite::connect_async(request).await?;
     let (mut write, mut read) = ws.split();
 
-    // hello
+    // hello (clone the served set: we keep the original to hand the #449 refresh-watcher the exact set we
+    // registered with, so it can detect a later change against it)
     let hello = Frame::Hello {
         v: PROTOCOL_VERSION,
         host: cfg.host_id_or_hostname(),
-        agents,
+        agents: agents.clone(),
         token: cfg.token.clone(),
     };
     write.send(Message::Text(hello.to_json().into())).await?;
@@ -238,6 +239,38 @@ async fn run_once(cfg: &Config, health: &Arc<HealthState>) -> Result<(), BoxErro
     health.set_keepalive(keepalive);
     health.set_connected(true);
     health.mark_board_frame();
+
+    // #449: re-derive the served set on this LIVE connection and, if it changed, close the socket so
+    // run_forever re-dials + re-registers the fresh set. Without this the set only refreshes at an
+    // incidental reconnect, so a newly-spun/relocated agent silently gets no event-wakes until then (the
+    // George-on-dev-dsk outage). Only when `agents_cmd` derives the set dynamically; disabled otherwise.
+    // The watcher is aborted when this connection ends (below), so watchers never accumulate across reconnects.
+    let (reconnect_rx, watcher) = match cfg.served_refresh_interval() {
+        Some(interval) => {
+            let (rtx, rrx) = tokio::sync::oneshot::channel::<()>();
+            let cfg = cfg.clone();
+            let connected_with = agents; // the exact set we handshook with
+            let handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.tick().await; // the first tick fires immediately; skip it
+                loop {
+                    ticker.tick().await;
+                    let fresh = resolve_served_agents(&cfg).await;
+                    if fleet_tunnel::config::served_set_differs(&connected_with, &fresh) {
+                        tracing::info!(
+                            "served-set changed on the live connection ({} -> {} agents); reconnecting to re-register",
+                            connected_with.len(),
+                            fresh.len()
+                        );
+                        let _ = rtx.send(());
+                        break;
+                    }
+                }
+            });
+            (Some(rrx), Some(handle))
+        }
+        None => (None, None),
+    };
 
     // A single writer task owns the sink; heartbeat, req responses, and pongs push Messages to it
     // over an mpsc, so nothing has to lock the sink.
@@ -267,14 +300,18 @@ async fn run_once(cfg: &Config, health: &Arc<HealthState>) -> Result<(), BoxErro
 
     let agent = ureq::AgentBuilder::new().timeout(UPSTREAM_TIMEOUT).build();
     let upstream = cfg.upstream_trimmed().to_string();
-    let result = serve(&mut read, &tx, &upstream, &agent, health, keepalive).await;
+    let result = serve(&mut read, &tx, &upstream, &agent, health, keepalive, reconnect_rx).await;
 
     heartbeat.abort();
+    if let Some(w) = watcher {
+        w.abort(); // stop the served-set poller when this connection ends (no accumulation across reconnects)
+    }
     drop(tx); // let the writer drain + finish
     let _ = writer.await;
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve<S>(
     read: &mut S,
     tx: &mpsc::UnboundedSender<Message>,
@@ -282,6 +319,7 @@ async fn serve<S>(
     agent: &ureq::Agent,
     health: &Arc<HealthState>,
     keepalive: u64,
+    reconnect_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), BoxError>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -293,21 +331,39 @@ where
             .saturating_mul(IDLE_KEEPALIVE_MULT)
             .max(MIN_IDLE_TIMEOUT_SECS),
     );
+    // #449 served-set-changed signal: fires when the refresh-watcher sees a new/removed served agent, so we
+    // close + re-dial to re-register. `pending()` when there is no watcher, so the select arm is inert then.
+    let reconnect = async move {
+        match reconnect_rx {
+            Some(rx) => {
+                let _ = rx.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(reconnect);
     loop {
-        let msg = match tokio::time::timeout(idle, read.next()).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => break, // stream ended: clean close
-            Err(_) => {
-                // No frame (not even a keepalive) within the idle window: treat the socket as dead.
-                // Returning Ok triggers a prompt re-dial + hello in run_forever, re-registering us
-                // in the board's tunnel registry so wakes resume.
-                tracing::warn!(
-                    "no board frame for {}s ({}x keepalive); socket presumed dead, reconnecting",
-                    idle.as_secs(),
-                    IDLE_KEEPALIVE_MULT
-                );
+        let msg = tokio::select! {
+            _ = &mut reconnect => {
+                // The served set changed under us; a clean reconnect re-sends hello with the fresh set.
+                tracing::info!("served-set change signalled; closing connection to re-register");
                 return Ok(());
             }
+            read_result = tokio::time::timeout(idle, read.next()) => match read_result {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break, // stream ended: clean close
+                Err(_) => {
+                    // No frame (not even a keepalive) within the idle window: treat the socket as dead.
+                    // Returning Ok triggers a prompt re-dial + hello in run_forever, re-registering us
+                    // in the board's tunnel registry so wakes resume.
+                    tracing::warn!(
+                        "no board frame for {}s ({}x keepalive); socket presumed dead, reconnecting",
+                        idle.as_secs(),
+                        IDLE_KEEPALIVE_MULT
+                    );
+                    return Ok(());
+                }
+            },
         };
         // Any inbound frame proves the socket is alive; stamp it for the health probe's staleness
         // check before dispatching.

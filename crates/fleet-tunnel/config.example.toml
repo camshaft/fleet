@@ -21,6 +21,12 @@ board_ws = "ws://127.0.0.1:8880/board/tunnel/ws"
 # On command failure or empty output the daemon falls back to the static `agents` list below.
 # agents_cmd = "fleet served-set"
 
+# With `agents_cmd`, also re-derive the served set on a LIVE connection every N seconds and, if it CHANGED,
+# reconnect to re-register — so a newly-spun or relocated agent starts getting event-wakes within ~N seconds
+# instead of waiting for an incidental reconnect (the gap that silently starved a just-moved agent). Default
+# 90s when `agents_cmd` is set; set to 0 to disable (refresh only at reconnect). Ignored without `agents_cmd`.
+# served_refresh_secs = 90
+
 # Agent ids whose loops run on this host. The board keys live tunnels by this set and routes each
 # agent's wakes down the matching socket. Used verbatim unless `agents_cmd` (above) yields a set.
 agents = [
