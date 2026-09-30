@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -57,6 +57,12 @@ pub struct Capture {
     /// Set by cpal's error callback when the stream faults (typically `StreamError::DeviceNotAvailable`
     /// on a hot-unplug). The loop polls [`healthy`](Self::healthy) and rebuilds the capture when it flips.
     dead: Arc<AtomicBool>,
+    /// Set by the error callback when errors arrive as a STORM (a burst within a short window): the Jabra's
+    /// intermittent `POLLERR` -> errno `-32` `snd_pcm_poll_descriptors` flood on a long-running stream. An
+    /// in-process reopen does NOT clear it (the USB/ALSA state stays faulted; only a fresh process recovers),
+    /// so the loop polls [`stormed`](Self::stormed) and exits for a clean systemd auto-restart instead of
+    /// tight-looping a dead fd (#448).
+    stormed: Arc<AtomicBool>,
 }
 
 impl Capture {
@@ -83,10 +89,34 @@ impl Capture {
         // A device fault (unplug) is delivered to the error callback, not the data callback, so record it
         // on a shared flag the main loop can see and act on (reconnect) rather than crashing.
         let dead = Arc::new(AtomicBool::new(false));
+        let stormed = Arc::new(AtomicBool::new(false));
         let dead_cb = dead.clone();
+        let stormed_cb = stormed.clone();
+        // Storm detection: once a long-running stream faults, the Jabra floods errors (~70k/s POLLERR/-32),
+        // and an in-process reopen does not clear it (#448). Count errors in a sliding window; a burst is a
+        // storm -> flag it so the loop exits for a clean restart. Also SUPPRESS the per-error log (only the
+        // first-in-window + the storm trigger) so a storm doesn't spam millions of journal lines.
+        const STORM_WINDOW: Duration = Duration::from_millis(500);
+        const STORM_THRESHOLD: u32 = 20;
+        let mut win_start = Instant::now();
+        let mut win_count: u32 = 0;
         let err_fn = move |e| {
-            eprintln!("[audio] capture stream error: {e}");
             dead_cb.store(true, Ordering::Relaxed);
+            let now = Instant::now();
+            if now.duration_since(win_start) > STORM_WINDOW {
+                win_start = now;
+                win_count = 0;
+            }
+            win_count += 1;
+            if win_count == 1 {
+                eprintln!("[audio] capture stream error: {e}");
+            } else if win_count == STORM_THRESHOLD {
+                eprintln!(
+                    "[audio] capture stream error STORM (>= {STORM_THRESHOLD} in {STORM_WINDOW:?}); \
+                     releasing the device and exiting for a clean auto-restart"
+                );
+                stormed_cb.store(true, Ordering::Relaxed);
+            }
         };
         let stream = device
             .build_input_stream(
@@ -109,6 +139,7 @@ impl Capture {
             frames: rx,
             frame,
             dead,
+            stormed,
         })
     }
 
@@ -117,15 +148,15 @@ impl Capture {
     /// begin the loop the moment a device appears, instead of exiting and letting the supervisor
     /// crash-loop. Blocks until a device is open.
     pub fn open_with_retry(audio: &Audio) -> Self {
-        // A freshly-opened stream must stay fault-free for this window before we trust it. An ALSA open
-        // race — e.g. the Jabra's intermittent errno -32 `snd_pcm_poll_descriptors` storm seen on a
-        // service restart — makes `open` return Ok, then delivers a flood of faults to the error callback
-        // within milliseconds. So `open` succeeding is NOT enough: without this settle check the reconnect
-        // path respins instantly (open ok -> immediate storm -> reopen -> storm), spamming ~10k errors/min
-        // and starving the wake engine so no wake fires, while the process still looks healthy to its
-        // supervisor. A stream that survives the window is genuinely up; one that faults inside it is an
-        // open race we back off from, giving the device time to settle (which is why a manual restart
-        // clears it today).
+        // A freshly-opened stream must stay fault-free for this window before we trust it. The NEAR-OPEN
+        // race — a successor opening a device that a SIGKILL'd predecessor never released — makes `open`
+        // return Ok, then floods faults to the error callback within milliseconds. So `open` succeeding is
+        // NOT enough: without this settle check the retry respins instantly (open ok -> immediate storm ->
+        // reopen -> storm). A stream that survives the window is genuinely up; one that faults inside it is
+        // an open race we back off from, giving the device time to settle. (The far more common LATER
+        // running-stream -32 storm is handled separately — the error callback flags a storm via
+        // `stormed()` and the loop exits for a clean systemd restart, since an in-process reopen can't
+        // clear that fault — #448.)
         const SETTLE: Duration = Duration::from_millis(300);
         let mut backoff = Duration::ZERO;
         loop {
@@ -161,6 +192,13 @@ impl Capture {
     /// device was unplugged). The loop uses this to trigger a reconnect.
     pub fn healthy(&self) -> bool {
         !self.dead.load(Ordering::Relaxed)
+    }
+
+    /// True once the error callback has seen a STORM (a burst of stream errors within a short window) — the
+    /// running-stream `-32` flood that an in-process reopen can't clear. The loop exits on this for a clean
+    /// systemd auto-restart rather than reconnecting in place (#448).
+    pub fn stormed(&self) -> bool {
+        self.stormed.load(Ordering::Relaxed)
     }
 
     /// Block for the next frame, up to `timeout`. `None` on timeout or if the stream has ended.
