@@ -81,7 +81,7 @@ impl Assistant {
     /// Play int16 PCM at the chime sample rate (cue tones) — write a temp WAV, play it, clean up.
     fn play_cue(&self, samples: &[i16]) {
         if let Ok(path) = audio::write_wav(samples, chime::CHIME_SR) {
-            audio::play_wav(&path);
+            audio::play_wav(&path, &self.cfg.audio.output_device);
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -101,7 +101,7 @@ impl Assistant {
                 return false;
             }
         };
-        let mut playback = Playback::start(&path);
+        let mut playback = Playback::start(&path, &self.cfg.audio.output_device);
         self.wake.reset(); // the wake that opened this turn must not count as a barge-in
 
         const ARM_FRAMES: u32 = 3;

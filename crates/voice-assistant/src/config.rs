@@ -110,8 +110,10 @@ impl Default for Wake {
 
 // ─────────────────────────────── [stt] ───────────────────────────────
 
-/// Speech-to-text via sherpa-onnx Whisper. GPU by default (`provider = "cuda"`) — the original ran
-/// faster-whisper on the box's GPU; sherpa's CUDA build runs on the same card.
+/// Speech-to-text via sherpa-onnx Whisper. CPU by default (`provider = "cpu"`) — stable everywhere and
+/// fast enough for short utterances (small.en). Set `provider = "cuda"` for GPU, but only when the box's
+/// onnxruntime/cuDNN CUDA provider actually has kernels for the card's arch (e.g. a Pascal 1080 Ti /
+/// sm_61 has none in the bundled build → GPU Whisper aborts, so CPU is the right default).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Stt {
@@ -120,7 +122,8 @@ pub struct Stt {
     pub model_dir: PathBuf,
     /// Whisper model basename inside `model_dir` (e.g. `small.en` → `small.en-encoder.onnx`, …).
     pub model: String,
-    /// Inference provider: `cuda` (default, GPU) or `cpu`.
+    /// Inference provider: `cpu` (default — stable everywhere) or `cuda` (GPU, only if the box's provider
+    /// has kernels for the card's arch).
     pub provider: String,
     /// ONNX intra-op threads (CPU fallback / non-GPU ops).
     pub num_threads: i32,
@@ -136,7 +139,7 @@ impl Default for Stt {
         Self {
             model_dir: home_share("voice-assistant/whisper"),
             model: "small.en".to_string(),
-            provider: "cuda".to_string(),
+            provider: "cpu".to_string(),
             num_threads: 2,
             language: "en".to_string(),
             initial_prompt: String::new(),
@@ -321,6 +324,11 @@ pub struct Audio {
     pub frame: usize,
     /// Input device name substring to pin capture to (empty → the system default input).
     pub input_device: String,
+    /// PLAYBACK output device (an ALSA device string, e.g. `plughw:CARD=USB`). When set, replies + cues
+    /// play via a single deterministic `aplay -D <output_device>`, bypassing player auto-selection and the
+    /// ALSA `default` PCM — which on a session-less system service is often a dead PipeWire sink (silent).
+    /// Empty → the best-effort player list (paplay/pw-play/aplay), unchanged.
+    pub output_device: String,
     /// Quiet needed to END an utterance (seconds) — long enough to survive a thinking pause.
     pub silence_secs: f64,
     /// Minimum real speech before an utterance can end (seconds).
@@ -341,6 +349,7 @@ impl Default for Audio {
             sample_rate: 16000,
             frame: 1280,
             input_device: String::new(),
+            output_device: String::new(),
             silence_secs: 2.5,
             min_speech_secs: 0.3,
             start_timeout_secs: 5.0,
@@ -420,7 +429,8 @@ mod tests {
         assert_eq!(cfg.assistant.name, "assistant");
         assert_eq!(cfg.audio.sample_rate, 16000);
         assert_eq!(cfg.audio.frame, 1280);
-        assert_eq!(cfg.stt.provider, "cuda");
+        assert_eq!(cfg.audio.output_device, "");
+        assert_eq!(cfg.stt.provider, "cpu");
         assert_eq!(cfg.wake.threshold, 0.25);
         assert_eq!(cfg.brain.max_turns, 8);
         assert!(
@@ -526,6 +536,13 @@ mod tests {
         let cfg = parse("").unwrap();
         assert_eq!(cfg.tts.resolved_lexicon(), None);
         assert_eq!(cfg.tts.lang_opt(), None);
+    }
+
+    #[test]
+    fn audio_output_device_defaults_empty_and_round_trips() {
+        assert_eq!(parse("").unwrap().audio.output_device, "");
+        let cfg = parse("[audio]\noutput_device = \"plughw:CARD=USB\"\n").unwrap();
+        assert_eq!(cfg.audio.output_device, "plughw:CARD=USB");
     }
 
     #[test]

@@ -31,14 +31,16 @@ threshold = 0.25
 provider = "cpu"
 num_threads = 1
 
-# ── Speech-to-text (sherpa-onnx Whisper, GPU) ──────────────────────────────
+# ── Speech-to-text (sherpa-onnx Whisper) ───────────────────────────────────
 [stt]
 # Dir with the Whisper ONNX files: <model>-encoder.onnx, <model>-decoder.onnx, <model>-tokens.txt.
 model_dir = "~/.local/share/voice-assistant/whisper"
 # Whisper model basename inside model_dir (e.g. small.en → small.en-encoder.onnx, …).
 model = "small.en"
-# Provider: "cuda" (default, GPU — runs on the box's card) or "cpu".
-provider = "cuda"
+# Provider: "cpu" (default — stable everywhere, fast enough for small.en) or "cuda". Only use "cuda" if
+# the box's onnxruntime/cuDNN CUDA provider actually has kernels for the card's arch — e.g. a Pascal
+# 1080 Ti (sm_61) has none in the bundled build, so GPU Whisper aborts and CPU is the right choice.
+provider = "cpu"
 num_threads = 2
 # Decode language ("en"). Empty → Whisper auto-detects.
 language = "en"
@@ -112,6 +114,11 @@ sample_rate = 16000
 frame = 1280
 # Input device name substring to pin capture to (empty → the system default input).
 input_device = ""
+# PLAYBACK output device — an ALSA device string. When set, replies + cues play via a single
+# `aplay -D <output_device>`, bypassing player auto-selection and the ALSA "default" PCM (which on a
+# session-less system service is often a dead PipeWire sink → silent). Empty → best-effort player list
+# (paplay/pw-play/aplay). For a USB speakerphone: "plughw:CARD=USB".
+output_device = ""
 # Quiet needed to END an utterance (seconds) — long enough to survive a thinking pause.
 silence_secs = 2.5
 # Minimum real speech before an utterance can end (seconds).
