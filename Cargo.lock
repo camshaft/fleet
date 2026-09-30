@@ -2069,6 +2069,7 @@ dependencies = [
  "axum",
  "clap",
  "fastembed",
+ "image",
  "md-5",
  "ort",
  "ort-sys",

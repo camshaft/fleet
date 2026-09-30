@@ -13,10 +13,18 @@
 // Ported ahead of its callers (the phase-2 ingest workers), so the helpers read as dead code until then.
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use pdfium_render::prelude::*;
 use walkdir::{DirEntry, WalkDir};
+
+use crate::config;
+
+/// Render scale for OCR: image-only pages are rendered at this factor of their point size before OCR, so the
+/// rasterized glyphs are large enough for tesseract to read reliably. 2x is a good legibility/size balance.
+const OCR_RENDER_SCALE: f32 = 2.0;
 
 /// The extracted text of one source file, split into pages. A PDF has one entry per page (document order); a
 /// text/markdown file has exactly one entry (the whole file). Empty when the file held no extractable text.
@@ -133,10 +141,11 @@ fn extract_pdf(path: &Path) -> Result<Vec<String>, String> {
     let doc = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|e| format!("extract: pdf {}: {e}", path.display()))?;
+    let min_chars = config::get().pdf_ocr_min_chars;
     Ok(doc
         .pages()
         .iter()
-        .map(|page| normalize_newlines(&page.text().map(|t| t.all()).unwrap_or_default()))
+        .map(|page| page_text(&page, min_chars))
         .collect())
 }
 
@@ -150,11 +159,68 @@ pub fn extract_pdf_bytes(data: &[u8]) -> Result<Vec<String>, String> {
     let doc = pdfium
         .load_pdf_from_byte_slice(data, None)
         .map_err(|e| format!("extract: pdf from bytes ({} bytes): {e}", data.len()))?;
+    let min_chars = config::get().pdf_ocr_min_chars;
     Ok(doc
         .pages()
         .iter()
-        .map(|page| normalize_newlines(&page.text().map(|t| t.all()).unwrap_or_default()))
+        .map(|page| page_text(&page, min_chars))
         .collect())
+}
+
+/// Count of non-whitespace characters — the "how much real text is on this page" measure the OCR threshold
+/// keys on (whitespace-only extraction from an image-only page scores 0).
+fn nonws(s: &str) -> usize {
+    s.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// Whether a page's extracted text looks image-only and should be OCR'd: OCR enabled (`min_chars > 0`) AND
+/// the page has fewer than `min_chars` non-whitespace characters. `min_chars == 0` disables OCR (the default),
+/// so this is always false then. Pure; unit-tested.
+fn page_needs_ocr(text: &str, min_chars: usize) -> bool {
+    min_chars > 0 && nonws(text) < min_chars
+}
+
+/// One page's text: the embedded text (CRLF-normalized), except a page that looks image-only
+/// ([`page_needs_ocr`]) is rendered + OCR'd, and the OCR result is used when it recovers MORE non-whitespace
+/// text than the sparse embedded layer. OCR is best-effort ([`ocr_page`] returns `None` on any failure ->
+/// fall back to the embedded text). With `min_chars == 0` (the default) this is exactly the pre-OCR behavior.
+fn page_text(page: &PdfPage, min_chars: usize) -> String {
+    let embedded = normalize_newlines(&page.text().map(|t| t.all()).unwrap_or_default());
+    if !page_needs_ocr(&embedded, min_chars) {
+        return embedded;
+    }
+    match ocr_page(page) {
+        Some(ocr) if nonws(&ocr) > nonws(&embedded) => ocr,
+        _ => embedded,
+    }
+}
+
+/// Render a page to an image and OCR it with the `tesseract` CLI (task_40). Best-effort: returns `None` on any
+/// failure (tesseract not on PATH, render/encode/spawn error, non-zero exit, or empty output) so the caller
+/// keeps the embedded text. Renders at [`OCR_RENDER_SCALE`], PNG-encodes, and pipes the image to
+/// `tesseract stdin stdout`. Blocking subprocess — the PDF extractors already run under `spawn_blocking`.
+fn ocr_page(page: &PdfPage) -> Option<String> {
+    let render = PdfRenderConfig::new().scale_page_by_factor(OCR_RENDER_SCALE);
+    let bitmap = page.render_with_config(&render).ok()?;
+    let img = bitmap.as_image().ok()?;
+    let mut png: Vec<u8> = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    let mut child = Command::new("tesseract")
+        .args(["stdin", "stdout", "-l", "eng"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Write the PNG to stdin, then drop the handle so tesseract sees EOF and proceeds.
+    child.stdin.take()?.write_all(&png).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = normalize_newlines(String::from_utf8_lossy(&out.stdout).trim());
+    (!text.is_empty()).then_some(text)
 }
 
 /// Normalize line endings to `\n` — PDFium's text extraction emits `\r\n` (and can emit lone `\r`), whereas
@@ -289,5 +355,17 @@ mod tests {
     fn extract_pdf_bytes_errors_gracefully_on_non_pdf() {
         // Non-PDF bytes must surface an Err (bad load or missing libpdfium), never panic.
         assert!(extract_pdf_bytes(b"this is not a pdf").is_err());
+    }
+
+    #[test]
+    fn page_needs_ocr_only_when_enabled_and_sparse() {
+        // Disabled (0) never triggers OCR -> the default is a pure no-op / pre-OCR behavior.
+        assert!(!page_needs_ocr("", 0));
+        assert!(!page_needs_ocr("plenty of text here", 0));
+        // Enabled: fewer than min_chars NON-WHITESPACE chars -> image-only candidate.
+        assert!(page_needs_ocr("   \n  \t", 5)); // 0 non-ws < 5 (image-only page yields ~whitespace)
+        assert!(page_needs_ocr("ab", 5)); // 2 < 5
+        assert!(!page_needs_ocr("abcde", 5)); // 5 is NOT < 5 (boundary)
+        assert!(!page_needs_ocr("a b c d e f", 5)); // 6 non-ws (spaces ignored) >= 5
     }
 }

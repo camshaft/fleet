@@ -72,7 +72,12 @@ walkdir = "2"
 # parser (fidelity matters for the byte-identical vectors). Uses runtime dynamic binding, so it compiles
 # WITHOUT libpdfium present (no build-time network/toolchain); libpdfium is provided at RUNTIME via
 # LD_LIBRARY_PATH in the kb-inbox/uploader roles. Only the ingest workers use it.
-pdfium-render = "0.9"
+# `image_025` enables PdfBitmap::as_image() -> image::DynamicImage, used by the OCR fallback (task_40) to
+# render an image-only page to a bitmap for tesseract.
+pdfium-render = { version = "0.9", features = ["image_025"] }
+# OCR fallback (task_40): encode a rendered PDF page to PNG bytes to feed the `tesseract` CLI. Matches the
+# image 0.25 that pdfium-render's image_025 feature pulls in (so DynamicImage types line up). PNG only.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Phase-2 crate-docs ingest: docs.rs serves the rustdoc JSON as a zstd-compressed body. Already in the
 # workspace lock (transitive), so declaring it here pulls no new tree. Default features include the pure
 # decode path we use (`decode_all`).
