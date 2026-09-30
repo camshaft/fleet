@@ -19,6 +19,7 @@
 //! [`build_identity_body`], [`parse_channel_links`]) that are unit-tested without a network or a runtime.
 
 use crate::resolver::ChannelLink;
+use crate::sse::{SseDecoder, SseFrame};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -105,6 +106,23 @@ pub fn parse_events(body: &str) -> Result<Vec<Event>, String> {
     arr.into_iter()
         .map(|e| serde_json::from_value::<Event>(e).map_err(|err| format!("board /events: bad event: {err}")))
         .collect()
+}
+
+/// Decode one SSE frame's `data` payload into board events. The firehose sends one event per SSE message, so
+/// a single-`Event` JSON object is the common case; fall back to the array / `{ "events": [...] }` envelope
+/// [`parse_events`] accepts, for robustness against a batched frame. An empty `data` (a keepalive / id-only
+/// cursor frame) yields no events. Pure — the frame's own `id` is the resume cursor and is tracked by the
+/// caller independently, so an event whose `seq` is carried only by the SSE `id` still advances the stream.
+pub fn frame_events(frame: &SseFrame) -> Result<Vec<Event>, String> {
+    let data = frame.data.trim();
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A single event object is the expected board framing; the envelope forms are a robustness fallback.
+    if let Ok(ev) = serde_json::from_str::<Event>(data) {
+        return Ok(vec![ev]);
+    }
+    parse_events(data)
 }
 
 /// Build the JSON body for an inbound post (`POST /channels/:id/posts`). `sender` is the bridge's own board
@@ -250,6 +268,63 @@ impl BoardClient {
             .await
             .map_err(|e| format!("board GET /events read failed: {e}"))?;
         parse_events(&raw)
+    }
+
+    /// CONSUME the firehose as a Server-Sent Events push stream (operator directive #363) instead of polling
+    /// `poll_events` on a timer: open `GET /events` with `Accept: text/event-stream`, resuming after
+    /// `since_seq` via the `Last-Event-ID` header, and invoke `on_event(seq, Event)` for each decoded event as
+    /// the board pushes it. `seq` is the SSE frame id when present (the authoritative resume cursor — see
+    /// [`Event::seq`]), else the event's own `seq`; the caller persists it so a reconnect resumes exactly.
+    ///
+    /// Returns `Ok(())` when the server closes the stream (the caller reconnects, or falls back to polling);
+    /// an `Err` on a connect/transport failure. A frame whose `data` fails to decode is skipped (logged to
+    /// stderr) rather than propagated, so one malformed event can't wedge the stream — the same fail-soft
+    /// posture as the poll loop. Between events this awaits the socket (the point of the push model).
+    pub async fn stream_events<F>(&self, since_seq: i64, mut on_event: F) -> Result<(), String>
+    where
+        F: FnMut(i64, Event),
+    {
+        let url = format!("{}/events", self.base);
+        let mut req = self
+            .http
+            .get(&url)
+            .header("accept", "text/event-stream");
+        // Resume from the last seq the caller durably saw (0 = from the current head, no Last-Event-ID).
+        if since_seq > 0 {
+            req = req.header("last-event-id", since_seq.to_string());
+        }
+        let mut resp = req
+            .send()
+            .await
+            .map_err(|e| format!("board GET /events (SSE) failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("board GET /events (SSE) failed: {e}"))?;
+
+        let mut decoder = SseDecoder::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("board /events (SSE) read failed: {e}"))?
+        {
+            for frame in decoder.push(&chunk) {
+                // The frame id is the resume cursor when present; else fall back to a decoded event's seq.
+                let frame_seq: Option<i64> = frame.id.as_deref().and_then(|s| s.parse().ok());
+                match frame_events(&frame) {
+                    Ok(events) => {
+                        for ev in events {
+                            let seq = frame_seq.unwrap_or(ev.seq);
+                            on_event(seq, ev);
+                        }
+                    }
+                    Err(e) => {
+                        // Skip a malformed frame but still advance the cursor past it (fail-soft — one bad
+                        // event never wedges the stream), matching the poll loop's batch-advance behavior.
+                        eprintln!("board /events (SSE): skipping undecodable frame (id={:?}): {e}", frame.id);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Post an inbound (external → board) message into board channel `channel_id`, attributed to
@@ -560,5 +635,52 @@ mod tests {
     fn parse_channels_rejects_non_channel_json() {
         assert!(parse_channels(r#"{"nope": 1}"#).is_err());
         assert!(parse_channels("not json").is_err());
+    }
+
+    #[test]
+    fn frame_events_decodes_a_single_event_object() {
+        let frame = SseFrame {
+            id: Some("7".into()),
+            event: Some("message".into()),
+            data: r#"{"seq":7,"type":"channel.outbound_reflect","channel_id":3,
+                     "data":{"channel_id":3,"post_seq":9,"author":"frank","body":"hi"}}"#
+                .into(),
+        };
+        let evs = frame_events(&frame).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].seq, 7);
+        assert_eq!(evs[0].kind, OUTBOUND_REFLECT);
+        assert_eq!(evs[0].as_outbound_reflect().unwrap().author, "frank");
+    }
+
+    #[test]
+    fn frame_events_empty_data_yields_nothing() {
+        // A keepalive / id-only cursor frame carries no event.
+        let frame = SseFrame { id: Some("12".into()), event: None, data: String::new() };
+        assert!(frame_events(&frame).unwrap().is_empty());
+        // Whitespace-only data is also treated as empty.
+        let ws = SseFrame { data: "   \n ".into(), ..Default::default() };
+        assert!(frame_events(&ws).unwrap().is_empty());
+    }
+
+    #[test]
+    fn frame_events_falls_back_to_array_and_envelope() {
+        // A batched frame: an array of events.
+        let arr = SseFrame {
+            data: r#"[{"seq":1,"type":"a","data":null},{"seq":2,"type":"b","data":null}]"#.into(),
+            ..Default::default()
+        };
+        let evs = frame_events(&arr).unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].seq, 2);
+        // And the {events:[...]} envelope.
+        let env = SseFrame { data: r#"{"events":[{"seq":5,"type":"x","data":null}]}"#.into(), ..Default::default() };
+        assert_eq!(frame_events(&env).unwrap()[0].seq, 5);
+    }
+
+    #[test]
+    fn frame_events_surfaces_a_bad_payload() {
+        let bad = SseFrame { data: "not json".into(), ..Default::default() };
+        assert!(frame_events(&bad).is_err());
     }
 }

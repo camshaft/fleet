@@ -17,6 +17,8 @@
 //! - [`relay`] — the outbound relay-resilience escalation ([`relay::relay_plan`]): a message that
 //!   deterministically fails to deliver degrades then quarantines, so it never head-of-line-blocks the
 //!   outbound loop. Transport-agnostic (the transport supplies the actual rich/degraded render).
+//! - [`sse`] — a spec-compliant Server-Sent Events decoder so a bridge CONSUMES the board firehose as a push
+//!   stream ([`board::BoardClient::stream_events`]) instead of polling `GET /events` on a timer (#363).
 //!
 //! Source-agnostic on purpose: `external_author = "<source>:<id>"` (e.g. `slack:U123`, `voice:<speaker>`),
 //! and the external channel is an opaque `String`. Slack-, voice-, or GitHub-specifics live in the
@@ -26,6 +28,7 @@ pub mod board;
 pub mod channel_config;
 pub mod relay;
 pub mod resolver;
+pub mod sse;
 pub mod sync;
 
 pub use board::{
@@ -33,6 +36,7 @@ pub use board::{
     BoardChannel, BoardClient, Event, OutboundReflect, LINK_KIND_CHANNEL, LINK_SOURCE,
     OUTBOUND_REFLECT,
 };
+pub use sse::{SseDecoder, SseFrame};
 pub use channel_config::{bridged_channels, Bridged, BridgeConfig};
 pub use relay::{relay_plan, RelayPlan, RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN};
 pub use resolver::{ChannelLink, ChannelMap};
