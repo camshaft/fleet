@@ -3075,6 +3075,76 @@ fn build_observer_kickoff(
     )
 }
 
+/// The distinct angles an adversarial review is run on (#374, Doc #5 D16) — one ephemeral reviewer per angle,
+/// each `(key, focus)`: `key` labels the angle in the reviewer's board writes, `focus` is the lens it reviews
+/// through. The clarity angle names the MAINTAINED writing lists (Doc #7 / Doc #8) as run-time truth rather
+/// than a hardcoded pattern copy, because those lists are data-driven and grow (board-pm, fleet writing policy).
+const REVIEW_ANGLES: &[(&str, &str)] = &[
+    (
+        "correctness-completeness",
+        "Is it CORRECT and COMPLETE? Find factual errors, missing cases, unhandled inputs, gaps between what \
+         it claims and what it does, and requirements it does not meet.",
+    ),
+    (
+        "clarity-writing",
+        "Is it CLEAR and well WRITTEN? Apply the humanize three-pass — remove AI vocabulary, break AI \
+         sentence/section structures, add human texture — judging against the Fleet Doc-Writing Style Guide \
+         (Document #7, including the A6 humanize-judgment appendix) and the banned-phrases list (Document #8), \
+         which you READ AT REVIEW TIME (they are maintained and growing — never a frozen copy).",
+    ),
+    (
+        "risk-security",
+        "What could go WRONG? Find security holes, unsafe assumptions, failure modes, data-loss or \
+         irreversibility, and operational risks the author did not call out.",
+    ),
+    (
+        "alternatives",
+        "What ALTERNATIVES were not considered? Name simpler or stronger approaches the author did not weigh, \
+         and any stated choice that lacks a rationale versus its alternatives.",
+    ),
+];
+
+/// The kickoff for an EPHEMERAL adversarial reviewer session (#374): it acts as the stable board id
+/// `reviewer`, reads ONE review's target on ONE angle, files each finding to the review's append-only log
+/// (an actionable finding links a child task), then EXITS — no loop. It NEVER transitions the review status:
+/// the changes_requested / approved / vetted transitions are the D17 person-review gate, not the reviewer's
+/// (board-pm confirmed). `fleet_bin` is the ABSOLUTE path to THIS standalone fleet binary (the `fleet` on PATH
+/// may be a different build); `role_path` points at the full role body (`loops/reviewer.md`), the
+/// authoritative method — the kickoff carries the review id + angle + identity so the review is well-formed
+/// regardless. Pure so the prompt is unit-tested. Mirrors [`build_observer_kickoff`] on the same ephemeral
+/// spawn engine (#187/#188/#290) — one review, one angle, then exit.
+fn build_reviewer_kickoff(
+    review_id: i64,
+    angle_key: &str,
+    angle_focus: &str,
+    role_path: &str,
+    fleet_bin: &str,
+) -> String {
+    format!(
+        "You are an EPHEMERAL fleet `reviewer`. Board IDENTITY: you act as the single stable board agent id \
+         `reviewer`. FIRST call register_agent 'reviewer' (idempotent). Then author EVERY board write AS \
+         `reviewer` by PASSING THE IDENTITY PARAMETER on each call — the board defaults these to NULL: \
+         append_review_log / comment_task with author=\"reviewer\", create_task with created_by=\"reviewer\", \
+         update_task with actor=\"reviewer\". Never leave author/created_by null. This session makes exactly \
+         ONE adversarial review on ONE angle and EXITS — do NOT start a /loop. IMPORTANT: for every `fleet` \
+         command use THIS binary by its absolute path — `{fleet_bin}` — NOT the `fleet` on PATH (which may be \
+         a different build). Read your full role and method at {role_path} and follow it exactly. \
+         YOUR REVIEW: review #{review_id}, ANGLE `{angle_key}`. Call get_review {review_id} to read its \
+         target_ref, kind, and source, then read that target IN FULL before forming any finding. YOUR LENS: \
+         {angle_focus} Lean HARD on kb_search for the relevant norms/standards. Record each above-floor, \
+         evidence-cited, deduped finding on the review's append-only log — `append_review_log` with \
+         review_id={review_id}, author=\"reviewer\", a `finding`-type entry naming your angle `{angle_key}` and \
+         quoting the exact spot in the target; an ACTIONABLE finding also links a CHILD task (create_task with \
+         created_by=\"reviewer\", then reference its id in the entry). Dedup against the review's existing log \
+         entries before appending. If your angle is CLEAN (nothing above-floor), append ONE brief no-op finding \
+         (angle `{angle_key}`: no findings, and why) so the log records that your angle ran — do not invent a \
+         finding to look busy. DO NOT call set_review_status — you NEVER transition the review \
+         (open/in_review/changes_requested/approved/closed); the vetted/approved and changes-requested \
+         transitions are the person-review gate (D17), decided on your recorded findings, not by you. When you \
+         have appended your finding(s) or the no-op, EXIT — this is a one-shot review session, you do not loop."
+    )
+}
+
 /// Launch (or, with `dry_run`, preview) an ephemeral observer session for one target window. Runs in a
 /// repo-less workspace under the fleet root; the board identity is `observer` (the session registers/authors
 /// as it per [`build_observer_kickoff`]). Returns a short action label for the sweep report. Best-effort:
@@ -4396,6 +4466,46 @@ mod tests {
             assert!(k.contains("observe-record v-t --session sess-9"), "confirms via observe-record last");
             assert!(k.contains("/abs/fleet"), "uses this binary's absolute path");
         }
+    }
+
+    #[test]
+    fn review_angles_are_the_four_confirmed_adversarial_lenses() {
+        // The angle set is board-pm-confirmed against Doc #5 D16 (#374): correctness+completeness, clarity+writing,
+        // risk+security, alternatives-not-considered — one ephemeral reviewer per angle.
+        let keys: Vec<&str> = REVIEW_ANGLES.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec!["correctness-completeness", "clarity-writing", "risk-security", "alternatives"]
+        );
+        // The clarity angle names the MAINTAINED lists as run-time truth (not a hardcoded pattern copy).
+        let clarity = REVIEW_ANGLES.iter().find(|(k, _)| *k == "clarity-writing").unwrap().1;
+        assert!(clarity.contains("three-pass"), "clarity angle applies the humanize three-pass");
+        assert!(clarity.contains("Document #7") && clarity.contains("Document #8"), "names the maintained writing lists");
+        assert!(clarity.contains("READ AT REVIEW TIME"), "reads the lists at review time, not a frozen copy");
+    }
+
+    #[test]
+    fn build_reviewer_kickoff_reviews_one_review_on_one_angle_and_never_transitions() {
+        let (key, focus) = REVIEW_ANGLES[0]; // correctness-completeness
+        let k = build_reviewer_kickoff(88, key, focus, "/repo/loops/reviewer.md", "/abs/fleet");
+        // Identity + ephemeral (one review, no loop) — the reviewer analog of the observer kickoff.
+        assert!(k.contains("register_agent 'reviewer'"), "binds the stable reviewer identity");
+        assert!(k.contains("author=\"reviewer\""), "authors board writes as reviewer");
+        assert!(k.contains("do NOT start a /loop") && k.contains("you do not loop"), "ephemeral one-shot, not a loop");
+        // Drives from the review + its angle.
+        assert!(k.contains("review #88") && k.contains("get_review 88"), "reads the assigned review");
+        assert!(k.contains("ANGLE `correctness-completeness`"), "carries the assigned angle");
+        assert!(k.contains(focus), "carries the angle's review lens");
+        assert!(k.contains("/repo/loops/reviewer.md") && k.contains("/abs/fleet"), "names the role + this binary");
+        // Files findings on the review log (+ actionable child tasks); does NOT transition status (D17 person-gate).
+        assert!(k.contains("append_review_log") && k.contains("review_id=88"), "records findings on the review log");
+        assert!(k.contains("finding"), "entries are findings");
+        assert!(k.contains("CHILD task"), "an actionable finding links a child task");
+        assert!(k.contains("DO NOT call set_review_status"), "the reviewer never transitions the review (D17 person-gate)");
+        assert!(k.contains("no-op finding"), "a clean angle still records that it ran");
+        // The clarity angle carries the maintained-lists-at-review-time contract when built for it.
+        let clarity_k = build_reviewer_kickoff(88, REVIEW_ANGLES[1].0, REVIEW_ANGLES[1].1, "/r/loops/reviewer.md", "/abs/fleet");
+        assert!(clarity_k.contains("three-pass") && clarity_k.contains("Document #7"), "clarity kickoff points at the writing guide + three-pass");
     }
 
     #[test]
