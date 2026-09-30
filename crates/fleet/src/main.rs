@@ -2369,9 +2369,15 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
          exists, then get_agent '{agent}' to read your OWN charter + metadata from the board and follow that \
          charter as your role. IMPORTANT — the board does NOT bind your session: each call may reach a fresh, \
          unbound board, so register_agent does NOT make later id-less calls work. Pass your identity \
-         EXPLICITLY on EVERY board call — agent_id on check_notifications / set_status / get_messages / \
-         list_tasks, from_agent on send_message, created_by / author / actor on writes (all = '{agent}'); the \
-         board defaults these to null and any call that omits them fails with 'no identity for this session'. \
+         EXPLICITLY on EVERY board call, and note that each tool NAMES the identity field DIFFERENTLY — \
+         agent_id on check_notifications / set_status / get_messages / list_tasks, from_agent on send_message, \
+         author on comment_task / comment_document, actor on update_task, created_by on create_task (all = \
+         '{agent}'). Passing the WRONG field (e.g. agent_id to comment_task, which takes author) is silently \
+         accepted but records the actor as null, so the board cannot exclude you from your own notification and \
+         you wake on your OWN comment — use each tool's own field. The board defaults identity to null and a \
+         call that omits it fails with 'no identity for this session'. Never PRECOMPUTE or guess a task id: \
+         reference a task only by the id create_task RETURNS, because concurrent creation on the shared board \
+         can hand a guessed next-id to a DIFFERENT agent's task. \
          Coordinate through the board (send_message / check_notifications / \
          comment_task / set_status) — there is no file inbox. Any board Document you author (design / \
          proposal / plan) MUST follow the Fleet Doc-Writing Style Guide — wiki guides/doc-writing-style-guide \
@@ -5360,6 +5366,13 @@ mod tests {
         assert!(k.contains("does NOT bind your session"), "states the board never binds the session (#336)");
         assert!(k.contains("EVERY board call"), "explicit ids on every call, not a fallback");
         assert!(k.contains("from_agent") && k.contains("created_by") && k.contains("actor"), "names the explicit-id params incl. send_message's from_agent");
+        // Per-tool identity map (#531): each tool names identity DIFFERENTLY, and the wrong field records
+        // actor=null and self-notifies you on your own comment — the exact footgun task_531 exists to stop.
+        assert!(k.contains("author on comment_task"), "names comment_task's author field explicitly (#531)");
+        assert!(k.contains("actor on update_task") && k.contains("created_by on create_task"), "per-tool write-identity map");
+        assert!(k.contains("wake on your OWN comment"), "warns that the wrong identity field self-notifies");
+        // Never precompute a task id (#526): reference only the id create_task returns.
+        assert!(k.contains("Never PRECOMPUTE") && k.contains("id create_task RETURNS"), "bans guessing a task id (#526)");
         assert!(k.contains("'v-x'") && k.contains("/wt/v-x"));
         // OWNER-CONFIRM gate (#352): a trace-derived destructive/operator action against a service you don't
         // own must be owner-confirmed before executing or routing (a near-miss almost restarted a stale unit).
