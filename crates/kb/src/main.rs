@@ -10,6 +10,8 @@
 mod board;
 mod chunk;
 mod config;
+// Phase-2 ingest worker core: docs.rs rustdoc-JSON ingest (`kb crate-docs`), shared with the pipeline (#238).
+mod crate_docs;
 mod curate;
 mod embed;
 // Phase-2 ingest infra: file discovery + text/PDF extraction the inbox/pipeline workers build on. Its own
@@ -74,6 +76,15 @@ enum Command {
     },
     /// Drain the drop-folder inbox once: ingest + IPFS-pin each file, then delete (the Python `kb.inbox`).
     Inbox,
+    /// Ingest a crate's docs.rs rustdoc JSON into `crate.<name>.<version>` (the Python `kb.crate_docs`).
+    CrateDocs {
+        /// Crate name as published on docs.rs.
+        crate_name: String,
+        /// Version to fetch; `latest` resolves to the newest release. The resolved crate_version names the
+        /// collection, so `latest` and the explicit version it resolves to ingest into the same place.
+        #[arg(long, default_value = "latest")]
+        version: String,
+    },
 }
 
 #[tokio::main]
@@ -101,6 +112,14 @@ async fn main() {
             run_search(&query, collection, limit, all).await
         }
         Command::Inbox => inbox::run().await,
+        Command::CrateDocs {
+            crate_name,
+            version,
+        } => crate_docs::ingest_crate(&crate_name, &version)
+            .await
+            .map(|(chunks, collection)| {
+                println!("ingested {chunks} chunks into {collection}");
+            }),
     };
 
     if let Err(e) = result {

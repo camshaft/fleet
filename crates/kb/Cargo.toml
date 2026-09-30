@@ -73,6 +73,10 @@ walkdir = "2"
 # WITHOUT libpdfium present (no build-time network/toolchain); libpdfium is provided at RUNTIME via
 # LD_LIBRARY_PATH in the kb-inbox/uploader roles. Only the ingest workers use it.
 pdfium-render = "0.9"
+# Phase-2 crate-docs ingest: docs.rs serves the rustdoc JSON as a zstd-compressed body. Already in the
+# workspace lock (transitive), so declaring it here pulls no new tree. Default features include the pure
+# decode path we use (`decode_all`).
+zstd = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
