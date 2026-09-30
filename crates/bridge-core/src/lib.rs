@@ -28,8 +28,9 @@ pub mod resolver;
 pub mod sync;
 
 pub use board::{
-    build_identity_body, build_post_body, parse_channel_links, parse_events, BoardClient, Event,
-    OutboundReflect, LINK_KIND_CHANNEL, LINK_SOURCE, OUTBOUND_REFLECT,
+    build_identity_body, build_post_body, parse_channel_links, parse_channels, parse_events,
+    BoardChannel, BoardClient, Event, OutboundReflect, LINK_KIND_CHANNEL, LINK_SOURCE,
+    OUTBOUND_REFLECT,
 };
 pub use relay::{relay_plan, RelayPlan, RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN};
 pub use resolver::{ChannelLink, ChannelMap};

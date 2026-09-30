@@ -181,6 +181,40 @@ pub fn parse_channel_links(body: &str, source: &str) -> Result<Vec<ChannelLink>,
     Ok(links)
 }
 
+/// One board channel as returned by `GET /channels`. Only the fields a bridge needs are modeled; `metadata`
+/// stays a raw [`Value`] (the board sometimes stores it as an object and sometimes as a JSON-encoded string)
+/// so a transport can pull its own config key out of it. Unknown fields are ignored (forward compatible).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BoardChannel {
+    /// The board channel id.
+    pub id: i64,
+    /// The channel name.
+    #[serde(default)]
+    pub name: String,
+    /// The channel's metadata bag (per-channel config lives here, e.g. a bridge's `*_bridge_config`).
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+/// Parse the JSON body of `GET /channels` into [`BoardChannel`]s. Accepts a bare array or a
+/// `{ "channels": [...] }` envelope. Pure — unit-tested without a network. A bridge reads its per-channel
+/// config out of each channel's `metadata` (see e.g. the membrain bridge's `slack_bridge_config`).
+pub fn parse_channels(body: &str) -> Result<Vec<BoardChannel>, String> {
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| format!("board /channels: response was not JSON: {e}"))?;
+    let arr = match v {
+        Value::Array(a) => a,
+        Value::Object(ref o) => match o.get("channels") {
+            Some(Value::Array(a)) => a.clone(),
+            _ => return Err(format!("board /channels: object without a `channels` array: {v}")),
+        },
+        other => return Err(format!("board /channels: expected an array or {{channels:[…]}}, got {other}")),
+    };
+    arr.into_iter()
+        .map(|c| serde_json::from_value::<BoardChannel>(c).map_err(|e| format!("board /channels: bad channel: {e}")))
+        .collect()
+}
+
 /// A handle to the board's token-less localhost REST API (stateless — each call is one request). The
 /// firehose cursor (`since_seq`) is owned by the caller (the transport loop), not this client.
 pub struct BoardClient {
@@ -268,6 +302,26 @@ impl BoardClient {
             .await
             .map_err(|e| format!("board GET /external-links read failed: {e}"))?;
         parse_channel_links(&raw, source)
+    }
+
+    /// List all board channels (`GET /channels`) with their metadata. A bridge filters these by its own
+    /// per-channel config key in `metadata` (e.g. the membrain bridge's `slack_bridge_config.bridge_instance`)
+    /// to discover the channels it manages — live, without a restart.
+    pub async fn list_channels(&self) -> Result<Vec<BoardChannel>, String> {
+        let url = format!("{}/channels", self.base);
+        let raw = self
+            .http
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("board GET /channels failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("board GET /channels failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("board GET /channels read failed: {e}"))?;
+        parse_channels(&raw)
     }
 
     /// Register (idempotent on `(source, external_id)`) a board channel ↔ external channel link (board-core
@@ -482,5 +536,29 @@ mod tests {
     #[test]
     fn parse_channel_links_empty_is_ok() {
         assert!(parse_channel_links("[]", "slack").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_channels_bare_array_and_envelope() {
+        let body = r#"[
+            {"id": 30, "name": "operator-dm", "metadata": {"outbound_authors": ["concierge"]}},
+            {"id": 31, "name": "bare"}
+        ]"#;
+        let chans = parse_channels(body).unwrap();
+        assert_eq!(chans.len(), 2);
+        assert_eq!(chans[0].id, 30);
+        assert_eq!(chans[0].name, "operator-dm");
+        assert_eq!(chans[0].metadata["outbound_authors"][0], "concierge");
+        assert_eq!(chans[1].id, 31, "a channel with no metadata still parses");
+        assert!(chans[1].metadata.is_null());
+
+        let env = parse_channels(r#"{"channels": [{"id": 7}]}"#).unwrap();
+        assert_eq!(env[0].id, 7);
+    }
+
+    #[test]
+    fn parse_channels_rejects_non_channel_json() {
+        assert!(parse_channels(r#"{"nope": 1}"#).is_err());
+        assert!(parse_channels("not json").is_err());
     }
 }
