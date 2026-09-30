@@ -106,7 +106,7 @@ impl VoiceBridge {
             |ext| self.map.external_to_board(ext),
         );
         match planned {
-            Some(p) => self.client.post_raw(p.board_channel_id, &p.body).await,
+            Some(p) => self.client.post_raw(p.board_channel_id, &p.body).await.map(|_| ()),
             None => Err(format!(
                 "voice channel {:?} is not mapped to a board channel",
                 self.voice_channel
