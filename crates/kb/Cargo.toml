@@ -30,7 +30,7 @@ rmcp = { version = "3", features = [
 ] }
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs"] }
 tokio-util = "0.7"
 schemars = "1"
 # Local embeddings + cross-encoder rerank. Pulls ort (onnxruntime); the CUDA execution provider is a
@@ -48,8 +48,12 @@ ort = { version = "=2.0.0-rc.9", default-features = false }
 # explicit ureq-TLS feature and fails to compile. rc.9 is what fastembed 4.9 builds against (proven at the
 # embedding-parity gate). Bump in lockstep with `ort`/`fastembed`.
 ort-sys = "=2.0.0-rc.9"
-# Qdrant is reached over its plain REST API with a thin blocking client — matches the fleet/slack-bridge
-# `ureq` house idiom and keeps the dep tree light (no qdrant-client/tonic/gRPC).
+# Async HTTP for all network IO (Qdrant, board, IPFS): operator directive — no blocking IO on the tokio
+# runtime (#439). `reqwest` is the workspace's async client (bridge-core uses the same version/features), so
+# adding it here pulls no new tree. rustls-tls matches bridge-core; localhost traffic is plain http.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `ureq` (blocking) still backs store.rs + board.rs until they migrate to reqwest under #439; removed in the
+# final step of that migration. New code uses reqwest.
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: payloads round-trip through Qdrant without silently reordering an agent's fields.

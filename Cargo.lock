@@ -2123,6 +2123,7 @@ dependencies = [
  "ort",
  "ort-sys",
  "pdf-extract",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",
