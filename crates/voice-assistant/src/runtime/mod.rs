@@ -37,6 +37,12 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 const PROACTIVE_POLL_EVERY: Duration = Duration::from_secs(2);
 /// Sleep between reply polls while awaiting a turn's answer (keeps the poll from busy-spinning the board).
 const REPLY_POLL_INTERVAL: Duration = Duration::from_millis(300);
+/// If the idle wait sees NO capture frames for this long, treat the stream as silently dead and reconnect.
+/// A live ALSA stream delivers frames continuously (ambient silence is ~zero-value samples, but frames keep
+/// arriving at the sample rate), so a gap this long means a phantom/dead device — a hot-unplug cpal never
+/// signaled via the error callback, or a default-device latch (task-575). Generous so a slow board poll or
+/// scheduling jitter can't false-trip it.
+const CAPTURE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The assembled engines + config + board session for one running assistant.
 struct Assistant {
@@ -330,23 +336,30 @@ impl Assistant {
 
     /// Block on wake frames until the wake phrase fires OR a proactive board reply is available. Polls the
     /// firehose on a cadence while listening, so George posting unprompted wakes the loop.
+    /// Rebuild the capture stream, blocking until a device opens (operator req #239: survive a hot-unplug,
+    /// never crash), and reset the wake model so stale pre-fault state can't linger. Shared by the idle
+    /// wait's two fault-detection paths: the cpal error callback (`!healthy()`) and the liveness guard.
+    fn reconnect_capture(&mut self, reason: &str) {
+        eprintln!("[audio] {reason}; reconnecting…");
+        self.cap = Capture::open_with_retry(&self.cfg.audio);
+        self.wake.reset();
+        eprintln!("[audio] capture device reconnected");
+    }
+
     fn wait_for_wake_or_event(&mut self) -> Woke {
         let per_frame = Duration::from_millis(500);
         let mut next_poll = Instant::now(); // poll immediately on entry, then every PROACTIVE_POLL_EVERY
+        let mut last_frame = Instant::now(); // liveness guard: when we last received capture audio
         loop {
             // A shutdown signal ends the idle wait promptly (this is where the daemon sits almost all the
             // time, so it is the state a deploy stop lands in) — return so the loop can drop the stream.
             if self.shutdown.load(Ordering::Relaxed) {
                 return Woke::Shutdown;
             }
-            // If the capture device faulted (e.g. the mic was unplugged mid-run), don't spin on a dead
-            // stream — rebuild it, blocking until the device returns (operator req #239: survive hot-unplug,
-            // never crash). Reset the wake stream so stale pre-unplug state can't linger.
+            // If the mic was unplugged mid-run cpal signals the error callback — rebuild the stream.
             if !self.cap.healthy() {
-                eprintln!("[audio] capture device lost; reconnecting…");
-                self.cap = Capture::open_with_retry(&self.cfg.audio);
-                self.wake.reset();
-                eprintln!("[audio] capture device reconnected");
+                self.reconnect_capture("capture device lost");
+                last_frame = Instant::now();
             }
             // A proactive board reply wakes the loop even without the wake phrase. Buffer what we drain for
             // speak_pending_replies to handle.
@@ -361,10 +374,26 @@ impl Assistant {
                     Err(e) => eprintln!("[voice-bridge] proactive poll failed: {e}"),
                 }
             }
-            if let Some(frame) = self.cap.next_frame(per_frame)
-                && self.wake.accept(&frame)
-            {
-                return Woke::Wake;
+            // Liveness guard: cpal does NOT always fire the error callback on a fault (the task-448 -32 saga
+            // showed this), and a default-device latch never faults at all — either way the stream just
+            // stops delivering frames while `healthy()` stays true. A live stream delivers them
+            // continuously, so no frame for CAPTURE_LIVENESS_TIMEOUT means it is silently dead → reconnect
+            // (re-enumerating, so a replugged device is picked up with no restart — task-575).
+            match self.cap.next_frame(per_frame) {
+                Some(frame) => {
+                    last_frame = Instant::now();
+                    if self.wake.accept(&frame) {
+                        return Woke::Wake;
+                    }
+                }
+                None => {
+                    if last_frame.elapsed() > CAPTURE_LIVENESS_TIMEOUT {
+                        self.reconnect_capture(&format!(
+                            "no capture frames for {CAPTURE_LIVENESS_TIMEOUT:?} (stream silently dead)"
+                        ));
+                        last_frame = Instant::now();
+                    }
+                }
             }
         }
     }

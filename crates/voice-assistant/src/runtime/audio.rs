@@ -207,13 +207,19 @@ impl Capture {
     }
 }
 
-/// Pick the input device whose name contains `want` (case-insensitive), else the host default. An empty
-/// `want` goes straight to the default.
+/// Pick the input device whose name contains `want` (case-insensitive). An empty `want` uses the host
+/// default; a NON-EMPTY `want` that matches nothing returns `None` (NOT the default) so the caller keeps
+/// waiting for that specific device to appear.
 ///
 /// NOTE (#279): cpal reports ALSA **PCM names** (e.g. `sysdefault:CARD=USB`, `front:CARD=USB,DEV=0`) from
 /// `device.name()`, NOT the human card description ("Jabra SPEAK 410 USB") — so `want` must match the PCM
-/// name. When nothing matches we LOG the available names so an operator can see exactly what to configure,
-/// rather than silently falling back to `default` (which on some hosts can't even be opened).
+/// name. When nothing matches we LOG the available names so an operator can see exactly what to configure.
+///
+/// A CONFIGURED-but-absent device does NOT fall back to the default (task-575): that fallback let a
+/// hot-unplugged daemon latch a dead/phantom default stream — one that opens, passes the settle check, then
+/// silently delivers no frames forever, never noticing the real mic's replug. Returning `None` makes
+/// [`open`](Capture::open) error so [`open_with_retry`](Capture::open_with_retry) keeps re-enumerating until
+/// the NAMED device reappears (and never even calls `snd_pcm_open` on the default, which could itself hang).
 fn pick_input(host: &cpal::Host, want: &str) -> Option<cpal::Device> {
     if want.is_empty() {
         return host.default_input_device();
@@ -222,8 +228,12 @@ fn pick_input(host: &cpal::Host, want: &str) -> Option<cpal::Device> {
     let devices: Vec<cpal::Device> = match host.input_devices() {
         Ok(devs) => devs.collect(),
         Err(e) => {
-            eprintln!("[audio] could not enumerate input devices ({e}); using the default device");
-            return host.default_input_device();
+            // Enumeration itself failed (transient host churn during an unplug): keep waiting for the named
+            // device rather than latching the default.
+            eprintln!(
+                "[audio] could not enumerate input devices ({e}); waiting for {want:?} to appear"
+            );
+            return None;
         }
     };
     if let Some(d) = devices.iter().find(|d| {
@@ -233,16 +243,16 @@ fn pick_input(host: &cpal::Host, want: &str) -> Option<cpal::Device> {
     }) {
         return Some(d.clone());
     }
-    // No match — surface what IS available so the misconfiguration is self-diagnosing (the substring must
-    // match a listed PCM name; the human device label is not what cpal exposes).
+    // No match for a CONFIGURED device — surface what IS available (self-diagnosing misconfig: the substring
+    // must match a listed PCM name, not the human device label) and keep waiting for it, NOT the default.
     let names: Vec<String> = devices.iter().filter_map(|d| d.name().ok()).collect();
     eprintln!(
-        "[audio] no input device matches {want:?}; available input devices: [{}]. Falling back to the \
-         default device — set audio.input_device to a substring of one of the names above (e.g. \
-         \"CARD=USB\" for a USB mic).",
+        "[audio] no input device matches {want:?}; available input devices: [{}]. Waiting for it to \
+         appear — if this is a misconfiguration, set audio.input_device to a substring of one of the names \
+         above (e.g. \"CARD=USB\" for a USB mic).",
         names.join(", ")
     );
-    host.default_input_device()
+    None
 }
 
 /// int16 RMS of one frame — the energy VAD's speech/silence measure (ported from the Python `np.sqrt(
