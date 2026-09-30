@@ -28,13 +28,19 @@ pub struct BridgeConfig {
     pub bridge_instance: String,
 }
 
-/// A board channel wired to a bridge: its board id + the resolved [`BridgeConfig`].
+/// A board channel wired to a bridge: its board id, the resolved [`BridgeConfig`], and the channel's
+/// top-level `outbound_authors` (board-owned #150 authz). A bridge does NOT use `outbound_authors` for
+/// authorization (that stays board-side — the existence of a `channel.outbound_reflect` event is the authz);
+/// it reads them only to know which agent NAMES to watch for in inbound mentions (the #429 wake-word / #430
+/// ack path), e.g. reacting when a human says "hey frank". Absent/malformed -> empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bridged {
     /// The board channel id.
     pub board_channel_id: i64,
     /// The channel's `bridge_config`.
     pub config: BridgeConfig,
+    /// The channel's top-level `metadata.outbound_authors` (the named agents that post OUT via this bridge).
+    pub outbound_authors: Vec<String>,
 }
 
 /// Coerce a channel's `metadata` to a JSON object: accept an object, or a JSON-encoded string (`"{...}"`);
@@ -66,9 +72,20 @@ pub fn bridged_channels(
             Err(_) => continue,
         };
         if cfg.source == source && cfg.bridge_instance == bridge_instance {
+            // Top-level (board-owned) authz list -> the agent names this bridge watches for in mentions.
+            let outbound_authors = meta
+                .get("outbound_authors")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
             out.push(Bridged {
                 board_channel_id: ch.id,
                 config: cfg,
+                outbound_authors,
             });
         }
     }
@@ -181,9 +198,49 @@ mod tests {
                 external_channel_id: "C30".into(),
                 bridge_instance: "membrain".into(),
             },
+            outbound_authors: vec!["frank".into()],
         }];
         let m = channel_map(&b);
         assert_eq!(m.board_to_external(30).as_deref(), Some("C30"));
         assert_eq!(m.external_to_board("C30"), Some(30));
+    }
+
+    #[test]
+    fn parses_top_level_outbound_authors() {
+        let channels = vec![chan(
+            123,
+            json!({
+                "bridge_config": {"source": "slack", "external_channel_id": "C0", "bridge_instance": "membrain"},
+                "outbound_authors": ["frank", "george"]
+            }),
+        )];
+        let b = bridged_channels(&channels, "slack", "membrain");
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            b[0].outbound_authors,
+            vec!["frank".to_string(), "george".into()]
+        );
+    }
+
+    #[test]
+    fn outbound_authors_default_empty_when_absent_or_malformed() {
+        let channels = vec![
+            chan(
+                1,
+                json!({"bridge_config": {"source": "slack", "external_channel_id": "C1", "bridge_instance": "membrain"}}),
+            ),
+            chan(
+                2,
+                json!({"bridge_config": {"source": "slack", "external_channel_id": "C2", "bridge_instance": "membrain"},
+                       "outbound_authors": "not-an-array"}),
+            ),
+        ];
+        let b = bridged_channels(&channels, "slack", "membrain");
+        assert_eq!(b.len(), 2);
+        assert!(b[0].outbound_authors.is_empty(), "absent -> empty");
+        assert!(
+            b[1].outbound_authors.is_empty(),
+            "malformed (non-array) -> empty"
+        );
     }
 }
