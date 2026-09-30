@@ -31,9 +31,11 @@ const DEFAULT_BASE: &str = "http://127.0.0.1:8880/board/api";
 const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) fleet-orchestrator";
 
 /// Whether a task is ACTIONABLE pending work for the work-conserving loop (board-pm refinement): only a
-/// `todo`/`in_progress` task that is NOT blocked/parked. A `blocked_on` link (waiting on a blocker, or on a
-/// prereq that does not exist yet) means the task is parked, not actionable — counting it kept an agent's
-/// loop hot on a parked item (the v-runtime #230 false-fire). Pure — unit-tested.
+/// `todo`/`in_progress` task that is NOT blocked/parked and NOT monitor-exempt. A `blocked_on` link (waiting
+/// on a blocker, or on a prereq that does not exist yet) means the task is parked, not actionable — counting
+/// it kept an agent's loop hot on a parked item (the v-runtime #230 false-fire). A `monitor_exempt` task
+/// (#167) is a genuinely continuous monitor, not a deliverable to loop tightly on, so it likewise does not
+/// keep the loop hot (#535). Pure — unit-tested.
 fn task_is_actionable(task: &Value) -> bool {
     let status = task.get("status").and_then(Value::as_str).unwrap_or("");
     let actionable_status = status == "todo" || status == "in_progress";
@@ -42,7 +44,13 @@ fn task_is_actionable(task: &Value) -> bool {
     let blocked = ["blocked_on_kind", "blocked_on"]
         .iter()
         .any(|k| task.get(*k).is_some_and(|v| !v.is_null()));
-    actionable_status && !blocked
+    // A monitor-exempt task (derived top-level bool, #167) is a legitimate continuous monitor — never
+    // actionable "loop tighter" work.
+    let monitor_exempt = task
+        .get("monitor_exempt")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    actionable_status && !blocked && !monitor_exempt
 }
 
 /// The board query path for an OPEN observation task tagged `observes=<target>` in a project — the #290
@@ -393,6 +401,12 @@ mod tests {
         );
         // A null blocked_on does NOT mean parked.
         assert!(task_is_actionable(&serde_json::json!({ "status": "todo", "blocked_on": null })));
+        // A monitor-exempt in_progress task is a continuous monitor, not actionable loop-tighter work (#535).
+        assert!(
+            !task_is_actionable(&serde_json::json!({ "status": "in_progress", "monitor_exempt": true })),
+            "monitor-exempt is not actionable work"
+        );
+        assert!(task_is_actionable(&serde_json::json!({ "status": "in_progress", "monitor_exempt": false })));
     }
 
     #[test]
