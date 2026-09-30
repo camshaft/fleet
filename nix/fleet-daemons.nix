@@ -112,14 +112,15 @@ let
   fleetBin = "${fleet}/bin/fleet";
 
   # ── The managed daemon set ──────────────────────────────────────────────────────────────────────────
-  # Phase 0 (#493): the #478 nudge-stale pilot -- a SINGLE-SWEEP oneshot (enumerate in_progress tasks, nudge
-  # the stale ones, exit) so a timer pair, NOT a long-running service. The 2h cooldown is enforced in-logic
-  # from the daemon's own prior comments, so a 30-min cadence is not spam-sensitive -- it just keeps it
-  # responsive. Group A daemons + Group B cron conversions land in Phase 1/2 (#494/#495) via mkService/mkTimer.
+  # Phase 0 (#493): the #478 nudge-stale pilot -- a SINGLE-SWEEP oneshot (enumerate stale assigned in_progress
+  # + todo tasks, nudge them, exit) so a timer pair, NOT a long-running service. The cooldown is enforced
+  # in-logic from the daemon's own prior comments; a 1h cooldown re-nudges a task each time it re-stales past
+  # the 1h threshold (operator #540), and the 30-min timer keeps it responsive without spamming inside the
+  # cooldown. Group A daemons + Group B cron conversions land in Phase 1/2 (#494/#495) via mkService/mkTimer.
   units = mkTimer {
     name = "fleet-nudge-stale";
     description = "Fleet stale-task nudger (board #478)";
-    exec = "${fleetBin} nudge-stale --apply --threshold-hours 1 --cooldown-hours 2";
+    exec = "${fleetBin} nudge-stale --apply --threshold-hours 1 --cooldown-hours 1";
     intervalSecs = 1800;
     persistent = true;
     restartSec = 5;
