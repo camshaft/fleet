@@ -31,10 +31,12 @@ use serde_json::{Map, Value};
 use crate::store::Store;
 use crate::{chunk, config, curate, embed};
 
-/// The payload `source` and first component of the point id — the Python `KB_*` docs.rs source tag.
-const SOURCE: &str = "docs.rs";
-/// The payload curation `kind` for crate docs (authority 0.8, static — no recency decay).
-const KIND: &str = "doc";
+/// The payload `source` and first component of the point id — the Python `KB_*` docs.rs source tag. Shared
+/// with the pipeline's docs.rs branch (#238 reconciliation) so both paths key point ids identically.
+pub(crate) const SOURCE: &str = "docs.rs";
+/// The payload curation `kind` for crate docs (authority 0.8, static — no recency decay). Shared with the
+/// pipeline docs.rs branch.
+pub(crate) const KIND: &str = "doc";
 /// Items' chunks embedded + upserted per batch, bounding peak memory and the Qdrant request size on large
 /// crates (`store::upsert` sends one PUT for whatever it's given) — the Python `kb.crate_docs` batch of 128.
 const BATCH: usize = 128;
@@ -98,15 +100,9 @@ pub async fn ingest_crate(
     let mut texts: Vec<String> = Vec::new();
     let mut payloads: Vec<Map<String, Value>> = Vec::new();
     for item in &items {
-        let body = format!("{} \u{2014} {}\n\n{}", item.path, item.kind, item.docs);
+        let body = item_body(item);
         for (idx, piece) in chunk::chunk_default(&body).into_iter().enumerate() {
-            ids.push(chunk::id(&[
-                SOURCE,
-                name,
-                &crate_version,
-                &item.path,
-                &idx.to_string(),
-            ]));
+            ids.push(point_id(name, &crate_version, &item.path, idx));
             let mut extra = Map::new();
             extra.insert("text".into(), Value::from(piece.clone()));
             extra.insert("source".into(), Value::from(SOURCE));
@@ -210,8 +206,36 @@ fn dry_run_json(collection: &str, id: &str, vector: &[f32], payload: &Map<String
 /// form pipeline.rs's rustdoc branch uses — green-side parity (task_237) confirmed all 599 live tokio points
 /// carry it, so matching it makes crate-docs byte-identical to live (a re-ingest updates the url in place
 /// rather than clobbering it) and aligns the two docs.rs paths for the #238 reconciliation. Pure; unit-tested.
-fn docs_url(name: &str, crate_version: &str) -> String {
+pub(crate) fn docs_url(name: &str, crate_version: &str) -> String {
     format!("https://docs.rs/{name}/{crate_version}/{name}/")
+}
+
+/// The chunk body for one documented item: `"{path} \u{2014} {kind}\n\n{docs}"` (a literal em-dash), matching
+/// the Python. Single-sourced so crate_docs and the pipeline docs.rs branch (#238) build identical bodies.
+pub(crate) fn item_body(item: &DocItem) -> String {
+    format!("{} \u{2014} {}\n\n{}", item.path, item.kind, item.docs)
+}
+
+/// The point-id parts BEFORE the chunk index for a docs.rs item: `[SOURCE, name, crate_version, path]`. The
+/// pipeline's docs.rs branch stores these as the item's `id_override_parts` and appends the chunk index, so
+/// both paths key ids identically. Single-sourced here.
+pub(crate) fn item_id_parts(name: &str, crate_version: &str, path: &str) -> Vec<String> {
+    vec![
+        SOURCE.to_string(),
+        name.to_string(),
+        crate_version.to_string(),
+        path.to_string(),
+    ]
+}
+
+/// The deterministic point id for a docs.rs chunk: `chunk::id([SOURCE, name, crate_version, path, chunk_idx])`
+/// — the parity-proven live formula (task_237). Single-sourced (via [`item_id_parts`]) so `ingest_crate` and
+/// the pipeline docs.rs branch produce byte-identical ids, i.e. re-ingest via either path updates the same
+/// live points in place.
+pub(crate) fn point_id(name: &str, crate_version: &str, path: &str, idx: usize) -> String {
+    let mut parts = item_id_parts(name, crate_version, path);
+    parts.push(idx.to_string());
+    chunk::id(&parts.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 /// Extract documented items from rustdoc JSON — the Python `_items`. Iterates `doc["index"]` (id -> item)
