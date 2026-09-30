@@ -51,12 +51,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This build is slow (~4min, and often queued). It is a REQUIRED check, so the JOB must ALWAYS run
+      # and report a status — a `paths:`-skipped required check never posts and blocks the PR forever. So
+      # instead of skipping the job, we detect whether any file that can affect the runtime build changed
+      # and SHORT-CIRCUIT the nix build when none did. A fleet-crate-only PR (main.rs / board.rs edits that
+      # never touch voice-assistant, the flake, or the lockfile) then satisfies this check in seconds and
+      # merges on the fast `clippy + test` gate — the whole-workspace clippy already compiles voice-assistant's
+      # lib, so a cross-crate API break is still caught; only the native sherpa/cpal LINK path is skipped.
+      # (task_563: the check taxed every unrelated fleet-crate PR with minutes of poll-and-wait wall-clock.)
+      - name: Detect voice-assistant-relevant changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            relevant:
+              - 'crates/voice-assistant/**'
+              - 'crates/bridge-core/**'
+              - 'flake.nix'
+              - 'flake.lock'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/checks.yml'
+
       # voice-assistant's `runtime` feature (sherpa-onnx STT/TTS/wake + cpal audio) links a prebuilt
       # linux-x64 sherpa lib and needs cmake/alsa, so it is gated to x86_64-linux in flake.nix (checks +
       # packages). The GHA `ubuntu-latest` runner IS x86_64, so this is the one CI-native path that can
       # build it — without this job, no PR touching the runtime feature has any green build signal short
       # of a manual x86_64 machine round-trip (see crates/voice-assistant's aarch64-owner gap).
       - uses: DeterminateSystems/nix-installer-action@v23
+        if: steps.filter.outputs.relevant == 'true'
 
       - name: nix build .#voice-assistant (runtime feature, hermetic sherpa lib)
+        if: steps.filter.outputs.relevant == 'true'
         run: nix build .#voice-assistant --print-build-logs
+
+      - name: Skip (no voice-assistant-relevant changes)
+        if: steps.filter.outputs.relevant != 'true'
+        run: echo "No voice-assistant / flake / workspace-manifest changes on this PR; skipping the ~4min runtime build. The fast 'clippy + test (workspace)' job is the merge gate — it already compiles voice-assistant's lib, so a cross-crate break is still caught."
