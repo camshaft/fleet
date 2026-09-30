@@ -119,6 +119,16 @@ pub fn parse_events(body: &str) -> Result<Vec<Event>, String> {
         .collect()
 }
 
+/// Parse the created post's `seq` from a `POST /channels/:id/posts` response (`{ "channel_id": .., "seq": N }`).
+/// The `seq` is what a later `reply_to` / a `channel.outbound_reflect`'s `post_seq` refers to. Pure.
+pub fn parse_post_seq(body: &str) -> Result<i64, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("board POST /posts: response was not JSON: {e}"))?;
+    v.get("seq")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("board POST /posts: response had no integer `seq`: {v}"))
+}
+
 /// Decode one SSE frame's `data` payload into board events. The firehose sends one event per SSE message, so
 /// a single-`Event` JSON object is the common case; fall back to the array / `{ "events": [...] }` envelope
 /// [`parse_events`] accepts, for robustness against a batched frame. An empty `data` (a keepalive / id-only
@@ -377,6 +387,8 @@ impl BoardClient {
 
     /// Post an inbound (external → board) message into board channel `channel_id`, attributed to
     /// `external_author` (the external identity) with the bridge as `sender`. `reply_to` threads a parent.
+    /// Returns the created board post's `seq` (the identifier `reply_to` / a reflect's `post_seq` reference),
+    /// so a transport can correlate it (e.g. map it to the external message id for threaded replies, #429).
     pub async fn post_message(
         &self,
         channel_id: i64,
@@ -384,7 +396,7 @@ impl BoardClient {
         body: &str,
         external_author: Option<&str>,
         reply_to: Option<i64>,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         self.post_raw(
             channel_id,
             &build_post_body(sender, body, external_author, reply_to),
@@ -394,9 +406,12 @@ impl BoardClient {
 
     /// Post a pre-built post body (as produced by [`build_post_body`] / [`crate::sync::plan_inbound`]) to
     /// board channel `channel_id`. The transport uses this so it posts exactly the tested planner output.
-    pub async fn post_raw(&self, channel_id: i64, body: &Value) -> Result<(), String> {
+    /// Returns the created post's `seq` (the value a later `reply_to` / a `channel.outbound_reflect`'s
+    /// `post_seq` refers to), enabling reply/thread correlation.
+    pub async fn post_raw(&self, channel_id: i64, body: &Value) -> Result<i64, String> {
         let url = format!("{}/channels/{}/posts", self.base, channel_id);
-        self.http
+        let resp = self
+            .http
             .post(&url)
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -404,8 +419,11 @@ impl BoardClient {
             .await
             .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?
             .error_for_status()
-            .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("board POST /channels/{channel_id}/posts failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("board POST /channels/{channel_id}/posts read failed: {e}"))?;
+        parse_post_seq(&resp)
     }
 
     /// Read the board-registered channel links for `source` (board-core #149 slice 2). The transport merges
@@ -700,6 +718,19 @@ mod tests {
     fn parse_channels_rejects_non_channel_json() {
         assert!(parse_channels(r#"{"nope": 1}"#).is_err());
         assert!(parse_channels("not json").is_err());
+    }
+
+    #[test]
+    fn parse_post_seq_reads_created_seq() {
+        assert_eq!(
+            parse_post_seq(r#"{"channel_id":123,"seq":4855}"#).unwrap(),
+            4855
+        );
+        assert!(
+            parse_post_seq(r#"{"channel_id":123}"#).is_err(),
+            "missing seq is an error"
+        );
+        assert!(parse_post_seq("not json").is_err());
     }
 
     #[test]

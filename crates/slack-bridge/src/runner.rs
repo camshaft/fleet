@@ -376,8 +376,8 @@ async fn handle_message(state: &BridgeState, client: &SlackHyperClient, msg: Sla
 
     let board_channel = plan.board_channel_id;
     match BoardClient::new(&cfg.board_api).post_raw(board_channel, &plan.body).await {
-        Ok(()) => {
-            tracing::info!(%channel, board_channel, %user, "inbound: posted Slack message to board")
+        Ok(seq) => {
+            tracing::info!(%channel, board_channel, %user, board_post_seq = seq, "inbound: posted Slack message to board")
         }
         Err(e) => tracing::warn!(error = %e, "inbound: board post failed"),
     }
