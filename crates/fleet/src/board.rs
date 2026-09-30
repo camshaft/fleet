@@ -16,6 +16,11 @@
 //! agent still coordinates through its own in-session board MCP; the fleet only sets the launch-shaping
 //! metadata the board can't infer.
 
+// `ureq::Error` is a large enum (~272B) that ureq's own API returns by value everywhere; the transient-retry
+// wrapper + its request closures thread it through, but it is always handled immediately (mapped to a String
+// or matched), never stored in bulk — so `result_large_err` is noise here, not a real cost.
+#![allow(clippy::result_large_err)]
+
 use serde_json::Value;
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:8880/board/api";
@@ -48,6 +53,33 @@ fn open_observation_query(project_id: i64, observes: &str) -> String {
     format!("/tasks?project_id={project_id}&status=todo&meta_key=observes&meta_value={observes}")
 }
 
+/// A TRANSIENT board failure worth a brief retry: an origin 5xx (502/503/504 — the green origin's occasional
+/// blip) or a transport-level error. A 4xx (e.g. a 404) or any other status is NOT transient — surface it so
+/// real errors are not masked. Pure — unit-tested.
+fn is_transient(err: &ureq::Error) -> bool {
+    matches!(err, ureq::Error::Status(502..=504, _) | ureq::Error::Transport(_))
+}
+
+/// Run a board request, retrying a TRANSIENT failure (see [`is_transient`]) up to 2 extra times with a short
+/// backoff — so a brief green-origin blip does not hard-fail a one-shot command or skip a whole watchdog
+/// sweep. A sustained outage still surfaces (the error returns once the attempts are spent). `f` rebuilds the
+/// request each try because ureq consumes the `Request` on `call`/`send`.
+fn with_transient_retry<F>(f: F) -> Result<ureq::Response, ureq::Error>
+where
+    F: Fn() -> Result<ureq::Response, ureq::Error>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match f() {
+            Err(e) if attempt < 2 && is_transient(&e) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(300 * u64::from(attempt)));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A handle to the board's REST API (stateless — each call is one `GET`).
 pub struct Board {
     base: String,
@@ -70,13 +102,14 @@ impl Board {
 
     fn get_json(&self, path: &str) -> Result<Value, String> {
         let url = format!("{}{}", self.base, path);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("accept", "application/json")
-            .set("user-agent", BOARD_UA)
-            .call()
-            .map_err(|e| format!("board GET {path} failed: {e}"))?;
+        let resp = with_transient_retry(|| {
+            self.agent
+                .get(&url)
+                .set("accept", "application/json")
+                .set("user-agent", BOARD_UA)
+                .call()
+        })
+        .map_err(|e| format!("board GET {path} failed: {e}"))?;
         let raw = resp
             .into_string()
             .map_err(|e| format!("board GET {path} read failed: {e}"))?;
@@ -114,13 +147,13 @@ impl Board {
     /// free-form `config` object carries the launch hints (cwd/pre_trust/env) the consumer reads.
     pub fn get_workspace_kind(&self, kind: &str) -> Result<Option<Value>, String> {
         let url = format!("{}/workspace-kinds/{}", self.base, kind);
-        match self
-            .agent
-            .get(&url)
-            .set("accept", "application/json")
-            .set("user-agent", BOARD_UA)
-            .call()
-        {
+        match with_transient_retry(|| {
+            self.agent
+                .get(&url)
+                .set("accept", "application/json")
+                .set("user-agent", BOARD_UA)
+                .call()
+        }) {
             Ok(resp) => {
                 let raw = resp
                     .into_string()
@@ -194,12 +227,15 @@ impl Board {
     pub fn patch_metadata(&self, agent: &str, metadata: Value) -> Result<(), String> {
         let url = format!("{}/agents/{}", self.base, agent);
         let body = serde_json::json!({ "metadata": metadata }).to_string();
-        self.agent
-            .request("PATCH", &url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(&body)
-            .map_err(|e| format!("board PATCH /agents/{agent} failed: {e}"))?;
+        // A key-merge PATCH is idempotent, so a transient-blip retry is safe.
+        with_transient_retry(|| {
+            self.agent
+                .request("PATCH", &url)
+                .set("content-type", "application/json")
+                .set("user-agent", BOARD_UA)
+                .send_string(&body)
+        })
+        .map_err(|e| format!("board PATCH /agents/{agent} failed: {e}"))?;
         Ok(())
     }
 
@@ -211,12 +247,15 @@ impl Board {
         let url = format!("{}/agents/{}", self.base, agent);
         let body =
             serde_json::json!({ "status": status, "status_message": status_message }).to_string();
-        self.agent
-            .request("PATCH", &url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(&body)
-            .map_err(|e| format!("board PATCH /agents/{agent} (status) failed: {e}"))?;
+        // Setting status is idempotent (last write wins), so a transient-blip retry is safe.
+        with_transient_retry(|| {
+            self.agent
+                .request("PATCH", &url)
+                .set("content-type", "application/json")
+                .set("user-agent", BOARD_UA)
+                .send_string(&body)
+        })
+        .map_err(|e| format!("board PATCH /agents/{agent} (status) failed: {e}"))?;
         Ok(())
     }
 
@@ -226,13 +265,15 @@ impl Board {
     pub fn create_or_get_channel(&self, name: &str, created_by: &str) -> Result<i64, String> {
         let url = format!("{}/channels", self.base);
         let body = serde_json::json!({ "name": name, "created_by": created_by }).to_string();
-        let resp = self
-            .agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(&body)
-            .map_err(|e| format!("board POST /channels ({name}) failed: {e}"))?;
+        // Idempotent (posting an existing name returns it), so a transient-blip retry is safe.
+        let resp = with_transient_retry(|| {
+            self.agent
+                .post(&url)
+                .set("content-type", "application/json")
+                .set("user-agent", BOARD_UA)
+                .send_string(&body)
+        })
+        .map_err(|e| format!("board POST /channels ({name}) failed: {e}"))?;
         let raw = resp
             .into_string()
             .map_err(|e| format!("board POST /channels read failed: {e}"))?;
@@ -267,6 +308,20 @@ mod tests {
         // The default is the front-door /board/api proxy, not the board's own unreachable port.
         assert!(DEFAULT_BASE.ends_with("/board/api"));
         assert!(DEFAULT_BASE.starts_with("http://"));
+    }
+
+    #[test]
+    fn is_transient_matches_origin_5xx_and_transport_only() {
+        // A synthetic Status error: ureq builds one from a Response. Construct via the HTTP builder.
+        let mk = |code: u16| {
+            ureq::Error::Status(code, ureq::Response::new(code, "x", "").expect("build response"))
+        };
+        assert!(is_transient(&mk(502)), "502 bad gateway → transient");
+        assert!(is_transient(&mk(503)), "503 → transient");
+        assert!(is_transient(&mk(504)), "504 → transient");
+        assert!(!is_transient(&mk(404)), "404 is a real answer, not transient");
+        assert!(!is_transient(&mk(400)), "4xx is not transient");
+        assert!(!is_transient(&mk(500)), "a plain 500 is not retried (not a gateway blip)");
     }
 
     #[test]
