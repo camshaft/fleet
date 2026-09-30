@@ -79,15 +79,44 @@ pub fn tmux_inject(session: &str, window: &str, text: &str) -> Result<(), String
     Ok(())
 }
 
+/// How the notifier handles one incoming request. The board POSTs webhook events; a supervisor (a systemd
+/// service health check, `fleet board-health`, a monitor) probes liveness with a plain `GET`. Classifying up
+/// front lets a liveness probe get a clean `200` without being read as a webhook — which would log a spurious
+/// "unparseable body" line and is indistinguishable from a real event.
+#[derive(Debug, PartialEq, Eq)]
+enum Incoming {
+    /// A liveness probe (`GET /health`, `/healthz`, or `/`) — answer `200` and read nothing.
+    HealthProbe,
+    /// A board webhook event — read the body and map it to a wake (the default for any other request).
+    Webhook,
+}
+
+/// Classify an incoming request by method + path (query string ignored): a `GET` to `/health`, `/healthz`, or
+/// `/` is a liveness probe; every other request is a webhook. Pure — unit-tested.
+fn classify_request(method: &tiny_http::Method, url: &str) -> Incoming {
+    let path = url.split('?').next().unwrap_or(url);
+    if *method == tiny_http::Method::Get && matches!(path, "/health" | "/healthz" | "/") {
+        Incoming::HealthProbe
+    } else {
+        Incoming::Webhook
+    }
+}
+
 /// Run the notifier: bind a local HTTP endpoint and, for each board webhook POST, inject the wake prompt
 /// into the recipient agent's tmux window in `session`. Blocks (a long-running daemon). Best-effort: every
 /// request is answered `200` immediately, and a payload that is unparseable or not actionable is logged and
-/// dropped (a wake is never worth wedging the endpoint the board POSTs to).
+/// dropped (a wake is never worth wedging the endpoint the board POSTs to). A supervisor liveness-probes the
+/// daemon with a `GET` to `/health` (see [`classify_request`]), answered `200` without webhook parsing.
 pub fn serve(port: u16, session: &str) -> Result<(), String> {
     let server = tiny_http::Server::http(("127.0.0.1", port))
         .map_err(|e| format!("fleet notify: bind 127.0.0.1:{port}: {e}"))?;
-    eprintln!("fleet notify: listening on http://127.0.0.1:{port} — waking session '{session}' on board webhooks");
+    eprintln!("fleet notify: listening on http://127.0.0.1:{port} — waking session '{session}' on board webhooks (GET /health for liveness)");
     for mut req in server.incoming_requests() {
+        // A supervisor's liveness probe gets a clean 200 and is never read as a webhook.
+        if classify_request(req.method(), req.url()) == Incoming::HealthProbe {
+            let _ = req.respond(tiny_http::Response::from_string("ok"));
+            continue;
+        }
         let mut body = String::new();
         let _ = req.as_reader().read_to_string(&mut body);
         let _ = req.respond(tiny_http::Response::from_string("ok")); // ack the best-effort POST first
@@ -110,6 +139,22 @@ pub fn serve(port: u16, session: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_request_routes_get_health_paths_to_a_probe_else_webhook() {
+        use tiny_http::Method;
+        // A GET to a health path (query string ignored) is a liveness probe.
+        assert_eq!(classify_request(&Method::Get, "/health"), Incoming::HealthProbe);
+        assert_eq!(classify_request(&Method::Get, "/healthz"), Incoming::HealthProbe);
+        assert_eq!(classify_request(&Method::Get, "/"), Incoming::HealthProbe);
+        assert_eq!(classify_request(&Method::Get, "/health?probe=1"), Incoming::HealthProbe);
+        // The board POSTs webhooks — never a probe, even to a health path.
+        assert_eq!(classify_request(&Method::Post, "/"), Incoming::Webhook);
+        assert_eq!(classify_request(&Method::Post, "/health"), Incoming::Webhook);
+        // A non-health GET is treated as a webhook (the default), not a probe.
+        assert_eq!(classify_request(&Method::Get, "/webhook"), Incoming::Webhook);
+        assert_eq!(classify_request(&Method::Get, "/events"), Incoming::Webhook);
+    }
 
     #[test]
     fn prompt_wakes_only_on_actionable_assignment_and_dm_not_informational() {
