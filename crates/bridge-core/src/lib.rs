@@ -19,6 +19,11 @@
 //!   outbound loop. Transport-agnostic (the transport supplies the actual rich/degraded render).
 //! - [`sse`] — a spec-compliant Server-Sent Events decoder so a bridge CONSUMES the board firehose as a push
 //!   stream ([`board::BoardClient::stream_events`]) instead of polling `GET /events` on a timer (#363).
+//! - [`mention`] — a pure text wake-word detector ([`mention::is_mentioned`]): a bridge rouses a named agent
+//!   only when a message ADDRESSES it by name (#429), not on every message.
+//! - [`echo`] — a board-origin marker ([`echo::mark_board_origin`] / [`echo::is_board_origin`]): stamp every
+//!   reflected outbound message so the inbound poller drops it and the bridge never re-ingests its own posts
+//!   (#430 echo-loop suppression).
 //!
 //! Source-agnostic on purpose: `external_author = "<source>:<id>"` (e.g. `slack:U123`, `voice:<speaker>`),
 //! and the external channel is an opaque `String`. Slack-, voice-, or GitHub-specifics live in the
@@ -26,6 +31,7 @@
 
 pub mod board;
 pub mod channel_config;
+pub mod echo;
 pub mod mention;
 pub mod relay;
 pub mod resolver;
@@ -39,6 +45,7 @@ pub use board::{
 };
 pub use sse::{SseDecoder, SseFrame};
 pub use channel_config::{bridged_channels, Bridged, BridgeConfig};
+pub use echo::{is_board_origin, mark_board_origin, MARK_EMOJI};
 pub use mention::{is_mentioned, mentioned_agent};
 pub use relay::{relay_plan, RelayPlan, RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN};
 pub use resolver::{ChannelLink, ChannelMap};
