@@ -4707,13 +4707,9 @@ fn wake_audit(verbose: bool) {
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
 /// The operator's board id — an `in_progress` task assigned here is never nudged (#478 exclusion).
 const NUDGE_EXEMPT_ASSIGNEE: &str = "cameron";
-/// #540 inc2: where an unassigned-or-idle-owner stale task is ROUTED — the router that owns assignment. It is
+/// #540 inc2: where an unassigned-or-gone-owner stale task is ROUTED — the router that owns assignment. It is
 /// event-woken on the reassignment (task.assigned), so this needs no polling on board-pm's side.
 const NUDGE_ROUTER: &str = "board-pm";
-/// #540 inc2: an owner not seen for at least this long reads as idle/dead for routing purposes — a generous
-/// bound so a legitimately long-cadence owner is not mistaken for dead (offline/away status catches the
-/// explicit cases sooner). Report-only-first surfaces any edge case before a reassign actually fires.
-const NUDGE_OWNER_DEAD_SECS: i64 = 3 * 3600; // 3h
 
 /// Whether a task idle for `idle_secs` should be nudged now, given `last_nudge_secs` (the age of this
 /// daemon's own most recent nudge comment on it, if any). Pure — unit-tested. First nudge fires once idle
@@ -4819,20 +4815,20 @@ fn nudge_body(threshold_hours: f64, assignee: &str, idle_secs: i64) -> String {
     )
 }
 
-/// #540 inc2: is a task's assigned OWNER idle/dead — so a stale task it holds should be ROUTED to a router
-/// rather than nudged at an owner who cannot act? True when the owner's board status is `offline`/`away` (an
-/// explicit not-working state) OR its heartbeat is older than [`NUDGE_OWNER_DEAD_SECS`] (not ticking). A live
-/// owner (`online`/recent heartbeat) returns false — it gets the normal nudge. Absent status + unknown age →
-/// false (do not route on missing data). Pure — unit-tested.
-fn owner_is_idle_or_dead(status: Option<&str>, last_seen_age_secs: Option<i64>) -> bool {
-    if matches!(status, Some("offline") | Some("away")) {
-        return true;
-    }
-    matches!(last_seen_age_secs, Some(age) if age >= NUDGE_OWNER_DEAD_SECS)
+/// #540 inc2: is a task's assigned OWNER GONE — no longer a registered agent in the roster (retired/removed),
+/// so its stale task is genuinely orphaned and should be ROUTED to the router for re-placement? This is the
+/// FALSE-POSITIVE-FREE reroute signal: an `offline`/`away` owner, or one with a stale heartbeat, is NOT gone —
+/// it is a DELIBERATELY spun-down (operator-directed, RESUMABLE) or slow-cadence owner whose tasks are its own
+/// correct work parked until it resumes, and rerouting those just bounces (board-pm #540 inc2 review: all 4
+/// offline/stale-owner reroutes were spun-down-resumable false positives). Only an owner absent from the live
+/// roster cannot come back to its work. `roster_ids` is the set of currently-registered agent ids. Pure —
+/// unit-tested.
+fn owner_is_gone(owner: &str, roster_ids: &std::collections::BTreeSet<String>) -> bool {
+    !roster_ids.contains(owner)
 }
 
 /// #540 inc2: the comment posted when a stale task is ROUTED to the router (board-pm) — an audit trail naming
-/// WHY it landed in the router's queue (unassigned, or its owner is idle/dead). Pure — unit-tested.
+/// WHY it landed in the router's queue (unassigned, or its owner is gone from the roster). Pure — unit-tested.
 fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
     format!(
         "fleet nudge: reassigned to {NUDGE_ROUTER} for routing — {reason}, and stale for over {threshold_hours}h \
@@ -4845,7 +4841,7 @@ fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
 /// Nudge stale ASSIGNED work + ROUTE stale ownerless work (board #478 + #540). A `todo`/`in_progress` task
 /// whose latest activity is at least `threshold_hours` old is acted on, at most once per `cooldown_hours` while
 /// it stays idle: a task with a live owner gets a comment pinging that owner ([`nudge_body`]); an UNASSIGNED
-/// task, or one whose owner is idle/dead ([`owner_is_idle_or_dead`]), is REASSIGNED to the router
+/// task, or one whose owner is gone from the roster ([`owner_is_gone`]), is REASSIGNED to the router
 /// ([`NUDGE_ROUTER`]) with an audit comment ([`route_body`]) so it lands in the router's queue for placement.
 /// Always excludes tasks assigned to `cameron` (the operator) and `monitor_exempt` tasks (#167 — a deliberate
 /// continuous monitor, and the opt-out for a task the router intentionally leaves unassigned). A `todo` task
@@ -4859,18 +4855,15 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     });
     let threshold_secs = (threshold_hours * 3600.0).round() as i64;
     let cooldown_secs = (cooldown_hours * 3600.0).round() as i64;
-    // #540 inc2: owner status/heartbeat map (id → agent record) for the idle/dead-owner routing signal.
-    // Best-effort — a roster query error degrades to "no owner is known dead" (we still nudge live owners and
-    // route unassigned tasks) rather than failing the sweep.
-    let owner_status: std::collections::BTreeMap<String, serde_json::Value> = board
+    // #540 inc2: the set of currently-registered agent ids, for the gone-owner routing signal (an assignee
+    // absent from this set is retired/removed → its stale task is orphaned). Best-effort — a roster query
+    // error degrades to an EMPTY set, which would make every owner look "gone"; guard that below by only
+    // consulting it when it is non-empty (a failed roster query must not mass-reroute live owners' tasks).
+    let roster_ids: std::collections::BTreeSet<String> = board
         .list_agents()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|a| {
-            a.get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(|id| (id.to_string(), a.clone()))
-        })
+        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
         .collect();
     // #540: nudge stale ASSIGNED work in in_progress AND todo. A task where work started (a plan comment) but
     // was never flipped to in_progress still stalls, and the operator wants it caught (task_512). A bare
@@ -4964,19 +4957,16 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
 
         let title = t.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
         // #540 inc2: decide ROUTE (reassign to the router) vs NUDGE (ping a live owner). Route an UNASSIGNED
-        // task, or one whose owner is idle/dead (but never re-route one already owned by the router itself —
-        // that would be a self-reassign loop). Otherwise nudge the live owner (inc1).
+        // task, or one whose owner is GONE from the roster — retired/removed, not merely offline (an offline
+        // owner is usually a DELIBERATELY spun-down, resumable agent whose task must stay with it, board-pm
+        // seq-7848). Never re-route one already owned by the router itself (self-reassign loop). Otherwise nudge
+        // the owner (inc1). Guard: an empty roster means the roster query failed — do NOT treat every owner as
+        // gone and mass-reroute; skip the gone-owner route entirely in that case.
         let route_reason: Option<String> = match assignee {
             None => Some("unassigned".to_string()),
-            Some(owner) if owner != NUDGE_ROUTER => {
-                let rec = owner_status.get(owner);
-                let ostatus = rec.and_then(|r| r.get("status")).and_then(serde_json::Value::as_str);
-                let oage = rec
-                    .and_then(|r| r.get("last_seen"))
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|ls| last_seen_age_secs(ls, now));
-                owner_is_idle_or_dead(ostatus, oage).then(|| format!("owner {owner} is idle/dead"))
-            }
+            Some(owner) if owner != NUDGE_ROUTER => (!roster_ids.is_empty()
+                && owner_is_gone(owner, &roster_ids))
+            .then(|| format!("owner {owner} is gone from the roster")),
             Some(_) => None, // already the router → nudge it, don't self-reassign
         };
 
@@ -7369,19 +7359,15 @@ mod tests {
     }
 
     #[test]
-    fn owner_is_idle_or_dead_flags_offline_away_or_a_stale_heartbeat() {
-        let dead = NUDGE_OWNER_DEAD_SECS;
-        // Explicit not-working states → idle/dead regardless of heartbeat.
-        assert!(owner_is_idle_or_dead(Some("offline"), Some(0)));
-        assert!(owner_is_idle_or_dead(Some("away"), None));
-        // A live owner (online) with a recent heartbeat → NOT idle/dead (it gets the normal nudge).
-        assert!(!owner_is_idle_or_dead(Some("online"), Some(60)));
-        // Online but heartbeat older than the dead bound → idle/dead (not ticking).
-        assert!(owner_is_idle_or_dead(Some("online"), Some(dead)));
-        assert!(owner_is_idle_or_dead(Some("online"), Some(dead + 1)));
-        assert!(!owner_is_idle_or_dead(Some("online"), Some(dead - 1)), "just under the bound → still live");
-        // Missing status + unknown age → NOT flagged (never route on absent data).
-        assert!(!owner_is_idle_or_dead(None, None));
+    fn owner_is_gone_flags_only_an_owner_absent_from_the_roster() {
+        let roster: std::collections::BTreeSet<String> =
+            ["v-alpha", "v-beta"].iter().map(|s| s.to_string()).collect();
+        // A registered owner is present regardless of its status (offline is deliberate/resumable, board-pm
+        // seq-7848) → NOT gone, so its stale task stays with it.
+        assert!(!owner_is_gone("v-alpha", &roster));
+        assert!(!owner_is_gone("v-beta", &roster));
+        // An owner no longer in the roster (retired/removed) → gone → its stale task is orphaned and routes.
+        assert!(owner_is_gone("v-retired", &roster));
     }
 
     #[test]
