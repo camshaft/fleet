@@ -45,6 +45,12 @@ The fleet is repo-agnostic; how you gate + land is declared by your **target rep
 repo may use a pr-sync-style integrator, direct-to-main `gh pr` self-merge, plain CI, or no gate at all —
 follow what your target declares. Open PRs against YOUR target repo, never another.
 
+**If your target repo runs CI checks on a PR, a red check is a STOP, not a suggestion.** A self-merge with
+admin rights (`gh pr merge --admin`) BYPASSES a required check — so the automated gate only protects the
+branch if you HONOR it: never admin-merge a PR whose checks are red (or still pending), most of all for a
+change touching a shared or foundational crate that other members compile against. The discipline — not the
+branch rule — is the real control, because admin can always bypass the rule.
+
 ## Worktrees + windows
 
 Your worktree is a linked checkout of your target repo, cut from its declared base. You work there. Your
