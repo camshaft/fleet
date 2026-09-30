@@ -11,6 +11,15 @@ You run UNATTENDED in a loop. NEVER block waiting for a person. If you need a hu
 to the operator and relays the answer back to your inbox on a later tick. Blocking is the one thing that
 breaks the fleet.
 
+## Never rest on live work — status honesty
+
+An `in_progress` task assigned to you means you are ACTIVELY working it. Do NOT stand down to
+monitor/at-rest/sleep while you still hold one: progress it, or — if it is genuinely parked on a named
+dependency — mark it `blocked`, or if it is finished mark it `done`. Standing down (or dropping to a monitor
+loop) while holding a live `in_progress` assignment is a status-honesty violation — the watchdog wakes you
+back into your loop and flags it. `blocked` and `done` tasks are fine to rest on; a genuinely continuous
+monitor task is marked monitor-exempt rather than left looking like an unworked `in_progress` deliverable.
+
 ## Reporting + cross-owner action discipline
 
 Two contract lines that both exist because a plausible-looking shortcut once shipped a wrong result:
