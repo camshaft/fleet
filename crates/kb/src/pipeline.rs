@@ -157,13 +157,19 @@ fn str_or<'a>(meta: &'a Map<String, Value>, key: &str, default: &'a str) -> &'a 
     meta.get(key).and_then(Value::as_str).unwrap_or(default)
 }
 
-/// One unit to embed — the Python `_items_from` yield: `key` seeds the point id (`_id(collection, key,
-/// chunk_idx)`), `body` is chunked + embedded, `extra` is merged into each chunk's payload.
+/// One unit to embed — the Python `_items_from` yield: `key` seeds the point id, `body` is chunked +
+/// embedded, `extra` is merged into each chunk's payload.
+///
+/// `id_override_parts`: normally a chunk's point id is `chunk::id([collection, key, chunk_idx])`. A docs.rs
+/// item instead sets this to the canonical crate_docs id parts `["docs.rs", name, ver, path]` (see the #238
+/// reconciliation), so `chunk::id(parts + [chunk_idx])` reproduces the parity-proven live docs.rs ids exactly
+/// — collection-independent, byte-identical to `kb crate-docs`. `None` for every other source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub key: String,
     pub body: String,
     pub extra: Map<String, Value>,
+    pub id_override_parts: Option<Vec<String>>,
 }
 
 /// Turn a ticket's fetched bytes into embeddable [`Item`]s, dispatching on content-type — the Python
@@ -182,10 +188,14 @@ pub fn items_from(
     }
 }
 
-/// rustdoc-JSON: one item per documented index entry with a matching `paths` entry. `path` is the joined
-/// `paths[id].path` (present-but-empty array -> ""), else `item.name` else the raw id; `kind` defaults to
-/// `"item"` when absent. body = `"{path} \u{2014} {kind}\n\n{docs}"`. Faithful to pipeline.py (which differs
-/// from crate_docs.rs's parse: different fallbacks + a different point-id formula — see decision #2).
+/// rustdoc-JSON: DELEGATES to the shared `crate_docs` core (the #238 decision-2 reconciliation), so a docs.rs
+/// source ingested via the pipeline is byte-identical to `kb crate-docs` and to the live Python-built
+/// `crate.<name>.<ver>` collections (proven at parity, task_237): same item selection ([`crate_docs::parse_items`]:
+/// non-empty docs AND a matching `paths` entry with a `path` array), same body ([`crate_docs::item_body`]),
+/// same payload url ([`crate_docs::docs_url`], the rendered-docs root), and — crucially — the same point id via
+/// [`Item::id_override_parts`] = [`crate_docs::item_id_parts`] `["docs.rs", name, ver, path]`, NOT the
+/// pipeline's own `[collection, key, idx]` formula. `crate` is `meta.crate` else `meta.source`; `ver` is the
+/// doc's `crate_version` else `meta.version` else `latest`.
 fn items_from_rustdoc(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item>, String> {
     let doc: Value = serde_json::from_slice(data)
         .map_err(|e| format!("pipeline: rustdoc JSON did not parse: {e}"))?;
@@ -200,49 +210,26 @@ fn items_from_rustdoc(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item
         .or_else(|| truthy_str(meta, "version"))
         .unwrap_or("latest")
         .to_string();
-    let src_url = format!("https://docs.rs/{crate_name}/{ver}/{crate_name}/");
-    let (Some(index), Some(paths)) = (
-        doc.get("index").and_then(Value::as_object),
-        doc.get("paths").and_then(Value::as_object),
-    ) else {
-        return Ok(vec![]);
-    };
-    let mut out = Vec::new();
-    for (iid, item) in index {
-        let docs = item.get("docs").and_then(Value::as_str).unwrap_or("");
-        if docs.trim().is_empty() {
-            continue;
-        }
-        let Some(p) = paths.get(iid) else { continue };
-        // path = "::".join(p.path) when a "path" array is present (empty -> ""), else item.name, else id.
-        let path = match p.get("path") {
-            Some(Value::Array(segs)) => segs
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join("::"),
-            _ => item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(iid)
-                .to_string(),
-        };
-        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("item");
-        let body = format!("{path} \u{2014} {kind}\n\n{docs}");
-        let mut extra = Map::new();
-        extra.insert("kind".into(), Value::from("doc"));
-        extra.insert("source".into(), Value::from("docs.rs"));
-        extra.insert("path".into(), Value::from(path.clone()));
-        extra.insert("title".into(), Value::from(path.clone()));
-        extra.insert("url".into(), Value::from(src_url.clone()));
-        extra.insert("crate".into(), Value::from(crate_name.clone()));
-        extra.insert("crate_version".into(), Value::from(ver.clone()));
-        out.push(Item {
-            key: path,
-            body,
-            extra,
-        });
-    }
+    let url = crate_docs::docs_url(&crate_name, &ver);
+    let out = crate_docs::parse_items(&doc)
+        .into_iter()
+        .map(|item| {
+            let mut extra = Map::new();
+            extra.insert("kind".into(), Value::from(crate_docs::KIND));
+            extra.insert("source".into(), Value::from(crate_docs::SOURCE));
+            extra.insert("path".into(), Value::from(item.path.clone()));
+            extra.insert("title".into(), Value::from(item.path.clone()));
+            extra.insert("url".into(), Value::from(url.clone()));
+            extra.insert("crate".into(), Value::from(crate_name.clone()));
+            extra.insert("crate_version".into(), Value::from(ver.clone()));
+            Item {
+                body: crate_docs::item_body(&item),
+                id_override_parts: Some(crate_docs::item_id_parts(&crate_name, &ver, &item.path)),
+                key: item.path,
+                extra,
+            }
+        })
+        .collect();
     Ok(out)
 }
 
@@ -270,6 +257,7 @@ fn items_from_pdf(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item>, S
             key: format!("p{}", i + 1),
             body: t.to_string(),
             extra,
+            id_override_parts: None,
         });
     }
     Ok(out)
@@ -293,6 +281,7 @@ fn items_from_text(data: &[u8], meta: &Map<String, Value>) -> Vec<Item> {
         key: title,
         body: String::from_utf8_lossy(data).into_owned(),
         extra,
+        id_override_parts: None,
     }]
 }
 
@@ -433,6 +422,22 @@ pub async fn handle_upload(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<()
 
 // ---- embedder stage: IPFS -> parse -> chunk + embed -> upsert ----
 
+/// The deterministic point id for one chunk. A docs.rs item carries `id_override_parts` = the canonical
+/// crate_docs parts `["docs.rs", name, ver, path]`, so its id is `chunk::id(parts + [idx])` — byte-identical
+/// to `kb crate-docs` and the live store (#238), collection-independent. Every other item keys on
+/// `[collection, key, idx]` (the pipeline's own formula, for net-new pdf/text/url sources). Pure; unit-tested.
+fn point_id(collection: &str, item: &Item, idx: usize) -> String {
+    let idx = idx.to_string();
+    match &item.id_override_parts {
+        Some(parts) => {
+            let mut refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+            refs.push(&idx);
+            chunk::id(&refs)
+        }
+        None => chunk::id(&[collection, item.key.as_str(), &idx]),
+    }
+}
+
 /// Build the per-chunk payload — the Python `handle_embed` inner block: `base_payload(text=piece, chunk=idx,
 /// **{extra without "page"})`, then re-add `page`, then stamp `ipfs_cid`/`ipfs_url`. The item's `kind` is
 /// lifted out of `extra` into the `base_payload` `kind` argument (which sets `kind` + its `authority`); every
@@ -493,19 +498,16 @@ pub async fn handle_embed(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<(),
     let items = items_from(&content_type, &data, &meta)?;
     let n_items = items.len();
 
-    // Build every (id, text, payload) up front; the point id keys on (collection, item key, chunk idx), so
-    // item/chunk order does not affect ids (a re-ingest updates in place).
+    // Build every (id, text, payload) up front; the point id keys on the item's id parts + chunk idx, so
+    // item/chunk order does not affect ids (a re-ingest updates in place). A docs.rs item overrides the parts
+    // to the canonical crate_docs formula (#238); everything else keys on [collection, key, idx].
     let cfg = config::get();
     let mut ids: Vec<String> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
     let mut payloads: Vec<Map<String, Value>> = Vec::new();
     for item in &items {
         for (idx, piece) in chunk::chunk_default(&item.body).into_iter().enumerate() {
-            ids.push(chunk::id(&[
-                collection.as_str(),
-                item.key.as_str(),
-                &idx.to_string(),
-            ]));
+            ids.push(point_id(&collection, item, idx));
             payloads.push(embed_payload(cfg, item, &piece, idx, &cid, &ipfs_url));
             texts.push(piece);
         }
@@ -785,7 +787,7 @@ mod tests {
             "crate_version": "1.0.104",
             "index": {
                 "10": { "docs": "The Chain iterator.", "name": "Chain" },
-                "11": { "docs": "   ", "name": "Blank" },
+                "11": { "docs": "", "name": "Blank" },
                 "12": { "docs": "No paths entry.", "name": "Orphan" }
             },
             "paths": {
@@ -794,7 +796,8 @@ mod tests {
             }
         }"#;
         let items = items_from(RUSTDOC_JSON, data, &m).unwrap();
-        // Only id 10 survives: 11 has whitespace-only docs, 12 has no paths entry.
+        // Delegates to crate_docs::parse_items (#238): id 10 survives; 11 has empty docs (skipped), 12 has no
+        // paths entry (skipped). Byte-identical selection to `kb crate-docs`.
         assert_eq!(items.len(), 1);
         let it = &items[0];
         assert_eq!(it.key, "anyhow::Chain");
@@ -808,20 +811,29 @@ mod tests {
         assert_eq!(it.extra["crate"], "anyhow");
         assert_eq!(it.extra["crate_version"], "1.0.104");
         assert_eq!(it.extra["url"], "https://docs.rs/anyhow/1.0.104/anyhow/");
+        // docs.rs items carry the canonical crate_docs id parts, NOT the pipeline's [collection, key, idx].
+        assert_eq!(
+            it.id_override_parts,
+            Some(vec![
+                "docs.rs".to_string(),
+                "anyhow".to_string(),
+                "1.0.104".to_string(),
+                "anyhow::Chain".to_string(),
+            ])
+        );
     }
 
     #[test]
-    fn items_from_rustdoc_kind_defaults_to_item_and_path_falls_back_to_name() {
-        // No "path" array on the paths entry, and no "kind": path falls back to item.name, kind -> "item".
+    fn items_from_rustdoc_skips_entries_without_a_path_array() {
+        // The shared crate_docs::parse_items requires a `paths` entry WITH a `path` array; an entry lacking it
+        // is skipped -- no name/id fallback (that was the pipeline's old divergent variant, dropped in #238).
         let m = meta(json!({ "crate": "c", "version": "0.1.0" }));
         let data = br#"{
             "index": { "7": { "docs": "d", "name": "Widget" } },
             "paths": { "7": {} }
         }"#;
         let items = items_from(RUSTDOC_JSON, data, &m).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].key, "Widget");
-        assert_eq!(items[0].body, "Widget \u{2014} item\n\nd");
+        assert!(items.is_empty());
     }
 
     #[test]
@@ -867,6 +879,7 @@ mod tests {
             key: "p3".into(),
             body: "unused here".into(),
             extra,
+            id_override_parts: None,
         };
         let pl = embed_payload(
             config::get(),
@@ -894,17 +907,45 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_point_id_keys_on_collection_key_idx_and_differs_from_crate_docs() {
-        // The pipeline's own id formula: chunk::id([collection, key, chunk_idx]) — stable across runs.
-        let a = chunk::id(&["docs.fleet", "readme.md", "0"]);
-        assert_eq!(a, chunk::id(&["docs.fleet", "readme.md", "0"]));
-        assert_ne!(a, chunk::id(&["docs.fleet", "readme.md", "1"])); // different chunk idx
-        // Decision #2: this is DISTINCT from crate_docs's formula ["docs.rs", name, ver, path, idx], so a
-        // docs.rs source ingested via the pipeline vs `kb crate-docs` lands under different point ids until
-        // the two are reconciled. This assertion pins that divergence so it can't drift silently.
+    fn point_id_uses_crate_docs_formula_for_docs_rs_and_collection_key_for_others() {
+        // Non-docs.rs item (id_override_parts None): id = chunk::id([collection, key, idx]) — the pipeline's
+        // own formula for net-new pdf/text/url sources.
+        let text_item = Item {
+            key: "readme.md".into(),
+            body: "b".into(),
+            extra: Map::new(),
+            id_override_parts: None,
+        };
+        assert_eq!(
+            point_id("docs.fleet", &text_item, 0),
+            chunk::id(&["docs.fleet", "readme.md", "0"])
+        );
         assert_ne!(
-            chunk::id(&["crate.anyhow.1.0.104", "anyhow::Chain", "0"]),
-            chunk::id(&["docs.rs", "anyhow", "1.0.104", "anyhow::Chain", "0"])
+            point_id("docs.fleet", &text_item, 0),
+            point_id("docs.fleet", &text_item, 1) // different chunk idx -> different id
+        );
+
+        // #238 reconciliation: a docs.rs item's id_override_parts drive the id to the canonical crate_docs
+        // formula, byte-identical to crate_docs::point_id / `kb crate-docs` / the live store, and INDEPENDENT
+        // of the collection arg.
+        let docs_item = Item {
+            key: "anyhow::Chain".into(),
+            body: "b".into(),
+            extra: Map::new(),
+            id_override_parts: Some(crate_docs::item_id_parts(
+                "anyhow",
+                "1.0.104",
+                "anyhow::Chain",
+            )),
+        };
+        assert_eq!(
+            point_id("crate.anyhow.1.0.104", &docs_item, 0),
+            crate_docs::point_id("anyhow", "1.0.104", "anyhow::Chain", 0)
+        );
+        // Collection-independent: the same id no matter what collection is passed.
+        assert_eq!(
+            point_id("ignored.collection", &docs_item, 0),
+            crate_docs::point_id("anyhow", "1.0.104", "anyhow::Chain", 0)
         );
     }
 }
