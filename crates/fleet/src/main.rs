@@ -1759,7 +1759,9 @@ enum Cmd {
     /// Emit or install a systemd USER service that supervises a long-running fleet-host daemon (Type=simple,
     /// Restart=on-failure), so it survives a tmux-window reap and restarts on crash — the durable replacement
     /// for a bare keep-alive window (#359). The service captures a known-good PATH so the daemon resolves
-    /// tmux/git/curl at runtime. `--install` writes it to `~/.config/systemd/user/` (no sudo); `--uninstall`
+    /// tmux/git/curl at runtime. `--install` writes it to `~/.config/systemd/user/` (no sudo); `--enable`
+    /// writes it AND brings it fully up (`daemon-reload` + `enable --now`) in one shot — the launch default
+    /// that makes the supervised service, not a bare tmux window, the way a host daemon comes up; `--uninstall`
     /// removes it; default prints it for a declarative host to translate.
     DaemonUnit {
         /// Daemon name → unit `fleet-<name>.service` (e.g. `notifier`, `tunnel`).
@@ -1776,6 +1778,10 @@ enum Cmd {
         /// INSTALL into `~/.config/systemd/user/` (user-level, no sudo) instead of printing; prints the enable command.
         #[arg(long)]
         install: bool,
+        /// ENABLE in one shot: write the unit, then `systemctl --user daemon-reload` + `enable --now` so the
+        /// daemon comes up supervised immediately (the #359 launch default). Idempotent; implies the write.
+        #[arg(long)]
+        enable: bool,
         /// REMOVE the user unit this installed (the inverse of `--install`) and print the disable command.
         #[arg(long)]
         uninstall: bool,
@@ -1883,8 +1889,8 @@ fn main() {
             install,
             uninstall,
         } => watchdog_unit(!no_rearm, observe, pinned_only, self_redeploy, interval_secs, bin, install, uninstall),
-        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, uninstall } => {
-            daemon_unit(&name, exec, restart_sec, bin, install, uninstall)
+        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall } => {
+            daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall)
         }
         Cmd::Version => println!("{}", version_line()),
         Cmd::Redeploy { apply } => redeploy(apply),
@@ -4620,16 +4626,29 @@ fn captured_daemon_env() -> String {
     render_service_env_lines(&[("PATH", std::env::var("PATH").ok())])
 }
 
+/// The `systemctl --user …` invocations that bring a freshly-written unit fully up: reload the manager so it
+/// sees the new file, then enable-and-start it. Split out so the argv is unit-tested without shelling
+/// systemctl. Pure.
+fn enable_argv(unit: &str) -> Vec<Vec<String>> {
+    vec![
+        vec!["--user".into(), "daemon-reload".into()],
+        vec!["--user".into(), "enable".into(), "--now".into(), unit.into()],
+    ]
+}
+
 /// `fleet daemon-unit <name>` — supervise a fleet-host daemon under systemd (see [`daemon_unit_file`]). Default:
 /// PRINT the unit (a declarative host translates it). `--install`: WRITE `fleet-<name>.service` into
-/// `~/.config/systemd/user/` (no sudo). `--uninstall`: remove it. `exec` is the daemon command; the built-in
-/// `notifier` defaults to `<bin> notify`, any other name requires `--exec`.
+/// `~/.config/systemd/user/` (no sudo). `--enable`: write it AND bring it up in one shot (`daemon-reload` +
+/// `enable --now`) — the #359 launch default, so a host daemon comes up supervised rather than as a bare tmux
+/// window. `--uninstall`: remove it. `exec` is the daemon command; the built-in `notifier` defaults to
+/// `<bin> notify`, any other name requires `--exec`.
 fn daemon_unit(
     name: &str,
     exec: Option<String>,
     restart_sec: u64,
     bin: Option<String>,
     install: bool,
+    enable: bool,
     uninstall: bool,
 ) {
     let unit = format!("fleet-{name}.service");
@@ -4663,24 +4682,39 @@ fn daemon_unit(
         }
     };
     let body = daemon_unit_file(name, &exec, restart_sec, &captured_daemon_env());
-    if install {
+    // `--enable` implies the write (it is the one-shot bring-up), so either flag lands the unit file.
+    if install || enable {
         let Some(dir) = user_unit_dir() else {
-            eprintln!("fleet daemon-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
+            eprintln!("fleet daemon-unit: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
             std::process::exit(1);
         };
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("fleet daemon-unit --install: mkdir {}: {e}", dir.display());
+            eprintln!("fleet daemon-unit: mkdir {}: {e}", dir.display());
             std::process::exit(1);
         }
         let path = dir.join(&unit);
         if let Err(e) = std::fs::write(&path, &body) {
-            eprintln!("fleet daemon-unit --install: write {}: {e}", path.display());
+            eprintln!("fleet daemon-unit: write {}: {e}", path.display());
             std::process::exit(1);
         }
         println!("installed {}", path.display());
         println!("  ExecStart: {exec}");
-        println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now {unit}");
-        println!("  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})");
+        if enable {
+            // Bring it fully up now: reload so systemd sees the new unit, then enable --now (start + start on
+            // login/boot). Idempotent. A non-zero/failed systemctl (e.g. no user manager on this host) is a
+            // WARN, not fatal — the unit file is written and can be enabled later, same as plain --install.
+            for args in enable_argv(&unit) {
+                match std::process::Command::new("systemctl").args(&args).status() {
+                    Ok(s) if s.success() => println!("  ran: systemctl {}", args.join(" ")),
+                    Ok(_) => eprintln!("  WARN: systemctl {} returned non-zero (enable it later once the user manager is up)", args.join(" ")),
+                    Err(e) => eprintln!("  WARN: systemctl {} failed: {e} (enable it later)", args.join(" ")),
+                }
+            }
+            println!("  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})");
+        } else {
+            println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now {unit}");
+            println!("  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})");
+        }
         return;
     }
     print!("# ---- {unit} (systemd USER daemon, Restart=on-failure) ----\n{body}");
@@ -5664,6 +5698,19 @@ mod tests {
         // The captured PATH is seeded ahead of ExecStart so the daemon resolves tmux/git/curl at runtime (#347/#359).
         let env_at = u.find("Environment=\"PATH=/usr/bin:/bin\"").expect("PATH env line present");
         assert!(env_at < u.find("ExecStart=").expect("ExecStart present"), "env precedes ExecStart");
+    }
+
+    #[test]
+    fn enable_argv_reloads_then_enables_now_the_named_unit() {
+        let steps = enable_argv("fleet-notifier.service");
+        // Two invocations, IN ORDER: reload so systemd sees the freshly-written unit, THEN enable --now.
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0], vec!["--user", "daemon-reload"]);
+        assert_eq!(steps[1], vec!["--user", "enable", "--now", "fleet-notifier.service"]);
+        // Every invocation is user-level (no sudo) — the same no-privilege install path as --install.
+        assert!(steps.iter().all(|a| a.first().map(String::as_str) == Some("--user")), "all user-level");
+        // The unit name is carried verbatim into the enable step (a tunnel unit enables the same way).
+        assert_eq!(enable_argv("fleet-tunnel.service")[1].last().unwrap(), "fleet-tunnel.service");
     }
 
     #[test]
