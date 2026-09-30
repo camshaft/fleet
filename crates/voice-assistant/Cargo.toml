@@ -28,7 +28,7 @@ required-features = ["runtime"]
 [features]
 # The live voice loop: pulls the ONNX backend (sherpa-onnx: STT/TTS/wake) + audio I/O (cpal). Off by
 # default; enable to build/run the daemon.
-runtime = ["dep:sherpa-onnx", "dep:cpal", "dep:clap"]
+runtime = ["dep:sherpa-onnx", "dep:cpal", "dep:clap", "dep:signal-hook"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -50,3 +50,8 @@ sherpa-onnx = { version = "1.13", optional = true, default-features = false, fea
 cpal = { version = "0.15", optional = true }
 # `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate seq-1377).
 clap = { version = "4", features = ["derive"], optional = true }
+# Graceful SIGTERM/SIGINT shutdown: break the loop and RETURN so the cpal capture stream drops
+# (snd_pcm_close releases the ALSA device) before the process exits, instead of the default abrupt
+# terminate. A slow old instance that still holds the device makes the next one storm errno -32 on a
+# deploy restart (#239, green-machine-ops). No thread — it installs a plain sigaction flag.
+signal-hook = { version = "0.3", optional = true }
