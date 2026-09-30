@@ -3,8 +3,9 @@
 //! The Python workers drove the board over its MCP surface (`TB_MCP_URL`). This port uses the board's plain
 //! REST API instead — the established house pattern for a non-session daemon talking to the board
 //! (github-bridge/src/board.rs, fleet/src/board.rs), and it avoids an MCP client entirely (there is none in
-//! this workspace). HTTP is the `ureq` house idiom (see `store`); all body SHAPING is factored into pure
-//! `build_*` functions so it is unit-testable without a live board.
+//! this workspace). HTTP is async `reqwest` — operator directive: no blocking IO on the tokio runtime
+//! (#439). All body SHAPING is factored into pure `build_*` functions so it is unit-testable without a live
+//! board.
 //!
 //! Identity: the board keys writes on an explicit caller id, so every write carries the worker's own agent
 //! id — `created_by` on create, `actor` on update (so the worker isn't notified of its own change), `author`
@@ -52,7 +53,7 @@ impl Task {
 pub struct Board {
     base: String,
     agent_id: String,
-    http: ureq::Agent,
+    http: reqwest::Client,
 }
 
 impl Board {
@@ -66,18 +67,25 @@ impl Board {
         Board {
             base: base.trim_end_matches('/').to_string(),
             agent_id: agent_id.into(),
-            http: ureq::agent(),
+            http: reqwest::Client::new(),
         }
     }
 
     /// Register (upsert) this worker, optionally with a `webhook_url` the board POSTs events to — `POST
     /// /agents`. Idempotent: creates the record if new, merges if it exists.
-    pub fn register(&self, webhook_url: Option<&str>, metadata: &Value) -> Result<(), String> {
+    pub async fn register(
+        &self,
+        webhook_url: Option<&str>,
+        metadata: &Value,
+    ) -> Result<(), String> {
         let url = format!("{}/agents", self.base);
         let body = build_register_body(&self.agent_id, webhook_url, metadata);
         self.http
             .post(&url)
-            .send_json(body)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board POST /agents failed: {e}"))?;
         Ok(())
     }
@@ -85,52 +93,64 @@ impl Board {
     /// Subscribe this worker to a whole project's task events — `POST /subscriptions`. A worker is already
     /// auto-subscribed to tasks it creates or is assigned, so this is for watching a queue project it does
     /// not own every task in.
-    pub fn subscribe_project(&self, project_id: i64) -> Result<(), String> {
+    pub async fn subscribe_project(&self, project_id: i64) -> Result<(), String> {
         let url = format!("{}/subscriptions", self.base);
         let body = build_subscribe_body(&self.agent_id, project_id);
         self.http
             .post(&url)
-            .send_json(body)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board POST /subscriptions failed: {e}"))?;
         Ok(())
     }
 
     /// List tasks filtered by assignee and/or status — `GET /tasks`. The startup catch-up the workers run
     /// before going event-reactive.
-    pub fn list_tasks(
+    pub async fn list_tasks(
         &self,
         assignee: Option<&str>,
         status: Option<&str>,
     ) -> Result<Vec<Task>, String> {
         let url = format!("{}/tasks", self.base);
-        let mut req = self.http.get(&url);
+        let mut query: Vec<(&str, &str)> = Vec::new();
         if let Some(a) = assignee {
-            req = req.query("assignee", a);
+            query.push(("assignee", a));
         }
         if let Some(s) = status {
-            req = req.query("status", s);
+            query.push(("status", s));
         }
-        let text = req
-            .call()
+        let text = self
+            .http
+            .get(&url)
+            .query(&query)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board GET /tasks failed: {e}"))?
-            .into_string()
+            .text()
+            .await
             .map_err(|e| format!("board GET /tasks read failed: {e}"))?;
         parse_tasks(&text)
     }
 
     /// Fetch one task — `GET /tasks/{id}`.
-    pub fn get_task(&self, id: i64) -> Result<Task, String> {
+    pub async fn get_task(&self, id: i64) -> Result<Task, String> {
         let url = format!("{}/tasks/{}", self.base, id);
         self.http
             .get(&url)
-            .call()
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board GET /tasks/{id} failed: {e}"))?
-            .into_json::<Task>()
+            .json::<Task>()
+            .await
             .map_err(|e| format!("board GET /tasks/{id} decode failed: {e}"))
     }
 
     /// Create a task in `project_id` — `POST /tasks`, attributed to this worker. Returns the created task.
-    pub fn create_task(
+    pub async fn create_task(
         &self,
         project_id: i64,
         title: &str,
@@ -141,15 +161,19 @@ impl Board {
         let body = build_create_task_body(project_id, title, description, &self.agent_id, metadata);
         self.http
             .post(&url)
-            .send_json(body)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board POST /tasks failed: {e}"))?
-            .into_json::<Task>()
+            .json::<Task>()
+            .await
             .map_err(|e| format!("board POST /tasks decode failed: {e}"))
     }
 
     /// Update a task's status and/or assignee — `PATCH /tasks/{id}`. `actor` is this worker so it isn't
     /// notified of its own change.
-    pub fn update_task(
+    pub async fn update_task(
         &self,
         id: i64,
         status: Option<&str>,
@@ -158,30 +182,39 @@ impl Board {
         let url = format!("{}/tasks/{}", self.base, id);
         let body = build_update_task_body(status, assignee, &self.agent_id);
         self.http
-            .request("PATCH", &url)
-            .send_json(body)
+            .patch(&url)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board PATCH /tasks/{id} failed: {e}"))?;
         Ok(())
     }
 
     /// Merge props into a task's metadata — `PATCH /tasks/{id}/props`. The body IS the props object (e.g.
     /// `{ipfs_cid, content_type, collection, chunks}`). This is how a worker records ingest results.
-    pub fn set_task_props(&self, id: i64, props: &Value) -> Result<(), String> {
+    pub async fn set_task_props(&self, id: i64, props: &Value) -> Result<(), String> {
         let url = format!("{}/tasks/{}/props", self.base, id);
         self.http
-            .request("PATCH", &url)
-            .send_json(props)
+            .patch(&url)
+            .json(props)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board PATCH /tasks/{id}/props failed: {e}"))?;
         Ok(())
     }
 
     /// Add a comment to a task — `POST /tasks/{id}/comments`, authored by this worker.
-    pub fn comment_task(&self, id: i64, body: &str) -> Result<(), String> {
+    pub async fn comment_task(&self, id: i64, body: &str) -> Result<(), String> {
         let url = format!("{}/tasks/{}/comments", self.base, id);
         let payload = build_comment_body(body, &self.agent_id);
         self.http
             .post(&url)
-            .send_json(payload)
+            .json(&payload)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| format!("board POST /tasks/{id}/comments failed: {e}"))?;
         Ok(())
     }
