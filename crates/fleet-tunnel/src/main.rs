@@ -46,6 +46,16 @@ const MAX_RESP_BODY: u64 = 16 * 1024 * 1024;
 // Bound the health probe's upstream reachability check so a hung notifier can't wedge the probe.
 const HEALTH_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 
+// Reconnect if no board frame arrives for this many keepalive intervals. A healthy board sends a
+// keepalive frame every `keepalive`s, so prolonged silence means a half-open/dead socket (an
+// ungracefully-restarted or killed board that sent no close). Without this the read blocks for the
+// OS TCP timeout (minutes) while we still look "connected" — silently dropped from the board's
+// tunnel registry and missing wakes. Kept below the health probe's staleness threshold (3x) so the
+// daemon self-heals before the probe reports unhealthy.
+const IDLE_KEEPALIVE_MULT: u64 = 2;
+// Floor so a small negotiated keepalive can't make the idle timeout hair-trigger.
+const MIN_IDLE_TIMEOUT_SECS: u64 = 20;
+
 #[derive(Parser)]
 #[command(about = "fleet-tunnel reverse HTTP-over-websocket bridge (fleet-host daemon)")]
 struct Args {
@@ -257,7 +267,7 @@ async fn run_once(cfg: &Config, health: &Arc<HealthState>) -> Result<(), BoxErro
 
     let agent = ureq::AgentBuilder::new().timeout(UPSTREAM_TIMEOUT).build();
     let upstream = cfg.upstream_trimmed().to_string();
-    let result = serve(&mut read, &tx, &upstream, &agent, health).await;
+    let result = serve(&mut read, &tx, &upstream, &agent, health, keepalive).await;
 
     heartbeat.abort();
     drop(tx); // let the writer drain + finish
@@ -271,11 +281,34 @@ async fn serve<S>(
     upstream: &str,
     agent: &ureq::Agent,
     health: &Arc<HealthState>,
+    keepalive: u64,
 ) -> Result<(), BoxError>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    while let Some(msg) = read.next().await {
+    // Silence longer than this means a dead/half-open socket (see IDLE_KEEPALIVE_MULT) — reconnect
+    // rather than block forever on a board that vanished without a close.
+    let idle = Duration::from_secs(
+        keepalive
+            .saturating_mul(IDLE_KEEPALIVE_MULT)
+            .max(MIN_IDLE_TIMEOUT_SECS),
+    );
+    loop {
+        let msg = match tokio::time::timeout(idle, read.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break, // stream ended: clean close
+            Err(_) => {
+                // No frame (not even a keepalive) within the idle window: treat the socket as dead.
+                // Returning Ok triggers a prompt re-dial + hello in run_forever, re-registering us
+                // in the board's tunnel registry so wakes resume.
+                tracing::warn!(
+                    "no board frame for {}s ({}x keepalive); socket presumed dead, reconnecting",
+                    idle.as_secs(),
+                    IDLE_KEEPALIVE_MULT
+                );
+                return Ok(());
+            }
+        };
         // Any inbound frame proves the socket is alive; stamp it for the health probe's staleness
         // check before dispatching.
         health.mark_board_frame();
