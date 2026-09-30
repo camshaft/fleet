@@ -136,8 +136,17 @@ fn extract_pdf(path: &Path) -> Result<Vec<String>, String> {
     Ok(doc
         .pages()
         .iter()
-        .map(|page| page.text().map(|t| t.all()).unwrap_or_default())
+        .map(|page| normalize_newlines(&page.text().map(|t| t.all()).unwrap_or_default()))
         .collect())
+}
+
+/// Normalize line endings to `\n` — PDFium's text extraction emits `\r\n` (and can emit lone `\r`), whereas
+/// the rest of the KB corpus (and the Python pymupdf path) uses `\n`. Normalizing keeps ingested PDF text
+/// consistent with every other source and removes one source of pdfium-vs-pymupdf drift if an existing
+/// pymupdf-built PDF collection is ever re-ingested (board task #468). Order matters: collapse `\r\n` first,
+/// then map any remaining lone `\r`.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[cfg(test)]
@@ -247,5 +256,15 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    #[test]
+    fn normalize_newlines_maps_crlf_and_lone_cr_to_lf() {
+        // CRLF -> LF, lone CR -> LF, existing LF untouched, no doubling.
+        assert_eq!(normalize_newlines("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        assert_eq!(normalize_newlines("no breaks"), "no breaks");
+        assert_eq!(normalize_newlines("trailing\r\n"), "trailing\n");
+        // A bare \r\n does not become \n\n.
+        assert_eq!(normalize_newlines("x\r\ny"), "x\ny");
     }
 }
