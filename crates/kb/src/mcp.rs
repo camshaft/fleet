@@ -137,6 +137,11 @@ pub struct RememberArgs {
     pub authority: Option<f64>,
     #[serde(default)]
     pub confidence: Option<f64>,
+    /// Curation kind (default "memory"). Drives the default authority and recency: "memory" DECAYS over time,
+    /// while any non-"memory" kind is treated as a static reference (recency 1.0, no decay). Use "tenet" for
+    /// durable operator law (authority 1.0, non-decaying) — see the task_538 tenets store.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -313,7 +318,7 @@ impl Kb {
     }
 
     #[tool(
-        description = "Store a durable fact/note any future agent can retrieve. Use for knowledge worth keeping across sessions."
+        description = "Store a durable fact/note any future agent can retrieve. Use for knowledge worth keeping across sessions. Optional `kind` (default \"memory\", which decays); pass a non-memory kind like \"tenet\" for a non-decaying reference (operator tenets: kind=\"tenet\" gives authority 1.0 + no decay)."
     )]
     async fn kb_remember(
         &self,
@@ -338,12 +343,13 @@ impl Kb {
         })
         .await?;
         let pid = uuid::Uuid::new_v4().to_string();
+        let kind = a.kind.as_deref().unwrap_or("memory");
         let mut extra = Map::new();
         extra.insert("text".into(), Value::from(text));
         extra.insert("source".into(), Value::from("memory"));
         put_opt_str(&mut extra, "tags", a.tags);
         put_opt_f64(&mut extra, "confidence", a.confidence);
-        let payload = curate::base_payload(cfg, "memory", a.authority, extra);
+        let payload = curate::base_payload(cfg, kind, a.authority, extra);
         store
             .upsert(&collection, &[(pid.clone(), vec, payload)])
             .await
