@@ -9,6 +9,9 @@ mod chunk;
 mod config;
 mod curate;
 mod embed;
+// Phase-2 ingest infra: file discovery + text/PDF extraction the inbox/pipeline workers build on. Its own
+// `allow(dead_code)` (see the module) covers being landed ahead of its callers.
+mod extract;
 // Phase-2 ingest infra: the Kubo IPFS client the inbox worker (#236) will use to pin ingested files. Landed
 // ahead of its consumer (#233), so `allow(dead_code)` until the worker wires it in.
 #[allow(dead_code)]
