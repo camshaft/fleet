@@ -1681,6 +1681,18 @@ enum Cmd {
         /// installed path on the target host, e.g. the flake output).
         #[arg(long)]
         bin: Option<String>,
+        /// Drop the `--rearm --stale-only` liveness sweep from the unit — an OBSERVER-ONLY cadence
+        /// (`--observe`) that coexists with an existing rearm watchdog without double-rearming (dev-desk).
+        #[arg(long)]
+        no_rearm: bool,
+        /// INSTALL the units into `~/.config/systemd/user/` (user-level, no sudo) instead of printing them, and
+        /// print the `systemctl --user enable` command — a clean, reversible install path for a host not on the
+        /// declarative (nix) model. Reverse with `--uninstall`.
+        #[arg(long)]
+        install: bool,
+        /// REMOVE the user units this installed (the inverse of `--install`) and print the `disable` command.
+        #[arg(long)]
+        uninstall: bool,
     },
     /// Print the build provenance — package version + the commit the binary was built from (baked at build
     /// time). Compare the rev to `origin/main` to tell whether a deployed binary is current (a stale binary
@@ -1768,7 +1780,10 @@ fn main() {
             pinned_only,
             interval_secs,
             bin,
-        } => watchdog_unit(observe, pinned_only, interval_secs, bin),
+            no_rearm,
+            install,
+            uninstall,
+        } => watchdog_unit(!no_rearm, observe, pinned_only, interval_secs, bin, install, uninstall),
         Cmd::Version => println!("{}", version_line()),
     }
 }
@@ -3800,11 +3815,15 @@ fn served_set(toml: bool) {
     }
 }
 
-/// The watchdog invocation a cadence unit runs: always the liveness sweep (`--rearm --stale-only`), plus the
-/// observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. Pure so the
-/// exact flag string is unit-tested. See [`render_watchdog_units`].
-fn watchdog_exec_args(observe: bool, pinned_only: bool) -> String {
-    let mut args = String::from("watchdog --rearm --stale-only");
+/// The watchdog invocation a cadence unit runs: the liveness sweep (`--rearm --stale-only`) when `rearm`, plus
+/// the observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. An
+/// OBSERVER-ONLY unit (`rearm=false, observe=true` → `watchdog --observe --spawn`) can run alongside an
+/// existing rearm watchdog without double-rearming — the dev-desk coexistence case. Pure — unit-tested.
+fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool) -> String {
+    let mut args = String::from("watchdog");
+    if rearm {
+        args.push_str(" --rearm --stale-only");
+    }
     if observe {
         args.push_str(" --observe --spawn");
     }
@@ -3814,23 +3833,22 @@ fn watchdog_exec_args(observe: bool, pinned_only: bool) -> String {
     args
 }
 
-/// Render a systemd USER service + timer (INI unit text) that runs the watchdog every `interval_secs`. The
-/// service is a `oneshot` (the watchdog is single-sweep) ordered After/Wants `fleet-notify` (the wake path it
-/// complements); the timer re-fires it on `OnUnitActiveSec`. A host installs these DECLARATIVELY (home-manager
-/// `systemd.user.services`/`timers`) — the emitted text is the canonical shape to translate, not a file to
-/// write. Pure — unit-tested.
-fn render_watchdog_units(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> String {
-    format!(
-        "# ---- fleet-watchdog.service (systemd USER oneshot) ----\n\
-         [Unit]\n\
+/// The systemd USER service + timer for the watchdog cadence as `(service_text, timer_text)` — pure unit text
+/// (no display headers), so it can be written to unit files or wrapped for stdout. The service is a `oneshot`
+/// (the watchdog is single-sweep) ordered After/Wants `fleet-notify` (the wake path it complements); the timer
+/// re-fires it on `OnUnitActiveSec`. Pure — unit-tested.
+fn watchdog_unit_files(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> (String, String) {
+    let service = format!(
+        "[Unit]\n\
          Description=Fleet watchdog — out-of-band /loop re-arm + observer cadence\n\
          After=fleet-notify.service\n\
          Wants=fleet-notify.service\n\n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart={fleet_bin} {exec_args}\n\n\
-         # ---- fleet-watchdog.timer (fires the service every {interval_secs}s) ----\n\
-         [Unit]\n\
+         ExecStart={fleet_bin} {exec_args}\n"
+    );
+    let timer = format!(
+        "[Unit]\n\
          Description=Fleet watchdog cadence\n\n\
          [Timer]\n\
          OnBootSec=60\n\
@@ -3838,21 +3856,104 @@ fn render_watchdog_units(fleet_bin: &str, exec_args: &str, interval_secs: u64) -
          Persistent=true\n\n\
          [Install]\n\
          WantedBy=timers.target\n"
+    );
+    (service, timer)
+}
+
+/// The two units concatenated with display headers, for `fleet watchdog-unit` stdout — a host installs these
+/// DECLARATIVELY (home-manager `systemd.user.services`/`timers`); the emitted text is the canonical shape to
+/// translate, not a file to write. Pure — unit-tested.
+fn render_watchdog_units(fleet_bin: &str, exec_args: &str, interval_secs: u64) -> String {
+    let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs);
+    format!(
+        "# ---- fleet-watchdog.service (systemd USER oneshot) ----\n{service}\n\
+         # ---- fleet-watchdog.timer (fires the service every {interval_secs}s) ----\n{timer}"
     )
 }
 
-/// `fleet watchdog-unit` — print the watchdog cadence's systemd USER service + timer for a host to install
-/// declaratively (see [`render_watchdog_units`]). `bin` defaults to this binary's absolute path; a target host
-/// sets it to its installed fleet path.
-fn watchdog_unit(observe: bool, pinned_only: bool, interval_secs: u64, bin: Option<String>) {
+/// The `~/.config/systemd/user` directory (XDG_CONFIG_HOME, else `$HOME/.config`) where a user timer installs.
+fn user_unit_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|c| c.join("systemd/user"))
+}
+
+/// `fleet watchdog-unit` — the watchdog cadence's systemd USER service + timer. Default: PRINT it (a host on
+/// the declarative/nix model translates the text). `--install`: WRITE it into `~/.config/systemd/user/`
+/// (user-level, no sudo) for a host not on that model — a clean, reversible path. `--uninstall`: remove it.
+/// `rearm=false` (`--no-rearm`) installs an OBSERVER-ONLY unit that coexists with an existing rearm watchdog
+/// (the dev-desk go-live: the system rearm service is left untouched, no sudo needed). `bin` defaults to this
+/// binary's absolute path.
+fn watchdog_unit(
+    rearm: bool,
+    observe: bool,
+    pinned_only: bool,
+    interval_secs: u64,
+    bin: Option<String>,
+    install: bool,
+    uninstall: bool,
+) {
     let fleet_bin = bin.unwrap_or_else(|| {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| "fleet".to_string())
     });
-    let exec_args = watchdog_exec_args(observe, pinned_only);
+    let exec_args = watchdog_exec_args(rearm, observe, pinned_only);
+    if uninstall {
+        watchdog_unit_uninstall();
+        return;
+    }
+    if install {
+        watchdog_unit_install(&fleet_bin, &exec_args, interval_secs);
+        return;
+    }
     print!("{}", render_watchdog_units(&fleet_bin, &exec_args, interval_secs));
+}
+
+/// Write the watchdog service + timer into `~/.config/systemd/user/` and print the enable command. User-level
+/// (no sudo). Idempotent (overwrites). Non-fatal guidance to stop any ad-hoc watchdog loop and to reverse.
+fn watchdog_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64) {
+    let Some(dir) = user_unit_dir() else {
+        eprintln!("fleet watchdog-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
+        std::process::exit(1);
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("fleet watchdog-unit --install: mkdir {}: {e}", dir.display());
+        std::process::exit(1);
+    }
+    let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs);
+    for (name, body) in [("fleet-watchdog.service", &service), ("fleet-watchdog.timer", &timer)] {
+        let path = dir.join(name);
+        if let Err(e) = std::fs::write(&path, body) {
+            eprintln!("fleet watchdog-unit --install: write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+        println!("installed {}", path.display());
+    }
+    println!("  ExecStart: {fleet_bin} {exec_args}");
+    println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now fleet-watchdog.timer");
+    println!("  reverse: fleet watchdog-unit --uninstall  (or: systemctl --user disable --now fleet-watchdog.timer)");
+}
+
+/// Remove the user watchdog units this installed and print the disable command. Best-effort (a missing file is
+/// fine — the inverse of an install that never happened).
+fn watchdog_unit_uninstall() {
+    let Some(dir) = user_unit_dir() else {
+        eprintln!("fleet watchdog-unit --uninstall: cannot resolve ~/.config/systemd/user");
+        std::process::exit(1);
+    };
+    println!("  disable FIRST: systemctl --user disable --now fleet-watchdog.timer");
+    for name in ["fleet-watchdog.service", "fleet-watchdog.timer"] {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("absent (ok): {}", path.display()),
+            Err(e) => eprintln!("  WARN: remove {}: {e}", path.display()),
+        }
+    }
+    println!("  then: systemctl --user daemon-reload");
 }
 
 /// The build-provenance line: package version + the revision the binary was built from (baked by `build.rs`
@@ -4310,19 +4411,22 @@ mod tests {
 
     #[test]
     fn watchdog_exec_args_builds_the_liveness_base_plus_opt_ins() {
-        assert_eq!(watchdog_exec_args(false, false), "watchdog --rearm --stale-only");
-        assert_eq!(watchdog_exec_args(true, false), "watchdog --rearm --stale-only --observe --spawn");
-        assert_eq!(watchdog_exec_args(false, true), "watchdog --rearm --stale-only --pinned-only");
+        // rearm base, opt-in observe + pinned.
+        assert_eq!(watchdog_exec_args(true, false, false), "watchdog --rearm --stale-only");
+        assert_eq!(watchdog_exec_args(true, true, false), "watchdog --rearm --stale-only --observe --spawn");
+        assert_eq!(watchdog_exec_args(true, false, true), "watchdog --rearm --stale-only --pinned-only");
         // The green go-live shape: liveness + observer cadence + host filter.
         assert_eq!(
-            watchdog_exec_args(true, true),
+            watchdog_exec_args(true, true, true),
             "watchdog --rearm --stale-only --observe --spawn --pinned-only"
         );
+        // OBSERVER-ONLY (rearm=false): coexists with an existing rearm watchdog without double-rearming (dev-desk).
+        assert_eq!(watchdog_exec_args(false, true, false), "watchdog --observe --spawn");
     }
 
     #[test]
     fn render_watchdog_units_is_a_oneshot_service_plus_timer() {
-        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true), 60);
+        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true), 60);
         // A oneshot service (the watchdog is single-sweep) driven by a timer — not a Restart loop.
         assert!(u.contains("Type=oneshot"), "single-sweep → oneshot, not a loop");
         assert!(u.contains("ExecStart=/run/fleet/bin/fleet watchdog --rearm --stale-only --observe --spawn --pinned-only"));
@@ -4330,6 +4434,20 @@ mod tests {
         // Ordered after the wake path it complements (green's request), and installable as a user timer.
         assert!(u.contains("After=fleet-notify.service") && u.contains("Wants=fleet-notify.service"));
         assert!(u.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn watchdog_unit_files_splits_service_and_timer_cleanly() {
+        // Observer-only exec, for the dev-desk coexistence install.
+        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false), 90);
+        // The service file has the oneshot + ExecStart, NO timer/header lines.
+        assert!(service.contains("Type=oneshot"));
+        assert!(service.contains("ExecStart=/bin/fleet watchdog --observe --spawn"));
+        assert!(!service.contains("OnUnitActiveSec"), "timer stanza belongs in the timer file, not the service");
+        assert!(!service.contains("# ----"), "unit files carry no display headers");
+        // The timer file drives the cadence + is enable-able.
+        assert!(timer.contains("OnUnitActiveSec=90") && timer.contains("WantedBy=timers.target"));
+        assert!(!timer.contains("ExecStart"), "no ExecStart in the timer");
     }
 
     #[test]
