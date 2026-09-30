@@ -3924,17 +3924,50 @@ fn set_interval(fleet: &Fleet, agent: &str, interval: &str) {
     }
 }
 
+/// Match a bare SESSION ID against a set of located session files by id (`session_id_of`). Returns the file
+/// whose id equals `sid`, or `None`. Pure over `candidates` — unit-tested.
+fn match_session_id_in(sid: &str, candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|c| transcripts::session_id_of(c).as_str() == sid)
+        .cloned()
+}
+
+/// Resolve a `--session` argument to a transcript file path: an existing FILE PATH is used verbatim,
+/// otherwise the argument is treated as a BARE SESSION ID and matched by id against the agent's located
+/// session files (`<agent-projects-dir>/<sid>.jsonl`). Returns `None` when a bare id matches no known
+/// session. This is the #360 fix: `--session <sid>` is the form the observer kickoff and observer.md
+/// document, but it used to fail with "No such file or directory" because the argument was used verbatim as
+/// a path — recurring friction on the observer self-improve loop. The `exists()` check is the only I/O; the
+/// id match is pure ([`match_session_id_in`]).
+fn resolve_session_arg(session: &Path, agent: &str) -> Option<PathBuf> {
+    if session.exists() {
+        return Some(session.to_path_buf());
+    }
+    match_session_id_in(&session.to_string_lossy(), &transcripts::locate_sessions(agent))
+}
+
 /// Render an agent's session transcript faithfully (see [`transcripts`]). Resolves the session file
-/// (`--session`, else the watermark's session, else the agent's newest), parses it, windows it by the
+/// (`--session` as a file path OR a bare session id, else the watermark's session, else the agent's newest),
+/// parses it, windows it by the
 /// `--since` record offset backed up by `--overlap`, renders + scrubs, and prints the advancing watermark.
 /// The watermark offset is a RECORD index (parsed JSONL records already observed), printed as
 /// `<session-id>:<record-count>` in the footer.
 fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, overlap: usize) {
     let (path, want_offset) = match session {
-        Some(p) => (
-            p.to_path_buf(),
-            since.map(|s| transcripts::parse_watermark(s).1).unwrap_or(0),
-        ),
+        Some(p) => {
+            let off = since.map(|s| transcripts::parse_watermark(s).1).unwrap_or(0);
+            match resolve_session_arg(p, agent) {
+                Some(found) => (found, off),
+                None => {
+                    eprintln!(
+                        "fleet transcripts: --session '{}' is neither an existing file nor a known session id for '{agent}'",
+                        p.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         None => {
             let sessions = transcripts::locate_sessions(agent);
             if sessions.is_empty() {
@@ -4714,6 +4747,24 @@ mod tests {
         // Unparseable stamps never flag (degrade safe).
         assert!(!agent_never_ticked("", "", now, grace));
         assert!(!agent_never_ticked("garbage", "garbage", now, grace));
+    }
+
+    #[test]
+    fn match_session_id_in_finds_the_file_by_bare_id() {
+        use std::path::PathBuf;
+        let candidates = vec![
+            PathBuf::from("/home/u/.claude/projects/-x/2ac1ff53-859a-4205-8a04-2be2f6f2e1b4.jsonl"),
+            PathBuf::from("/home/u/.claude/projects/-x/sess-9.jsonl"),
+        ];
+        // A bare session id (the observer-kickoff / observer.md form, #360) resolves to its file by file_stem.
+        assert_eq!(
+            match_session_id_in("2ac1ff53-859a-4205-8a04-2be2f6f2e1b4", &candidates),
+            Some(candidates[0].clone())
+        );
+        assert_eq!(match_session_id_in("sess-9", &candidates), Some(candidates[1].clone()));
+        // An unknown id matches nothing → the caller emits a clear error rather than reading a wrong file.
+        assert!(match_session_id_in("no-such-session", &candidates).is_none());
+        assert!(match_session_id_in("sess-9", &[]).is_none());
     }
 
     #[test]
