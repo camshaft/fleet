@@ -16,15 +16,25 @@
 //! in follow-ups. Landed ahead of its callers, so it reads as dead code until then.
 #![allow(dead_code)]
 
+use std::path::Path;
+
 use serde_json::{Map, Value};
 
-use crate::extract;
+use crate::board::{Board, Task};
+use crate::ipfs::Ipfs;
+use crate::{config, crate_docs, extract};
 
 /// Content-type tag the uploader stamps on a ticket and the embedder dispatches on — the Python string
 /// constants. `rustdoc-json` is set by the docs.rs fetch path; `pdf`/`text` come from [`content_type_for`].
 pub const RUSTDOC_JSON: &str = "rustdoc-json";
 pub const PDF: &str = "pdf";
 pub const TEXT: &str = "text";
+
+/// The two stage-agent roles (also the board agent ids) — the Python `UPLOADER`/`EMBEDDER`.
+pub const UPLOADER: &str = "uploader";
+pub const EMBEDDER: &str = "embedder";
+/// User-Agent for outbound fetches — the Python `UA`.
+const UA: &str = "camshaft-kb-pipeline/0.1";
 
 /// A ticket metadata string field, but only when present AND non-empty — mirrors Python truthiness
 /// (`meta.get(k)` / `... or ...`, where `""` is falsy), which the collection/version fallbacks rely on.
@@ -274,6 +284,141 @@ fn items_from_text(data: &[u8], meta: &Map<String, Value>) -> Vec<Item> {
     }]
 }
 
+// ---- uploader stage: source -> bytes -> IPFS ----
+
+/// Fetch a ticket's source into `(bytes, content_type, extra_meta)` — the Python `fetch_source`. `docs.rs`
+/// GETs the rustdoc JSON and zstd-decompresses it; `file`/`path` reads the file; `url` GETs (preferring a
+/// `raw_url`) and sniffs the content-type. An unknown `source_type` is an error.
+async fn fetch_source(
+    meta: &Map<String, Value>,
+) -> Result<(Vec<u8>, String, Map<String, Value>), String> {
+    let st = str_or(meta, "source_type", "");
+    let src = str_or(meta, "source", "");
+    let http = reqwest::Client::new();
+    match st {
+        "docs.rs" => {
+            let version = truthy_str(meta, "version").unwrap_or("latest");
+            let url = format!("https://docs.rs/crate/{src}/{version}/json");
+            let bytes = http
+                .get(&url)
+                .header(reqwest::header::USER_AGENT, UA)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|e| format!("pipeline: GET {url} failed: {e}"))?
+                .bytes()
+                .await
+                .map_err(|e| format!("pipeline: read {url}: {e}"))?;
+            let data = crate_docs::maybe_unzstd(&bytes);
+            let mut extra = Map::new();
+            extra.insert("crate".into(), Value::from(src));
+            Ok((data, RUSTDOC_JSON.to_string(), extra))
+        }
+        "file" | "path" => {
+            let data = tokio::fs::read(src)
+                .await
+                .map_err(|e| format!("pipeline: read file {src}: {e}"))?;
+            let name = Path::new(src)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(src);
+            let ct = content_type_for(name, "", &data);
+            let mut extra = Map::new();
+            extra.insert("filename".into(), Value::from(name));
+            Ok((data, ct.to_string(), extra))
+        }
+        "url" => {
+            let u = truthy_str(meta, "raw_url").unwrap_or(src);
+            let resp = http
+                .get(u)
+                .header(reqwest::header::USER_AGENT, UA)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|e| format!("pipeline: GET {u} failed: {e}"))?;
+            let header = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("pipeline: read {u}: {e}"))?;
+            let ct = content_type_for(u, &header, &bytes);
+            let mut extra = Map::new();
+            extra.insert("url".into(), Value::from(u));
+            extra.insert("filename".into(), Value::from(url_filename(u)));
+            Ok((bytes.to_vec(), ct.to_string(), extra))
+        }
+        other => Err(format!("pipeline: unknown source_type {other:?}")),
+    }
+}
+
+/// Flatten a name into a safe single IPFS filename — the Python `ipfs_add_bytes` guard: replace `/` and `\`
+/// with `_` (a slash makes Kubo build a DIRECTORY whose CID then 500s on `cat`), cap at 120 chars, and fall
+/// back to `blob` if empty.
+fn sanitize_ipfs_name(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .take(120)
+        .collect();
+    if replaced.is_empty() {
+        "blob".to_string()
+    } else {
+        replaced
+    }
+}
+
+/// The last path segment of a URL, or `doc` — the Python `u.rsplit("/", 1)[-1] or "doc"`.
+fn url_filename(u: &str) -> String {
+    match u.rsplit('/').next() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "doc".to_string(),
+    }
+}
+
+/// Uploader handler — the Python `handle_upload`: fetch the source, pin the bytes to IPFS, merge
+/// `{ipfs_cid, content_type, ipfs_url, ...extra}` onto the ticket, and reassign it to the embedder. (The REST
+/// `update_task` can't carry metadata like the Python MCP call, so props are merged via `set_task_props`
+/// first, then the reassign — the embedder reads them off the task either way.)
+pub async fn handle_upload(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<(), String> {
+    let meta = task.props();
+    let (data, content_type, extra) = fetch_source(&meta).await?;
+    let name = sanitize_ipfs_name(str_or(&meta, "source", "blob"));
+    let cid = ipfs.add_bytes(&name, &data).await?.cid;
+    let gateway = config::get().ipfs_gateway.trim_end_matches('/').to_string();
+
+    let mut props = Map::new();
+    props.insert("ipfs_cid".into(), Value::from(cid.clone()));
+    props.insert("content_type".into(), Value::from(content_type.clone()));
+    props.insert(
+        "ipfs_url".into(),
+        Value::from(format!("{gateway}/ipfs/{cid}")),
+    );
+    for (k, v) in extra {
+        props.insert(k, v);
+    }
+    board.set_task_props(task.id, &Value::Object(props)).await?;
+    board
+        .update_task(task.id, Some("todo"), Some(EMBEDDER))
+        .await?;
+    let short: String = cid.chars().take(14).collect();
+    board
+        .comment_task(
+            task.id,
+            &format!("Pinned to IPFS ({short}..., {content_type}); handed to embedder."),
+        )
+        .await?;
+    tracing::info!(
+        "pipeline uploader: task {} pinned {short} -> embedder",
+        task.id
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +576,22 @@ mod tests {
         assert_eq!(items[0].extra["kind"], "manual"); // meta.kind honored
         assert_eq!(items[0].extra["source"], "url");
         assert_eq!(items[0].extra["title"], "note.md");
+    }
+
+    #[test]
+    fn sanitize_ipfs_name_flattens_slashes_caps_and_defaults() {
+        assert_eq!(sanitize_ipfs_name("a/b\\c.pdf"), "a_b_c.pdf");
+        assert_eq!(sanitize_ipfs_name(""), "blob");
+        assert_eq!(sanitize_ipfs_name("plain.txt"), "plain.txt");
+        // Capped at 120 chars.
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_ipfs_name(&long).chars().count(), 120);
+    }
+
+    #[test]
+    fn url_filename_takes_last_segment_or_doc() {
+        assert_eq!(url_filename("https://h/a/b/readme.md"), "readme.md");
+        assert_eq!(url_filename("https://h/a/b/"), "doc"); // trailing slash
+        assert_eq!(url_filename("bare"), "bare");
     }
 }

@@ -263,7 +263,7 @@ async fn fetch_rustdoc(name: &str, version: &str) -> Result<Vec<u8>, String> {
 /// Decompress `bytes` if it is a zstd frame; otherwise return it unchanged. A zstd decode failure on
 /// magic-tagged bytes falls back to the raw bytes (so a corrupt-but-tagged body still surfaces as a JSON
 /// parse error upstream rather than being swallowed here).
-fn maybe_unzstd(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn maybe_unzstd(bytes: &[u8]) -> Vec<u8> {
     if bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC {
         match zstd::decode_all(bytes) {
             Ok(v) => v,
