@@ -84,11 +84,27 @@ fn agent_host_is_explicit(metadata: Option<&serde_json::Value>, this_host: &str)
     }
 }
 
-/// Whether the watchdog should manage an agent on this host. Under `pinned_only` (a secondary box like green),
-/// ONLY agents EXPLICITLY pinned here ([`agent_host_is_explicit`]) — so it never re-arms or spawns an observer
-/// against an unpinned agent whose tmux window / transcript lives on another box. Without it, the loose
-/// predicate ([`agent_host_matches`]): this-host-pinned OR unpinned run-anywhere. Pure — unit-tested.
+/// Whether a board agent record is STAGED — a `metadata.staged == true` agent is a pre-registered helper
+/// held in reserve (minted ahead of need, deployed later by clearing the flag), so NO auto-launch/manage
+/// path may bring it up: reconcile must not launch it and the watchdog must not re-arm or spawn an observer
+/// against it. Absent flag → not staged (the common case). Pure — unit-tested.
+fn agent_is_staged(md: Option<&serde_json::Value>) -> bool {
+    md.and_then(|m| m.get("staged"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the watchdog should manage an agent on this host. A STAGED agent ([`agent_is_staged`]) is never
+/// managed — it is a reserve helper that is not meant to be running, so re-arming or spawning an observer
+/// against it would be a spurious wake of an intentionally-down agent. Otherwise, under `pinned_only` (a
+/// secondary box like green), ONLY agents EXPLICITLY pinned here ([`agent_host_is_explicit`]) — so it never
+/// re-arms or spawns an observer against an unpinned agent whose tmux window / transcript lives on another
+/// box. Without it, the loose predicate ([`agent_host_matches`]): this-host-pinned OR unpinned run-anywhere.
+/// Pure — unit-tested.
 fn watchdog_manages_agent(md: Option<&serde_json::Value>, host: &str, pinned_only: bool) -> bool {
+    if agent_is_staged(md) {
+        return false;
+    }
     if pinned_only {
         agent_host_is_explicit(md, host)
     } else {
@@ -1048,6 +1064,7 @@ fn up_board(launch: bool, pinned_only: bool) {
     // Under --pinned-only, an agent whose host is not EXPLICITLY this box is excluded from the launch set and
     // reported as skipped — so a per-box reconcile can't launch another box's unpinned run-anywhere agents.
     let mut skipped_unpinned: Vec<String> = Vec::new();
+    let mut skipped_staged: Vec<String> = Vec::new();
     let declared: Vec<(String, bool)> = roster
         .iter()
         .filter_map(|a| {
@@ -1060,6 +1077,12 @@ fn up_board(launch: bool, pinned_only: bool) {
                 return None;
             }
             let id = a.get("id").and_then(serde_json::Value::as_str)?.to_string();
+            // A staged (reserve) agent is never auto-launched — it is minted ahead of need and deployed
+            // later by clearing metadata.staged, so exclude it from the reconcile set entirely.
+            if agent_is_staged(md) {
+                skipped_staged.push(id);
+                return None;
+            }
             if pinned_only && !agent_host_is_explicit(md, &host) {
                 skipped_unpinned.push(id);
                 return None;
@@ -1069,6 +1092,7 @@ fn up_board(launch: bool, pinned_only: bool) {
         })
         .collect();
     skipped_unpinned.sort();
+    skipped_staged.sort();
     let windows = tmux_window_names(&board_session());
     let plan = board_reconcile_plan(&declared, &windows);
     println!(
@@ -1081,6 +1105,12 @@ fn up_board(launch: bool, pinned_only: bool) {
             " pinned here"
         }
     );
+    if !skipped_staged.is_empty() {
+        println!(
+            "  ⊘ skipped (staged — reserve helper, not auto-launched): {}",
+            skipped_staged.join(", ")
+        );
+    }
     if !skipped_unpinned.is_empty() {
         println!(
             "  ⊘ skipped (unpinned — reported not launched under --pinned-only): {}",
@@ -4691,6 +4721,24 @@ mod tests {
         assert!(watchdog_manages_agent(Some(&green), "green-machine", true));
         assert!(!watchdog_manages_agent(Some(&unpinned), "green-machine", true), "unpinned EXCLUDED under --pinned-only");
         assert!(!watchdog_manages_agent(Some(&green), "dev-desk", true));
+    }
+
+    #[test]
+    fn agent_is_staged_reads_the_reserve_flag() {
+        assert!(agent_is_staged(Some(&serde_json::json!({ "staged": true }))));
+        assert!(!agent_is_staged(Some(&serde_json::json!({ "staged": false }))));
+        assert!(!agent_is_staged(Some(&serde_json::json!({}))), "absent flag → not staged");
+        assert!(!agent_is_staged(Some(&serde_json::json!({ "staged": "true" }))), "non-bool → not staged");
+        assert!(!agent_is_staged(None));
+    }
+
+    #[test]
+    fn watchdog_never_manages_a_staged_agent() {
+        // A staged reserve helper is not meant to be running, so the watchdog must never re-arm or observe it —
+        // even when it is native + pinned to this exact box (which would otherwise be managed).
+        let staged_here = serde_json::json!({ "host": "green-machine", "staged": true });
+        assert!(!watchdog_manages_agent(Some(&staged_here), "green-machine", false));
+        assert!(!watchdog_manages_agent(Some(&staged_here), "green-machine", true));
     }
 
     #[test]
