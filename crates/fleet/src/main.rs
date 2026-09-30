@@ -2202,7 +2202,13 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
          hold actionable assigned work OR unread messages, keep going — schedule your next tick SOON \
          (60-120s). Only when you have no actionable assigned task AND your inbox is drained may you fall \
          back to the long idle cadence (about {interval}). NEVER idle-sleep on the long cadence while you \
-         still hold an actionable assigned task."
+         still hold an actionable assigned task. If your assigned cluster is DONE / at-rest — no actionable \
+         work and your only revival triggers are external events (a routed message, a new assignment, a \
+         decline) — do NOT keep self-re-arming at your active interval: request a long REGISTRY cadence with \
+         `cargo xtask fleet set-interval {agent} <e.g. 2-3h>` (a raw next-tick reschedule does NOT persist \
+         against the registry-driven watchdog, so it keeps waking you at the active interval), then rely on \
+         event-wake — a routed message or assignment nudges your window awake immediately regardless of \
+         interval, so a long rest cadence never delays revival, it only cuts empty self-directed ticks."
     );
     format!(
         "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
@@ -2227,13 +2233,17 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
          another agent's trace or diagnosis of a service you do NOT own, first confirm the exact command with \
          that service's OWNER (the authority on their live unit); if the owner cannot confirm in time, mark it \
          OWNER-UNCONFIRMED so the operator double-checks — partial visibility can read a stale unit as live. \
-         If any task of \
-         yours becomes BLOCKED ON THE \
-         OPERATOR, do not idle on it: set the task status=blocked with blocked_on {{kind:operator, note}}, \
-         assign it to 'cameron', and stash your own id in metadata.blocked_owner — so list_tasks(assignee \
-         'cameron') is the operator's single 'my asks' dashboard; when the operator answers, reassign the task \
-         back to yourself and clear blocked (if your MCP cannot set a typed blocked_on, ask concierge or \
-         board-pm to stamp it). You work in {workdir}. Start your recurring \
+         If a task of \
+         yours becomes BLOCKED ON AN EXTERNAL DEPENDENCY you cannot act on — the operator, another agent, or \
+         a pending deploy/CI/cross-agent reply — do NOT sit on the SOON cadence polling for it: set the task \
+         status=blocked with a blocked_on note. A blocked task is NOT actionable pending work, so if it is \
+         your only open task you drop to the long/event-woken cadence — the live actionable-event wake \
+         re-tickets you the moment a reply, an assignment, or the dep landing arrives, so short-cadence \
+         polling buys nothing. If the block is ON THE OPERATOR specifically, ALSO assign the task to 'cameron' \
+         and stash your own id in metadata.blocked_owner — so list_tasks(assignee 'cameron') is the operator's \
+         single 'my asks' dashboard; when the operator answers, reassign the task back to yourself and clear \
+         blocked. (If your MCP cannot set a typed blocked_on, ask concierge or board-pm to stamp it.) You work \
+         in {workdir}. Start your recurring \
          loop now: /loop {tick}"
     )
 }
@@ -4266,10 +4276,22 @@ mod tests {
         // Banned-phrases self-check (operator writing policy): reference the maintained list (data-driven),
         // applied to any doc OR comment, until the #308 pre-submit scanner lands.
         assert!(k.contains("banned-phrases") && k.contains("doc OR comment"), "kickoff points authors at the banned-phrases list for docs and comments");
-        // Operator-blocked dashboard convention (operator seq-2292): a task blocked on the operator gets
-        // reassigned to 'cameron' + typed blocked_on so list_tasks(assignee cameron) is the operator's one dashboard.
-        assert!(k.contains("BLOCKED ON THE") && k.contains("assign it to 'cameron'"), "carries the operator-blocked convention");
+        // External-dependency blocked → long/event-woken cadence (#349): the block carve-out is generalized
+        // beyond the operator to ANY external dep (another agent, a pending deploy/CI), so an agent holding a
+        // sole externally-blocked task sets it blocked + drops to the long cadence instead of SOON-polling.
+        assert!(k.contains("BLOCKED ON AN EXTERNAL DEPENDENCY"), "generalizes the block carve-out beyond the operator (#349)");
+        assert!(k.contains("another agent") && k.contains("deploy/CI"), "names the non-operator external deps");
+        assert!(k.contains("long/event-woken cadence"), "a sole blocked task drops to the long/event-woken cadence, not SOON polling");
+        // Operator-blocked dashboard convention (operator seq-2292) is preserved as a sub-case: reassign to
+        // 'cameron' + typed blocked_on + stash the real owner so list_tasks(assignee cameron) is the one dashboard.
+        assert!(k.contains("ON THE OPERATOR specifically") && k.contains("assign the task to 'cameron'"), "keeps the operator-blocked convention as a sub-case");
         assert!(k.contains("metadata.blocked_owner"), "stashes the real owner for reassign-back");
+        // Drained / at-rest → persist a long REGISTRY cadence via set-interval (#383): a raw reschedule does not
+        // stick against the registry watchdog, so a done cluster must set-interval + rely on event-wake, not
+        // keep self-re-arming at its active interval.
+        assert!(k.contains("DONE / at-rest"), "routes a drained/done cluster to the rest-cadence path (#383)");
+        assert!(k.contains("fleet set-interval"), "names the registry cadence lever (set-interval), not a raw reschedule");
+        assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the registry watchdog");
     }
 
     #[test]
