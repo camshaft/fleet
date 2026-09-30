@@ -18,8 +18,8 @@ mod stt;
 mod tts;
 mod wake;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bridge::{SpokenReply, VoiceBridge};
@@ -132,10 +132,28 @@ impl Assistant {
         }
     }
 
-    /// Speak `text`; if the wake phrase is heard during playback, kill it and return `true` (a barge-in).
-    /// Includes the "arm only after a low streak" debounce so the wake that opened this turn (or stale
-    /// activation) can't count as a barge-in.
+    /// Speak `text`, chunked by sentence so audio starts after the FIRST sentence is synthesized rather
+    /// than the whole reply. Batch Kokoro synth of the full reply is the dominant reply→speaker latency
+    /// (#454) and grows with length; synthesizing + playing one sentence at a time drops time-to-first-
+    /// audio to the first sentence. Each sentence plays with barge-in; a wake during any sentence stops
+    /// playback and returns `true` (the rest of the reply is dropped). The per-sentence log lets green
+    /// separate first-sentence synth from pipeline overhead when measuring latency.
     fn speak_interruptible(&mut self, text: &str) -> bool {
+        let sentences = crate::bridge::render::split_sentences(text);
+        let n = sentences.len();
+        for (i, sentence) in sentences.iter().enumerate() {
+            eprintln!("[tts] sentence {}/{n}", i + 1);
+            if self.speak_one(sentence) {
+                return true; // barge-in — stop synthesizing/speaking the rest of the reply
+            }
+        }
+        false
+    }
+
+    /// Speak ONE already-sentence-sized chunk; if the wake phrase is heard during playback, kill it and
+    /// return `true` (a barge-in). Includes the "arm only after a low streak" debounce so the wake that
+    /// opened this turn (or stale activation) can't count as a barge-in.
+    fn speak_one(&mut self, text: &str) -> bool {
         let samples = self.tts.synth(text);
         if samples.is_empty() {
             return false;
@@ -232,7 +250,9 @@ impl Assistant {
         let mut conversing = false; // follow-up: keep the mic open, no wake phrase needed
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
-                eprintln!("[voice-assistant] shutdown signal — releasing the capture device and exiting");
+                eprintln!(
+                    "[voice-assistant] shutdown signal — releasing the capture device and exiting"
+                );
                 return;
             }
             let following = conversing; // this turn's record is a reopened follow-up mic
