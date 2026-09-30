@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use pdfium_render::prelude::*;
 use walkdir::{DirEntry, WalkDir};
 
 /// The extracted text of one source file, split into pages. A PDF has one entry per page (document order); a
@@ -86,16 +87,32 @@ pub fn extract(path: &Path) -> Result<Extracted, String> {
                 .map_err(|e| format!("extract: read {}: {e}", path.display()))?;
             Ok(Extracted { pages: vec![text] })
         }
-        Some(Kind::Pdf) => {
-            let pages = pdf_extract::extract_text_by_pages(path)
-                .map_err(|e| format!("extract: pdf {}: {e}", path.display()))?;
-            Ok(Extracted { pages })
-        }
+        Some(Kind::Pdf) => Ok(Extracted {
+            pages: extract_pdf(path)?,
+        }),
         None => Err(format!(
             "extract: unsupported file type: {}",
             path.display()
         )),
     }
+}
+
+/// Extract a PDF's text per page via PDFium (pdfium-render, greenlit decision #1). Binds libpdfium at
+/// runtime from the system library path (provided by the worker roles' LD_LIBRARY_PATH); a missing library
+/// or an unreadable PDF is an error. A page whose text can't be read contributes an empty page rather than
+/// failing the whole document.
+fn extract_pdf(path: &Path) -> Result<Vec<String>, String> {
+    let pdfium = Pdfium::new(Pdfium::bind_to_system_library().map_err(|e| {
+        format!("extract: pdfium bind failed (is libpdfium on the library path?): {e}")
+    })?);
+    let doc = pdfium
+        .load_pdf_from_file(path, None)
+        .map_err(|e| format!("extract: pdf {}: {e}", path.display()))?;
+    Ok(doc
+        .pages()
+        .iter()
+        .map(|page| page.text().map(|t| t.all()).unwrap_or_default())
+        .collect())
 }
 
 #[cfg(test)]
