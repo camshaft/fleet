@@ -1923,6 +1923,7 @@ fn spin_up_workspace_kind(
     effort: &str,
     interval: &str,
     devshell: bool,
+    reactive: bool,
     apply: bool,
     cwd_override: Option<&str>,
 ) {
@@ -2005,7 +2006,7 @@ fn spin_up_workspace_kind(
         Ok(false) => {}
         Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
-    match launch_board_agent(agent, &plan.cwd, harness, model, effort, interval, devshell) {
+    match launch_board_agent(agent, &plan.cwd, harness, model, effort, interval, devshell, reactive) {
         Ok(win) => {
             println!(
                 "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {}) — it will get_agent itself for its charter, then run a work-conserving dynamic /loop (idle cadence ~{interval})",
@@ -2051,6 +2052,10 @@ fn spin_up(agent: &str, apply: bool) {
     // Opt-in: launch inside the workdir's flake devShell so the pinned toolchain is on PATH (#214). Off by
     // default — set only for an agent whose workdir is a flake with a devShell.
     let devshell = md.get("devshell").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Opt-in REACTIVE responder pacing (#438): a mention-only bot (e.g. a Slack-channel participant) gets a
+    // kickoff whose only actionable trigger is being explicitly addressed, so it does not self-poll on ambient
+    // chatter. Off by default — a normal work-conserving worker is unchanged.
+    let reactive = md.get("reactive").and_then(|v| v.as_bool()).unwrap_or(false);
     let repos = md
         .get("repos")
         .and_then(|v| v.as_array())
@@ -2071,7 +2076,7 @@ fn spin_up(agent: &str, apply: bool) {
         let cwd_override = field("workspace_cwd");
         return spin_up_workspace_kind(
             &board, agent, &kind, &fleet_root, has_charter, &harness, &model, &effort, &interval,
-            devshell, apply, cwd_override.as_deref(),
+            devshell, reactive, apply, cwd_override.as_deref(),
         );
     }
 
@@ -2168,10 +2173,11 @@ fn spin_up(agent: &str, apply: bool) {
         Ok(false) => {}
         Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
     }
-    match launch_board_agent(agent, &workdir, &harness, &model, &effort, &interval, devshell) {
+    match launch_board_agent(agent, &workdir, &harness, &model, &effort, &interval, devshell, reactive) {
         Ok(win) => {
+            let loop_kind = if reactive { "reactive (mention-only) /loop" } else { "work-conserving dynamic /loop" };
             println!(
-                "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then run a work-conserving dynamic /loop (idle cadence ~{interval})"
+                "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then run a {loop_kind} (idle cadence ~{interval})"
             );
             // Mark the agent board-native. `spin-up` IS the board-native launch path, so whatever it
             // launches is board-native by construction; stamping `native: true` gives orchestrators a
@@ -2198,24 +2204,46 @@ fn spin_up(agent: &str, apply: bool) {
 /// inbox, does one unit, then gates the next wake on work-present: it keeps looping soon while it holds
 /// open assigned tasks or unread messages, and only falls back to the long `interval` idle cadence once its
 /// assigned queue is drained AND its inbox is empty — so an agent with assigned work never idle-sleeps.
-fn build_kickoff(agent: &str, workdir: &str, interval: &str) -> String {
-    let tick = format!(
-        "run one tick of your charter: drain your board notifications (check_notifications), do ONE unit \
-         of work per your charter, then update your presence (set_status). WORK-CONSERVING PACING: after \
-         the unit, check your OPEN assigned tasks (list_tasks with assignee '{agent}', counting ONLY \
-         todo/in_progress tasks that are NOT blocked/parked — a blocked task, or one parked on a blocker or \
-         a not-yet-existing prereq, is NOT actionable pending work) and your unread notifications. If you \
-         hold actionable assigned work OR unread messages, keep going — schedule your next tick SOON \
-         (60-120s). Only when you have no actionable assigned task AND your inbox is drained may you fall \
-         back to the long idle cadence (about {interval}). NEVER idle-sleep on the long cadence while you \
-         still hold an actionable assigned task. If your assigned cluster is DONE / at-rest — no actionable \
-         work and your only revival triggers are external events (a routed message, a new assignment, a \
-         decline) — do NOT keep self-re-arming at your active interval: request a long REGISTRY cadence with \
-         `cargo xtask fleet set-interval {agent} <e.g. 2-3h>` (a raw next-tick reschedule does NOT persist \
-         against the registry-driven watchdog, so it keeps waking you at the active interval), then rely on \
-         event-wake — a routed message or assignment nudges your window awake immediately regardless of \
-         interval, so a long rest cadence never delays revival, it only cuts empty self-directed ticks."
-    );
+fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> String {
+    // REACTIVE responders (mention-only bots like a Slack channel participant) invert the pacing: the generic
+    // work-conserving loop treats ANY unread notification as a reason to re-poll SOON, but a silence-default
+    // responder must treat ambient channel chatter as NON-work and only act when EXPLICITLY addressed — else
+    // it self-schedules short re-polls on coordination noise while (correctly) staying silent (#438). Its only
+    // actionable trigger is being addressed; otherwise it goes idle and waits for a live event-wake.
+    let tick = if reactive {
+        format!(
+            "run one tick as a REACTIVE responder. Your ONLY actionable trigger is being EXPLICITLY \
+             ADDRESSED — a mention or @mention of you in a channel you belong to, a direct message to you, or \
+             a task assigned to you. Ambient channel chatter and unread coordination posts that do NOT \
+             address you are NOT work — read them for context if useful, but they NEVER make you act or \
+             re-poll. Each wake: check whether anything ADDRESSES you (check_notifications with agent_id \
+             '{agent}'); if so, handle it per your charter (respond / act), then re-check. If NOTHING \
+             addresses you, you are DONE for this wake — update presence (set_status) if useful, then go idle \
+             and WAIT TO BE WOKEN. Do NOT schedule a soon next tick just because coordination chatter is \
+             unread — silence is your default and a live event-wake re-tickets you the instant you are \
+             addressed, so short-cadence polling on ambient activity buys nothing and risks a wrong ambient \
+             interjection. Fall straight to the long idle cadence (about {interval}) whenever nothing \
+             addresses you."
+        )
+    } else {
+        format!(
+            "run one tick of your charter: drain your board notifications (check_notifications), do ONE unit \
+             of work per your charter, then update your presence (set_status). WORK-CONSERVING PACING: after \
+             the unit, check your OPEN assigned tasks (list_tasks with assignee '{agent}', counting ONLY \
+             todo/in_progress tasks that are NOT blocked/parked — a blocked task, or one parked on a blocker or \
+             a not-yet-existing prereq, is NOT actionable pending work) and your unread notifications. If you \
+             hold actionable assigned work OR unread messages, keep going — schedule your next tick SOON \
+             (60-120s). Only when you have no actionable assigned task AND your inbox is drained may you fall \
+             back to the long idle cadence (about {interval}). NEVER idle-sleep on the long cadence while you \
+             still hold an actionable assigned task. If your assigned cluster is DONE / at-rest — no actionable \
+             work and your only revival triggers are external events (a routed message, a new assignment, a \
+             decline) — do NOT keep self-re-arming at your active interval: request a long REGISTRY cadence with \
+             `cargo xtask fleet set-interval {agent} <e.g. 2-3h>` (a raw next-tick reschedule does NOT persist \
+             against the registry-driven watchdog, so it keeps waking you at the active interval), then rely on \
+             event-wake — a routed message or assignment nudges your window awake immediately regardless of \
+             interval, so a long rest cadence never delays revival, it only cuts empty self-directed ticks."
+        )
+    };
     format!(
         "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
          this session. Call register_agent with agent_id '{agent}' once (idempotent) so your board record \
@@ -2502,7 +2530,8 @@ fn install_fmt_hook(hooks_dir: &std::path::Path) {
 /// fetches its own charter from the board via its in-session MCP — nothing is injected). The launch command
 /// is harness-specific (see [`build_launch_cmd`]); refuses to double-launch an existing same-named window.
 /// The kickoff is passed via a tmux env var so no shell quoting can mangle it.
-fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, effort: &str, interval: &str, devshell: bool) -> Result<String, String> {
+#[allow(clippy::too_many_arguments)]
+fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, effort: &str, interval: &str, devshell: bool, reactive: bool) -> Result<String, String> {
     let session = board_session();
     if let Ok(out) = std::process::Command::new("tmux")
         .args(["list-windows", "-t", &session, "-F", "#W"])
@@ -2511,7 +2540,7 @@ fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, ef
     {
         return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
     }
-    let kickoff = build_kickoff(agent, workdir, interval);
+    let kickoff = build_kickoff(agent, workdir, interval, reactive);
     let cmd = build_launch_cmd(harness, model, effort, devshell.then_some(workdir))?;
     let status = std::process::Command::new("tmux")
         .args([
@@ -4412,7 +4441,7 @@ mod tests {
 
     #[test]
     fn build_kickoff_is_work_conserving_and_self_discovering() {
-        let k = build_kickoff("v-x", "/wt/v-x", "30m");
+        let k = build_kickoff("v-x", "/wt/v-x", "30m", false);
         // Identity (#336): the board does NOT bind the session (a fresh unbound board per call), so
         // register_agent can't make later id-less calls work — the kickoff must say pass ids EXPLICITLY on
         // EVERY call, and still register once + self-discover the charter via get_agent.
@@ -4457,6 +4486,26 @@ mod tests {
         assert!(k.contains("DONE / at-rest"), "routes a drained/done cluster to the rest-cadence path (#383)");
         assert!(k.contains("fleet set-interval"), "names the registry cadence lever (set-interval), not a raw reschedule");
         assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the registry watchdog");
+    }
+
+    #[test]
+    fn build_kickoff_reactive_mode_only_acts_when_addressed() {
+        let r = build_kickoff("frank", "/wt/frank", "30m", true);
+        // Still self-discovering + explicit-identity like every kickoff (the boot contract is shared).
+        assert!(r.contains("register_agent") && r.contains("get_agent"), "reactive kickoff still self-discovers");
+        assert!(r.contains("'frank'"), "carries the agent id");
+        assert!(r.contains("/loop run one tick"), "still a dynamic /loop");
+        // The reactive discipline (#438): only being ADDRESSED is actionable; ambient chatter is NOT work.
+        assert!(r.contains("REACTIVE responder"), "declares reactive mode");
+        assert!(r.contains("EXPLICITLY") && r.contains("ADDRESSED"), "only an explicit address is a trigger");
+        assert!(r.contains("WAIT TO BE WOKEN"), "goes idle and waits for an event-wake when unaddressed");
+        // CRITICAL: it must NOT carry the work-conserving 'unread => keep going SOON' pacing that mis-fires on
+        // ambient channel chatter (the exact anti-pattern the observer caught in Frank's boot).
+        assert!(!r.contains("WORK-CONSERVING PACING"), "reactive mode drops the work-conserving pacing");
+        assert!(!r.contains("keep going — schedule your next tick SOON"), "no SOON re-poll on unread chatter");
+        // And the default (non-reactive) kickoff must be UNCHANGED — it keeps the work-conserving pacing.
+        let w = build_kickoff("v-x", "/wt/v-x", "30m", false);
+        assert!(w.contains("WORK-CONSERVING PACING") && !w.contains("REACTIVE responder"), "default worker unchanged");
     }
 
     #[test]
