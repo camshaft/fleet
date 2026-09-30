@@ -44,3 +44,19 @@ jobs:
 
       - name: test (workspace)
         run: cargo test --workspace
+
+  voice-assistant-runtime:
+    name: build (voice-assistant --features runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # voice-assistant's `runtime` feature (sherpa-onnx STT/TTS/wake + cpal audio) links a prebuilt
+      # linux-x64 sherpa lib and needs cmake/alsa, so it is gated to x86_64-linux in flake.nix (checks +
+      # packages). The GHA `ubuntu-latest` runner IS x86_64, so this is the one CI-native path that can
+      # build it — without this job, no PR touching the runtime feature has any green build signal short
+      # of a manual x86_64 machine round-trip (see crates/voice-assistant's aarch64-owner gap).
+      - uses: DeterminateSystems/nix-installer-action@v23
+
+      - name: nix build .#voice-assistant (runtime feature, hermetic sherpa lib)
+        run: nix build .#voice-assistant --print-build-logs
