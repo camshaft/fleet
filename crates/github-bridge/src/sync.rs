@@ -19,7 +19,7 @@
 //! #270), so dedup is the board's job and this layer never tracks already-ingested state itself.
 
 use crate::board::{comment_ref, issue_ref, Event, TaskReflect, LINK_SOURCE};
-use crate::github::{github_external_author, Issue, IssueComment};
+use crate::github::{github_external_author, Issue, IssueComment, PullReview};
 
 /// A mirrored board task to create from a GitHub issue (the daemon calls the idempotent `board::create_task`
 /// passing [`TaskCreate::issue_ref`] as the `external_link`, so the board de-dupes + links atomically).
@@ -148,13 +148,20 @@ pub fn plan_comment_ingest(
 
 // ── PR → review (BUILD 2a): map a GitHub pull request to a board code-review status ────────────────────
 
-/// The concluding review status for a GitHub pull request, per BUILD 2a of the Review-entity design
-/// (board Doc #5): a code review mirrors a PR with the three terminal-ish states only — intermediate
-/// states (draft / in-review / changes-requested) are BUILD 2b via the Pulls + Reviews APIs.
+/// The review status the adapter maps a GitHub pull request to. BUILD 2a emits the three concluding states
+/// ([`Open`](PrReviewStatus::Open) / [`Approved`](PrReviewStatus::Approved) /
+/// [`Closed`](PrReviewStatus::Closed)) from the issues-list row alone; BUILD 2b refines an open PR into the
+/// intermediate states ([`InReview`](PrReviewStatus::InReview) /
+/// [`ChangesRequested`](PrReviewStatus::ChangesRequested)) using the Pulls + Reviews APIs. Every variant maps
+/// to a status in BUILD 1's review lifecycle enum (v-task-board #372).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrReviewStatus {
-    /// The PR is still open (no verdict yet).
+    /// The PR is open with no active verdict yet (2a: any open PR; 2b: an open *draft* PR).
     Open,
+    /// The PR is open, ready (non-draft), and awaiting/under review (2b).
+    InReview,
+    /// The PR is open and its latest decisive review requested changes (2b).
+    ChangesRequested,
     /// The PR was merged — the code review concluded `approved`.
     Approved,
     /// The PR was closed without merging — the code review concluded `closed`.
@@ -162,15 +169,70 @@ pub enum PrReviewStatus {
 }
 
 impl PrReviewStatus {
-    /// The board review-status string. This is the status the adapter passes to the board's `create_review`
-    /// (co-designed on task #373); a stable spelling of each state so BUILD 1's status enum and the adapter
-    /// agree.
+    /// The board review-status string. This is the status the adapter passes to `create_review` /
+    /// `set_review_status` (co-designed on task #373); a stable spelling of each state matching BUILD 1's
+    /// lifecycle enum (open / in_review / changes_requested / approved / closed).
     pub fn as_board_status(self) -> &'static str {
         match self {
             PrReviewStatus::Open => "open",
+            PrReviewStatus::InReview => "in_review",
+            PrReviewStatus::ChangesRequested => "changes_requested",
             PrReviewStatus::Approved => "approved",
             PrReviewStatus::Closed => "closed",
         }
+    }
+}
+
+/// A GitHub pull-request review verdict, distilled from the Reviews API `state` string (BUILD 2b). Only the
+/// two DECISIVE verdicts drive the review status; `COMMENTED` / `PENDING` / `DISMISSED` and anything unknown
+/// are [`Other`](ReviewDecision::Other) (non-decisive, ignored by [`latest_review_decision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    Other,
+}
+
+impl ReviewDecision {
+    /// Classify a GitHub review `state` string (`APPROVED` / `CHANGES_REQUESTED` / …). Case-sensitive to
+    /// GitHub's uppercase enum; unknown/non-decisive verdicts are [`Other`](ReviewDecision::Other).
+    fn from_state(state: &str) -> ReviewDecision {
+        match state {
+            "APPROVED" => ReviewDecision::Approved,
+            "CHANGES_REQUESTED" => ReviewDecision::ChangesRequested,
+            _ => ReviewDecision::Other,
+        }
+    }
+}
+
+/// The effective decisive verdict across a PR's reviews (BUILD 2b): the verdict of the LATEST review (by
+/// `submitted_at`) that is decisive (`APPROVED` / `CHANGES_REQUESTED`), or `None` when no review is decisive
+/// yet (only comments / pending / dismissed). This is the signal that refines an open ready PR into
+/// `changes_requested` vs `in_review`. Pure; RFC3339 `submitted_at` sorts lexicographically.
+pub fn latest_review_decision(reviews: &[PullReview]) -> Option<ReviewDecision> {
+    reviews
+        .iter()
+        .filter(|r| matches!(ReviewDecision::from_state(&r.state), ReviewDecision::Approved | ReviewDecision::ChangesRequested))
+        .max_by(|a, b| a.submitted_at.cmp(&b.submitted_at))
+        .map(|r| ReviewDecision::from_state(&r.state))
+}
+
+/// Refine a BUILD-2a base status into the BUILD-2b intermediate states using the PR's `draft` flag and its
+/// effective review [`decision`](latest_review_decision). Terminal states ([`Approved`](PrReviewStatus::Approved)
+/// / [`Closed`](PrReviewStatus::Closed)) pass through unchanged — only an [`Open`](PrReviewStatus::Open) PR is
+/// refined: a draft stays `open`; a ready PR whose latest decisive review requested changes is
+/// `changes_requested`; otherwise `in_review`. (An approving review on a still-open PR stays `in_review` — a
+/// PR only concludes `approved` once merged.) Pure.
+pub fn refine_open_status(base: PrReviewStatus, draft: bool, decision: Option<ReviewDecision>) -> PrReviewStatus {
+    if base != PrReviewStatus::Open {
+        return base; // Approved / Closed are terminal
+    }
+    if draft {
+        PrReviewStatus::Open
+    } else if decision == Some(ReviewDecision::ChangesRequested) {
+        PrReviewStatus::ChangesRequested
+    } else {
+        PrReviewStatus::InReview
     }
 }
 
@@ -499,6 +561,79 @@ mod tests {
         // Defensive: an empty-string merged_at must not read as merged (only a real timestamp does).
         assert_eq!(pr_review_status(&pr(4, "closed", Some(""))), PrReviewStatus::Closed);
         assert_eq!(pr_review_status(&pr(5, "open", Some(""))), PrReviewStatus::Open);
+    }
+
+    // ── BUILD 2b: review-decision + open-status refinement ─────────────────────────────────────────
+
+    fn review(state: &str, author: &str, submitted_at: &str) -> PullReview {
+        PullReview {
+            id: 1,
+            state: state.to_string(),
+            author: author.to_string(),
+            submitted_at: submitted_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn latest_review_decision_picks_the_latest_decisive_verdict() {
+        // CHANGES_REQUESTED at 02:00 is later than APPROVED at 01:00; comments are non-decisive.
+        let reviews = [
+            review("APPROVED", "a", "2026-09-30T01:00:00Z"),
+            review("COMMENTED", "b", "2026-09-30T03:00:00Z"),
+            review("CHANGES_REQUESTED", "c", "2026-09-30T02:00:00Z"),
+        ];
+        assert_eq!(latest_review_decision(&reviews), Some(ReviewDecision::ChangesRequested));
+    }
+
+    #[test]
+    fn latest_review_decision_none_when_no_decisive_review() {
+        let reviews = [review("COMMENTED", "a", "t1"), review("PENDING", "b", "t2")];
+        assert_eq!(latest_review_decision(&reviews), None);
+        assert_eq!(latest_review_decision(&[]), None);
+    }
+
+    #[test]
+    fn latest_review_decision_approved_wins_when_latest() {
+        let reviews = [
+            review("CHANGES_REQUESTED", "a", "2026-09-30T01:00:00Z"),
+            review("APPROVED", "a", "2026-09-30T05:00:00Z"),
+        ];
+        assert_eq!(latest_review_decision(&reviews), Some(ReviewDecision::Approved));
+    }
+
+    #[test]
+    fn refine_open_status_draft_stays_open() {
+        assert_eq!(refine_open_status(PrReviewStatus::Open, true, None), PrReviewStatus::Open);
+        // Even a changes-requested draft stays open (draft dominates).
+        assert_eq!(
+            refine_open_status(PrReviewStatus::Open, true, Some(ReviewDecision::ChangesRequested)),
+            PrReviewStatus::Open
+        );
+    }
+
+    #[test]
+    fn refine_open_status_ready_pr_maps_to_in_review_or_changes_requested() {
+        assert_eq!(refine_open_status(PrReviewStatus::Open, false, None), PrReviewStatus::InReview);
+        assert_eq!(
+            refine_open_status(PrReviewStatus::Open, false, Some(ReviewDecision::Approved)),
+            PrReviewStatus::InReview,
+            "an approving review on a still-open PR stays in_review (only merge concludes approved)"
+        );
+        assert_eq!(
+            refine_open_status(PrReviewStatus::Open, false, Some(ReviewDecision::ChangesRequested)),
+            PrReviewStatus::ChangesRequested
+        );
+        assert_eq!(refine_open_status(PrReviewStatus::Open, false, None).as_board_status(), "in_review");
+    }
+
+    #[test]
+    fn refine_open_status_terminal_states_pass_through() {
+        // A merged/closed PR is terminal — draft/decision never override it.
+        assert_eq!(
+            refine_open_status(PrReviewStatus::Approved, false, Some(ReviewDecision::ChangesRequested)),
+            PrReviewStatus::Approved
+        );
+        assert_eq!(refine_open_status(PrReviewStatus::Closed, true, None), PrReviewStatus::Closed);
     }
 
     #[test]

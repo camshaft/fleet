@@ -48,12 +48,14 @@ pub use board::{
 };
 pub use config::{Config, DEFAULT_CONFIG_FILENAME};
 pub use github::{
-    github_external_author, parse_issue_comments, parse_issues, GithubClient, Issue, IssueComment, PER_PAGE,
+    github_external_author, parse_issue_comments, parse_issues, parse_pull_request, parse_pull_reviews,
+    GithubClient, Issue, IssueComment, PullRequest, PullReview, PER_PAGE,
 };
 pub use state::State;
 pub use sync::{
-    plan_comment_ingest, plan_issue_ingest, plan_outbound, plan_pr_comment_log, plan_pr_review_ingest,
-    pr_review_status, render_outbound_github_comment, render_pr_review_description, render_task_description,
-    CommentIngestPlan, CommentPost, IssueIngestPlan, OutboundComment, PrReviewIngestPlan, PrReviewStatus,
-    ReviewCreate, ReviewLogEntry, TaskCreate,
+    latest_review_decision, plan_comment_ingest, plan_issue_ingest, plan_outbound, plan_pr_comment_log,
+    plan_pr_review_ingest, pr_review_status, refine_open_status, render_outbound_github_comment,
+    render_pr_review_description, render_task_description, CommentIngestPlan, CommentPost, IssueIngestPlan,
+    OutboundComment, PrReviewIngestPlan, PrReviewStatus, ReviewCreate, ReviewDecision, ReviewLogEntry,
+    TaskCreate,
 };
