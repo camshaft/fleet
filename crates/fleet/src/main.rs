@@ -2923,6 +2923,20 @@ fn is_retighten_candidate(verdict: &str, open_tasks: usize, interval_secs: u64) 
     verdict == "STALE" || interval_secs >= WATCHDOG_LONG_INTERVAL_SECS
 }
 
+/// #535 work-driven tight cadence: an agent that HOLDS actionable work must loop tightly rather than sleep its
+/// full registered interval, so — independent of that interval — a native agent with open actionable tasks
+/// (`open_tasks > 0`, already unblocked/non-monitor-exempt via [`board::Board::open_task_count`]) that is NOT
+/// stood down and has gone quiet longer than [`WATCHDOG_WORK_CADENCE_SECS`] is a wake candidate. This closes
+/// the gap [`is_retighten_candidate`] left: a work-holder on a MODERATE interval (< 1h, not yet STALE) was
+/// judged "already tight" and slept its whole interval with work pending. The actual wake stays cooldown-
+/// limited and pane-fenced by [`rearm_candidate`], so this only changes WHICH agents are caught, never waking
+/// a working pane or spamming a stalled one. `None` age (unknown last_seen) is not a candidate. Pure.
+fn work_driven_rearm(open_tasks: usize, age_secs: Option<i64>, stood_down: bool) -> bool {
+    !stood_down
+        && open_tasks > 0
+        && matches!(age_secs, Some(a) if a >= WATCHDOG_WORK_CADENCE_SECS)
+}
+
 /// Grace window before an agent whose heartbeat never advanced past registration is called "never-ticked":
 /// below this, an agent legitimately still shows `last_seen == created_at` because its first loop tick has
 /// not landed yet (cold boot + charter fetch + first sweep). Comfortably longer than that for any interval.
@@ -3070,6 +3084,14 @@ const WATCHDOG_REARM_WAKE: &str = "[watchdog] you hold pending work and your loo
 
 /// A re-arm to the SAME agent is never sent more often than this, even for a short or unparsed (0s) interval.
 const WATCHDOG_REARM_COOLDOWN_FLOOR_SECS: u64 = 300; // 5 min = 5× the 1-min poll
+
+/// #535 work-driven tight cadence: how long an agent that HOLDS actionable work may be quiet before the
+/// watchdog treats it as a wake candidate, INDEPENDENT of its registered interval (which then only sets the
+/// idle cadence). Short — a work-holder should be cycling about this often. The actual wake is still
+/// cooldown-limited by [`rearm_on_cooldown`] (never shorter than [`WATCHDOG_REARM_COOLDOWN_FLOOR_SECS`]) and
+/// pane-fenced by [`rearm_candidate`], so this tightens WHEN a stalled work-holder is caught without waking a
+/// working pane or spamming every sweep.
+const WATCHDOG_WORK_CADENCE_SECS: i64 = 120; // 2 min
 
 /// Pure: is a re-arm to this agent still on cooldown? The watchdog re-arms an agent at most once per its OWN
 /// loop interval (floored at [`WATCHDOG_REARM_COOLDOWN_FLOOR_SECS`]) — so an agent whose self-firing loop the
@@ -3566,10 +3588,10 @@ fn rearm_candidate(
     fleet: &Fleet,
     session: &str,
     name: &str,
-    interval_secs: u64,
+    cooldown_base_secs: u64,
     now: u64,
 ) -> (&'static str, bool) {
-    if rearm_on_cooldown(read_rearm_stamp(fleet, name), now, interval_secs) {
+    if rearm_on_cooldown(read_rearm_stamp(fleet, name), now, cooldown_base_secs) {
         return ("cooldown", false);
     }
     // HARD FENCE (operator ban 2026-09-10 + seq-1387 wake-only): NEVER inject into a pane that is actively
@@ -3827,7 +3849,8 @@ fn watchdog_board(
             .unwrap_or("");
         let ls = a.get("last_seen").and_then(|v| v.as_str()).unwrap_or("");
         let interval_secs = parse_interval_secs(interval_str).unwrap_or(0);
-        let (verdict, age_str) = match last_seen_age_secs(ls, now) {
+        let age_secs = last_seen_age_secs(ls, now);
+        let (verdict, age_str) = match age_secs {
             Some(age) => (watchdog_verdict(age, interval_secs), format!("{}m", age / 60)),
             None => ("?", "?".to_string()),
         };
@@ -3863,7 +3886,10 @@ fn watchdog_board(
             obs.push((id.to_string(), stood_down, d));
         }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
-        if stale_only && !retighten && !never_ticked && !holding_work_at_rest {
+        // #535 work-driven tight cadence: a work-holder quiet beyond the short work cadence is a candidate even
+        // on a moderate interval that `is_retighten_candidate` would call "already tight".
+        let work_driven = work_driven_rearm(open_tasks, age_secs, stood_down);
+        if stale_only && !retighten && !work_driven && !never_ticked && !holding_work_at_rest {
             continue;
         }
         // A NEVER-TICKED agent takes priority: a wake cannot recover a loop that never started (no live pane
@@ -3888,14 +3914,24 @@ fn watchdog_board(
             } else {
                 "HOLDS-WORK@REST"
             }
-        } else if retighten {
+        } else if retighten || work_driven {
             flagged += 1;
             if rearm {
-                let (act, did) = rearm_candidate(&fleet, &session, id, interval_secs, now_unix);
+                // A work-holder is re-kicked on the tight work cadence (cooldown-limited to the 5-min floor),
+                // not its long idle interval — that is the #535 fix. A pure retighten candidate keeps its
+                // interval-based cooldown. Either way rearm_candidate fences a working pane.
+                let cooldown_base = if work_driven {
+                    WATCHDOG_WORK_CADENCE_SECS as u64
+                } else {
+                    interval_secs
+                };
+                let (act, did) = rearm_candidate(&fleet, &session, id, cooldown_base, now_unix);
                 if did {
                     rearmed += 1;
                 }
                 act
+            } else if work_driven && !retighten {
+                "WORK-CAND"
             } else {
                 "candidate"
             }
@@ -3913,7 +3949,7 @@ fn watchdog_board(
         );
     } else {
         println!(
-            "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, or open tasks on a long interval); pass --rearm to wake them"
+            "-- {native} board-native agent(s); {flagged} re-arm/retighten candidate(s) (overdue heartbeat, open tasks on a long interval, or holding actionable work past the tight work cadence); pass --rearm to wake them"
         );
     }
     if never_ticked_count > 0 {
@@ -5710,6 +5746,24 @@ mod tests {
         // Open work on a SHORT interval that is cycling (ok/late) is fine — it's already tight.
         assert!(!is_retighten_candidate("ok", 3, 600), "10m with tasks is already tight");
         assert!(!is_retighten_candidate("late", 3, 600), "short-interval late is the normal cycling band");
+    }
+
+    #[test]
+    fn work_driven_rearm_catches_a_quiet_work_holder_regardless_of_interval() {
+        let wc = WATCHDOG_WORK_CADENCE_SECS;
+        // Holds work and has been quiet beyond the short work cadence → candidate, even though (elsewhere) its
+        // interval may be moderate and is_retighten_candidate would call it "already tight" (the #535 gap).
+        assert!(work_driven_rearm(1, Some(wc), false));
+        assert!(work_driven_rearm(3, Some(wc * 100), false), "long quiet with work → still a candidate");
+        // Below the work cadence → not yet (it is cycling tightly enough / may be mid-tick).
+        assert!(!work_driven_rearm(1, Some(wc - 1), false));
+        // No actionable work → never a work-driven candidate (a drained/idle agent rests on its interval).
+        assert!(!work_driven_rearm(0, Some(wc * 100), false));
+        // Stood down (offline / spun down) → not woken by this path; a deliberate stand-down is not "holding
+        // work quietly" (the #506 holding-work-at-rest path handles an offline agent that still owns work).
+        assert!(!work_driven_rearm(2, Some(wc * 100), true));
+        // Unknown last_seen (None age) → not a candidate (no basis to call it quiet).
+        assert!(!work_driven_rearm(2, None, false));
     }
 
     #[test]
