@@ -129,6 +129,23 @@ impl Board {
         self.get_json(&format!("/agents/{agent}"))
     }
 
+    /// The set of agent ids the board currently has a LIVE reverse tunnel for (`GET /tunnels` →
+    /// `{"tunnels":[{"agent_id","host"},…]}`). This is the board's authoritative "is this agent reachable via
+    /// a tunnel wake" signal — an off-LAN agent with no `webhook_url` is push-woken only if it appears here.
+    /// The wake-path audit crosses it with each agent's `webhook_url` to spot poll-only agents (#386).
+    pub fn tunnel_agent_ids(&self) -> Result<std::collections::BTreeSet<String>, String> {
+        let v = self.get_json("/tunnels")?;
+        let arr = v
+            .get("tunnels")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("board /tunnels: expected a `tunnels` array, got {v}"))?;
+        Ok(arr
+            .iter()
+            .filter_map(|t| t.get("agent_id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Count an agent's ACTIONABLE assigned tasks — the `/tasks?assignee=<id>` list kept to `todo`/`in_progress`
     /// tasks that are NOT blocked/parked (see [`task_is_actionable`]). The watchdog uses this to spot an agent
     /// sitting on actionable work while idling on a long loop interval; a blocked/parked task must NOT keep the

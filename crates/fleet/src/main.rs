@@ -1706,6 +1706,19 @@ enum Cmd {
         #[arg(long)]
         toml: bool,
     },
+    /// Audit every board agent for a working PUSH-WAKE path (#386, operator: no poll-only agents). Each
+    /// EXPECTED-RUNNING agent (not offline / stood-down) must be reachable by a wake: either a non-empty
+    /// `webhook_url` (green-resident agents point it at their local fleet-notify) OR a LIVE reverse tunnel
+    /// (off-LAN agents, keyed on the board by `GET /tunnels`). An agent with NEITHER is POLL-ONLY — it only
+    /// sees work on its (slow) loop interval, the exact regression this guards. Prints one line per agent
+    /// with its wake class and exits non-zero when any poll-only agent is found, so a supervisor can gate on
+    /// it. Read-only (no board writes).
+    WakeAudit {
+        /// Also list agents classified `webhook` / `tunnel` (default: print those as a count and name only the
+        /// poll-only ones, so the signal is not buried).
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Print a systemd USER service + timer that runs the watchdog on a cadence (a host installs it
     /// declaratively — home-manager `systemd.user.services`/`timers`, same as fleet-notify — no imperative
     /// write path). The service is a oneshot (`fleet watchdog` is single-sweep); the timer re-fires it. Emit
@@ -1859,6 +1872,7 @@ fn main() {
             overlap,
         } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap),
         Cmd::ServedSet { toml } => served_set(toml),
+        Cmd::WakeAudit { verbose } => wake_audit(verbose),
         Cmd::WatchdogUnit {
             observe,
             pinned_only,
@@ -4133,6 +4147,147 @@ fn served_set(toml: bool) {
     }
 }
 
+/// How a board agent is reachable by a push-wake (#386). Decided purely from its `webhook_url` and whether
+/// the board has a live reverse tunnel for it. Pure — unit-tested.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WakePath {
+    /// A non-empty `webhook_url` — the board POSTs events straight to it (green-resident agents point it at
+    /// their local fleet-notify).
+    Webhook,
+    /// No webhook, but the board has a LIVE tunnel for the agent — an off-LAN agent woken down the tunnel.
+    Tunnel,
+    /// Neither — the agent only discovers work on its (slow) loop interval. The regression #386 forbids.
+    PollOnly,
+}
+
+impl WakePath {
+    fn label(self) -> &'static str {
+        match self {
+            WakePath::Webhook => "webhook",
+            WakePath::Tunnel => "tunnel",
+            WakePath::PollOnly => "POLL-ONLY",
+        }
+    }
+}
+
+/// Classify an agent's push-wake path: a non-empty `webhook_url` wins (a direct POST target); else a live
+/// tunnel covers it; else it is poll-only. A whitespace-only webhook is treated as absent. Pure — unit-tested.
+fn classify_wake_path(webhook_url: Option<&str>, has_live_tunnel: bool) -> WakePath {
+    let has_webhook = webhook_url.map(|u| !u.trim().is_empty()).unwrap_or(false);
+    if has_webhook {
+        WakePath::Webhook
+    } else if has_live_tunnel {
+        WakePath::Tunnel
+    } else {
+        WakePath::PollOnly
+    }
+}
+
+/// Whether an agent is a PERSISTENT LOOP agent EXPECTED to be running (and so subject to the no-poll rule).
+/// Excludes, because none has an event loop a missing wake path would strand: a not-running status (`offline`
+/// stood down, `done` finished, or `cancelled`); a pending/acted stand-down request (winding down before the
+/// status flips); and a non-loop `kind` — an `assistant` is an interactive human-driven session and an
+/// `observer` is spawned per watchdog sweep and exits, so neither waits on events. Pure — unit-tested.
+fn agent_expected_running(agent: &serde_json::Value) -> bool {
+    let status = agent.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+    if matches!(status.to_ascii_lowercase().as_str(), "offline" | "done" | "cancelled") {
+        return false;
+    }
+    let standing_down = agent
+        .get("stand_down_requested_at")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    if standing_down {
+        return false;
+    }
+    let kind = agent.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+    !matches!(kind, "assistant" | "observer")
+}
+
+/// `fleet wake-audit` (#386): confirm every expected-running board agent has a push-wake path. Cross the agent
+/// roster's `webhook_url` (from each agent's detail record) with the board's live tunnel set (`GET /tunnels`)
+/// and classify each. Prints a per-agent verdict and exits non-zero if any expected-running agent is poll-only,
+/// so a supervisor can gate on "no poll-only agents." Read-only.
+fn wake_audit(verbose: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet wake-audit: board unavailable ({e}); cannot audit wake paths");
+        std::process::exit(1);
+    });
+    let roster = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet wake-audit: board roster query failed ({e})");
+        std::process::exit(1);
+    });
+    let tunnels = board.tunnel_agent_ids().unwrap_or_else(|e| {
+        eprintln!("fleet wake-audit: board /tunnels query failed ({e}); cannot tell tunnel coverage");
+        std::process::exit(1);
+    });
+
+    let mut poll_only: Vec<String> = Vec::new();
+    let (mut n_webhook, mut n_tunnel, mut n_skipped) = (0usize, 0usize, 0usize);
+    // Stable order so the report reads the same run-to-run.
+    let mut ids: Vec<String> = roster
+        .iter()
+        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .collect();
+    ids.sort();
+
+    println!("fleet wake-audit: {} agent(s), {} live tunnel(s)", ids.len(), tunnels.len());
+    for id in &ids {
+        // The list record omits webhook_url; the DETAIL record carries it. Fall back to the (already-fetched)
+        // list record only if the detail fetch fails, so a transient error never silently flags an agent.
+        let detail = board.get_agent(id).ok();
+        let expected = detail
+            .as_ref()
+            .map(agent_expected_running)
+            .unwrap_or(true);
+        if !expected {
+            n_skipped += 1;
+            if verbose {
+                println!("  - {id}: offline / standing down (skipped)");
+            }
+            continue;
+        }
+        let webhook = detail
+            .as_ref()
+            .and_then(|d| d.get("webhook_url").and_then(serde_json::Value::as_str))
+            .map(str::to_string);
+        let path = classify_wake_path(webhook.as_deref(), tunnels.contains(id));
+        match path {
+            WakePath::Webhook => {
+                n_webhook += 1;
+                if verbose {
+                    println!("  - {id}: webhook ({})", webhook.as_deref().unwrap_or(""));
+                }
+            }
+            WakePath::Tunnel => {
+                n_tunnel += 1;
+                if verbose {
+                    println!("  - {id}: tunnel");
+                }
+            }
+            WakePath::PollOnly => {
+                poll_only.push(id.clone());
+                println!("  - {id}: {} — no webhook_url and no live tunnel", WakePath::PollOnly.label());
+            }
+        }
+    }
+
+    println!(
+        "\nsummary: {n_webhook} webhook, {n_tunnel} tunnel, {} poll-only, {n_skipped} stood-down",
+        poll_only.len()
+    );
+    if poll_only.is_empty() {
+        println!("PASS: every expected-running agent has a push-wake path (no poll-only agents).");
+    } else {
+        eprintln!(
+            "FAIL: {} poll-only agent(s) — wire a webhook_url (green-resident) or a tunnel (off-LAN): {}",
+            poll_only.len(),
+            poll_only.join(", ")
+        );
+        std::process::exit(1);
+    }
+}
+
 /// The watchdog invocation a cadence unit runs: the liveness sweep (`--rearm --stale-only`) when `rearm`, plus
 /// the observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. An
 /// OBSERVER-ONLY unit (`rearm=false, observe=true` → `watchdog --observe --spawn`) can run alongside an
@@ -5233,6 +5388,42 @@ mod tests {
             watchdog_exec_args(true, false, false, true),
             "watchdog --rearm --stale-only --self-redeploy"
         );
+    }
+
+    #[test]
+    fn classify_wake_path_prefers_webhook_then_tunnel_then_poll_only() {
+        // A non-empty webhook is a direct POST target — it wins even if a tunnel also covers the agent.
+        assert_eq!(classify_wake_path(Some("http://127.0.0.1:8899/wake"), true), WakePath::Webhook);
+        assert_eq!(classify_wake_path(Some("http://127.0.0.1:8899/wake"), false), WakePath::Webhook);
+        // No webhook (None, empty, or whitespace) but a live tunnel → tunnel-woken.
+        assert_eq!(classify_wake_path(None, true), WakePath::Tunnel);
+        assert_eq!(classify_wake_path(Some(""), true), WakePath::Tunnel);
+        assert_eq!(classify_wake_path(Some("   "), true), WakePath::Tunnel);
+        // Neither → poll-only, the #386 regression. (v-knowledge-base's empty webhook + no tunnel was the
+        // operator's original flagged instance.)
+        assert_eq!(classify_wake_path(None, false), WakePath::PollOnly);
+        assert_eq!(classify_wake_path(Some(""), false), WakePath::PollOnly);
+    }
+
+    #[test]
+    fn agent_expected_running_excludes_non_running_statuses_kinds_and_standdown() {
+        use serde_json::json;
+        // A live loop agent (vertical/named/worker/legacy-None kind) in a running status is in scope.
+        assert!(agent_expected_running(&json!({"status": "online", "kind": "vertical"})));
+        assert!(agent_expected_running(&json!({"status": "away", "kind": "named-agent"})));
+        assert!(agent_expected_running(&json!({"status": "busy"}))); // kind absent → legacy loop agent
+        // Not-running statuses (any case) are excluded — a stood-down/finished/cancelled agent needs no wake.
+        assert!(!agent_expected_running(&json!({"status": "offline"})));
+        assert!(!agent_expected_running(&json!({"status": "OFFLINE"})));
+        assert!(!agent_expected_running(&json!({"status": "done", "kind": "worker"})));
+        assert!(!agent_expected_running(&json!({"status": "cancelled"})));
+        // A pending stand-down request winds the agent down even before status flips.
+        assert!(!agent_expected_running(&json!({"status": "online", "stand_down_requested_at": "2026-09-30T00:00:00Z"})));
+        // A null stand-down field is NOT a stand-down.
+        assert!(agent_expected_running(&json!({"status": "online", "stand_down_requested_at": null})));
+        // Non-loop kinds have no event loop to strand: an interactive assistant session, an ephemeral observer.
+        assert!(!agent_expected_running(&json!({"status": "online", "kind": "assistant"})));
+        assert!(!agent_expected_running(&json!({"status": "online", "kind": "observer"})));
     }
 
     #[test]
