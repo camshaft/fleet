@@ -96,6 +96,10 @@ impl Default for Config {
         authority.insert("manual".to_string(), 1.0);
         authority.insert("doc".to_string(), 0.8);
         authority.insert("memory".to_string(), 0.5);
+        // NEW additive kind (not a Python default, so no drift to the above): operator tenets are durable
+        // law, so kind="tenet" gets top authority 1.0 by default AND is non-decaying (recency_score returns
+        // 1.0 for any non-"memory" kind). See the task_538 tenets store; written via kb_remember(kind="tenet").
+        authority.insert("tenet".to_string(), 1.0);
         Self {
             qdrant_url: "http://localhost:6333".to_string(),
             embed_model: "BAAI/bge-large-en-v1.5".to_string(),
@@ -194,6 +198,7 @@ mod tests {
         assert_eq!(c.authority_for("manual"), 1.0);
         assert_eq!(c.authority_for("doc"), 0.8);
         assert_eq!(c.authority_for("memory"), 0.5);
+        assert_eq!(c.authority_for("tenet"), 1.0); // operator tenets: top authority, non-decaying
         assert_eq!(c.authority_for("unknown"), 0.5);
     }
 
