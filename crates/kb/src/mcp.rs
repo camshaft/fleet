@@ -156,6 +156,8 @@ pub struct FeedbackArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkOutdatedArgs {
     pub id: String,
+    /// Defaults to the configured memory collection when omitted (like kb_remember / kb_update /
+    /// kb_supersede). Pass the `col` from a kb_search hit to mark an item in another collection outdated.
     #[serde(default)]
     pub collection: Option<String>,
     #[serde(default)]
@@ -397,9 +399,11 @@ impl Kb {
         Parameters(a): Parameters<MarkOutdatedArgs>,
     ) -> Result<CallToolResult, McpError> {
         let cfg = config::get();
+        // Default to the memory collection, consistent with kb_remember/kb_update/kb_supersede (this is a
+        // memory-lifecycle op; a bare id is usually a remembered fact). A search-result mark passes `col`.
         let collection = a
             .collection
-            .unwrap_or_else(|| cfg.default_collection.clone());
+            .unwrap_or_else(|| cfg.memory_collection.clone());
         let store = Store::connect().map_err(map_err)?;
         if store
             .get_point(&collection, &a.id)
