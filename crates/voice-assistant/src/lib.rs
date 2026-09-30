@@ -17,6 +17,7 @@
 //! `nix flake check` never builds the native/GPU tree.
 
 pub mod brain;
+pub mod bridge;
 pub mod chime;
 pub mod config;
 pub mod events;

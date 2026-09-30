@@ -31,6 +31,10 @@ required-features = ["runtime"]
 runtime = ["dep:sherpa-onnx", "dep:cpal", "dep:clap", "dep:signal-hook"]
 
 [dependencies]
+# The transport-agnostic bridge core (board REST client, pure sync planners, channel map, relay
+# resilience), shared with slack-bridge (#342). The voice bridge (#316) reuses its board contract; the
+# voice-specific parts (render-to-TTS-text, the audio loop) sit above it in `src/bridge` + `runtime`.
+bridge-core = { path = "../bridge-core" }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: the brain forwards MCP tool arguments straight through; don't reorder object keys.
 serde_json = { version = "1", features = ["preserve_order"] }
