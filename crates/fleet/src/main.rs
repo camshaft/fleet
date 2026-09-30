@@ -3814,6 +3814,17 @@ fn task_is_monitor_exempt(task: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// True if a task is PARKED on a blocker in the list projection: it carries a non-empty `blocked_on_kind`
+/// (e.g. `external` for an infra/no-owner wait — v-task-board seq-7873 / task-board#178 — or `operator` /
+/// `task`). A parked task is legitimately waiting, not a stalled deliverable, so the nudge cadence skips it
+/// (mirrors [`board::task_is_actionable`], which treats any blocker as not-actionable). Read straight from the
+/// list record — no per-task fetch. Pure — unit-tested.
+fn task_is_parked_on_blocker(task: &serde_json::Value) -> bool {
+    task.get("blocked_on_kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|k| !k.is_empty())
+}
+
 /// #544: assignees of monitor-exempt `in_progress` tasks — a DELIBERATE continuous monitor. Such an agent can
 /// legitimately show 0 "actionable" tasks ([`board::Board::open_task_count`] excludes its exempt task) yet is
 /// meant to keep polling at its cadence, so the drained-self-poller lengthen must EXCLUDE it. Pure —
@@ -4843,8 +4854,10 @@ fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
 /// it stays idle: a task with a live owner gets a comment pinging that owner ([`nudge_body`]); an UNASSIGNED
 /// task, or one whose owner is gone from the roster ([`owner_is_gone`]), is REASSIGNED to the router
 /// ([`NUDGE_ROUTER`]) with an audit comment ([`route_body`]) so it lands in the router's queue for placement.
-/// Always excludes tasks assigned to `cameron` (the operator) and `monitor_exempt` tasks (#167 — a deliberate
-/// continuous monitor, and the opt-out for a task the router intentionally leaves unassigned). A `todo` task
+/// Always excludes tasks assigned to `cameron` (the operator), `monitor_exempt` tasks (#167 — a deliberate
+/// continuous monitor, and the opt-out for a task the router intentionally leaves unassigned), and tasks PARKED
+/// on a blocker (`blocked_on_kind` — e.g. `external` for an infra wait, task-board#178 — which are legitimately
+/// waiting, not stalled). A `todo` task
 /// must show worker activity ([`task_has_worker_activity`]) to count — a bare backlog item is not a stall.
 /// Report-only unless `apply` — a dry run prints exactly what it WOULD do without writing (the #478/#540 review
 /// gate).
@@ -4907,6 +4920,15 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         // never nudge it. This is ALSO the #540 inc2 opt-out: a task the router DELIBERATELY leaves unassigned
         // is marked monitor_exempt so the daemon does not re-grab it. Read from the list record's derived bool.
         if task_is_monitor_exempt(t) {
+            continue;
+        }
+
+        // task-board#178: a task PARKED on a blocker is legitimately waiting, not a stalled deliverable, so
+        // nudging its owner (or routing it) is noise. The list projection carries the blocker as
+        // `blocked_on_kind` (e.g. `external` for an infra/no-owner wait — v-task-board seq-7873 — or `operator`
+        // / `task`); an external-blocked task in particular has no board owner who can act, and the
+        // operator/board-pm own unblocking the others. Mirror `task_is_actionable`: skip ANY non-empty blocker.
+        if task_is_parked_on_blocker(t) {
             continue;
         }
 
@@ -6192,6 +6214,19 @@ mod tests {
         assert!(!task_is_monitor_exempt(&serde_json::json!({"id":1,"monitor_exempt":false})));
         // Absent (pre-#167 payload or a non-exempt row) → false, so nothing is wrongly skipped.
         assert!(!task_is_monitor_exempt(&serde_json::json!({"id":1})));
+    }
+
+    #[test]
+    fn task_is_parked_on_blocker_flags_any_non_empty_blocked_on_kind() {
+        // task-board#178: an external/infra wait is parked, not stalled → skip its nudge.
+        assert!(task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":"external"})));
+        // Any other blocker kind (operator/task) is likewise parked.
+        assert!(task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":"operator"})));
+        assert!(task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":"task"})));
+        // Absent or empty blocker → NOT parked, so a genuinely stale unblocked task is still nudged.
+        assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1})));
+        assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":""})));
+        assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":null})));
     }
 
     #[test]
