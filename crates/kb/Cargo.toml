@@ -67,9 +67,12 @@ clap = { version = "4", features = ["derive"] }
 # Phase-2 ingest file discovery: recursive directory walk with sane hidden-file skipping. Already in the
 # workspace lock (shared with sibling crates), so no new tree.
 walkdir = "2"
-# Phase-2 PDF text extraction — pure Rust (lopdf-based), so no build-time network / native toolchain, which
-# keeps the Nix sandbox build happy. Text/markdown files need no extractor (read as UTF-8).
-pdf-extract = "0.12"
+# Phase-2 PDF text extraction — pdfium-render (greenlit decision #1, #232/#432): bundles Google's PDFium for
+# per-page text extraction that tracks the live store's pymupdf output far better than a pure-Rust lopdf
+# parser (fidelity matters for the byte-identical vectors). Uses runtime dynamic binding, so it compiles
+# WITHOUT libpdfium present (no build-time network/toolchain); libpdfium is provided at RUNTIME via
+# LD_LIBRARY_PATH in the kb-inbox/uploader roles. Only the ingest workers use it.
+pdfium-render = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
