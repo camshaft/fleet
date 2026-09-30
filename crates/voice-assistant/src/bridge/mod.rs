@@ -16,7 +16,9 @@
 pub mod cursor;
 pub mod render;
 pub mod reply;
+pub mod session;
 
 pub use cursor::{load_cursor, save_cursor};
 pub use render::render_reply;
 pub use reply::{plan_replies, SpokenReply};
+pub use session::VoiceBridge;
