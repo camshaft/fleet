@@ -13,6 +13,8 @@ mod stt;
 mod tts;
 mod wake;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -36,6 +38,9 @@ struct Assistant {
     /// Events drained while waiting for wake, held until [`Assistant::drain_proactive`] handles them (the
     /// channel is consume-on-read, so we can't peek — we buffer instead).
     pending_events: Vec<events::ProactiveEvent>,
+    /// Set true by the SIGTERM/SIGINT handler. The loop polls it and returns so the [`Assistant`] (and its
+    /// [`Capture`] cpal stream) drops normally, releasing the ALSA device before the process exits.
+    shutdown: Arc<AtomicBool>,
 }
 
 /// Build every engine from config. `scope_guard_command` is how to re-invoke this binary as the FS-scope
@@ -63,6 +68,22 @@ pub fn run(cfg: Config, scope_guard_command: String) -> Result<(), String> {
         scope_guard_command,
     );
 
+    // Install a graceful-shutdown flag. The default action for SIGTERM (which systemd sends on stop, and
+    // a deploy sends on restart) terminates the process abruptly, so the cpal capture stream never closes
+    // and the ALSA device release is left to the kernel's fd cleanup — which, under deploy load, can lag
+    // long enough that the *next* instance opens the device while this one still holds it and hits an
+    // errno -32 poll-descriptor storm (#239, green-machine-ops). Catching the signal lets the loop return
+    // so the Assistant (and its Capture stream) drops normally, calling snd_pcm_close before we exit.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        if let Err(e) = signal_hook::flag::register(sig, shutdown.clone()) {
+            eprintln!(
+                "[voice-assistant] could not install signal handler for {sig} ({e}); \
+                 continuing without graceful shutdown"
+            );
+        }
+    }
+
     let mut a = Assistant {
         cfg,
         cap,
@@ -72,8 +93,11 @@ pub fn run(cfg: Config, scope_guard_command: String) -> Result<(), String> {
         brain,
         webhook,
         pending_events: Vec::new(),
+        shutdown,
     };
     a.main_loop();
+    // main_loop returns on a shutdown signal (or never, on Ctrl-C without a handler). Returning here drops
+    // `a`, and with it the Capture stream, releasing the ALSA device before the process exits.
     Ok(())
 }
 
@@ -170,12 +194,28 @@ impl Assistant {
         let mut pending = false; // right after a barge-in: record immediately, skip the wake wait
         let mut conversing = false; // follow-up: keep the mic open, no wake phrase needed
         loop {
+            // A shutdown signal between turns exits the loop so we drop the capture stream and release the
+            // device cleanly (a barge-in/follow-up turn checks this next iteration; the common idle wait
+            // below also honors it).
+            if self.shutdown.load(Ordering::Relaxed) {
+                eprintln!("[voice-assistant] shutdown signal — releasing the capture device and exiting");
+                return;
+            }
             let following = conversing; // this turn's record is a reopened follow-up mic
             if !(pending || conversing) {
-                // Wait for the wake phrase, but wake early to service a queued board event.
-                if self.wait_for_wake_or_event() == Woke::Event {
-                    self.drain_proactive();
-                    continue;
+                // Wait for the wake phrase, but wake early to service a queued board event or a shutdown.
+                match self.wait_for_wake_or_event() {
+                    Woke::Shutdown => {
+                        eprintln!(
+                            "[voice-assistant] shutdown signal — releasing the capture device and exiting"
+                        );
+                        return;
+                    }
+                    Woke::Event => {
+                        self.drain_proactive();
+                        continue;
+                    }
+                    Woke::Wake => {}
                 }
                 eprintln!("[wake]");
                 self.play_cue(&chime::listening());
@@ -220,6 +260,11 @@ impl Assistant {
     fn wait_for_wake_or_event(&mut self) -> Woke {
         let per_frame = Duration::from_millis(500);
         loop {
+            // A shutdown signal ends the idle wait promptly (this is where the daemon sits almost all the
+            // time, so it is the state a deploy stop lands in) — return so the loop can drop the stream.
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Woke::Shutdown;
+            }
             // If the capture device faulted (e.g. the mic was unplugged mid-run), don't spin on a dead
             // stream — rebuild it, blocking until the device returns, then carry on (operator req #239:
             // survive hot-unplug, never crash). Reset the wake stream so stale pre-unplug state can't
@@ -253,4 +298,6 @@ impl Assistant {
 enum Woke {
     Wake,
     Event,
+    /// A SIGTERM/SIGINT arrived while waiting; the caller should return and let the stream drop.
+    Shutdown,
 }
