@@ -4590,6 +4590,21 @@ fn format_hm(secs: i64) -> String {
     format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
 }
 
+/// True iff a task is a tracking/epic PARENT whose progress lives in still-open children — it has children
+/// (`total > 0`) and not all are done (`done < total`). Such a parent is not itself stalled: its live work IS
+/// the children, so nudging it is a false positive (board-pm's #294 daemon-tuning class). A leaf task
+/// (`total == 0`) is not a tracking parent, and a parent whose children are ALL done (`done == total`) is not
+/// exempted — an all-children-done parent may itself need a nudge to close. Reads `child_rollup` ({done,total},
+/// returned by `get_task`). Pure — unit-tested.
+fn is_tracking_parent_with_open_children(child_rollup: Option<&serde_json::Value>) -> bool {
+    let Some(cr) = child_rollup else {
+        return false;
+    };
+    let total = cr.get("total").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let done = cr.get("done").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    total > 0 && done < total
+}
+
 /// Nudge stale `in_progress` tasks (board task #478): a task whose latest activity is at least
 /// `threshold_hours` old gets a comment pinging its assignee, at most once per `cooldown_hours` while it
 /// stays idle. Always excludes tasks assigned to `cameron` (the operator) and, by construction, anything
@@ -4648,6 +4663,11 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         };
         // Re-check status: it may have changed between the list query and this fetch.
         if full.get("status").and_then(serde_json::Value::as_str) != Some("in_progress") {
+            continue;
+        }
+        // #294 false-positive class: a tracking/epic parent whose progress is in its still-open children is
+        // not itself stalled — its live work IS the children — so skip it to keep nudges high-signal.
+        if is_tracking_parent_with_open_children(full.get("child_rollup")) {
             continue;
         }
         let idle_secs = match task_latest_activity_age_secs(&full, now) {
@@ -6905,5 +6925,21 @@ mod tests {
         assert_eq!(format_hm(3600), "1h0m");
         assert_eq!(format_hm(3600 * 3 + 60 * 12), "3h12m");
         assert_eq!(format_hm(-5), "0h0m", "never goes negative");
+    }
+
+    #[test]
+    fn is_tracking_parent_with_open_children_skips_only_parents_with_open_kids() {
+        let cr = |body: serde_json::Value| body;
+        // A parent with open children (done < total) → tracking parent, skip the nudge.
+        let open = cr(serde_json::json!({"child_rollup":{"done":1,"total":3}}));
+        assert!(is_tracking_parent_with_open_children(open.get("child_rollup")));
+        // All children done (done == total) → NOT exempted; the parent itself may need a nudge to close.
+        let all_done = cr(serde_json::json!({"child_rollup":{"done":3,"total":3}}));
+        assert!(!is_tracking_parent_with_open_children(all_done.get("child_rollup")));
+        // A leaf task (no children, total == 0) → not a tracking parent, nudge as normal.
+        let leaf = cr(serde_json::json!({"child_rollup":{"done":0,"total":0}}));
+        assert!(!is_tracking_parent_with_open_children(leaf.get("child_rollup")));
+        // Missing child_rollup → not exempted.
+        assert!(!is_tracking_parent_with_open_children(None));
     }
 }
