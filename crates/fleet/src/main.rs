@@ -1800,12 +1800,19 @@ struct WorkspaceKindPlan {
     env: Vec<(String, String)>,
 }
 
-/// Parse a board workspace-kind record into a launch plan. `config.cwd` is the launch directory (an
-/// absolute path is used as-is; a relative one is taken under `fleet_root`); when absent the agent's own
-/// root dir is the default. `config.pre_trust` is an optional list of extra paths to trust (the launch cwd
-/// and the fleet root are always trusted), and `config.env` an optional string map of environment variables
-/// the setup_script receives. Pure — unit-tested.
-fn parse_workspace_kind(agent: &str, fleet_root: &str, rec: &serde_json::Value) -> WorkspaceKindPlan {
+/// Parse a board workspace-kind record into a launch plan. The launch directory is resolved with precedence
+/// `cwd_override` (the agent's own `metadata.workspace_cwd`) > the kind's `config.cwd` > the agent's own root
+/// dir; an absolute path is used as-is, a relative one is taken under `fleet_root`. The per-agent override lets
+/// several agents share ONE kind (same setup_script/env) while each launches in its own workspace directory.
+/// `config.pre_trust` is an optional list of extra paths to trust (the launch cwd and the fleet root are always
+/// trusted), and `config.env` an optional string map of environment variables the setup_script receives. Pure —
+/// unit-tested.
+fn parse_workspace_kind(
+    agent: &str,
+    fleet_root: &str,
+    rec: &serde_json::Value,
+    cwd_override: Option<&str>,
+) -> WorkspaceKindPlan {
     let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
     let description = rec.get("description").and_then(|v| v.as_str()).map(str::to_string);
     let setup_script = rec
@@ -1814,7 +1821,10 @@ fn parse_workspace_kind(agent: &str, fleet_root: &str, rec: &serde_json::Value) 
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
     let config = rec.get("config").cloned().unwrap_or(serde_json::Value::Null);
-    let cwd = match config.get("cwd").and_then(|v| v.as_str()) {
+    let cwd_src = cwd_override
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| config.get("cwd").and_then(|v| v.as_str()));
+    let cwd = match cwd_src {
         Some(c) if c.starts_with('/') => c.to_string(),
         Some(c) => format!("{fleet_root}/{c}"),
         None => workspace::agent_root_dir(fleet_root, agent),
@@ -1851,6 +1861,7 @@ fn spin_up_workspace_kind(
     interval: &str,
     devshell: bool,
     apply: bool,
+    cwd_override: Option<&str>,
 ) {
     let rec = match board.get_workspace_kind(kind) {
         Ok(Some(r)) => r,
@@ -1865,7 +1876,7 @@ fn spin_up_workspace_kind(
             std::process::exit(1);
         }
     };
-    let plan = parse_workspace_kind(agent, fleet_root, &rec);
+    let plan = parse_workspace_kind(agent, fleet_root, &rec, cwd_override);
 
     println!("spin-up '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
     println!(
@@ -1992,9 +2003,12 @@ fn spin_up(agent: &str, apply: bool) {
     // free-form config with the launch hints (cwd/pre_trust/env). This lets an environment the fleet does
     // not model natively be defined in a board resource and driven from there. (#287)
     if let Some(kind) = field("workspace_kind") {
+        // A per-agent `metadata.workspace_cwd` overrides the kind's `config.cwd`, so several agents can share
+        // one kind (same setup_script/env) while each launches in its own workspace directory.
+        let cwd_override = field("workspace_cwd");
         return spin_up_workspace_kind(
             &board, agent, &kind, &fleet_root, has_charter, &harness, &model, &effort, &interval,
-            devshell, apply,
+            devshell, apply, cwd_override.as_deref(),
         );
     }
 
@@ -4222,7 +4236,7 @@ mod tests {
                 "env": { "FOO": "bar", "IGNORED_NUM": 7 }
             }
         });
-        let p = parse_workspace_kind("v-example", "/home/u/.fleet", &rec);
+        let p = parse_workspace_kind("v-example", "/home/u/.fleet", &rec, None);
         assert_eq!(p.name, "example-env");
         assert_eq!(p.description.as_deref(), Some("a board-defined environment"));
         assert_eq!(p.setup_script.as_deref(), Some("echo materialize\n"));
@@ -4245,14 +4259,34 @@ mod tests {
     fn parse_workspace_kind_defaults_cwd_and_treats_blank_setup_as_none() {
         // No config at all: cwd falls back to the agent's own root dir under the fleet root, no extra trust.
         let rec = serde_json::json!({ "name": "bare", "setup_script": "   \n" });
-        let p = parse_workspace_kind("v-bare", "/home/u/.fleet", &rec);
+        let p = parse_workspace_kind("v-bare", "/home/u/.fleet", &rec, None);
         assert_eq!(p.cwd, workspace::agent_root_dir("/home/u/.fleet", "v-bare"));
         assert_eq!(p.pre_trust, vec!["/home/u/.fleet".to_string(), p.cwd.clone()]);
         assert!(p.setup_script.is_none(), "whitespace-only setup_script is treated as absent");
         // A relative config.cwd is taken under the fleet root.
         let rec2 = serde_json::json!({ "name": "rel", "config": { "cwd": "checkout/here" } });
-        let p2 = parse_workspace_kind("v-rel", "/home/u/.fleet", &rec2);
+        let p2 = parse_workspace_kind("v-rel", "/home/u/.fleet", &rec2, None);
         assert_eq!(p2.cwd, "/home/u/.fleet/checkout/here");
+    }
+
+    #[test]
+    fn parse_workspace_kind_per_agent_cwd_override_beats_config_cwd() {
+        // Several agents share ONE kind (same setup_script/env) but each launches in its own workspace dir via
+        // metadata.workspace_cwd — the override wins over the kind's config.cwd, absolute used as-is.
+        let rec = serde_json::json!({
+            "name": "membrain",
+            "setup_script": "verify workspace\n",
+            "config": { "cwd": "/shared/default", "env": { "K": "v" } }
+        });
+        let p = parse_workspace_kind("m-a", "/home/u/.fleet", &rec, Some("/work/agent-a"));
+        assert_eq!(p.cwd, "/work/agent-a", "per-agent override beats config.cwd");
+        assert_eq!(p.env, vec![("K".to_string(), "v".to_string())], "shared env still comes from the kind");
+        // A blank/whitespace override is ignored → falls back to config.cwd.
+        let p2 = parse_workspace_kind("m-b", "/home/u/.fleet", &rec, Some("   "));
+        assert_eq!(p2.cwd, "/shared/default", "blank override falls back to config.cwd");
+        // A relative override is taken under the fleet root, same as config.cwd.
+        let p3 = parse_workspace_kind("m-c", "/home/u/.fleet", &rec, Some("rel/ws"));
+        assert_eq!(p3.cwd, "/home/u/.fleet/rel/ws");
     }
 
     #[test]
