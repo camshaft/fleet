@@ -272,6 +272,11 @@
             mainProgram = "kb";
           };
         };
+
+      # Fleet daemons as flake-managed USER systemd units (task #486/#493): the declarative mirror of the
+      # binary's `fleet daemon-unit`/`watchdog-unit` templates + `install-fleet-daemons` (reconcile + enable).
+      # Self-contained — ExecStart points at THIS flake's fleet package, no cross-repo input. See nix/fleet-daemons.nix.
+      fleetDaemons = pkgs: import ./nix/fleet-daemons.nix { inherit pkgs; fleet = fleetPackage pkgs; };
     in
     {
       packages = forAllSystems (pkgs: rec {
@@ -286,6 +291,9 @@
         # Version-locked libpdfium (build 7881) for the KB ingest workers' PDF path — see pdfiumLib above.
         # The kb-inbox/uploader roles consume this as inputs.fleet.packages.${system}.pdfium on LD_LIBRARY_PATH.
         pdfium = pdfiumLib pkgs;
+        # The generated USER systemd unit files for the flake-managed daemon set (task #486/#493). Build to
+        # inspect the rendered units (nix build .#fleet-user-units); `install-fleet-daemons` (an app) installs them.
+        fleet-user-units = (fleetDaemons pkgs).unitsDir;
         default = fleet;
       });
 
@@ -324,6 +332,12 @@
             type = "app";
             program = "${kb}/bin/kb";
           };
+          # Install the flake-managed daemon set into ~/.config/systemd/user + reconcile + enable (task #486/#493).
+          # `nix run .#install-fleet-daemons` — the deliberate cutover; it does NOT auto-run at build/land time.
+          install-fleet-daemons = {
+            type = "app";
+            program = "${(fleetDaemons pkgs).installApp}/bin/install-fleet-daemons";
+          };
           default = {
             type = "app";
             program = "${fleet}/bin/fleet";
@@ -339,6 +353,10 @@
         pkgs:
         {
           fleet = fleetPackage pkgs;
+          # Build the generated user units + the install app (writeShellApplication runs shellcheck) so a break
+          # in the unit generator or the install script fails `nix flake check` (task #486/#493).
+          fleet-user-units = (fleetDaemons pkgs).unitsDir;
+          install-fleet-daemons = (fleetDaemons pkgs).installApp;
         }
         # voice-assistant bundles a linux-x64 prebuilt sherpa lib, so it only builds there; gate the
         # check to that system so `nix flake check` on arm/darwin doesn't try (and fail) to build it.
