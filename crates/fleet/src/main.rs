@@ -2943,6 +2943,32 @@ fn work_driven_rearm(open_tasks: usize, age_secs: Option<i64>, stood_down: bool)
         && matches!(age_secs, Some(a) if a >= WATCHDOG_WORK_CADENCE_SECS)
 }
 
+/// #544 drained self-poller: a live, at-rest agent that keeps self-scheduling short ticks with NO actionable
+/// work should drop to a long registry cadence + event-wake, but a running `/loop` never picks up a
+/// `build_kickoff` edit (it re-passes its spawn-time prompt), so the watchdog injects the instruction
+/// ([`WATCHDOG_LENGTHEN_WAKE`]). Candidate = not stood down, not `reactive` (a mention-paced responder is not
+/// this), not a `deliberate_monitor` (holds a monitor_exempt task — it is MEANT to poll), 0 actionable tasks, a
+/// live heartbeat (`verdict != "STALE"` — a stale loop is a re-arm/relaunch case, not an over-eager poller),
+/// and a SHORT registered interval (`< WATCHDOG_LONG_INTERVAL_SECS` — a 1h+ agent is already at a long
+/// cadence). Once it lengthens past that bound it stops qualifying, so the inject fires about once per agent.
+/// Pure — unit-tested.
+fn drained_idle_candidate(
+    open_tasks: usize,
+    interval_secs: u64,
+    stood_down: bool,
+    reactive: bool,
+    deliberate_monitor: bool,
+    verdict: &str,
+) -> bool {
+    !stood_down
+        && !reactive
+        && !deliberate_monitor
+        && open_tasks == 0
+        && verdict != "STALE"
+        && interval_secs > 0
+        && interval_secs < WATCHDOG_LONG_INTERVAL_SECS
+}
+
 /// Grace window before an agent whose heartbeat never advanced past registration is called "never-ticked":
 /// below this, an agent legitimately still shows `last_seen == created_at` because its first loop tick has
 /// not landed yet (cold boot + charter fetch + first sweep). Comfortably longer than that for any interval.
@@ -3087,6 +3113,13 @@ fn inbox_pending_count(fleet: &Fleet, name: &str) -> usize {
 // so the wake states that plainly — no "overdue and/or open tasks" hedging that could name a phantom trigger
 // (the #332 false-nag). "Pending work" covers both paths: open assigned tasks (board) or unread inbox items.
 const WATCHDOG_REARM_WAKE: &str = "[watchdog] you hold pending work and your loop has gone quiet — run a tick NOW: check_notifications, do one unit, set_status, and keep looping until your queue drains (do not idle-sleep while you hold pending work).";
+
+/// The wake injected to a DRAINED self-poller (#544): an at-rest agent with no actionable work that keeps
+/// self-scheduling short ticks. It cannot pick this up from a `build_kickoff` edit (a running `/loop` re-passes
+/// its spawn-time prompt), so the watchdog injects the instruction directly — the agent then persists a long
+/// registry cadence via `set-interval` (so the change survives) and drops to event-wake. Once its interval is
+/// long it is no longer a candidate, so this fires about once per agent, not every sweep.
+const WATCHDOG_LENGTHEN_WAKE: &str = "[watchdog] you are at-rest with no actionable assigned work but are self-polling at a short cadence. Persist a long idle cadence: run `cargo xtask fleet set-interval <your-id> 3h` (a raw next-tick reschedule does NOT persist), then rely on event-wake — a routed message or new assignment wakes you immediately regardless of interval, so a long rest cadence never delays revival, it only stops the empty self-directed ticks. Do NOT schedule a short next tick.";
 
 /// A re-arm to the SAME agent is never sent more often than this, even for a short or unparsed (0s) interval.
 const WATCHDOG_REARM_COOLDOWN_FLOOR_SECS: u64 = 300; // 5 min = 5× the 1-min poll
@@ -3586,16 +3619,19 @@ fn post_deploy(repo: &str, sha: &str, host: &str, status: &str) {
     }
 }
 
-/// The fenced, cooldown-limited re-arm of ONE candidate window, shared by the board and file-hub scans:
-/// skip if still on cooldown (`"cooldown"`), skip if the pane is actively working (`"working-skip"`, the hard
-/// fence), else inject the wake and stamp (`"re-armed"`); a missing window is `"no-window"`. Returns the action
-/// label and whether a wake was actually sent. Never reaps or restarts.
+/// The fenced, cooldown-limited injection of ONE wake into a candidate window, shared by the board and
+/// file-hub scans: skip if still on cooldown (`"cooldown"`), skip if the pane is actively working
+/// (`"working-skip"`, the hard fence), else inject `wake` and stamp (`"re-armed"`); a missing window is
+/// `"no-window"`. `wake` is the message to inject — [`WATCHDOG_REARM_WAKE`] for a work-holder that went quiet,
+/// [`WATCHDOG_LENGTHEN_WAKE`] for a drained self-poller (#544). Returns the action label and whether a wake was
+/// actually sent. Never reaps or restarts.
 fn rearm_candidate(
     fleet: &Fleet,
     session: &str,
     name: &str,
     cooldown_base_secs: u64,
     now: u64,
+    wake: &str,
 ) -> (&'static str, bool) {
     if rearm_on_cooldown(read_rearm_stamp(fleet, name), now, cooldown_base_secs) {
         return ("cooldown", false);
@@ -3605,7 +3641,7 @@ fn rearm_candidate(
     if window_is_working(session, name) {
         return ("working-skip", false);
     }
-    match notify::tmux_inject(session, name, WATCHDOG_REARM_WAKE) {
+    match notify::tmux_inject(session, name, wake) {
         Ok(()) => {
             write_rearm_stamp(fleet, name, now);
             ("re-armed", true)
@@ -3773,6 +3809,20 @@ fn task_is_monitor_exempt(task: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// #544: assignees of monitor-exempt `in_progress` tasks — a DELIBERATE continuous monitor. Such an agent can
+/// legitimately show 0 "actionable" tasks ([`board::Board::open_task_count`] excludes its exempt task) yet is
+/// meant to keep polling at its cadence, so the drained-self-poller lengthen must EXCLUDE it. Pure —
+/// unit-tested.
+fn monitor_exempt_task_owners(tasks: &[serde_json::Value]) -> std::collections::BTreeSet<String> {
+    tasks
+        .iter()
+        .filter(|t| task_is_monitor_exempt(t))
+        .filter_map(|t| t.get("assignee").and_then(serde_json::Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
 /// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
 #[allow(clippy::too_many_arguments)]
@@ -3819,9 +3869,13 @@ fn watchdog_board(
     // sweep. An agent that is `offline` (stood down) while it appears here left a live, non-blocked deliverable
     // behind — the v-bolero case. Best-effort: a query error degrades to an empty set (no false violations)
     // rather than failing the whole watchdog.
-    let inprogress_owners = match board.list_tasks_by_status("in_progress") {
-        Ok(tasks) => inprogress_task_assignees(&tasks),
-        Err(_) => std::collections::BTreeSet::new(),
+    // Both sets are derived from ONE in_progress query: `inprogress_owners` (non-exempt owners, the #506
+    // holding-work signal) and `monitor_exempt_owners` (deliberate continuous monitors, excluded from the #544
+    // drained-self-poller lengthen). A query error degrades both to empty (no false violations / no false
+    // lengthens) rather than failing the whole watchdog.
+    let (inprogress_owners, monitor_exempt_owners) = match board.list_tasks_by_status("in_progress") {
+        Ok(tasks) => (inprogress_task_assignees(&tasks), monitor_exempt_task_owners(&tasks)),
+        Err(_) => (std::collections::BTreeSet::new(), std::collections::BTreeSet::new()),
     };
     println!(
         "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
@@ -3895,7 +3949,22 @@ fn watchdog_board(
         // #535 work-driven tight cadence: a work-holder quiet beyond the short work cadence is a candidate even
         // on a moderate interval that `is_retighten_candidate` would call "already tight".
         let work_driven = work_driven_rearm(open_tasks, age_secs, stood_down);
-        if stale_only && !retighten && !work_driven && !never_ticked && !holding_work_at_rest {
+        // #544 drained self-poller: an at-rest agent (0 actionable tasks) on a short interval that a
+        // build_kickoff edit can't reach — inject the lengthen instruction. Excludes reactive responders and
+        // deliberate continuous monitors (a monitor_exempt-task owner is MEANT to poll).
+        let reactive = md
+            .and_then(|m| m.get("reactive"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let drained_idle = drained_idle_candidate(
+            open_tasks,
+            interval_secs,
+            stood_down,
+            reactive,
+            monitor_exempt_owners.contains(id),
+            verdict,
+        );
+        if stale_only && !retighten && !work_driven && !drained_idle && !never_ticked && !holding_work_at_rest {
             continue;
         }
         // A NEVER-TICKED agent takes priority: a wake cannot recover a loop that never started (no live pane
@@ -3912,7 +3981,7 @@ fn watchdog_board(
             flagged += 1;
             holding_work_count += 1;
             if rearm {
-                let (_act, did) = rearm_candidate(&fleet, &session, id, interval_secs, now_unix);
+                let (_act, did) = rearm_candidate(&fleet, &session, id, interval_secs, now_unix, WATCHDOG_REARM_WAKE);
                 if did {
                     rearmed += 1;
                 }
@@ -3931,7 +4000,7 @@ fn watchdog_board(
                 } else {
                     interval_secs
                 };
-                let (act, did) = rearm_candidate(&fleet, &session, id, cooldown_base, now_unix);
+                let (act, did) = rearm_candidate(&fleet, &session, id, cooldown_base, now_unix, WATCHDOG_REARM_WAKE);
                 if did {
                     rearmed += 1;
                 }
@@ -3940,6 +4009,29 @@ fn watchdog_board(
                 "WORK-CAND"
             } else {
                 "candidate"
+            }
+        } else if drained_idle {
+            // #544: a drained self-poller — inject the lengthen instruction ONCE (cooldown base = the long idle
+            // cadence, so it is not re-poked before it has had a chance to set-interval itself). Pane-fenced by
+            // rearm_candidate. Once it lengthens past WATCHDOG_LONG_INTERVAL_SECS it no longer qualifies.
+            flagged += 1;
+            if rearm {
+                let (act, did) = rearm_candidate(
+                    &fleet,
+                    &session,
+                    id,
+                    WATCHDOG_LONG_INTERVAL_SECS,
+                    now_unix,
+                    WATCHDOG_LENGTHEN_WAKE,
+                );
+                if did {
+                    rearmed += 1;
+                    "LENGTHEN"
+                } else {
+                    act
+                }
+            } else {
+                "DRAINED-CAND"
             }
         } else {
             "ok"
@@ -4149,7 +4241,7 @@ fn watchdog_file_hub(stale_only: bool, rearm: bool, native_ids: &std::collection
         let action = if retighten {
             flagged += 1;
             if rearm {
-                let (act, did) = rearm_candidate(&fleet, &session, &a.name, interval_secs, now);
+                let (act, did) = rearm_candidate(&fleet, &session, &a.name, interval_secs, now, WATCHDOG_REARM_WAKE);
                 if did {
                     rearmed += 1;
                 }
@@ -5819,6 +5911,42 @@ mod tests {
         assert!(!work_driven_rearm(2, Some(wc * 100), true));
         // Unknown last_seen (None age) → not a candidate (no basis to call it quiet).
         assert!(!work_driven_rearm(2, None, false));
+    }
+
+    #[test]
+    fn drained_idle_candidate_catches_a_short_interval_at_rest_self_poller() {
+        let short = WATCHDOG_LONG_INTERVAL_SECS - 1; // e.g. 30m, under the 1h long bound
+        let long = WATCHDOG_LONG_INTERVAL_SECS; // already at a long cadence
+        // Live, drained (0 actionable), short interval, not reactive, not a deliberate monitor → lengthen it.
+        assert!(drained_idle_candidate(0, short, false, false, false, "ok"));
+        assert!(drained_idle_candidate(0, short, false, false, false, "late"), "late still counts (ticking)");
+        // Has actionable work → not this path (the work-driven/retighten paths own that).
+        assert!(!drained_idle_candidate(1, short, false, false, false, "ok"));
+        // Already at a long interval → nothing to lengthen (this is what convergence looks like).
+        assert!(!drained_idle_candidate(0, long, false, false, false, "ok"));
+        // Stood down → a spun-down agent is left alone, not lengthened.
+        assert!(!drained_idle_candidate(0, short, true, false, false, "ok"));
+        // Reactive responder paces on mentions, not on an idle interval → excluded.
+        assert!(!drained_idle_candidate(0, short, false, true, false, "ok"));
+        // Deliberate continuous monitor (holds a monitor_exempt task) is MEANT to poll → never lengthened.
+        assert!(!drained_idle_candidate(0, short, false, false, true, "ok"));
+        // STALE = a stopped loop (a re-arm/relaunch case), not an over-eager poller → not this path.
+        assert!(!drained_idle_candidate(0, short, false, false, false, "STALE"));
+        // Unknown/zero interval → can't call it a short self-poller.
+        assert!(!drained_idle_candidate(0, 0, false, false, false, "ok"));
+    }
+
+    #[test]
+    fn monitor_exempt_task_owners_collects_only_exempt_task_assignees() {
+        let tasks = vec![
+            serde_json::json!({"assignee":"v-monitor","status":"in_progress","monitor_exempt":true}),
+            serde_json::json!({"assignee":"v-worker","status":"in_progress","monitor_exempt":false}),
+            serde_json::json!({"assignee":"","status":"in_progress","monitor_exempt":true}), // empty → dropped
+        ];
+        let owners = monitor_exempt_task_owners(&tasks);
+        assert!(owners.contains("v-monitor"));
+        assert!(!owners.contains("v-worker"), "a non-exempt task's owner is not a deliberate monitor");
+        assert_eq!(owners.len(), 1);
     }
 
     #[test]
