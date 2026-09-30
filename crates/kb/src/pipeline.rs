@@ -22,7 +22,8 @@ use serde_json::{Map, Value};
 
 use crate::board::{Board, Task};
 use crate::ipfs::Ipfs;
-use crate::{config, crate_docs, extract};
+use crate::store::Store;
+use crate::{chunk, config, crate_docs, curate, embed, extract};
 
 /// Content-type tag the uploader stamps on a ticket and the embedder dispatches on — the Python string
 /// constants. `rustdoc-json` is set by the docs.rs fetch path; `pdf`/`text` come from [`content_type_for`].
@@ -35,6 +36,17 @@ pub const UPLOADER: &str = "uploader";
 pub const EMBEDDER: &str = "embedder";
 /// User-Agent for outbound fetches — the Python `UA`.
 const UA: &str = "camshaft-kb-pipeline/0.1";
+/// Chunks embedded + upserted per batch — the Python `if len(txt) >= 128` flush in `handle_embed`. Bounds
+/// peak memory and the Qdrant request size on a large source (`store::upsert` sends one PUT per batch).
+const BATCH: usize = 128;
+
+/// The embedder's work lock — the Python `_work_lock` (`with _work_lock, embed.gpu_lock()`). The embedder is
+/// a single process, but its reactive webhook runtime dispatches one task per event concurrently, so this
+/// serializes the embed+upsert critical section: one embed job at a time, no model/CPU (or, on a CUDA host,
+/// VRAM) overcommit. On green the embedder runs `embed_device="cpu"` (the GTX 1080 Ti is sm_61, which the
+/// bundled onnxruntime CUDA EP has no kernels for), so the Python cross-process `gpu_lock()` flock is a no-op
+/// there; this in-process lock is the meaningful serialization for the single embedder agent.
+static WORK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A ticket metadata string field, but only when present AND non-empty — mirrors Python truthiness
 /// (`meta.get(k)` / `... or ...`, where `""` is falsy), which the collection/version fallbacks rely on.
@@ -419,6 +431,134 @@ pub async fn handle_upload(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<()
     Ok(())
 }
 
+// ---- embedder stage: IPFS -> parse -> chunk + embed -> upsert ----
+
+/// Build the per-chunk payload — the Python `handle_embed` inner block: `base_payload(text=piece, chunk=idx,
+/// **{extra without "page"})`, then re-add `page`, then stamp `ipfs_cid`/`ipfs_url`. The item's `kind` is
+/// lifted out of `extra` into the `base_payload` `kind` argument (which sets `kind` + its `authority`); every
+/// other `extra` field (source/path/title/url/crate/crate_version, and `page` for a PDF) is merged verbatim.
+/// Pure, so it's unit-tested; the caller supplies the embedding vector separately.
+fn embed_payload(
+    cfg: &config::Config,
+    item: &Item,
+    piece: &str,
+    idx: usize,
+    cid: &str,
+    ipfs_url: &str,
+) -> Map<String, Value> {
+    let kind = item
+        .extra
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("doc");
+    let mut extra = Map::new();
+    extra.insert("text".into(), Value::from(piece));
+    extra.insert("chunk".into(), Value::from(idx as i64));
+    // Everything the item carried except `kind` (which becomes the base_payload argument). This includes
+    // `page` for PDF items — Python excludes it from the base_payload call then re-adds it; the merged result
+    // is identical, so we merge it here directly.
+    for (k, v) in &item.extra {
+        if k != "kind" {
+            extra.insert(k.clone(), v.clone());
+        }
+    }
+    extra.insert("ipfs_cid".into(), Value::from(cid));
+    extra.insert("ipfs_url".into(), Value::from(ipfs_url));
+    curate::base_payload(cfg, kind, None, extra)
+}
+
+/// Embedder handler — the Python `handle_embed`: cat the ticket's `ipfs_cid`, resolve its collection, parse it
+/// into [`Item`]s by content-type, chunk + embed each into the collection, then mark the task done. The point
+/// id is `chunk::id([collection, key, chunk_idx])` (the pipeline's own formula — NOTE it differs from
+/// `crate_docs`'s `["docs.rs", name, ver, path, idx]`; decision #2 reconciles the two before either worker
+/// retires). Embedding + upsert run under [`WORK_LOCK`] (one embed job at a time), with the model off the
+/// reactor via `spawn_blocking`. Batches of [`BATCH`] bound memory + request size.
+pub async fn handle_embed(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<(), String> {
+    let meta = task.props();
+    let cid = truthy_str(&meta, "ipfs_cid")
+        .ok_or_else(|| "pipeline: ticket has no ipfs_cid".to_string())?
+        .to_string();
+    let content_type = str_or(&meta, "content_type", TEXT).to_string();
+    // cat back the exact bytes the uploader pinned (POST /api/v0/cat — the Python `ipfs_cat`; requires an
+    // ipfs endpoint that allows the write-verb cat, i.e. Kubo-direct as the live Python worker uses).
+    let data = ipfs.cat(&cid).await?;
+    let collection = collection_for(&content_type, &data, &meta)?;
+    let ipfs_url = truthy_str(&meta, "ipfs_url")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let gateway = config::get().ipfs_gateway.trim_end_matches('/');
+            format!("{gateway}/ipfs/{cid}")
+        });
+
+    let items = items_from(&content_type, &data, &meta)?;
+    let n_items = items.len();
+
+    // Build every (id, text, payload) up front; the point id keys on (collection, item key, chunk idx), so
+    // item/chunk order does not affect ids (a re-ingest updates in place).
+    let cfg = config::get();
+    let mut ids: Vec<String> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut payloads: Vec<Map<String, Value>> = Vec::new();
+    for item in &items {
+        for (idx, piece) in chunk::chunk_default(&item.body).into_iter().enumerate() {
+            ids.push(chunk::id(&[
+                collection.as_str(),
+                item.key.as_str(),
+                &idx.to_string(),
+            ]));
+            payloads.push(embed_payload(cfg, item, &piece, idx, &cid, &ipfs_url));
+            texts.push(piece);
+        }
+    }
+    let n_chunks = texts.len();
+
+    // Serialize the embed+upsert critical section across concurrent webhook dispatches (single embedder).
+    let _guard = WORK_LOCK.lock().await;
+    let store = Store::connect()?;
+    let dim = tokio::task::spawn_blocking(embed::dim)
+        .await
+        .map_err(|e| format!("pipeline: embed dim task panicked: {e}"))??;
+    store.ensure_collection(&collection, dim).await?;
+
+    let mut start = 0usize;
+    while start < n_chunks {
+        let end = (start + BATCH).min(n_chunks);
+        let batch_texts = texts[start..end].to_vec();
+        let vectors = tokio::task::spawn_blocking(move || embed::embed_docs(&batch_texts))
+            .await
+            .map_err(|e| format!("pipeline: embed task panicked: {e}"))??;
+        let points: Vec<(String, Vec<f32>, Map<String, Value>)> = ids[start..end]
+            .iter()
+            .cloned()
+            .zip(vectors)
+            .zip(payloads[start..end].iter().cloned())
+            .map(|((id, vec), pl)| (id, vec, pl))
+            .collect();
+        store.upsert(&collection, &points).await?;
+        start = end;
+    }
+    drop(_guard);
+
+    let props = serde_json::json!({
+        "collection": collection,
+        "items": n_items,
+        "chunks": n_chunks,
+    });
+    board.set_task_props(task.id, &props).await?;
+    board
+        .comment_task(
+            task.id,
+            &format!("Embedded {n_items} items ({n_chunks} chunks) into {collection}."),
+        )
+        .await?;
+    board.update_task(task.id, Some("done"), None).await?;
+    tracing::info!(
+        "pipeline embedder: task {} {n_chunks} chunks -> {collection}",
+        task.id
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +733,60 @@ mod tests {
         assert_eq!(url_filename("https://h/a/b/readme.md"), "readme.md");
         assert_eq!(url_filename("https://h/a/b/"), "doc"); // trailing slash
         assert_eq!(url_filename("bare"), "bare");
+    }
+
+    #[test]
+    fn embed_payload_lifts_kind_merges_extra_and_stamps_ipfs() {
+        // A PDF-shaped item: `page` in extra must survive into the payload; `kind` becomes the base_payload
+        // arg (not a duplicated extra), and ipfs_cid/ipfs_url are stamped on.
+        let mut extra = Map::new();
+        extra.insert("kind".into(), Value::from("doc"));
+        extra.insert("source".into(), Value::from("ipfs"));
+        extra.insert("path".into(), Value::from("Guide.pdf"));
+        extra.insert("title".into(), Value::from("Guide.pdf"));
+        extra.insert("page".into(), Value::from(3i64));
+        let item = Item {
+            key: "p3".into(),
+            body: "unused here".into(),
+            extra,
+        };
+        let pl = embed_payload(
+            config::get(),
+            &item,
+            "the chunk text",
+            2,
+            "bafkreicid",
+            "http://green-machine.lan:8080/ipfs/bafkreicid",
+        );
+        assert_eq!(pl["text"], "the chunk text");
+        assert_eq!(pl["chunk"], 2);
+        assert_eq!(pl["kind"], "doc");
+        assert_eq!(pl["source"], "ipfs");
+        assert_eq!(pl["path"], "Guide.pdf");
+        assert_eq!(pl["page"], 3); // PDF page preserved
+        assert_eq!(pl["ipfs_cid"], "bafkreicid");
+        assert_eq!(
+            pl["ipfs_url"],
+            "http://green-machine.lan:8080/ipfs/bafkreicid"
+        );
+        // base_payload curation defaults are present (authority derived from kind, status active).
+        assert_eq!(pl["status"], "active");
+        assert!(pl.contains_key("authority"));
+        assert!(pl.contains_key("created_at"));
+    }
+
+    #[test]
+    fn pipeline_point_id_keys_on_collection_key_idx_and_differs_from_crate_docs() {
+        // The pipeline's own id formula: chunk::id([collection, key, chunk_idx]) — stable across runs.
+        let a = chunk::id(&["docs.fleet", "readme.md", "0"]);
+        assert_eq!(a, chunk::id(&["docs.fleet", "readme.md", "0"]));
+        assert_ne!(a, chunk::id(&["docs.fleet", "readme.md", "1"])); // different chunk idx
+        // Decision #2: this is DISTINCT from crate_docs's formula ["docs.rs", name, ver, path, idx], so a
+        // docs.rs source ingested via the pipeline vs `kb crate-docs` lands under different point ids until
+        // the two are reconciled. This assertion pins that divergence so it can't drift silently.
+        assert_ne!(
+            chunk::id(&["crate.anyhow.1.0.104", "anyhow::Chain", "0"]),
+            chunk::id(&["docs.rs", "anyhow", "1.0.104", "anyhow::Chain", "0"])
+        );
     }
 }
