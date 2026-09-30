@@ -26,9 +26,9 @@ use crate::bridge::{SpokenReply, VoiceBridge};
 use crate::chime;
 use crate::config::Config;
 
-use audio::{Capture, Playback};
+use audio::{Capture, StreamPlayer};
 use stt::Transcriber;
-use tts::Synthesizer;
+use tts::TtsWorker;
 use wake::WakeSpotter;
 
 /// How long to wait for George's reply after posting a transcript before giving up on this turn.
@@ -44,7 +44,7 @@ struct Assistant {
     cap: Capture,
     wake: WakeSpotter,
     stt: Transcriber,
-    tts: Synthesizer,
+    tts: TtsWorker,
     /// The async board session (INBOUND post / OUTBOUND poll) driven via [`Assistant::rt`].
     bridge: VoiceBridge,
     /// The current-thread tokio runtime the loop uses to drive the async [`bridge`](Self::bridge) calls.
@@ -72,7 +72,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let cap = Capture::open_with_retry(&cfg.audio);
     let wake = WakeSpotter::new(&cfg.wake, cfg.audio.sample_rate)?;
     let stt = Transcriber::new(&cfg.stt, cfg.audio.sample_rate)?;
-    let tts = Synthesizer::new(&cfg.tts)?;
+    let tts = TtsWorker::new(&cfg.tts)?;
 
     // Build the board session INSIDE the runtime so reqwest's client binds to this runtime; then merge
     // board-registered voice links with the static config (best-effort), and on a first run advance the
@@ -132,67 +132,76 @@ impl Assistant {
         }
     }
 
-    /// Speak `text`, chunked by sentence so audio starts after the FIRST sentence is synthesized rather
-    /// than the whole reply. Batch Kokoro synth of the full reply is the dominant reply→speaker latency
-    /// (#454) and grows with length; synthesizing + playing one sentence at a time drops time-to-first-
-    /// audio to the first sentence. Each sentence plays with barge-in; a wake during any sentence stops
-    /// playback and returns `true` (the rest of the reply is dropped). The per-sentence log lets green
-    /// separate first-sentence synth from pipeline overhead when measuring latency.
-    fn speak_interruptible(&mut self, text: &str) -> bool {
-        let sentences = crate::bridge::render::split_sentences(text);
-        let n = sentences.len();
-        for (i, sentence) in sentences.iter().enumerate() {
-            eprintln!("[tts] sentence {}/{n}", i + 1);
-            if self.speak_one(sentence) {
-                return true; // barge-in — stop synthesizing/speaking the rest of the reply
-            }
-        }
-        false
-    }
-
-    /// Speak ONE already-sentence-sized chunk; if the wake phrase is heard during playback, kill it and
-    /// return `true` (a barge-in). Includes the "arm only after a low streak" debounce so the wake that
-    /// opened this turn (or stale activation) can't count as a barge-in.
-    fn speak_one(&mut self, text: &str) -> bool {
-        let samples = self.tts.synth(text);
-        if samples.is_empty() {
+    /// Speak `text`, STREAMING the synthesized audio to the player chunk-by-chunk so playback starts on the
+    /// first chunk instead of after the whole reply is synthesized — batch Kokoro synth of the full reply is
+    /// the dominant reply→speaker latency (#454) and grows with length. The synthesizer runs on its own
+    /// thread ([`TtsWorker`]) and streams PCM chunks over a channel; this loop pumps them to the player as
+    /// they arrive AND polls the mic for a barge-in, so synthesis of later audio overlaps playback and the
+    /// wake model stays live. A wake heard during playback aborts synthesis, kills playback, and returns
+    /// `true`. Includes the "arm only after a low streak" debounce so the wake that opened this turn (or
+    /// stale activation) can't count as a barge-in.
+    fn speak(&mut self, text: &str) -> bool {
+        if text.trim().is_empty() {
             return false;
         }
-        let path = match audio::write_wav(&samples, self.tts.sample_rate()) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[tts] wav write failed: {e}");
-                return false;
-            }
-        };
-        let mut playback = Playback::start(&path, &self.cfg.audio.output_device);
+        let abort = Arc::new(AtomicBool::new(false));
+        let chunks = self.tts.speak(text, abort.clone());
+        let mut player = StreamPlayer::start(self.tts.sample_rate(), &self.cfg.audio.output_device);
         self.wake.reset(); // the wake that opened this turn must not count as a barge-in
 
         const ARM_FRAMES: u32 = 3;
         let (mut armed, mut low_streak) = (false, 0u32);
         let mut interrupted = false;
-        let per_frame = Duration::from_millis(200);
-        while !playback.finished() {
-            let Some(frame) = self.cap.next_frame(per_frame) else {
-                continue;
-            };
-            let hit = self.wake.accept(&frame);
-            if !armed {
-                // Arm only once the score has been quiet for a few frames (clears stale activation; a
-                // muted mic reads as silence, so it arms but nothing fires).
-                low_streak = if hit { 0 } else { low_streak + 1 };
-                if low_streak >= ARM_FRAMES {
-                    armed = true;
+        let mut synth_done = false;
+        let mut first_chunk = true;
+        // A short mic-frame wait is the loop clock: each pass drains any ready synth chunks to the player,
+        // then services one wake frame for barge-in.
+        let per_frame = Duration::from_millis(100);
+        loop {
+            // Move all currently-available synth chunks to the player (non-blocking).
+            if !synth_done {
+                loop {
+                    match chunks.try_recv() {
+                        Ok(pcm) => {
+                            if first_chunk {
+                                eprintln!("[tts] first audio chunk");
+                                first_chunk = false;
+                            }
+                            player.write(&pcm);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            // Synthesis ended: no more input, so close stdin and let the player drain its
+                            // buffer and exit on its own.
+                            synth_done = true;
+                            player.finish();
+                            break;
+                        }
+                    }
                 }
-                continue;
             }
-            if hit {
-                interrupted = true;
+            // Done once synthesis has ended AND the player has drained + exited.
+            if synth_done && player.finished() {
                 break;
             }
+            // Barge-in: service one wake frame. On a hit (once armed), abort synthesis and kill playback.
+            if let Some(frame) = self.cap.next_frame(per_frame) {
+                let hit = self.wake.accept(&frame);
+                if !armed {
+                    // Arm only once the score has been quiet for a few frames (clears stale activation; a
+                    // muted mic reads as silence, so it arms but nothing fires).
+                    low_streak = if hit { 0 } else { low_streak + 1 };
+                    if low_streak >= ARM_FRAMES {
+                        armed = true;
+                    }
+                } else if hit {
+                    interrupted = true;
+                    abort.store(true, Ordering::Relaxed); // tell the worker to stop synthesizing
+                    player.stop();
+                    break;
+                }
+            }
         }
-        playback.stop();
-        let _ = std::fs::remove_file(&path);
         interrupted
     }
 
@@ -201,7 +210,7 @@ impl Assistant {
     fn speak_replies(&mut self, replies: Vec<SpokenReply>) -> bool {
         for r in replies {
             eprintln!("[assistant] {}", r.text);
-            if self.speak_interruptible(&r.text) {
+            if self.speak(&r.text) {
                 return true;
             }
         }

@@ -5,18 +5,19 @@
 //! nothing is said within a start window. cpal delivers audio on its own callback thread, so a frame
 //! channel bridges it to the blocking VAD loop.
 //!
-//! Playback mirrors the Python TTS: write a temp WAV and hand it to an external player (`paplay`/`pw-play`/
-//! `aplay`) — `sounddevice.play()` hung on the box, and cpal output has the same class of driver trouble,
-//! so the external-player path is the validated one. Playback is exposed blocking ([`play_wav`]) and async
-//! ([`Playback`]) so the loop can barge-in and kill it. With `[audio].output_device` set, playback pins to
-//! a single deterministic `aplay -D <device>` (bypassing player auto-selection + the ALSA `default` PCM,
-//! which is a dead PipeWire sink for a session-less system service — #296).
+//! Playback hands PCM to an external player (`paplay`/`pw-play`/`aplay`) — `sounddevice.play()` hung on the
+//! box and cpal output has the same class of driver trouble, so the external-player path is the validated
+//! one. Cue tones play a whole temp WAV ([`play_wav`], blocking); a spoken reply is STREAMED chunk-by-chunk
+//! to the player's stdin as it synthesizes ([`StreamPlayer`]) so audio starts on the first chunk and the
+//! loop can barge-in and kill it (#454). With `[audio].output_device` set, playback pins to a single
+//! deterministic `aplay -D <device>` (bypassing player auto-selection + the ALSA `default` PCM, which is a
+//! dead PipeWire sink for a session-less system service — #296).
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -320,34 +321,101 @@ pub fn play_wav(path: &std::path::Path, output_device: &str) {
         }
     }
     let tried: Vec<&str> = list.iter().map(|p| p[0].as_str()).collect();
-    eprintln!("[audio] no working audio player (tried: {})", tried.join(", "));
+    eprintln!(
+        "[audio] no working audio player (tried: {})",
+        tried.join(", ")
+    );
 }
 
-/// A killable background playback (for barge-in). Mirrors the Python `play_async` + terminate/kill.
-pub struct Playback {
+/// The streaming player invocations to try, in order, each reading raw S16_LE mono PCM from stdin at `sr`.
+/// With an explicit `output_device`, use ONE deterministic `aplay -q -D <device> … -t raw` (same rationale
+/// as [`players`]: bypass auto-selection + the dead `default` PCM, #296). Empty → paplay then aplay.
+fn stream_players(output_device: &str, sr: u32) -> Vec<Vec<String>> {
+    let sr = sr.to_string();
+    let aplay = |dev: &[String]| {
+        let mut v = vec!["aplay".to_string(), "-q".to_string()];
+        v.extend_from_slice(dev);
+        v.extend(
+            ["-f", "S16_LE", "-c", "1", "-r", &sr, "-t", "raw"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        v
+    };
+    if output_device.is_empty() {
+        vec![
+            vec![
+                "paplay".to_string(),
+                "--raw".to_string(),
+                "--format=s16le".to_string(),
+                format!("--rate={sr}"),
+                "--channels=1".to_string(),
+            ],
+            aplay(&[]),
+        ]
+    } else {
+        vec![aplay(&["-D".to_string(), output_device.to_string()])]
+    }
+}
+
+/// A streaming PCM player: pipes raw int16 mono PCM to an external player's stdin as chunks are produced,
+/// so playback starts on the FIRST chunk instead of after a whole WAV is written + handed over (#454).
+/// Feed it with [`write`](Self::write) as synthesis streams chunks in, [`finish`](Self::finish) to signal
+/// end-of-input (the player drains its buffer and exits), and [`stop`](Self::stop) to kill it on a
+/// barge-in. Returns a handle even if no player is found (then [`finished`](Self::finished) is true and
+/// `write` is a no-op).
+pub struct StreamPlayer {
     child: Option<Child>,
+    stdin: Option<std::process::ChildStdin>,
 }
 
-impl Playback {
-    /// Start playing `path` in the background. With `output_device` set, uses `aplay -D <device>`; else
-    /// the best-effort player list. Returns a handle even if no player is found (then
-    /// [`finished`](Self::finished) is immediately true).
-    pub fn start(path: &std::path::Path, output_device: &str) -> Self {
-        for player in players(output_device) {
+impl StreamPlayer {
+    /// Spawn a raw-PCM player reading stdin at `sample_rate`. With `output_device` set, uses
+    /// `aplay -q -D <device> -f S16_LE -c 1 -r <sr> -t raw`; else best-effort paplay/aplay.
+    pub fn start(sample_rate: u32, output_device: &str) -> Self {
+        for player in stream_players(output_device, sample_rate) {
             let child = Command::new(&player[0])
                 .args(&player[1..])
-                .arg(path)
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn();
-            if let Ok(c) = child {
-                return Self { child: Some(c) };
+            if let Ok(mut c) = child {
+                let stdin = c.stdin.take();
+                return Self {
+                    child: Some(c),
+                    stdin,
+                };
             }
         }
-        Self { child: None }
+        Self {
+            child: None,
+            stdin: None,
+        }
     }
 
-    /// True once playback has ended on its own (or never started).
+    /// Write one PCM chunk to the player. Best-effort: once the pipe is closed (player gone / killed) this
+    /// becomes a no-op so a mid-stream player exit doesn't error the synth loop.
+    pub fn write(&mut self, pcm: &[i16]) {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return;
+        };
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for &s in pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        if stdin.write_all(&bytes).is_err() {
+            self.stdin = None; // player exited / pipe closed — stop feeding it
+        }
+    }
+
+    /// Signal end-of-input: close stdin so the player reads EOF, drains its buffer, and exits on its own.
+    pub fn finish(&mut self) {
+        self.stdin = None; // drop ChildStdin -> EOF
+    }
+
+    /// True once the player has exited (or never started). After [`finish`](Self::finish) this flips true
+    /// when the buffered audio has finished playing.
     pub fn finished(&mut self) -> bool {
         match &mut self.child {
             None => true,
@@ -355,8 +423,9 @@ impl Playback {
         }
     }
 
-    /// Stop playback now (barge-in): terminate, then kill if it doesn't exit promptly.
+    /// Stop playback now (barge-in): close stdin, kill, reap.
     pub fn stop(&mut self) {
+        self.stdin = None;
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
