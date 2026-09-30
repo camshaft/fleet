@@ -1587,6 +1587,14 @@ enum Cmd {
         /// own pinned agents; the primary box runs without it to cover the unpinned roster.
         #[arg(long)]
         pinned_only: bool,
+        /// When THIS binary is stale relative to its checkout (a merged fix not yet rebuilt — #388), ACT on it:
+        /// run `fleet redeploy --apply` (fast-forward origin/main, rebuild every daemon binary, restart the
+        /// daemon services) instead of only printing the STALE warning. Safe by construction — redeploy declines
+        /// a dirty or off-`main` checkout and keeps the old binaries if a build fails — and self-limiting: after
+        /// the rebuild the binary matches the checkout, so the trigger does not re-fire. Off by default: a host
+        /// opts in via its watchdog unit's `ExecStart` so an auto-restart of the daemons is never a surprise.
+        #[arg(long)]
+        self_redeploy: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -1721,6 +1729,11 @@ enum Cmd {
         /// (`--observe`) that coexists with an existing rearm watchdog without double-rearming (dev-desk).
         #[arg(long)]
         no_rearm: bool,
+        /// Include `--self-redeploy` (#388): the installed watchdog rebuilds + restarts the daemons when this
+        /// binary falls behind its checkout, so a merged fix goes live without a manual rebuild. For a host that
+        /// builds its daemons from a local checkout (not a hermetic flake deploy).
+        #[arg(long)]
+        self_redeploy: bool,
         /// INSTALL the units into `~/.config/systemd/user/` (user-level, no sudo) instead of printing them, and
         /// print the `systemctl --user enable` command — a clean, reversible install path for a host not on the
         /// declarative (nix) model. Reverse with `--uninstall`.
@@ -1810,7 +1823,8 @@ fn main() {
             spawn,
             dry_run,
             pinned_only,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only),
+            self_redeploy,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -1851,9 +1865,10 @@ fn main() {
             interval_secs,
             bin,
             no_rearm,
+            self_redeploy,
             install,
             uninstall,
-        } => watchdog_unit(!no_rearm, observe, pinned_only, interval_secs, bin, install, uninstall),
+        } => watchdog_unit(!no_rearm, observe, pinned_only, self_redeploy, interval_secs, bin, install, uninstall),
         Cmd::DaemonUnit { name, exec, restart_sec, bin, install, uninstall } => {
             daemon_unit(&name, exec, restart_sec, bin, install, uninstall)
         }
@@ -3411,12 +3426,33 @@ fn watchdog(
     spawn: bool,
     spawn_dry_run: bool,
     pinned_only: bool,
+    self_redeploy: bool,
 ) {
-    // Self-surface a stale binary: the watchdog is long-running (a timer/loop re-execs this binary), so if its
-    // source checkout advanced past the built rev it would silently run old logic (a merged fix not effective
-    // until rebuilt). Warn rather than act — rebuilding is out of band. No-op for a deployed binary (no .git).
-    if let Some(w) = build_freshness_warning(env!("FLEET_BUILD_REV"), checkout_head_short().as_deref()) {
-        eprintln!("{w}");
+    // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
+    // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
+    // fix not effective until rebuilt). With `--self-redeploy` (#388) ACT on it — rebuild + restart the daemons
+    // so the fix goes live without a manual step; otherwise WARN (rebuilding stays out of band). No-op for a
+    // deployed binary (no .git) or when already fresh.
+    match watchdog_stale_self_action(env!("FLEET_BUILD_REV"), checkout_head_short().as_deref(), self_redeploy) {
+        StaleSelfAction::Fresh => {}
+        StaleSelfAction::Warn(w) => eprintln!("{w}"),
+        StaleSelfAction::Redeploy(w) => {
+            eprintln!("{w}");
+            eprintln!("fleet watchdog: --self-redeploy set → redeploying the daemons now…");
+            match run_redeploy(true) {
+                Ok(msg) => {
+                    eprintln!("fleet watchdog: self-redeploy: {msg}");
+                    // The daemons (including this watchdog's timer) were just restarted onto the fresh binary;
+                    // skip the rest of THIS sweep so we don't run stale liveness logic against a just-restarted
+                    // daemon set — the next timer fire runs the current binary and does a clean pass.
+                    return;
+                }
+                // A failed/DECLINED self-redeploy (dirty tree, off main, build error) must NOT abort the sweep or
+                // skip the liveness pass — stale-but-running liveness beats none. Log and fall through to the
+                // normal sweep on the still-stale binary; the next sweep re-triggers once the blocker clears.
+                Err(why) => eprintln!("fleet watchdog: self-redeploy skipped: {why}"),
+            }
+        }
     }
     // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
     // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
@@ -4101,7 +4137,7 @@ fn served_set(toml: bool) {
 /// the observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. An
 /// OBSERVER-ONLY unit (`rearm=false, observe=true` → `watchdog --observe --spawn`) can run alongside an
 /// existing rearm watchdog without double-rearming — the dev-desk coexistence case. Pure — unit-tested.
-fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool) -> String {
+fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool, self_redeploy: bool) -> String {
     let mut args = String::from("watchdog");
     if rearm {
         args.push_str(" --rearm --stale-only");
@@ -4111,6 +4147,9 @@ fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool) -> String {
     }
     if pinned_only {
         args.push_str(" --pinned-only");
+    }
+    if self_redeploy {
+        args.push_str(" --self-redeploy");
     }
     args
 }
@@ -4219,10 +4258,12 @@ fn user_unit_dir() -> Option<std::path::PathBuf> {
 /// `rearm=false` (`--no-rearm`) installs an OBSERVER-ONLY unit that coexists with an existing rearm watchdog
 /// (the dev-desk go-live: the system rearm service is left untouched, no sudo needed). `bin` defaults to this
 /// binary's absolute path.
+#[allow(clippy::too_many_arguments)]
 fn watchdog_unit(
     rearm: bool,
     observe: bool,
     pinned_only: bool,
+    self_redeploy: bool,
     interval_secs: u64,
     bin: Option<String>,
     install: bool,
@@ -4234,7 +4275,7 @@ fn watchdog_unit(
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| "fleet".to_string())
     });
-    let exec_args = watchdog_exec_args(rearm, observe, pinned_only);
+    let exec_args = watchdog_exec_args(rearm, observe, pinned_only, self_redeploy);
     // Only an observer-spawning watchdog needs a launch environment (a rearm-only sweep just sends keys to an
     // existing window). Capture it from this (working) session so the installed service can launch Claude.
     let env_block = if observe { captured_observer_env() } else { String::new() };
@@ -4414,6 +4455,29 @@ fn build_freshness_warning(baked_rev: &str, checkout_head: Option<&str>) -> Opti
     })
 }
 
+/// What the watchdog should do about its OWN binary freshness at the start of a sweep (#388). Decided purely
+/// from the baked build rev, the checkout HEAD, and whether `--self-redeploy` is set. Pure — unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum StaleSelfAction {
+    /// The binary matches its checkout (or freshness can't be told: unknown rev / no source tree) — do nothing.
+    Fresh,
+    /// Stale, but `--self-redeploy` is off — print the STALE warning (the long-standing report-only behavior).
+    Warn(String),
+    /// Stale and `--self-redeploy` is on — surface the warning AND trigger `fleet redeploy --apply`.
+    Redeploy(String),
+}
+
+/// Decide the watchdog's binary-freshness action (#388). Reuses [`build_freshness_warning`] as the cheap
+/// baked-vs-HEAD staleness signal (no per-sweep network fetch): when it reports staleness, `--self-redeploy`
+/// turns the passive warning into a redeploy trigger. Pure — unit-tested.
+fn watchdog_stale_self_action(baked_rev: &str, checkout_head: Option<&str>, self_redeploy: bool) -> StaleSelfAction {
+    match build_freshness_warning(baked_rev, checkout_head) {
+        None => StaleSelfAction::Fresh,
+        Some(w) if self_redeploy => StaleSelfAction::Redeploy(w),
+        Some(w) => StaleSelfAction::Warn(w),
+    }
+}
+
 /// The git checkout root the running binary was built from — walk up from the binary's path to a dir
 /// containing `.git`. `None` when there is no source tree (a deployed/hermetic binary). Best-effort.
 fn checkout_root() -> Option<PathBuf> {
@@ -4488,17 +4552,34 @@ fn redeploy_action(baked_rev: &str, remote_sha: &str, dirty: bool, on_main: bool
 /// restart the daemon services. SAFE: reports by default (acts only with `--apply`) and refuses a dirty or
 /// off-`main` checkout so it never clobbers a sibling's in-progress work.
 fn redeploy(apply: bool) {
+    // CLI wrapper: run the redeploy, then translate its outcome to a process exit code. The core is
+    // `run_redeploy` (no `process::exit`) so the watchdog can invoke it inline without a failure flapping the
+    // long-running watchdog service (#388's `--self-redeploy`).
+    match run_redeploy(apply) {
+        Ok(msg) => println!("{msg}"),
+        Err(why) => {
+            eprintln!("fleet redeploy: {why}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The redeploy core, decoupled from `process::exit` so it is callable BOTH from the `redeploy` CLI (which
+/// exits on `Err`) and inline from the watchdog's `--self-redeploy` path (which must only LOG on `Err`, never
+/// abort the sweep). Emits progress lines as it goes and returns a one-line terminal outcome: `Ok` when there
+/// was nothing to do or the rebuild+restart succeeded, `Err(why)` when it declined (dirty / off-main) or a
+/// step failed. On any build failure it aborts BEFORE restarting so the daemons keep their old, working
+/// binaries. Never restarts on a half-rebuilt tree.
+fn run_redeploy(apply: bool) -> Result<String, String> {
     let Some(root) = checkout_root() else {
-        eprintln!("fleet redeploy: no source checkout (a deployed/hermetic binary tracks its flake input, not git) — nothing to redeploy");
-        std::process::exit(1);
+        return Err("no source checkout (a deployed/hermetic binary tracks its flake input, not git) — nothing to redeploy".to_string());
     };
     // Refresh the remote ref so the comparison is against the current origin/main.
     if git_capture(&root, &["fetch", "--quiet", "origin", "main"]).is_none() {
         // fetch prints nothing on success, so None here can be a clean fetch OR a failure; probe the ref next.
     }
     let Some(remote_sha) = git_capture(&root, &["rev-parse", "--short", "origin/main"]) else {
-        eprintln!("fleet redeploy: cannot resolve origin/main (fetch failed or no such remote) in {}", root.display());
-        std::process::exit(1);
+        return Err(format!("cannot resolve origin/main (fetch failed or no such remote) in {}", root.display()));
     };
     let dirty = git_capture(&root, &["status", "--porcelain"]).is_some();
     let on_main = git_capture(&root, &["symbolic-ref", "--short", "HEAD"]).as_deref() == Some("main");
@@ -4514,24 +4595,21 @@ fn redeploy(apply: bool) {
         }
     );
     match action {
-        RedeployAction::UpToDate => return,
+        RedeployAction::UpToDate => return Ok(format!("up to date at {remote_sha}; nothing to redeploy")),
         RedeployAction::NeedsManual(why) => {
-            eprintln!("fleet redeploy: not acting — {why}. Resolve it, then re-run (or rebuild by hand).");
-            std::process::exit(1);
+            return Err(format!("not acting — {why}. Resolve it, then re-run (or rebuild by hand)."));
         }
         RedeployAction::Rebuild => {}
     }
     if !apply {
-        println!("  (report only — re-run with --apply to fast-forward, rebuild, and restart the daemons)");
-        return;
+        return Ok("report only — re-run with --apply to fast-forward, rebuild, and restart the daemons".to_string());
     }
     // Fast-forward to origin/main (guaranteed possible: clean + on main + behind).
     println!("  fast-forwarding to origin/main…");
     if git_capture(&root, &["merge", "--ff-only", "origin/main"]).is_none()
         && git_capture(&root, &["rev-parse", "--short", "HEAD"]).as_deref() != Some(remote_sha.as_str())
     {
-        eprintln!("fleet redeploy: fast-forward to origin/main failed; aborting before rebuild");
-        std::process::exit(1);
+        return Err("fast-forward to origin/main failed; aborting before rebuild".to_string());
     }
     // Rebuild EVERY daemon binary before restarting anything (#451): the fleet binary AND the separate
     // fleet-tunnel binary. If any build fails, abort before restarting so the daemons keep their old, working
@@ -4544,16 +4622,14 @@ fn redeploy(apply: bool) {
         match build {
             Ok(s) if s.success() => {}
             Ok(s) => {
-                eprintln!(
-                    "fleet redeploy: `cargo build --release {}` failed (exit {:?}); daemons NOT restarted (they keep the old, working binaries)",
+                return Err(format!(
+                    "`cargo build --release {}` failed (exit {:?}); daemons NOT restarted (they keep the old, working binaries)",
                     extra.join(" "),
                     s.code()
-                );
-                std::process::exit(1);
+                ));
             }
             Err(e) => {
-                eprintln!("fleet redeploy: could not run cargo ({e}); daemons NOT restarted");
-                std::process::exit(1);
+                return Err(format!("could not run cargo ({e}); daemons NOT restarted"));
             }
         }
     }
@@ -4573,7 +4649,7 @@ fn redeploy(apply: bool) {
             Err(e) => println!("    could not restart {svc} ({e})"),
         }
     }
-    println!("fleet redeploy: now at {remote_sha}, binary rebuilt, daemons restarted.");
+    Ok(format!("now at {remote_sha}, binary rebuilt, daemons restarted."))
 }
 
 #[cfg(test)]
@@ -5142,21 +5218,46 @@ mod tests {
     #[test]
     fn watchdog_exec_args_builds_the_liveness_base_plus_opt_ins() {
         // rearm base, opt-in observe + pinned.
-        assert_eq!(watchdog_exec_args(true, false, false), "watchdog --rearm --stale-only");
-        assert_eq!(watchdog_exec_args(true, true, false), "watchdog --rearm --stale-only --observe --spawn");
-        assert_eq!(watchdog_exec_args(true, false, true), "watchdog --rearm --stale-only --pinned-only");
+        assert_eq!(watchdog_exec_args(true, false, false, false), "watchdog --rearm --stale-only");
+        assert_eq!(watchdog_exec_args(true, true, false, false), "watchdog --rearm --stale-only --observe --spawn");
+        assert_eq!(watchdog_exec_args(true, false, true, false), "watchdog --rearm --stale-only --pinned-only");
         // The green go-live shape: liveness + observer cadence + host filter.
         assert_eq!(
-            watchdog_exec_args(true, true, true),
+            watchdog_exec_args(true, true, true, false),
             "watchdog --rearm --stale-only --observe --spawn --pinned-only"
         );
         // OBSERVER-ONLY (rearm=false): coexists with an existing rearm watchdog without double-rearming (dev-desk).
-        assert_eq!(watchdog_exec_args(false, true, false), "watchdog --observe --spawn");
+        assert_eq!(watchdog_exec_args(false, true, false, false), "watchdog --observe --spawn");
+        // --self-redeploy (#388) appends last: a local-checkout host installs the self-healing watchdog.
+        assert_eq!(
+            watchdog_exec_args(true, false, false, true),
+            "watchdog --rearm --stale-only --self-redeploy"
+        );
+    }
+
+    #[test]
+    fn watchdog_stale_self_action_gates_redeploy_on_the_flag() {
+        // Fresh binary (baked == HEAD) → nothing, regardless of the flag.
+        assert_eq!(watchdog_stale_self_action("abc123", Some("abc123"), false), StaleSelfAction::Fresh);
+        assert_eq!(watchdog_stale_self_action("abc123", Some("abc123"), true), StaleSelfAction::Fresh);
+        // Can't tell (unknown rev / no checkout) → Fresh, never a spurious redeploy.
+        assert_eq!(watchdog_stale_self_action("unknown", Some("def456"), true), StaleSelfAction::Fresh);
+        assert_eq!(watchdog_stale_self_action("abc123", None, true), StaleSelfAction::Fresh);
+        // Stale + flag OFF → warn only (the long-standing report-only behavior).
+        assert!(matches!(
+            watchdog_stale_self_action("abc123", Some("def456"), false),
+            StaleSelfAction::Warn(_)
+        ));
+        // Stale + flag ON → redeploy trigger, carrying the same warning text.
+        assert!(matches!(
+            watchdog_stale_self_action("abc123", Some("def456"), true),
+            StaleSelfAction::Redeploy(_)
+        ));
     }
 
     #[test]
     fn render_watchdog_units_is_a_oneshot_service_plus_timer() {
-        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true), 60, "");
+        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true, false), 60, "");
         // A oneshot service (the watchdog is single-sweep) driven by a timer — not a Restart loop.
         assert!(u.contains("Type=oneshot"), "single-sweep → oneshot, not a loop");
         assert!(u.contains("ExecStart=/run/fleet/bin/fleet watchdog --rearm --stale-only --observe --spawn --pinned-only"));
@@ -5169,7 +5270,7 @@ mod tests {
     #[test]
     fn watchdog_unit_files_splits_service_and_timer_cleanly() {
         // Observer-only exec, for the dev-desk coexistence install.
-        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false), 90, "");
+        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false, false), 90, "");
         // The service file has the oneshot + ExecStart, NO timer/header lines.
         assert!(service.contains("Type=oneshot"));
         assert!(service.contains("ExecStart=/bin/fleet watchdog --observe --spawn"));
@@ -5197,12 +5298,12 @@ mod tests {
         // The captured env block sits in [Service] ahead of ExecStart so the spawned observer inherits PATH
         // (else `exec claude` is not found under the stripped systemd env and the window closes with 127).
         let env = render_service_env_lines(&[("PATH", Some("/home/u/.local/bin".into()))]);
-        let (service, _timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, true, false), 60, &env);
+        let (service, _timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, true, false, false), 60, &env);
         let env_at = service.find("Environment=\"PATH=").expect("env line present");
         let exec_at = service.find("ExecStart=").expect("ExecStart present");
         assert!(env_at < exec_at, "Environment= must precede ExecStart in the unit");
         // A rearm-only unit (no observe) is emitted with an empty env block — no launch environment needed.
-        let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false), 60, "");
+        let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false), 60, "");
         assert!(!rearm_only.contains("Environment="), "rearm-only watchdog spawns nothing → no env block");
     }
 
