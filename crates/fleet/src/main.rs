@@ -2356,9 +2356,12 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
              back to the long idle cadence (about {interval}). NEVER idle-sleep on the long cadence while you \
              still hold an actionable assigned task. If your assigned cluster is DONE / at-rest — no actionable \
              work and your only revival triggers are external events (a routed message, a new assignment, a \
-             decline) — do NOT keep self-re-arming at your active interval: request a long REGISTRY cadence with \
-             `cargo xtask fleet set-interval {agent} <e.g. 2-3h>` (a raw next-tick reschedule does NOT persist \
-             against the registry-driven watchdog, so it keeps waking you at the active interval), then rely on \
+             decline) — do NOT keep self-re-arming at your active interval: persist a long cadence by setting \
+             your BOARD metadata.interval (update_agent, e.g. 2-3h) — that is the source of truth the watchdog \
+             reads, and it works even for a board-only agent with no file-hub registry row (the frozen \
+             `cargo xtask fleet set-interval` writes only the registry, so it fails for a board-only agent and \
+             leaves the board mirror stale — do NOT rely on it); a raw next-tick reschedule does NOT persist \
+             against the watchdog either, so it keeps waking you at the active interval. Then rely on \
              event-wake — a routed message or assignment nudges your window awake immediately regardless of \
              interval, so a long rest cadence never delays revival, it only cuts empty self-directed ticks."
         )
@@ -3130,9 +3133,12 @@ const WATCHDOG_REARM_WAKE: &str = "[watchdog] you hold pending work and your loo
 /// The wake injected to a DRAINED self-poller (#544): an at-rest agent with no actionable work that keeps
 /// self-scheduling short ticks. It cannot pick this up from a `build_kickoff` edit (a running `/loop` re-passes
 /// its spawn-time prompt), so the watchdog injects the instruction directly — the agent then persists a long
-/// registry cadence via `set-interval` (so the change survives) and drops to event-wake. Once its interval is
-/// long it is no longer a candidate, so this fires about once per agent, not every sweep.
-const WATCHDOG_LENGTHEN_WAKE: &str = "[watchdog] you are at-rest with no actionable assigned work but are self-polling at a short cadence. Persist a long idle cadence: run `cargo xtask fleet set-interval <your-id> 3h` (a raw next-tick reschedule does NOT persist), then rely on event-wake — a routed message or new assignment wakes you immediately regardless of interval, so a long rest cadence never delays revival, it only stops the empty self-directed ticks. Do NOT schedule a short next tick.";
+/// cadence by setting its BOARD metadata.interval (the cadence this sweep reads) and drops to event-wake. Once
+/// its interval is long it is no longer a candidate, so this fires about once per agent, not every sweep. The
+/// lever is the board metadata (update_agent), NOT the frozen `cargo xtask fleet set-interval`: that writes
+/// only the file-hub registry, so it fails for a board-only agent (no registry row) and leaves the board
+/// metadata.interval this sweep reads stale (task_566: concierge + design-multi-operator both hit this).
+const WATCHDOG_LENGTHEN_WAKE: &str = "[watchdog] you are at-rest with no actionable assigned work but are self-polling at a short cadence. Persist a long idle cadence: set your board metadata.interval to 3h via update_agent (that is the cadence this watchdog reads, and it works even if you have no file-hub registry row) - a raw next-tick reschedule does NOT persist - then rely on event-wake, since a routed message or new assignment wakes you immediately regardless of interval, so a long rest cadence never delays revival, it only stops the empty self-directed ticks. Do NOT schedule a short next tick.";
 
 /// A re-arm to the SAME agent is never sent more often than this, even for a short or unparsed (0s) interval.
 const WATCHDOG_REARM_COOLDOWN_FLOOR_SECS: u64 = 300; // 5 min = 5× the 1-min poll
@@ -5672,12 +5678,14 @@ mod tests {
         // 'cameron' + typed blocked_on + stash the real owner so list_tasks(assignee cameron) is the one dashboard.
         assert!(k.contains("ON THE OPERATOR specifically") && k.contains("assign the task to 'cameron'"), "keeps the operator-blocked convention as a sub-case");
         assert!(k.contains("metadata.blocked_owner"), "stashes the real owner for reassign-back");
-        // Drained / at-rest → persist a long REGISTRY cadence via set-interval (#383): a raw reschedule does not
-        // stick against the registry watchdog, so a done cluster must set-interval + rely on event-wake, not
-        // keep self-re-arming at its active interval.
+        // Drained / at-rest → persist a long cadence on the BOARD metadata (#383 + task_566): the lever is the
+        // board metadata.interval (update_agent, the cadence the watchdog reads) which works even for a
+        // board-only agent — NOT the frozen `cargo xtask fleet set-interval` which only writes the file-hub
+        // registry (fails board-only, leaves the mirror stale). A raw reschedule also does not persist.
         assert!(k.contains("DONE / at-rest"), "routes a drained/done cluster to the rest-cadence path (#383)");
-        assert!(k.contains("fleet set-interval"), "names the registry cadence lever (set-interval), not a raw reschedule");
-        assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the registry watchdog");
+        assert!(k.contains("metadata.interval") && k.contains("update_agent"), "board metadata.interval via update_agent is the board-native cadence lever (task_566)");
+        assert!(k.contains("board-only agent with no file-hub registry row"), "the board lever works for a board-only agent, unlike the frozen cargo xtask set-interval");
+        assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the watchdog");
     }
 
     #[test]
