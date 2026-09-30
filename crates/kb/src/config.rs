@@ -61,6 +61,16 @@ pub struct Config {
     /// API not MCP). The green-resident workers reach the board on green; only the workers use it.
     pub board_url: String,
 
+    /// Drop-folder the `kb inbox` worker drains (was `KB_INBOX_DIR`). Each file is ingested + IPFS-pinned
+    /// then deleted; the first path component is its collection.
+    pub inbox_dir: String,
+    /// Collection for a file dropped directly in the inbox root, with no subfolder (was
+    /// `KB_INBOX_DEFAULT_COLLECTION`); also the `_sanitize` empty-name fallback.
+    pub inbox_default_collection: String,
+    /// IPFS HTTP gateway base used to build a pinned file's `ipfs_url` payload as `{gateway}/ipfs/{cid}`
+    /// (was `KB_IPFS_GATEWAY`). Citation URL only; not part of the point id.
+    pub ipfs_gateway: String,
+
     /// Default collection for the CLI + single-collection tool calls (was `KB_DEFAULT_COLLECTION`).
     pub default_collection: String,
     /// Where `kb_remember` / `kb_supersede` write by default (was `KB_MEMORY_COLLECTION`).
@@ -98,6 +108,9 @@ impl Default for Config {
             cache_dir: String::new(),
             ipfs_url: "http://127.0.0.1:5001".to_string(),
             board_url: "http://127.0.0.1:8079/api".to_string(),
+            inbox_dir: "/data/kb-inbox".to_string(),
+            inbox_default_collection: "inbox".to_string(),
+            ipfs_gateway: "http://green-machine.lan:8080".to_string(),
             mcp_host: "0.0.0.0".to_string(),
             mcp_port: 8077,
             mcp_allowed_hosts: vec!["*".to_string()],

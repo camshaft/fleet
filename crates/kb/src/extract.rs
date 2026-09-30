@@ -41,34 +41,47 @@ enum Kind {
     Pdf,
 }
 
-/// Classify a path by its extension (case-insensitive), or `None` if it isn't an ingestable kind.
+/// Ingestable text extensions — the Python `chunk.DOC_EXT`. Read verbatim as UTF-8. (Deliberately NOT the
+/// invented "text"/"markdown" — this matches the live worker's set exactly, incl. config/data formats.)
+const DOC_EXT: &[&str] = &[
+    "md", "txt", "rst", "cfg", "conf", "ini", "toml", "yaml", "yml", "json", "nix",
+];
+
+/// Directory names pruned during the walk — the Python `chunk.iter_files` skip substrings. Only these three
+/// (not every dotfile): a `.env.md` or other dot-named FILE is still ingestable, matching the live worker.
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", "__pycache__"];
+
+/// Classify a path by its extension (case-insensitive), or `None` if it isn't an ingestable kind. Matches
+/// the Python default (`{.pdf} | DOC_EXT`); CODE_EXT is opt-in there and not ingested by the drop-folder.
 fn classify(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "txt" | "text" | "md" | "markdown" | "rst" => Some(Kind::Text),
-        "pdf" => Some(Kind::Pdf),
-        _ => None,
+    if ext == "pdf" {
+        Some(Kind::Pdf)
+    } else if DOC_EXT.contains(&ext.as_str()) {
+        Some(Kind::Text)
+    } else {
+        None
     }
 }
 
-/// A hidden entry (dotfile or dot-directory) below the walk root — `.git`, `.DS_Store`, etc. The root itself
-/// (depth 0) is never treated as hidden, so pointing the walk at a dot-named drop folder still works.
-fn is_hidden(entry: &DirEntry) -> bool {
+/// A pruned directory below the walk root (`.git` / `node_modules` / `__pycache__`) — the Python skip set.
+/// The root itself (depth 0) is never pruned, so pointing the walk at such a dir still works.
+fn is_skipped(entry: &DirEntry) -> bool {
     entry.depth() > 0
         && entry
             .file_name()
             .to_str()
-            .is_some_and(|s| s.starts_with('.'))
+            .is_some_and(|s| SKIP_DIRS.contains(&s))
 }
 
-/// Discover every ingestable file under `root`, recursively. Hidden entries are pruned (so we never descend
-/// into `.git`), non-files and unsupported extensions are dropped, and the result is sorted for a
-/// deterministic total order regardless of the OS directory-read order. Unreadable entries are skipped
-/// rather than failing the whole walk.
+/// Discover every ingestable file under `root`, recursively — the Python `chunk.iter_files`. `.git` /
+/// `node_modules` / `__pycache__` are pruned, non-files and unsupported extensions are dropped, and the
+/// result is sorted for a deterministic total order regardless of the OS directory-read order. Unreadable
+/// entries are skipped rather than failing the whole walk.
 pub fn iter_files(root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e))
+        .filter_entry(|e| !is_skipped(e))
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .map(DirEntry::into_path)
@@ -78,23 +91,35 @@ pub fn iter_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Extract a file's text. Text/markdown is read as UTF-8 (one page); a PDF is extracted per page. An
-/// unsupported extension is an error — callers should only pass paths that came from [`iter_files`].
-pub fn extract(path: &Path) -> Result<Extracted, String> {
+/// Yield each extractable unit as `(page, text)` — the Python `chunk.extract`. A text/data file is a single
+/// unit with page `None`; a PDF yields one unit per 1-based page. The inbox worker keys chunks on
+/// `(page, chunk-index)`, so the page numbering (and `None` for non-paginated text) must be preserved
+/// exactly — `str(None) == "None"` lands in the point id.
+pub fn extract_units(path: &Path) -> Result<Vec<(Option<i64>, String)>, String> {
     match classify(path) {
         Some(Kind::Text) => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("extract: read {}: {e}", path.display()))?;
-            Ok(Extracted { pages: vec![text] })
+            Ok(vec![(None, text)])
         }
-        Some(Kind::Pdf) => Ok(Extracted {
-            pages: extract_pdf(path)?,
-        }),
+        Some(Kind::Pdf) => Ok(extract_pdf(path)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| (Some(i as i64 + 1), text))
+            .collect()),
         None => Err(format!(
             "extract: unsupported file type: {}",
             path.display()
         )),
     }
+}
+
+/// Extract a file's text as pages (page numbers dropped) — a thin view over [`extract_units`]. A text/data
+/// file is one page; a PDF is per page.
+pub fn extract(path: &Path) -> Result<Extracted, String> {
+    Ok(Extracted {
+        pages: extract_units(path)?.into_iter().map(|(_, t)| t).collect(),
+    })
 }
 
 /// Extract a PDF's text per page via PDFium (pdfium-render, greenlit decision #1). Binds libpdfium at
@@ -143,23 +168,28 @@ mod tests {
     }
 
     #[test]
-    fn classify_by_extension_case_insensitive() {
+    fn classify_matches_doc_ext_and_pdf() {
         assert_eq!(classify(Path::new("a.md")), Some(Kind::Text));
-        assert_eq!(classify(Path::new("a.MARKDOWN")), Some(Kind::Text));
+        assert_eq!(classify(Path::new("a.TOML")), Some(Kind::Text)); // case-insensitive, real DOC_EXT
+        assert_eq!(classify(Path::new("a.nix")), Some(Kind::Text));
         assert_eq!(classify(Path::new("a.PDF")), Some(Kind::Pdf));
+        // Not in DOC_EXT: the invented "markdown" alias and CODE_EXT are not ingested by default.
+        assert_eq!(classify(Path::new("a.markdown")), None);
+        assert_eq!(classify(Path::new("a.rs")), None);
         assert_eq!(classify(Path::new("a.png")), None);
         assert_eq!(classify(Path::new("noext")), None);
     }
 
     #[test]
-    fn iter_files_finds_supported_skips_hidden_and_unsupported_sorted() {
+    fn iter_files_prunes_git_but_keeps_dot_named_files_sorted() {
         let d = TmpDir::new();
         d.write("b.md", "b");
         d.write("a.txt", "a");
         d.write("nested/c.pdf", "not a real pdf");
-        d.write("skip.png", "img");
-        d.write(".hidden.md", "secret");
-        d.write(".git/config.md", "vcs");
+        d.write("skip.png", "img"); // unsupported extension
+        d.write(".env.md", "dotfile but ingestable"); // dot-named FILE is NOT skipped (only .git/etc dirs)
+        d.write(".git/config.md", "vcs"); // under .git -> pruned
+        d.write("node_modules/pkg.md", "dep"); // under node_modules -> pruned
         let got = iter_files(&d.0);
         let rel: Vec<String> = got
             .iter()
@@ -170,16 +200,21 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect();
-        assert_eq!(rel, vec!["a.txt", "b.md", "nested/c.pdf"]);
+        assert_eq!(rel, vec![".env.md", "a.txt", "b.md", "nested/c.pdf"]);
     }
 
     #[test]
-    fn extract_text_is_single_page() {
+    fn extract_text_is_single_page_none() {
         let d = TmpDir::new();
         let p = d.write("note.md", "# hello\nworld");
         let got = extract(&p).unwrap();
         assert_eq!(got.pages, vec!["# hello\nworld"]);
         assert!(!got.is_empty());
+        // extract_units tags a text file as one unit with page None (str(None) -> "None" in the id key).
+        assert_eq!(
+            extract_units(&p).unwrap(),
+            vec![(None, "# hello\nworld".to_string())]
+        );
     }
 
     #[test]

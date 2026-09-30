@@ -65,6 +65,8 @@ impl Ipfs {
         let text = self
             .http
             .post(&url)
+            // cid-version=1 + pin=true match the live Python ipfs_add so the recorded CID is byte-identical.
+            .query(&[("cid-version", "1"), ("pin", "true")])
             .header(
                 reqwest::header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
