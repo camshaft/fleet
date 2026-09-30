@@ -1724,6 +1724,19 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Seam-check a MONITOR vertical (task_579): ff-sync its worktree to origin/main, then report whether any
+    /// incoming commit touched the agent's declared SEAM — its `metadata.seam` file globs. A monitor wake is
+    /// otherwise 100% deterministic git plumbing, so this lets the kickoff GATE the model wake: exit 0 = GREEN
+    /// (no on-seam change — heartbeat and do NOT wake the model), exit 3 = CHANGED (wake the model; the
+    /// seam-touching paths are printed so its tick opens with the diff in hand), exit 1 = error / no seam
+    /// declared. Report-only — it computes the verdict, it does not itself wake or skip anything.
+    SeamCheck {
+        /// The agent whose `metadata.seam` globs + worktree to check.
+        agent: String,
+        /// Skip `git fetch` and check against the already-fetched `origin/main` (for tests / rapid re-runs).
+        #[arg(long)]
+        no_fetch: bool,
+    },
     /// Nudge stale in_progress tasks (board task #478, operator: automate what board-follow-up was missing).
     /// A task in `in_progress` whose latest activity (its `updated_at`, or a later comment) is at least
     /// `--threshold-hours` old gets a comment pinging its assignee for a progress update or ETA. Per-task
@@ -1905,6 +1918,7 @@ fn main() {
         } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap, &harness),
         Cmd::ServedSet { toml } => served_set(toml),
         Cmd::WakeAudit { verbose } => wake_audit(verbose),
+        Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::NudgeStale {
             apply,
             threshold_hours,
@@ -3817,6 +3831,62 @@ fn inprogress_task_assignees(tasks: &[serde_json::Value]) -> std::collections::B
         .collect()
 }
 
+/// Match a changed-file PATH against one SEAM glob (task_579). Glob grammar, deliberately small:
+///   `**` matches any run of characters INCLUDING `/` (recursive — spans path segments);
+///   `*`  matches any run of characters EXCEPT `/` (a single path segment);
+///   every other byte is literal.
+/// So `crates/foo/**` matches `crates/foo/a/b.rs`; `crates/*/mod.rs` matches `crates/foo/mod.rs` but not
+/// `crates/foo/bar/mod.rs`; `**/perform_arg_ground.rs` matches that file at any depth; a bare literal path
+/// matches only itself. Pure — unit-tested.
+fn seam_glob_matches(path: &str, glob: &str) -> bool {
+    glob_rec(glob.as_bytes(), path.as_bytes())
+}
+
+fn glob_rec(pat: &[u8], text: &[u8]) -> bool {
+    if let Some(rest) = pat.strip_prefix(b"**") {
+        // `**` matches zero or more chars, `/` included: try consuming 0..=all of text.
+        if glob_rec(rest, text) {
+            return true;
+        }
+        // `**/` also matches ZERO directories (gitignore semantics: `**/foo` matches `foo` at the root too).
+        if rest.strip_prefix(b"/").is_some_and(|after| glob_rec(after, text)) {
+            return true;
+        }
+        return (0..text.len()).any(|i| glob_rec(rest, &text[i + 1..]));
+    }
+    match pat.first() {
+        None => text.is_empty(),
+        Some(b'*') => {
+            // Single `*`: zero or more chars, but never crossing a `/`.
+            let rest = &pat[1..];
+            if glob_rec(rest, text) {
+                return true;
+            }
+            let mut i = 0;
+            while i < text.len() && text[i] != b'/' {
+                if glob_rec(rest, &text[i + 1..]) {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+        Some(&c) => text.first() == Some(&c) && glob_rec(&pat[1..], &text[1..]),
+    }
+}
+
+/// The subset of `changed` paths that touch any of the agent's declared `seams` (task_579). EMPTY means
+/// GREEN — no incoming commit touched the monitor's seam, so the wake is a deterministic no-op and the
+/// caller may heartbeat WITHOUT waking the model. Non-empty means CHANGED — wake the model with exactly
+/// these paths in hand. Pure — unit-tested.
+fn seam_touched<'a>(changed: &'a [String], seams: &[String]) -> Vec<&'a str> {
+    changed
+        .iter()
+        .filter(|p| seams.iter().any(|g| seam_glob_matches(p, g)))
+        .map(String::as_str)
+        .collect()
+}
+
 /// True if a task carries the board's derived `monitor_exempt` flag (v-task-board #167): a genuinely
 /// continuous monitor, marked via `metadata.monitor_exempt = true` and surfaced as a top-level bool on both
 /// `list_tasks` and `get_task` (absent/false by default). A monitor-exempt task is meant to stay `in_progress`
@@ -4437,6 +4507,74 @@ fn set_interval(fleet: &Fleet, agent: &str, interval: &str) {
         fleet.save(&reg);
         println!("  also updated the file-hub registry row (kept in sync during migration)");
     }
+}
+
+/// task_579: seam-check a monitor vertical (see [`Cmd::SeamCheck`]). Reads the agent's declared seam globs +
+/// worktree from its board record, ff-syncs the worktree to `origin/main`, and reports whether any incoming
+/// commit touched the seam — via EXIT CODE so a kickoff wrapper can gate the model wake without parsing text:
+/// 0 = GREEN (heartbeat, skip the model), 3 = CHANGED (wake the model; seam paths printed), 1 = error / no
+/// seam declared. The verdict itself is [`seam_touched`] (pure, unit-tested); this wrapper is the git + board
+/// IO around it.
+fn seam_check(agent: &str, no_fetch: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet seam-check: {e}");
+        std::process::exit(1);
+    });
+    let rec = board.get_agent(agent).unwrap_or_else(|e| {
+        eprintln!("fleet seam-check: get_agent '{agent}' failed: {e}");
+        std::process::exit(1);
+    });
+    let md = rec.get("metadata");
+    let seams: Vec<String> = md
+        .and_then(|m| m.get("seam"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if seams.is_empty() {
+        eprintln!(
+            "fleet seam-check '{agent}': no metadata.seam globs declared — cannot gate this monitor; wake the \
+             model. Declare the vertical's seam file globs in its board metadata.seam to enable gating."
+        );
+        std::process::exit(1);
+    }
+    let worktree = md.and_then(|m| m.get("worktree")).and_then(|v| v.as_str()).unwrap_or(".");
+    let git = |args: &[&str]| -> Result<String, String> {
+        let out = std::process::Command::new("git")
+            .current_dir(worktree)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git {args:?}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let fetch = if no_fetch { Ok(String::new()) } else { git(&["fetch", "origin", "main"]) };
+    if let Err(e) = fetch {
+        eprintln!("fleet seam-check '{agent}': {e}");
+        std::process::exit(1);
+    }
+    // Files in commits reachable from origin/main but not HEAD = what a ff-sync would bring in.
+    let diff = git(&["diff", "--name-only", "HEAD..origin/main"]).unwrap_or_else(|e| {
+        eprintln!("fleet seam-check '{agent}': {e}");
+        std::process::exit(1);
+    });
+    let changed: Vec<String> =
+        diff.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    let matched = seam_touched(&changed, &seams);
+    if matched.is_empty() {
+        println!(
+            "seam-check '{agent}': GREEN — {} incoming file(s), none on seam ({} glob(s)); heartbeat, do NOT wake the model",
+            changed.len(),
+            seams.len()
+        );
+        std::process::exit(0);
+    }
+    println!("seam-check '{agent}': CHANGED — {} seam-touching path(s), wake the model:", matched.len());
+    for p in &matched {
+        println!("  {p}");
+    }
+    std::process::exit(3);
 }
 
 /// Match a bare SESSION ID against a set of located session files by id (`session_id_of`). Returns the file
@@ -6256,6 +6394,46 @@ mod tests {
         assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1})));
         assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":""})));
         assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":null})));
+    }
+
+    #[test]
+    fn seam_glob_matches_handles_star_doublestar_and_literals() {
+        // Literal exact path.
+        assert!(seam_glob_matches("crates/foo/perform_arg_ground.rs", "crates/foo/perform_arg_ground.rs"));
+        assert!(!seam_glob_matches("crates/foo/other.rs", "crates/foo/perform_arg_ground.rs"));
+        // `**` spans path segments.
+        assert!(seam_glob_matches("crates/foo/a/b.rs", "crates/foo/**"));
+        assert!(seam_glob_matches("crates/foo/a/b/c.rs", "crates/foo/**"));
+        assert!(!seam_glob_matches("crates/bar/a.rs", "crates/foo/**"));
+        // `**/<file>` matches that file at ANY depth.
+        assert!(seam_glob_matches("a/b/perform_arg_ground.rs", "**/perform_arg_ground.rs"));
+        assert!(seam_glob_matches("perform_arg_ground.rs", "**/perform_arg_ground.rs"));
+        // Single `*` is one segment only — does NOT cross `/`.
+        assert!(seam_glob_matches("crates/foo/mod.rs", "crates/*/mod.rs"));
+        assert!(!seam_glob_matches("crates/foo/bar/mod.rs", "crates/*/mod.rs"), "* must not cross a slash");
+        // `*.rs` is top-level only.
+        assert!(seam_glob_matches("x.rs", "*.rs"));
+        assert!(!seam_glob_matches("a/x.rs", "*.rs"), "*.rs is one segment, not recursive");
+        // `**.rs` (or **/*.rs) matches nested.
+        assert!(seam_glob_matches("a/x.rs", "**/*.rs"));
+    }
+
+    #[test]
+    fn seam_touched_returns_only_on_seam_paths_and_is_green_when_empty() {
+        let seams = vec!["crates/effects/**".to_string(), "**/const_fold.rs".to_string()];
+        let changed = vec![
+            "crates/effects/perform_arg_ground.rs".to_string(), // on seam (** dir)
+            "crates/opt/const_fold.rs".to_string(),             // on seam (** file)
+            "docs/readme.md".to_string(),                       // off seam
+            "crates/syntax/lexer.rs".to_string(),               // off seam
+        ];
+        let hit = seam_touched(&changed, &seams);
+        assert_eq!(hit, vec!["crates/effects/perform_arg_ground.rs", "crates/opt/const_fold.rs"]);
+        // No seam-touching change -> GREEN (empty) -> caller need not wake the model.
+        let clean = vec!["docs/x.md".to_string(), "crates/syntax/lexer.rs".to_string()];
+        assert!(seam_touched(&clean, &seams).is_empty(), "no on-seam change is GREEN");
+        // No declared seam -> nothing can match -> GREEN (the command treats 'no seam' separately).
+        assert!(seam_touched(&changed, &[]).is_empty());
     }
 
     #[test]
