@@ -111,6 +111,79 @@ fn watchdog_manages_agent(md: Option<&serde_json::Value>, host: &str, pinned_onl
     }
 }
 
+/// A declared observer cadence: a host that runs `fleet watchdog --observe`, with whether it runs under
+/// `--pinned-only`. A pinned-only cadence (a secondary box) observes ONLY agents EXPLICITLY pinned to it; a
+/// non-pinned cadence (the primary box) observes unpinned run-anywhere agents plus agents pinned to it. The
+/// observe-coverage audit reasons over the SET of these to decide whether any cadence covers each agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObserveCadence {
+    host: String,
+    pinned_only: bool,
+}
+
+/// The observer-coverage verdict for one agent against a declared set of [`ObserveCadence`]s. `Blind` is the
+/// standing blind spot task_711 guards: an agent pinned to a host that runs no observer cadence (or, when every
+/// declared cadence is pinned-only, an unpinned agent served by none) is observed by nobody. The two `Covered`
+/// variants differ only in how sure the AUDIT can be: this process reads ONLY the local host's `~/.claude`, so
+/// transcript presence is VERIFIED when a local cadence manages the agent (`CoveredLocalTranscript`) and merely
+/// ASSUMED when the only managing cadence is on another host (`CoveredAssumed`). `ManagedNoLocalTranscript` is a
+/// soft gap: a local cadence claims scope but no session JSONL exists here to observe.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ObserveCoverage {
+    CoveredLocalTranscript,
+    CoveredAssumed,
+    ManagedNoLocalTranscript,
+    Blind,
+}
+
+/// Classify an agent's observer coverage against the declared cadence set. `local_transcript_present` is
+/// `Some(bool)` only when a cadence on `this_host` manages the agent (the one host whose transcripts this
+/// process can read), else `None`. Reuses [`watchdog_manages_agent`] so the audit's notion of "a cadence
+/// manages this agent" is byte-identical to the watchdog's own gate — the audit can never disagree with the
+/// thing it audits. Pure — unit-tested.
+fn classify_observe_coverage(
+    md: Option<&serde_json::Value>,
+    cadences: &[ObserveCadence],
+    this_host: &str,
+    local_transcript_present: Option<bool>,
+) -> ObserveCoverage {
+    let managed_anywhere = cadences
+        .iter()
+        .any(|c| watchdog_manages_agent(md, &c.host, c.pinned_only));
+    if !managed_anywhere {
+        return ObserveCoverage::Blind;
+    }
+    let managed_locally = cadences
+        .iter()
+        .any(|c| c.host == this_host && watchdog_manages_agent(md, &c.host, c.pinned_only));
+    if managed_locally {
+        match local_transcript_present {
+            Some(true) => ObserveCoverage::CoveredLocalTranscript,
+            Some(false) => ObserveCoverage::ManagedNoLocalTranscript,
+            None => ObserveCoverage::CoveredAssumed,
+        }
+    } else {
+        ObserveCoverage::CoveredAssumed
+    }
+}
+
+/// Render an agent's `metadata.host` pin for a human-readable audit line: `unpinned` (unset / null / empty),
+/// a single host, or `[h1, h2]` for a list. Pure — unit-tested.
+fn host_pin_display(md: Option<&serde_json::Value>) -> String {
+    match md.and_then(|m| m.get("host")) {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(serde_json::Value::Array(items)) if !items.is_empty() => {
+            let hs: Vec<&str> = items.iter().filter_map(serde_json::Value::as_str).collect();
+            if hs.is_empty() {
+                "unpinned".to_string()
+            } else {
+                format!("[{}]", hs.join(", "))
+            }
+        }
+        _ => "unpinned".to_string(),
+    }
+}
+
 /// Derive the set of agents this host should serve on the reverse tunnel: the tmux `windows` that are also
 /// board agents (`id`→optional host metadata) AND whose host-affinity matches `this_host`. Sorted, deduped.
 /// This replaces a hand-maintained static list — a window that isn't a board agent (a daemon/scratch window)
@@ -1724,6 +1797,28 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Audit observer-cadence COVERAGE (task_711): confirm every expected-running board-native agent is observed
+    /// by at least one declared observer cadence, so a host-local blind spot is flagged LOUDLY instead of
+    /// silently dropping a whole host's agents out of the fleet-self-improve loop. A cadence is a host that runs
+    /// `fleet watchdog --observe` — declare the primary box with `--cadence <host>` and any secondary
+    /// (`--pinned-only`) box with `--cadence-pinned <host>`; with none given, the audit assumes ONLY this host
+    /// observes (run-anywhere scope). An agent managed by NO declared cadence is BLIND (hard fail, exit 1); one
+    /// in local scope with no session transcript present here is a soft WARN. Transcript presence is verifiable
+    /// only for the local host (this process reads only the local `~/.claude`); coverage by a cadence on another
+    /// host is ASSUMED from the declared set. Read-only (no board writes).
+    ObserveCoverage {
+        /// A host that runs `fleet watchdog --observe` WITHOUT `--pinned-only` (a primary box): it observes
+        /// unpinned run-anywhere agents plus agents pinned to it. Repeatable.
+        #[arg(long = "cadence")]
+        cadence: Vec<String>,
+        /// A host that runs `fleet watchdog --observe --pinned-only` (a secondary box): it observes ONLY agents
+        /// explicitly pinned to it. Repeatable.
+        #[arg(long = "cadence-pinned")]
+        cadence_pinned: Vec<String>,
+        /// Also list the covered agents (default: print counts and name only the blind / no-transcript ones).
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Seam-check a MONITOR vertical (task_579): ff-sync its worktree to origin/main, then report whether any
     /// incoming commit touched the agent's declared SEAM — its `metadata.seam` file globs. A monitor wake is
     /// otherwise 100% deterministic git plumbing, so this lets the kickoff GATE the model wake: exit 0 = GREEN
@@ -1940,6 +2035,11 @@ fn main() {
         } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap, &harness),
         Cmd::ServedSet { toml } => served_set(toml),
         Cmd::WakeAudit { verbose } => wake_audit(verbose),
+        Cmd::ObserveCoverage {
+            cadence,
+            cadence_pinned,
+            verbose,
+        } => observe_coverage(cadence, cadence_pinned, verbose),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::NudgeStale {
@@ -5280,6 +5380,145 @@ fn wake_audit(verbose: bool) {
     }
 }
 
+/// `fleet observe-coverage` (task_711): confirm every expected-running board-native agent is observed by at
+/// least one declared observer cadence. The observer/self-improve loop reads an agent's `~/.claude` transcripts
+/// on the host where its watchdog runs, so an agent pinned to a host that runs NO observer cadence is a silent
+/// blind spot — never size/spin-down triggered, never observed. This audit makes that loud: it crosses the
+/// board roster with the declared cadence set (`--cadence` / `--cadence-pinned`) and flags any agent covered by
+/// no cadence as BLIND (exit 1). Transcript presence is verified only for the LOCAL host (this process reads
+/// only the local `~/.claude`); remote-cadence coverage is assumed from the declared set. Read-only.
+fn observe_coverage(cadence: Vec<String>, cadence_pinned: Vec<String>, verbose: bool) {
+    let this = this_host();
+    // Build the declared cadence set from the flags. With none supplied, assume ONLY this host observes, with
+    // run-anywhere scope — the honest worst case (and the common single-box invocation). The set is printed
+    // below so the audit never reasons from a hidden assumption.
+    let mut cadences: Vec<ObserveCadence> = Vec::new();
+    for host in cadence {
+        cadences.push(ObserveCadence { host, pinned_only: false });
+    }
+    for host in cadence_pinned {
+        cadences.push(ObserveCadence { host, pinned_only: true });
+    }
+    if cadences.is_empty() {
+        cadences.push(ObserveCadence { host: this.clone(), pinned_only: false });
+    }
+
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet observe-coverage: board unavailable ({e}); cannot audit observer coverage");
+        std::process::exit(1);
+    });
+    let roster = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet observe-coverage: board roster query failed ({e})");
+        std::process::exit(1);
+    });
+
+    let cadence_desc = cadences
+        .iter()
+        .map(|c| format!("{}{}", c.host, if c.pinned_only { " (pinned-only)" } else { "" }))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("fleet observe-coverage: {} declared cadence(s): {cadence_desc}", cadences.len());
+    println!("local host: {this} (transcript presence verifiable only here)");
+
+    // Stable order so the report reads the same run-to-run.
+    let mut ids: Vec<String> = roster
+        .iter()
+        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .collect();
+    ids.sort();
+
+    let mut blind: Vec<String> = Vec::new();
+    let mut no_transcript: Vec<String> = Vec::new();
+    let (mut n_covered, mut n_assumed, mut n_skipped) = (0usize, 0usize, 0usize);
+
+    for id in &ids {
+        // The DETAIL record reliably carries metadata (the list projection has historically dropped it — the
+        // task_418 roster-compaction bug), so fetch it per agent, exactly as wake-audit does.
+        let detail = board.get_agent(id).ok();
+        let rec = detail.as_ref();
+        if !rec.map(agent_expected_running).unwrap_or(true) {
+            n_skipped += 1;
+            if verbose {
+                println!("  - {id}: not expected-running (skipped)");
+            }
+            continue;
+        }
+        let md = rec.and_then(|r| r.get("metadata"));
+        // Only board-native agents are observed (mirror watchdog_board's native gate). An EXPLICIT native:false
+        // is a file-hub row to skip; Unknown is fail-safe (process + warn), never a silent skip.
+        match read_native(md) {
+            NativeVerdict::NotNative => {
+                n_skipped += 1;
+                if verbose {
+                    println!("  - {id}: native:false file-hub row (skipped)");
+                }
+                continue;
+            }
+            NativeVerdict::Unknown => {
+                eprintln!("  - {id}: WARN native/metadata unknown (roster shape) — auditing fail-safe");
+            }
+            NativeVerdict::Native => {}
+        }
+        // A local cadence manages it → probe the one host whose transcripts we can actually read.
+        let managed_locally = cadences
+            .iter()
+            .any(|c| c.host == this && watchdog_manages_agent(md, &c.host, c.pinned_only));
+        let local_present = managed_locally.then(|| !transcripts::locate_sessions(id).is_empty());
+        match classify_observe_coverage(md, &cadences, &this, local_present) {
+            ObserveCoverage::CoveredLocalTranscript => {
+                n_covered += 1;
+                if verbose {
+                    println!("  - {id}: covered (local cadence, transcript present)");
+                }
+            }
+            ObserveCoverage::CoveredAssumed => {
+                n_assumed += 1;
+                if verbose {
+                    println!("  - {id}: covered (assumed — managed by a declared cadence on another host)");
+                }
+            }
+            ObserveCoverage::ManagedNoLocalTranscript => {
+                no_transcript.push(id.clone());
+                println!(
+                    "  - {id}: MANAGED-NO-TRANSCRIPT — in scope on {this} but no session transcript present here"
+                );
+            }
+            ObserveCoverage::Blind => {
+                blind.push(id.clone());
+                println!(
+                    "  - {id}: BLIND — no declared cadence observes it (host pin: {})",
+                    host_pin_display(md)
+                );
+            }
+        }
+    }
+
+    println!(
+        "\nsummary: {n_covered} covered-local, {n_assumed} covered-assumed, {} managed-no-transcript, {} blind, {n_skipped} skipped",
+        no_transcript.len(),
+        blind.len()
+    );
+    if blind.is_empty() && no_transcript.is_empty() {
+        println!("PASS: every expected-running native agent is observed by a declared cadence.");
+        return;
+    }
+    if !no_transcript.is_empty() {
+        eprintln!(
+            "WARN: {} agent(s) in local scope with no session transcript present: {}",
+            no_transcript.len(),
+            no_transcript.join(", ")
+        );
+    }
+    if !blind.is_empty() {
+        eprintln!(
+            "FAIL: {} agent(s) observed by NO cadence (host-local blind spot) — declare the host's cadence or deploy a watchdog there: {}",
+            blind.len(),
+            blind.join(", ")
+        );
+        std::process::exit(1);
+    }
+}
+
 /// The `author` a nudge comment is posted as — also the marker `nudge_last_secs` searches a task's prior
 /// comments for, to find this daemon's own last nudge (the cooldown clock; #478).
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
@@ -7562,6 +7801,70 @@ mod tests {
         // operator's original flagged instance.)
         assert_eq!(classify_wake_path(None, false), WakePath::PollOnly);
         assert_eq!(classify_wake_path(Some(""), false), WakePath::PollOnly);
+    }
+
+    #[test]
+    fn classify_observe_coverage_flags_the_host_local_blind_spot() {
+        use serde_json::json;
+        let dev = ObserveCadence { host: "dev-desk".to_string(), pinned_only: false };
+        let green = ObserveCadence { host: "green".to_string(), pinned_only: true };
+
+        // task_711: a green-pinned agent, with ONLY dev-desk observing, is covered by nobody → BLIND.
+        let green_pinned = json!({"host": "green"});
+        assert_eq!(
+            classify_observe_coverage(Some(&green_pinned), std::slice::from_ref(&dev), "dev-desk", None),
+            ObserveCoverage::Blind
+        );
+        // Add green's pinned-only cadence and the SAME agent becomes covered (assumed — green is not the local
+        // host, so transcript presence is not probed here).
+        assert_eq!(
+            classify_observe_coverage(Some(&green_pinned), &[dev.clone(), green.clone()], "dev-desk", None),
+            ObserveCoverage::CoveredAssumed
+        );
+
+        // An agent managed by the LOCAL cadence: transcript present → verified; absent → soft gap.
+        let dev_pinned = json!({"host": "dev-desk"});
+        assert_eq!(
+            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "dev-desk", Some(true)),
+            ObserveCoverage::CoveredLocalTranscript
+        );
+        assert_eq!(
+            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "dev-desk", Some(false)),
+            ObserveCoverage::ManagedNoLocalTranscript
+        );
+
+        // An UNPINNED agent is covered by the non-pinned local cadence (transcript present here).
+        let unpinned = json!({});
+        assert_eq!(
+            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&dev), "dev-desk", Some(true)),
+            ObserveCoverage::CoveredLocalTranscript
+        );
+        // ...but if EVERY declared cadence is pinned-only, an unpinned agent is served by none → BLIND.
+        assert_eq!(
+            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&green), "dev-desk", None),
+            ObserveCoverage::Blind
+        );
+
+        // A STAGED agent is managed by no cadence (watchdog_manages_agent returns false) → BLIND here, though
+        // the handler excludes it upstream via agent_expected_running, so it never reaches this classifier.
+        let staged = json!({"host": "dev-desk", "staged": true});
+        assert_eq!(
+            classify_observe_coverage(Some(&staged), std::slice::from_ref(&dev), "dev-desk", None),
+            ObserveCoverage::Blind
+        );
+    }
+
+    #[test]
+    fn host_pin_display_renders_unset_single_and_list() {
+        use serde_json::json;
+        assert_eq!(host_pin_display(None), "unpinned");
+        assert_eq!(host_pin_display(Some(&json!({}))), "unpinned");
+        assert_eq!(host_pin_display(Some(&json!({"host": null}))), "unpinned");
+        assert_eq!(host_pin_display(Some(&json!({"host": ""}))), "unpinned");
+        assert_eq!(host_pin_display(Some(&json!({"host": "  "}))), "unpinned");
+        assert_eq!(host_pin_display(Some(&json!({"host": []}))), "unpinned");
+        assert_eq!(host_pin_display(Some(&json!({"host": "green"}))), "green");
+        assert_eq!(host_pin_display(Some(&json!({"host": ["green", "dev-desk"]}))), "[green, dev-desk]");
     }
 
     #[test]
