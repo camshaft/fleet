@@ -1,8 +1,8 @@
-//! github-bridge daemon — a thin BLOCKING poll loop that wires the pure core (`config` + `board` + `github`
+//! github-bridge daemon — a thin ASYNC poll loop that wires the pure core (`config` + `board` + `github`
 //! + `sync` + `state`) into a live GitHub↔board sync. Behind the `daemon` feature.
 //!
-//! Unlike the Slack adapter (Socket Mode / tokio), GitHub is plain REST polling, so this is a single blocking
-//! loop with no async runtime. Each tick does two phases:
+//! Runs on tokio (operator directive: NO blocking IO in rust daemons). The two sync directions run as
+//! INDEPENDENT concurrent loops (see [`runner`]) so neither blocks the other, with no thread-per-direction:
 //!   1. IN  (GitHub → board): poll issues + comments, ingest new issues as attributed tasks and new comments
 //!      as attributed board comments (idempotent via the board's external_links).
 //!   2. OUT (board → GitHub): poll the board firehose and post each authorized `task.outbound_reflect` as a
@@ -15,8 +15,8 @@
 mod runner;
 
 use clap::Parser;
-use github_bridge::config::DEFAULT_CONFIG_FILENAME;
 use github_bridge::Config;
+use github_bridge::config::DEFAULT_CONFIG_FILENAME;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -28,7 +28,8 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -37,9 +38,15 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILENAME));
+    let config_path = cli
+        .config
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILENAME));
     let cfg = Config::load(&config_path);
-    let repos = if cfg.repos.is_empty() { "<none>".to_string() } else { cfg.repos.join(",") };
+    let repos = if cfg.repos.is_empty() {
+        "<none>".to_string()
+    } else {
+        cfg.repos.join(",")
+    };
     tracing::info!(
         config = %config_path.display(),
         board_api = %cfg.board_api,
@@ -49,6 +56,7 @@ fn main() {
         "github↔board bridge starting"
     );
 
-    // Blocks forever: the poll loop, or a dormant sleep loop when no token is configured (fail-soft).
-    runner::run(cfg);
+    // Runs until SIGTERM/ctrl-c: the concurrent IN/OUT poll loops, or a dormant sleep when no token is
+    // configured (fail-soft).
+    runner::run(cfg).await;
 }

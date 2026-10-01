@@ -31,8 +31,9 @@ path = "src/main.rs"
 required-features = ["daemon"]
 
 [features]
-# The live daemon: CLI parsing + structured logging. Off by default; the lib (and its tests) never need it.
-daemon = ["dep:clap", "dep:tracing", "dep:tracing-subscriber"]
+# The live daemon: the tokio runtime + CLI parsing + structured logging. Off by default; the lib (and its
+# pure tests) never need it — the async HTTP clients compile without a runtime, only RUNNING them needs tokio.
+daemon = ["dep:tokio", "dep:clap", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -40,12 +41,16 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # The daemon's config format: a single TOML file (operator mandate #159 — no env-var config). Holds the
 # GitHub token + wiring; delivered at deploy time as the agenix-decrypted secret, gitignored in dev.
 toml = "0.8"
-# Minimal blocking HTTP client for BOTH sides: the board's token-less localhost REST (firehose poll +
-# task/comment writes) and the GitHub REST API (HTTPS via ureq's default rustls TLS). Light + blocking, so
-# the whole bridge stays a plain poll loop with no heavy async tree (unlike Slack's Socket Mode transport).
-ureq = "2"
+# ASYNC HTTP client for BOTH sides: the board's token-less localhost REST (firehose poll + task/review/comment
+# writes) and the GitHub REST API (HTTPS). Async on tokio — operator directive: NO blocking IO in rust daemons
+# (blocking IO forces thread-spawning for concurrency + scales badly). Matches bridge-core / slack-bridge
+# (reqwest + rustls, no OpenSSL). The BoardClient / GithubClient methods are `async fn`; the daemon provides
+# the runtime.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # ── The daemon binary's shell — OPTIONAL, pulled only by the `daemon` feature (see above). ──
+# The async runtime the daemon runs on (the concurrent IN/OUT poll loops + bounded per-repo fan-out).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"], optional = true }
 # `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate #159).
 clap = { version = "4", features = ["derive"], optional = true }
 tracing = { version = "0.1", optional = true }

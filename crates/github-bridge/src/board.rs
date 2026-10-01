@@ -21,6 +21,7 @@
 //! ([`parse_events`], [`build_task_body`], [`build_comment_body`], [`build_identity_body`]) that are
 //! unit-tested without a network.
 
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -152,20 +153,29 @@ pub struct TaskReflect {
 /// Parse the JSON body of `GET /events` into the event list. The board returns either a bare array or an
 /// `{ "events": [...] }` envelope — accept both. Returns the parse error text on a body that is neither.
 pub fn parse_events(body: &str) -> Result<Vec<Event>, String> {
-    let v: Value =
-        serde_json::from_str(body).map_err(|e| format!("board /events: response was not JSON: {e}"))?;
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("board /events: response was not JSON: {e}"))?;
     let arr = match v {
         Value::Array(a) => a,
         Value::Object(ref o) => match o.get("events") {
             Some(Value::Array(a)) => a.clone(),
-            _ => return Err(format!("board /events: object without an `events` array: {v}")),
+            _ => {
+                return Err(format!(
+                    "board /events: object without an `events` array: {v}"
+                ));
+            }
         },
         other => {
-            return Err(format!("board /events: expected an array or {{events:[…]}}, got {other}"));
+            return Err(format!(
+                "board /events: expected an array or {{events:[…]}}, got {other}"
+            ));
         }
     };
     arr.into_iter()
-        .map(|e| serde_json::from_value::<Event>(e).map_err(|err| format!("board /events: bad event: {err}")))
+        .map(|e| {
+            serde_json::from_value::<Event>(e)
+                .map_err(|err| format!("board /events: bad event: {err}"))
+        })
         .collect()
 }
 
@@ -201,7 +211,12 @@ pub fn build_task_body(
 /// own board agent id; `external_author` attributes the originating GitHub user; `external_id` is the comment
 /// ref (`owner/repo#c<id>`) that makes the comment IDEMPOTENT (board-core #270, dedup keyed on
 /// `(source, external_id)`). Pure — unit-tested. Omits the optional `external_author` when absent.
-pub fn build_comment_body(author: &str, body: &str, external_author: Option<&str>, external_id: &str) -> Value {
+pub fn build_comment_body(
+    author: &str,
+    body: &str,
+    external_author: Option<&str>,
+    external_id: &str,
+) -> Value {
     let mut m = json!({
         "author": author,
         "body": body,
@@ -274,33 +289,66 @@ pub fn build_identity_body(id: &str, source: &str, display_name: &str) -> Value 
     json!({ "id": id, "source": source, "display_name": display_name })
 }
 
-/// A handle to the board's token-less localhost REST API (stateless — each call is one request). The firehose
-/// cursor (`since_seq`) is owned by the caller (the poll loop), not this client.
+/// A handle to the board's token-less localhost REST API (stateless — each call is one request). ASYNC over
+/// reqwest (operator directive: NO blocking IO — the caller provides the tokio runtime; constructing the
+/// client needs no runtime, only sending does). The firehose cursor (`since_seq`) is owned by the caller (the
+/// poll/stream loop), not this client.
 pub struct BoardClient {
     base: String,
-    agent: ureq::Agent,
+    http: Client,
 }
 
 impl BoardClient {
-    /// Build a client against the board REST base (e.g. `http://127.0.0.1:8079/api`). No network
-    /// round-trip — the REST API is sessionless. A trailing slash on `base_api` is trimmed so path joins
-    /// don't double up.
+    /// Build a client against the board REST base (e.g. `http://127.0.0.1:8079/api`). No network round-trip —
+    /// the REST API is sessionless and the reqwest `Client` is constructed without a runtime. A trailing slash
+    /// on `base_api` is trimmed so path joins don't double up.
     pub fn new(base_api: &str) -> Self {
-        BoardClient { base: base_api.trim_end_matches('/').to_string(), agent: ureq::agent() }
+        BoardClient {
+            base: base_api.trim_end_matches('/').to_string(),
+            http: Client::new(),
+        }
+    }
+
+    /// GET a URL and return the raw body text, mapping any transport/status error to a labeled `Err`.
+    async fn get_text(&self, url: &str, label: &str) -> Result<String, String> {
+        self.http
+            .get(url)
+            .header("accept", "application/json")
+            .header("user-agent", BOARD_UA)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("board {label} failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("board {label} read failed: {e}"))
+    }
+
+    /// POST a JSON body and return the raw response text, mapping any transport/status error to a labeled
+    /// `Err`. Shared by every write method.
+    async fn post_text(&self, url: &str, body: String, label: &str) -> Result<String, String> {
+        self.http
+            .post(url)
+            .header("content-type", "application/json")
+            .header("user-agent", BOARD_UA)
+            .body(body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("board {label} failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("board {label} read failed: {e}"))
     }
 
     /// Poll the firehose for events after `since_seq` (exclusive), up to `limit`. Returns them in ascending
     /// `seq` order; an empty vec when nothing is newer.
-    pub fn poll_events(&self, since_seq: i64, limit: usize) -> Result<Vec<Event>, String> {
-        let url = format!("{}/events?since_seq={}&limit={}", self.base, since_seq, limit);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("accept", "application/json")
-            .set("user-agent", BOARD_UA)
-            .call()
-            .map_err(|e| format!("board GET /events failed: {e}"))?;
-        let raw = resp.into_string().map_err(|e| format!("board GET /events read failed: {e}"))?;
+    pub async fn poll_events(&self, since_seq: i64, limit: usize) -> Result<Vec<Event>, String> {
+        let url = format!(
+            "{}/events?since_seq={}&limit={}",
+            self.base, since_seq, limit
+        );
+        let raw = self.get_text(&url, "GET /events").await?;
         parse_events(&raw)
     }
 
@@ -309,7 +357,7 @@ impl BoardClient {
     /// one transaction. Returns `(task_id, created)` — `created == false` means the issue was already ingested
     /// and the returned id is the existing task, so the caller short-circuits with no duplicate and no
     /// separate link-register call.
-    pub fn create_task(
+    pub async fn create_task(
         &self,
         project_id: i64,
         title: &str,
@@ -319,20 +367,18 @@ impl BoardClient {
         external_id: &str,
     ) -> Result<(i64, bool), String> {
         let url = format!("{}/tasks", self.base);
-        let body =
-            build_task_body(project_id, title, description, created_by, external_author, external_id)
-                .to_string();
-        let raw = self
-            .agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(&body)
-            .map_err(|e| format!("board POST /tasks failed: {e}"))?
-            .into_string()
-            .map_err(|e| format!("board POST /tasks read failed: {e}"))?;
-        let v: Value =
-            serde_json::from_str(&raw).map_err(|e| format!("board POST /tasks: response was not JSON: {e}"))?;
+        let body = build_task_body(
+            project_id,
+            title,
+            description,
+            created_by,
+            external_author,
+            external_id,
+        )
+        .to_string();
+        let raw = self.post_text(&url, body, "POST /tasks").await?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST /tasks: response was not JSON: {e}"))?;
         let id = v
             .get("id")
             .and_then(Value::as_i64)
@@ -346,7 +392,7 @@ impl BoardClient {
     /// Add an attributed comment to a board task (`POST /tasks/:id/comments`), IDEMPOTENT on the comment link
     /// (board-core #270): `external_id` (the comment ref) dedups server-side. `author` = the bridge agent,
     /// `external_author` = the GitHub user (`github:<login>`). Returns `created` (false = already synced).
-    pub fn comment_task(
+    pub async fn comment_task(
         &self,
         task_id: i64,
         author: &str,
@@ -357,16 +403,11 @@ impl BoardClient {
         let url = format!("{}/tasks/{}/comments", self.base, task_id);
         let payload = build_comment_body(author, body, external_author, external_id).to_string();
         let raw = self
-            .agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(&payload)
-            .map_err(|e| format!("board POST /tasks/{task_id}/comments failed: {e}"))?
-            .into_string()
-            .map_err(|e| format!("board POST /tasks/{task_id}/comments read failed: {e}"))?;
-        let v: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("board POST /tasks/{task_id}/comments: response was not JSON: {e}"))?;
+            .post_text(&url, payload, &format!("POST /tasks/{task_id}/comments"))
+            .await?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| {
+            format!("board POST /tasks/{task_id}/comments: response was not JSON: {e}")
+        })?;
         Ok(v.get("created").and_then(Value::as_bool).unwrap_or(true))
     }
 
@@ -376,7 +417,7 @@ impl BoardClient {
     /// the PR was already mirrored and the returned id is the existing review (the caller then advances its
     /// status via [`set_review_status`](Self::set_review_status)).
     #[allow(clippy::too_many_arguments)]
-    pub fn create_review(
+    pub async fn create_review(
         &self,
         project_id: i64,
         kind: &str,
@@ -388,20 +429,20 @@ impl BoardClient {
         external_id: &str,
     ) -> Result<(i64, bool), String> {
         let url = format!("{}/reviews", self.base);
-        let body =
-            build_review_body(project_id, kind, title, description, created_by, external_author, status, external_id)
-                .to_string();
-        let raw = self
-            .agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(&body)
-            .map_err(|e| format!("board POST /reviews failed: {e}"))?
-            .into_string()
-            .map_err(|e| format!("board POST /reviews read failed: {e}"))?;
-        let v: Value =
-            serde_json::from_str(&raw).map_err(|e| format!("board POST /reviews: response was not JSON: {e}"))?;
+        let body = build_review_body(
+            project_id,
+            kind,
+            title,
+            description,
+            created_by,
+            external_author,
+            status,
+            external_id,
+        )
+        .to_string();
+        let raw = self.post_text(&url, body, "POST /reviews").await?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST /reviews: response was not JSON: {e}"))?;
         let id = v
             .get("id")
             .and_then(Value::as_i64)
@@ -413,17 +454,19 @@ impl BoardClient {
     /// Advance a review's status (`POST /reviews/:id/status`, Review entity #372). Idempotent server-side —
     /// re-applying the same status is a no-op — so the poll loop can call it every time a PR is re-seen to
     /// advance `open` → `approved`/`closed` without tracking prior state itself.
-    pub fn set_review_status(&self, review_id: i64, status: &str) -> Result<(), String> {
+    pub async fn set_review_status(&self, review_id: i64, status: &str) -> Result<(), String> {
         let url = format!("{}/reviews/{}/status", self.base, review_id);
         let body = json!({ "status": status }).to_string();
-        self.post_json(&url, &body, &format!("POST /reviews/{review_id}/status"))
+        self.post_text(&url, body, &format!("POST /reviews/{review_id}/status"))
+            .await?;
+        Ok(())
     }
 
     /// Append an entry to a review's log (`POST /reviews/:id/log`, Review entity #372), IDEMPOTENT on the
     /// entry link (`external_id` = the comment ref): a re-append of the same comment is a no-op. Used by IN
     /// to mirror a PR's conversation comments as `comment`-type log entries. Returns `appended` (false =
     /// already logged).
-    pub fn append_review_log(
+    pub async fn append_review_log(
         &self,
         review_id: i64,
         log_type: &str,
@@ -432,18 +475,14 @@ impl BoardClient {
         external_id: &str,
     ) -> Result<bool, String> {
         let url = format!("{}/reviews/{}/log", self.base, review_id);
-        let payload = build_review_log_body(log_type, body, external_author, external_id).to_string();
+        let payload =
+            build_review_log_body(log_type, body, external_author, external_id).to_string();
         let raw = self
-            .agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(&payload)
-            .map_err(|e| format!("board POST /reviews/{review_id}/log failed: {e}"))?
-            .into_string()
-            .map_err(|e| format!("board POST /reviews/{review_id}/log read failed: {e}"))?;
-        let v: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("board POST /reviews/{review_id}/log: response was not JSON: {e}"))?;
+            .post_text(&url, payload, &format!("POST /reviews/{review_id}/log"))
+            .await?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| {
+            format!("board POST /reviews/{review_id}/log: response was not JSON: {e}")
+        })?;
         Ok(v.get("appended").and_then(Value::as_bool).unwrap_or(true))
     }
 
@@ -451,20 +490,16 @@ impl BoardClient {
     /// the #85 rendering redeploy). The inbound path calls this to attach a resolved GitHub display name to
     /// the stable `github:<login>` key, so board readers see `external_author_name` instead of a bare id.
     /// Best-effort at the call site (fail-soft — a failure just leaves the name absent, readers fall back).
-    pub fn upsert_external_identity(&self, id: &str, source: &str, display_name: &str) -> Result<(), String> {
+    pub async fn upsert_external_identity(
+        &self,
+        id: &str,
+        source: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
         let url = format!("{}/external-identities", self.base);
         let body = build_identity_body(id, source, display_name).to_string();
-        self.post_json(&url, &body, "POST /external-identities")
-    }
-
-    /// POST a JSON body, mapping any transport error to a labeled `Err`. Shared by the write methods.
-    fn post_json(&self, url: &str, body: &str, label: &str) -> Result<(), String> {
-        self.agent
-            .post(url)
-            .set("content-type", "application/json")
-            .set("user-agent", BOARD_UA)
-            .send_string(body)
-            .map_err(|e| format!("board {label} failed: {e}"))?;
+        self.post_text(&url, body, "POST /external-identities")
+            .await?;
         Ok(())
     }
 }
@@ -496,7 +531,9 @@ mod tests {
             "data": {"task_id": 7, "comment_id": 42, "author": "concierge", "body": "ship it",
                      "external_author": "github:octocat", "source": "github",
                      "external_id": "camshaft/fleet#3", "external_parent_id": null}}]"#;
-        let r = parse_events(body).unwrap()[0].as_task_reflect().expect("decodes");
+        let r = parse_events(body).unwrap()[0]
+            .as_task_reflect()
+            .expect("decodes");
         assert_eq!(r.task_id, 7);
         assert_eq!(r.comment_id, 42);
         assert_eq!(r.author, "concierge");
@@ -519,13 +556,22 @@ mod tests {
 
     #[test]
     fn parse_issue_ref_round_trips_issue_ref() {
-        assert_eq!(parse_issue_ref("camshaft/fleet#42"), Some(("camshaft/fleet".to_string(), 42)));
-        assert_eq!(parse_issue_ref(&issue_ref("o/r", 7)), Some(("o/r".to_string(), 7)));
+        assert_eq!(
+            parse_issue_ref("camshaft/fleet#42"),
+            Some(("camshaft/fleet".to_string(), 42))
+        );
+        assert_eq!(
+            parse_issue_ref(&issue_ref("o/r", 7)),
+            Some(("o/r".to_string(), 7))
+        );
     }
 
     #[test]
     fn parse_issue_ref_rejects_non_issue_shapes() {
-        assert!(parse_issue_ref("camshaft/fleet#c555").is_none(), "a comment ref is not an issue ref");
+        assert!(
+            parse_issue_ref("camshaft/fleet#c555").is_none(),
+            "a comment ref is not an issue ref"
+        );
         assert!(parse_issue_ref("no-hash").is_none());
         assert!(parse_issue_ref("#5").is_none(), "empty repo");
         assert!(parse_issue_ref("o/r#").is_none(), "no number");
@@ -576,7 +622,10 @@ mod tests {
 
     #[test]
     fn review_comment_ref_is_distinct_from_conversation_and_issue_refs() {
-        assert_eq!(review_comment_ref("camshaft/fleet", 900), "camshaft/fleet#rc900");
+        assert_eq!(
+            review_comment_ref("camshaft/fleet", 900),
+            "camshaft/fleet#rc900"
+        );
         // A finding and a conversation comment with the same numeric id must not collide.
         assert_ne!(review_comment_ref("o/r", 5), comment_ref("o/r", 5));
         assert_ne!(review_comment_ref("o/r", 5), issue_ref("o/r", 5));
@@ -587,8 +636,12 @@ mod tests {
     #[test]
     fn build_task_body_shape_attribution_and_external_link() {
         let v = build_task_body(
-            16, "Fix the thing", "as reported on GitHub", "github-bridge",
-            Some("github:octocat"), "camshaft/fleet#42",
+            16,
+            "Fix the thing",
+            "as reported on GitHub",
+            "github-bridge",
+            Some("github:octocat"),
+            "camshaft/fleet#42",
         );
         assert_eq!(v["project_id"], 16);
         assert_eq!(v["title"], "Fix the thing");
@@ -603,7 +656,10 @@ mod tests {
     fn build_task_body_omits_external_author_but_always_links() {
         let v = build_task_body(1, "t", "d", "github-bridge", None, "o/r#1");
         assert!(v.get("external_author").is_none(), "no explicit null");
-        assert_eq!(v["external_link"]["external_id"], "o/r#1", "link always present for idempotency");
+        assert_eq!(
+            v["external_link"]["external_id"], "o/r#1",
+            "link always present for idempotency"
+        );
     }
 
     #[test]
@@ -628,8 +684,14 @@ mod tests {
     #[test]
     fn build_review_body_shape_attribution_and_github_pr_link() {
         let v = build_review_body(
-            16, "code", "Add gizmo", "the PR body", "github-bridge",
-            Some("github:octocat"), "approved", "camshaft/fleet#88",
+            16,
+            "code",
+            "Add gizmo",
+            "the PR body",
+            "github-bridge",
+            Some("github:octocat"),
+            "approved",
+            "camshaft/fleet#88",
         );
         assert_eq!(v["project_id"], 16);
         assert_eq!(v["kind"], "code");
@@ -638,7 +700,10 @@ mod tests {
         assert_eq!(v["created_by"], "github-bridge");
         assert_eq!(v["status"], "approved");
         assert_eq!(v["external_author"], "github:octocat");
-        assert_eq!(v["external_link"]["source"], "github_pr", "PR reviews use the github_pr link namespace");
+        assert_eq!(
+            v["external_link"]["source"], "github_pr",
+            "PR reviews use the github_pr link namespace"
+        );
         assert_eq!(v["external_link"]["external_id"], "camshaft/fleet#88");
     }
 
@@ -646,12 +711,20 @@ mod tests {
     fn build_review_body_omits_external_author_but_always_links() {
         let v = build_review_body(1, "code", "t", "d", "github-bridge", None, "open", "o/r#1");
         assert!(v.get("external_author").is_none(), "no explicit null");
-        assert_eq!(v["external_link"]["external_id"], "o/r#1", "link always present for idempotency");
+        assert_eq!(
+            v["external_link"]["external_id"], "o/r#1",
+            "link always present for idempotency"
+        );
     }
 
     #[test]
     fn build_review_log_body_shape_and_github_pr_link() {
-        let v = build_review_log_body("comment", "a review remark", Some("github:hubot"), "o/r#c777");
+        let v = build_review_log_body(
+            "comment",
+            "a review remark",
+            Some("github:hubot"),
+            "o/r#c777",
+        );
         assert_eq!(v["type"], "comment");
         assert_eq!(v["body"], "a review remark");
         assert_eq!(v["external_author"], "github:hubot");
