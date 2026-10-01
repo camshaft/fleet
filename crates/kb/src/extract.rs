@@ -173,11 +173,52 @@ fn nonws(s: &str) -> usize {
     s.chars().filter(|c| !c.is_whitespace()).count()
 }
 
-/// Whether a page's extracted text looks image-only and should be OCR'd: OCR enabled (`min_chars > 0`) AND
-/// the page has fewer than `min_chars` non-whitespace characters. `min_chars == 0` disables OCR (the default),
-/// so this is always false then. Pure; unit-tested.
+/// OCR-trigger garbage threshold: a PDF page whose extracted content is more than this FRACTION non-text
+/// "junk" is treated as an image/binary-stream page and becomes an OCR candidate even when it has plenty of
+/// characters. Set conservatively — real document text in ANY language is dominated by alphanumeric +
+/// punctuation + whitespace, so legitimate prose scores far below this and never trips it; the safe failure
+/// mode is a MISS (unchanged behavior), never a false OCR of real text. This catches the BINARY-junk class of
+/// image-only pages (the sparse-only check missed them — see task_40 comment_1922, docs.ldo_awd). The harder
+/// printable-but-high-entropy case (decoded bytes that happen to land in printable ASCII, e.g. "igmJ,di4>i$G")
+/// is NOT separable from real prose by this ratio and is deferred to the fixture-calibrated green-side slice,
+/// where the real docs.ldo_awd / Rapido-Plus page text is available to tune against.
+const OCR_GARBAGE_RATIO: f32 = 0.35;
+
+/// Fraction of a page's NON-WHITESPACE characters that are "junk" — neither alphanumeric (Unicode-aware, so
+/// accented and CJK letters and digits all count as real text) nor ASCII punctuation. Control chars, the
+/// U+FFFD replacement char, and stray symbol/other-category codepoints — the hallmark of a decoded
+/// image/binary stream — count as junk. Whitespace is ignored (neither signal nor junk). Returns 0.0 for an
+/// all-whitespace or empty page (the sparse check owns those). Pure; unit-tested.
+fn junk_ratio(s: &str) -> f32 {
+    let mut content = 0usize;
+    let mut junk = 0usize;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        content += 1;
+        if !(c.is_alphanumeric() || c.is_ascii_punctuation()) {
+            junk += 1;
+        }
+    }
+    if content == 0 {
+        return 0.0;
+    }
+    junk as f32 / content as f32
+}
+
+/// Whether a page's extracted text looks image-only and should be OCR'd. OCR must be enabled
+/// (`min_chars > 0`; `0` disables it — the default — so this is always false then), AND the page is EITHER:
+///  - sparse: fewer than `min_chars` non-whitespace characters (an image-only page yields ~nothing), OR
+///  - garbage: it has enough characters but more than [`OCR_GARBAGE_RATIO`] of its content chars are non-text
+///    junk (a decoded image/binary stream — many chars, but not real text), which the sparse check misses.
+///
+/// Pure; unit-tested.
 fn page_needs_ocr(text: &str, min_chars: usize) -> bool {
-    min_chars > 0 && nonws(text) < min_chars
+    if min_chars == 0 {
+        return false;
+    }
+    nonws(text) < min_chars || junk_ratio(text) > OCR_GARBAGE_RATIO
 }
 
 /// One page's text: the embedded text (CRLF-normalized), except a page that looks image-only
@@ -362,10 +403,41 @@ mod tests {
         // Disabled (0) never triggers OCR -> the default is a pure no-op / pre-OCR behavior.
         assert!(!page_needs_ocr("", 0));
         assert!(!page_needs_ocr("plenty of text here", 0));
+        // Even an all-junk page is NOT flagged while OCR is disabled (min_chars == 0).
+        assert!(!page_needs_ocr(&"\u{FFFD}".repeat(50), 0));
         // Enabled: fewer than min_chars NON-WHITESPACE chars -> image-only candidate.
         assert!(page_needs_ocr("   \n  \t", 5)); // 0 non-ws < 5 (image-only page yields ~whitespace)
         assert!(page_needs_ocr("ab", 5)); // 2 < 5
         assert!(!page_needs_ocr("abcde", 5)); // 5 is NOT < 5 (boundary)
         assert!(!page_needs_ocr("a b c d e f", 5)); // 6 non-ws (spaces ignored) >= 5
+    }
+
+    #[test]
+    fn page_needs_ocr_flags_binary_garbage_not_just_sparse() {
+        // NOT sparse (plenty of non-ws chars) but mostly non-text junk -> a decoded image/binary stream page
+        // the sparse-only check missed (task_40 comment_1922). min_chars=10, so these clear the sparse gate.
+        assert!(page_needs_ocr(&"\u{FFFD}".repeat(50), 10)); // decoded-bytes replacement chars
+        let soup = "\u{1}\u{2}\u{3}\u{7f}\u{80}\u{9c}\u{ad}\u{feff}".repeat(10); // control/other-category soup
+        assert!(page_needs_ocr(&soup, 10));
+        // Real prose with digits, punctuation, and ASCII operators is NOT flagged (junk ratio ~0).
+        assert!(!page_needs_ocr(
+            "The Rapido Plus hotend ships with a 60W heater cartridge (24V). Torque: 1.2 N*m.",
+            10
+        ));
+        // Non-English / accented prose is real text (Unicode-aware alphanumeric), so the degree/middle-dot
+        // symbols stay a tiny minority -> not flagged.
+        assert!(!page_needs_ocr(
+            "Fixez la t\u{ea}te \u{e0} 1,2 N\u{b7}m; temp\u{e9}rature max 300 \u{b0}C.",
+            10
+        ));
+    }
+
+    #[test]
+    fn junk_ratio_separates_text_from_binary() {
+        assert_eq!(junk_ratio(""), 0.0);
+        assert_eq!(junk_ratio("   \n\t "), 0.0); // whitespace-only -> no content chars -> 0
+        assert!(junk_ratio("plain english text") < 0.05);
+        assert!(junk_ratio("digits 123 and punct .,;:!?()[]{}") < 0.05);
+        assert!(junk_ratio(&"\u{FFFD}".repeat(20)) > 0.9); // all replacement chars -> ~all junk
     }
 }
