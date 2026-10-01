@@ -34,7 +34,7 @@ transport = [
   "dep:tokio",
   "dep:tokio-tungstenite",
   "dep:futures-util",
-  "dep:ureq",
+  "dep:reqwest",
   "dep:tracing",
   "dep:tracing-subscriber",
   "dep:clap",
@@ -54,8 +54,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 # stack slack-bridge already pulls, so no new lockfile entries).
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
-# Minimal blocking HTTP client for the localhost forward to the notifier (run in spawn_blocking).
-ureq = { version = "2", optional = true }
+# Async HTTP client for the localhost forward to the notifier. Async (not blocking ureq) per the
+# fleet NO-blocking-IO policy; rustls-tls (default-features off) matches the TLS stack the rest of
+# the workspace already pulls, so no new lockfile entries.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 # `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate #159).

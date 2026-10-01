@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -298,9 +297,11 @@ async fn run_once(cfg: &Arc<Config>, health: &Arc<HealthState>) -> Result<(), Bo
         }
     });
 
-    let agent = ureq::AgentBuilder::new().timeout(UPSTREAM_TIMEOUT).build();
+    let client = reqwest::Client::builder()
+        .timeout(UPSTREAM_TIMEOUT)
+        .build()?;
     let upstream = cfg.upstream_trimmed().to_string();
-    let result = serve(&mut read, &tx, &upstream, &agent, health, keepalive, reconnect_rx).await;
+    let result = serve(&mut read, &tx, &upstream, &client, health, keepalive, reconnect_rx).await;
 
     heartbeat.abort();
     if let Some(w) = watcher {
@@ -316,7 +317,7 @@ async fn serve<S>(
     read: &mut S,
     tx: &mpsc::UnboundedSender<Message>,
     upstream: &str,
-    agent: &ureq::Agent,
+    client: &reqwest::Client,
     health: &Arc<HealthState>,
     keepalive: u64,
     reconnect_rx: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -379,11 +380,11 @@ where
                 }) => {
                     // Forward concurrently; responses may complete out of id order.
                     let tx = tx.clone();
-                    let agent = agent.clone();
+                    let client = client.clone();
                     let upstream = upstream.to_string();
                     tokio::spawn(async move {
                         let resp =
-                            forward(&agent, &upstream, id, method, path, headers, body).await;
+                            forward(&client, &upstream, id, method, path, headers, body).await;
                         let _ = tx.send(Message::Text(resp.to_json().into()));
                     });
                 }
@@ -410,11 +411,8 @@ where
 /// Forward one `req` to the local upstream and build the `resp`/`err` frame. Tunnels the HTTP
 /// faithfully (no payload interpretation — the notifier demuxes) and forwards to exactly the one
 /// configured upstream: not an open proxy.
-// `ureq::Error` is a large enum, but it's ureq's type and we match it directly (incl. the
-// `Status(_, resp)` arm), so boxing would just add churn without value.
-#[allow(clippy::result_large_err)]
 async fn forward(
-    agent: &ureq::Agent,
+    client: &reqwest::Client,
     upstream: &str,
     id: i64,
     method: Option<String>,
@@ -440,33 +438,35 @@ async fn forward(
         }
     };
 
-    let agent = agent.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut req = agent.request(&method, &url);
-        for (k, v) in &headers {
-            // Drop hop-by-hop / length headers the client recomputes itself.
-            let kl = k.to_ascii_lowercase();
-            if matches!(
-                kl.as_str(),
-                "host" | "content-length" | "connection" | "transfer-encoding"
-            ) {
-                continue;
-            }
-            req = req.set(k, v);
+    let method = match reqwest::Method::from_bytes(method.as_bytes()) {
+        Ok(m) => m,
+        Err(e) => {
+            return Frame::Err {
+                id,
+                code: "bad_method".into(),
+                msg: e.to_string(),
+            };
         }
-        req.send_bytes(&body)
-    })
-    .await;
+    };
+    let mut req = client.request(method, &url);
+    for (k, v) in &headers {
+        // Drop hop-by-hop / length headers the client recomputes itself.
+        let kl = k.to_ascii_lowercase();
+        if matches!(
+            kl.as_str(),
+            "host" | "content-length" | "connection" | "transfer-encoding"
+        ) {
+            continue;
+        }
+        req = req.header(k, v);
+    }
 
-    match outcome {
-        Err(join) => Frame::Err {
-            id,
-            code: "internal".into(),
-            msg: join.to_string(),
-        },
-        // A non-2xx status is still a response the board asked us to relay, not a tunnel error.
-        Ok(Ok(resp)) | Ok(Err(ureq::Error::Status(_, resp))) => resp_to_frame(id, resp),
-        Ok(Err(e)) => Frame::Err {
+    // A non-2xx status is still a response the board asked us to relay, not a tunnel error:
+    // reqwest surfaces it as `Ok(resp)` (we never call `error_for_status`), so the status rides
+    // through. Only a transport/connect error is a tunnel-level failure.
+    match req.body(body).send().await {
+        Ok(resp) => resp_to_frame(id, resp).await,
+        Err(e) => Frame::Err {
             id,
             code: "upstream_unreachable".into(),
             msg: e.to_string(),
@@ -474,16 +474,33 @@ async fn forward(
     }
 }
 
-fn resp_to_frame(id: i64, resp: ureq::Response) -> Frame {
-    let status = resp.status();
+async fn resp_to_frame(id: i64, resp: reqwest::Response) -> Frame {
+    let status = resp.status().as_u16();
     let mut headers = BTreeMap::new();
-    for name in resp.headers_names() {
-        if let Some(v) = resp.header(&name) {
-            headers.insert(name, v.to_string());
+    for (name, value) in resp.headers() {
+        if let Ok(v) = value.to_str() {
+            headers.insert(name.as_str().to_string(), v.to_string());
         }
     }
+    // Read the body under the same memory cap the blocking path enforced: pull chunks until the
+    // cap is reached rather than buffering an unbounded upstream response.
+    let mut resp = resp;
     let mut buf = Vec::new();
-    let _ = resp.into_reader().take(MAX_RESP_BODY).read_to_end(&mut buf);
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() as u64 >= MAX_RESP_BODY {
+                    buf.truncate(MAX_RESP_BODY as usize);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            // A mid-body transport error: relay what we have, same as the blocking reader which
+            // ignored its read error and returned the bytes collected so far.
+            Err(_) => break,
+        }
+    }
     Frame::Resp {
         id,
         status,
@@ -542,18 +559,16 @@ async fn serve_health(addr: SocketAddr, health: Arc<HealthState>, upstream: Stri
 /// HTTP response (including a non-2xx status) proves reachability; only a transport/connect error
 /// means unreachable — the same "reachable vs not" distinction [`forward`] draws.
 async fn probe_upstream(upstream: &str) -> bool {
-    let base = upstream.to_string();
-    tokio::task::spawn_blocking(move || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(HEALTH_UPSTREAM_TIMEOUT)
-            .build();
-        matches!(
-            agent.get(&base).call(),
-            Ok(_) | Err(ureq::Error::Status(_, _))
-        )
-    })
-    .await
-    .unwrap_or(false)
+    let client = match reqwest::Client::builder()
+        .timeout(HEALTH_UPSTREAM_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // Any HTTP response (including a non-2xx status) proves reachability; only a transport/connect
+    // error means unreachable — the same "reachable vs not" distinction `forward` draws.
+    client.get(upstream).send().await.is_ok()
 }
 
 /// Build the WS handshake request, adding the Cloudflare Access service-token headers for the
