@@ -5113,6 +5113,11 @@ const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
 /// #540 inc2: where an unassigned-or-gone-owner stale task is ROUTED — the router that owns assignment. It is
 /// event-woken on the reassignment (task.assigned), so this needs no polling on board-pm's side.
 const NUDGE_ROUTER: &str = "board-pm";
+/// task_627 inc2b: the channel a sweep posts its accountability digest to — a once-per-sweep roll-up of the
+/// tasks that escalated past their owner (round-2 PM-tags + round-3 reassigns). The router ([`NUDGE_ROUTER`])
+/// subscribes, so a `channel.post` wake lands the escalations in its inbox without it polling. Resolved by name
+/// (create-if-absent) each sweep, mirroring the `deploys` channel ([`post_deploy`]).
+const ACCOUNTABILITY_CHANNEL: &str = "fleet-accountability";
 /// task_540 follow-on (board-pm greenlit): the EXTENDED re-nudge cooldown applied when the assignee has
 /// acknowledged a queued todo since the last nudge — a fresh ack/ETA buys this much quiet instead of the
 /// normal ~1h, so an acknowledged-queued backlog is not re-nudged hourly. 4h to start (tune toward 4–6h);
@@ -5372,6 +5377,53 @@ fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
     )
 }
 
+/// task_627 inc2b: one router-escalation captured during a sweep for the end-of-sweep accountability digest.
+/// `reassign` marks a round-3 REASSIGN escalation (vs a round-2 PM-tag); the rest name the task, the silent
+/// owner, how long it has been idle, and the unanswered-round count so the router can act straight from the
+/// digest.
+struct Escalation {
+    id: i64,
+    title: String,
+    owner: String,
+    idle_secs: i64,
+    unanswered_rounds: usize,
+    reassign: bool,
+}
+
+/// task_627 inc2b: the once-per-sweep accountability digest posted to the [`ACCOUNTABILITY_CHANNEL`] when a
+/// sweep escalated one or more tasks past their owner (round-2 PM-tags and/or round-3 reassigns). ONE post per
+/// sweep — not one per task — so the router ([`NUDGE_ROUTER`], a channel member) is woken a single time with
+/// every actionable item rather than N times. Reassigns are listed first (more urgent), then PM-tags; each line
+/// names the task with a typed `task_<id>` ref (never a bare `#<id>`, which board content hard-rejects) and the
+/// silence detail. Pure — unit-tested.
+fn accountability_digest_body(escalations: &[Escalation]) -> String {
+    let reassign = escalations.iter().filter(|e| e.reassign).count();
+    let pm_tag = escalations.len() - reassign;
+    let mut lines = String::new();
+    // Reassigns (round 3, more urgent) before PM-tags (round 2); within each tier, in sweep order.
+    for e in escalations
+        .iter()
+        .filter(|e| e.reassign)
+        .chain(escalations.iter().filter(|e| !e.reassign))
+    {
+        let kind = if e.reassign { "REASSIGN" } else { "PM-TAG" };
+        lines.push_str(&format!(
+            "\n- {kind} task_{} \"{}\" - owner {} silent, {} unanswered round(s), idle {}",
+            e.id,
+            e.title,
+            e.owner,
+            e.unanswered_rounds,
+            format_hm(e.idle_secs)
+        ));
+    }
+    format!(
+        "fleet accountability digest: {} task(s) escalated past their owner this sweep ({reassign} reassign, \
+         {pm_tag} pm-tag). {NUDGE_ROUTER}, each needs a call - chase an ETA, reassign to an available agent, \
+         mark it explicitly blocked with a blocked_on note, or close it:{lines}",
+        escalations.len()
+    )
+}
+
 /// Nudge stale ASSIGNED work + ROUTE stale ownerless work (board #478 + #540). A `todo`/`in_progress` task
 /// whose latest activity is at least `threshold_hours` old is acted on, at most once per `cooldown_hours` while
 /// it stays idle: a task with a live owner gets a comment pinging that owner ([`nudge_body`]); an UNASSIGNED
@@ -5382,6 +5434,10 @@ fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
 /// on a blocker (`blocked_on_kind` — e.g. `external` for an infra wait, task-board#178 — which are legitimately
 /// waiting, not stalled). A `todo` task
 /// must show worker activity ([`task_has_worker_activity`]) to count — a bare backlog item is not a stall.
+/// task_627 inc2b: after the per-task pass, a sweep that escalated any task past its owner (a round-2 PM-tag or
+/// round-3 reassign) posts ONE accountability digest to the [`ACCOUNTABILITY_CHANNEL`] ([`NUDGE_ROUTER`]
+/// subscribes), so the router is woken once with every actionable item; a channel resolve/post failure is
+/// logged but never fails the sweep or trips the outage guard.
 /// Report-only unless `apply` — a dry run prints exactly what it WOULD do without writing (the #478/#540 review
 /// gate).
 /// task_609: whether a nudge-stale run is a total OUTAGE — it attempted at least one post but landed ZERO.
@@ -5449,6 +5505,11 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     // exit 0, or systemd/the watchdog sees a healthy sweep and nothing chases stale work (the operator then
     // fills the gap by hand). See the outage check after the loop.
     let mut failed = 0usize;
+    // task_627 inc2b: router escalations (PM-tag / reassign tiers) captured this sweep for the end-of-sweep
+    // accountability digest posted to the fleet-accountability channel. Collected only on a SUCCESSFUL apply
+    // comment, so a total outage (zero landed posts) yields no digest; `would_escalate` is the dry-run count.
+    let mut escalations: Vec<Escalation> = Vec::new();
+    let mut would_escalate = 0usize;
     for t in &candidates {
         let id = match t.get("id").and_then(serde_json::Value::as_i64) {
             Some(id) => id,
@@ -5607,6 +5668,19 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                         Ok(()) => {
                             nudged += 1;
                             println!("  nudged #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})", format_hm(idle_secs));
+                            // task_627 inc2b: a PM-tag or reassign is a ROUTER escalation — capture it for the
+                            // once-per-sweep accountability digest so the router is woken with it. A plain
+                            // owner nudge (round 1) is owner-facing only and does not go to the channel.
+                            if matches!(tier, NudgeTier::PmTag | NudgeTier::Reassign) {
+                                escalations.push(Escalation {
+                                    id,
+                                    title: title.to_string(),
+                                    owner: owner.to_string(),
+                                    idle_secs,
+                                    unanswered_rounds: unanswered,
+                                    reassign: matches!(tier, NudgeTier::Reassign),
+                                });
+                            }
                         }
                         Err(e) => {
                             failed += 1;
@@ -5616,6 +5690,9 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                 } else {
                     nudged += 1;
                     println!("  would nudge #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})", format_hm(idle_secs));
+                    if matches!(tier, NudgeTier::PmTag | NudgeTier::Reassign) {
+                        would_escalate += 1;
+                    }
                 }
             }
         }
@@ -5629,6 +5706,37 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         if failed > 0 { format!(" ({failed} FAILED)") } else { String::new() },
         if apply { "" } else { " — re-run with --apply to act" }
     );
+
+    // task_627 inc2b: push this sweep's router escalations (PM-tags + reassigns) to the fleet-accountability
+    // channel as ONE digest so the router ([`NUDGE_ROUTER`], a subscriber) is woken once with every actionable
+    // item. The per-task comments above are the owner-facing trail; this is the router-facing push. Apply-only
+    // (a dry run neither creates the channel nor posts). Best-effort: a resolve/post failure is logged but does
+    // NOT fail the sweep or feed the outage guard — the per-task comments already landed, and the digest is an
+    // additional wake path, not the authoritative record.
+    if apply {
+        if !escalations.is_empty() {
+            match board.create_or_get_channel(ACCOUNTABILITY_CHANNEL, NUDGE_AUTHOR) {
+                Ok(channel_id) => {
+                    let body = accountability_digest_body(&escalations);
+                    match board.post_to_channel(channel_id, NUDGE_AUTHOR, &body) {
+                        Ok(()) => println!(
+                            "  posted accountability digest ({} escalation(s)) to #{ACCOUNTABILITY_CHANNEL} (id {channel_id})",
+                            escalations.len()
+                        ),
+                        Err(e) => eprintln!(
+                            "  accountability digest post to #{ACCOUNTABILITY_CHANNEL} failed: {e} (per-task comments already landed)"
+                        ),
+                    }
+                }
+                Err(e) => eprintln!(
+                    "  resolve '{ACCOUNTABILITY_CHANNEL}' channel failed: {e} (per-task comments already landed; skipping digest)"
+                ),
+            }
+        }
+    } else if would_escalate > 0 {
+        println!("  would post accountability digest ({would_escalate} escalation(s)) to #{ACCOUNTABILITY_CHANNEL}");
+    }
+
     // task_609: a total-outage guard. If this apply run ATTEMPTED posts but landed ZERO (every nudge/route
     // failed — the board unreachable, auth broken, etc.), exiting 0 would mask the outage: systemd marks the
     // oneshot succeeded and the push-based accountability loop silently stops chasing stale work (the operator
@@ -8194,6 +8302,27 @@ mod tests {
         assert!(b.contains("REASSIGN") && b.contains("board-pm"), "escalation tags the router to reassign");
         assert!(b.contains("v-x") && b.contains('3'), "names the silent owner + the unanswered round count");
         assert!(b.contains("mint a helper"), "offers minting a fresh owner");
+    }
+
+    #[test]
+    fn accountability_digest_lists_escalations_router_first_with_typed_refs() {
+        let esc = vec![
+            Escalation { id: 10, title: "pm one".into(), owner: "v-a".into(), idle_secs: 7200, unanswered_rounds: 1, reassign: false },
+            Escalation { id: 20, title: "reassign one".into(), owner: "v-b".into(), idle_secs: 10800, unanswered_rounds: 2, reassign: true },
+        ];
+        let b = accountability_digest_body(&esc);
+        // Counts both tiers and names the router to make the call.
+        assert!(b.contains("2 task(s) escalated") && b.contains("1 reassign") && b.contains("1 pm-tag"));
+        assert!(b.contains("board-pm"), "names the router");
+        // Typed task_<id> refs only — never a bare #<id>, which board content hard-rejects.
+        assert!(b.contains("task_10") && b.contains("task_20"), "uses typed task refs");
+        assert!(!b.contains("#10") && !b.contains("#20"), "no bare #N refs (board hard-rejects them)");
+        // Reassign (more urgent) is listed before the PM-tag.
+        let r = b.find("REASSIGN").expect("has a reassign line");
+        let p = b.find("PM-TAG").expect("has a pm-tag line");
+        assert!(r < p, "reassigns are listed before pm-tags");
+        // ASCII-only (board content rule).
+        assert!(b.is_ascii(), "digest body must be ASCII");
     }
 
     #[test]
