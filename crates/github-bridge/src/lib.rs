@@ -28,9 +28,10 @@
 //! - [`state`] — the daemon's persisted cursors (board firehose seq for OUT, GitHub `?since=` for IN),
 //!   fail-soft load. Unit-tested here.
 //!
-//! The daemon binary (`src/main.rs` + `src/runner.rs`, behind the `daemon` feature) is a thin BLOCKING poll
-//! loop that wires these together — GitHub is plain REST polling, so no async runtime — and is exercised
-//! live, not unit-tested; the gate is this lib's `cargo test`.
+//! The daemon binary (`src/main.rs` + `src/runner.rs`, behind the `daemon` feature) is a thin ASYNC poll loop
+//! on tokio that wires these together — the IN and OUT directions run as independent concurrent loops so
+//! neither blocks the other (operator directive: no blocking IO in rust daemons) — and is exercised live, not
+//! unit-tested; the gate is this lib's `cargo test`.
 //!
 //! Kept generic on purpose: GitHub-specifics live in this adapter; the Slack adapter (#152) drops in over the
 //! same board core, so any concern shared by both belongs on the board, not duplicated here.
@@ -42,20 +43,22 @@ pub mod state;
 pub mod sync;
 
 pub use board::{
-    build_comment_body, build_identity_body, build_review_body, build_review_log_body, build_task_body,
-    comment_ref, issue_ref, parse_events, parse_issue_ref, review_comment_ref, BoardClient, Event,
-    TaskReflect, LINK_SOURCE, REVIEW_LINK_SOURCE, TASK_OUTBOUND_REFLECT,
+    BoardClient, Event, LINK_SOURCE, REVIEW_LINK_SOURCE, TASK_OUTBOUND_REFLECT, TaskReflect,
+    build_comment_body, build_identity_body, build_review_body, build_review_log_body,
+    build_task_body, comment_ref, issue_ref, parse_events, parse_issue_ref, review_comment_ref,
 };
 pub use config::{Config, DEFAULT_CONFIG_FILENAME};
 pub use github::{
-    github_external_author, parse_issue_comments, parse_issues, parse_pull_request, parse_pull_review_comments,
-    parse_pull_reviews, GithubClient, Issue, IssueComment, PullRequest, PullReview, ReviewComment, PER_PAGE,
+    GithubClient, Issue, IssueComment, PER_PAGE, PullRequest, PullReview, ReviewComment,
+    github_external_author, parse_issue_comments, parse_issues, parse_pull_request,
+    parse_pull_review_comments, parse_pull_reviews,
 };
 pub use state::State;
 pub use sync::{
-    latest_review_decision, plan_comment_ingest, plan_issue_ingest, plan_outbound, plan_pr_comment_log,
-    plan_pr_finding_log, plan_pr_review_ingest, pr_review_status, refine_open_status, render_finding_body,
-    render_outbound_github_comment, render_pr_review_description, render_task_description, CommentIngestPlan,
-    CommentPost, IssueIngestPlan, OutboundComment, PrReviewIngestPlan, PrReviewStatus, ReviewCreate,
-    ReviewDecision, ReviewLogEntry, TaskCreate,
+    CommentIngestPlan, CommentPost, IssueIngestPlan, OutboundComment, PrReviewIngestPlan,
+    PrReviewStatus, ReviewCreate, ReviewDecision, ReviewLogEntry, TaskCreate,
+    latest_review_decision, plan_comment_ingest, plan_issue_ingest, plan_outbound,
+    plan_pr_comment_log, plan_pr_finding_log, plan_pr_review_ingest, pr_review_status,
+    refine_open_status, render_finding_body, render_outbound_github_comment,
+    render_pr_review_description, render_task_description,
 };

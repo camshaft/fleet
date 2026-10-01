@@ -1,6 +1,20 @@
-//! The blocking poll-loop transport — the thin layer between the pure lib and the live GitHub + board REST
-//! I/O. Kept out of `main.rs` so `main` reads as a wiring diagram. Not unit-tested (live network); every
-//! DECISION it calls into (`sync::*`, `state::*`, the parsers) IS tested in the lib.
+//! The async poll-loop transport — the thin layer between the pure lib and the live GitHub + board REST I/O.
+//! Kept out of `main.rs` so `main` reads as a wiring diagram. Not unit-tested (live network); every DECISION
+//! it calls into (`sync::*`, `state::*`, the parsers) IS tested in the lib.
+//!
+//! ## Concurrency (operator directive: NO blocking IO in rust daemons)
+//! All I/O is `async` on tokio — never a blocking call that pins a runtime thread. The two sync directions run
+//! as INDEPENDENT concurrent loops under one [`tokio::join!`], sharing the async board + GitHub clients:
+//! - **IN** ([`in_loop`]) polls each configured repo's issues/PRs and mirrors them to the board, then sleeps.
+//! - **OUT** ([`out_loop`]) polls the board firehose and reflects authorized comments to GitHub, then sleeps.
+//!
+//! Because both futures are driven on the same task, OUT keeps flowing while IN awaits GitHub (and vice
+//! versa): neither direction blocks the other, with no thread-per-direction. The shared cursor [`State`] lives
+//! behind a [`Mutex`] locked only for the brief read/update around the network calls — the guard is NEVER held
+//! across an `.await`, so the lock can't stall the runtime. The (rare, tiny) local state-file write is pushed
+//! off the runtime via [`tokio::task::spawn_blocking`] so even that touch of fs IO never blocks a poll loop.
+//! Per-repo IN is sequential-await for now (a handful of repos, well under GitHub's rate limit); bounded
+//! per-repo concurrent fan-out is a non-breaking follow-up.
 //!
 //! ## Delivery semantics
 //! - **IN (GitHub → board) is EXACTLY-ONCE.** `create_task`/`comment_task` (issues) and
@@ -15,15 +29,16 @@
 //!   next tick. Inherent to the GitHub API; rare + non-fatal. The firehose cursor advances per
 //!   terminally-handled event so nothing before the last success re-posts.
 
-use github_bridge::board::{parse_issue_ref, BoardClient, LINK_SOURCE};
+use github_bridge::board::{BoardClient, LINK_SOURCE, parse_issue_ref};
 use github_bridge::config::Config;
 use github_bridge::{
-    github_external_author, latest_review_decision, plan_comment_ingest, plan_issue_ingest, plan_outbound,
-    plan_pr_comment_log, plan_pr_finding_log, plan_pr_review_ingest, refine_open_status, GithubClient, Issue,
-    PrReviewStatus, State, PER_PAGE,
+    GithubClient, Issue, PER_PAGE, PrReviewStatus, State, github_external_author,
+    latest_review_decision, plan_comment_ingest, plan_issue_ingest, plan_outbound,
+    plan_pr_comment_log, plan_pr_finding_log, plan_pr_review_ingest, refine_open_status,
 };
 use std::collections::HashSet;
-use std::thread;
+use std::future::Future;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// The poll cadence. GitHub's authenticated rate limit is 5000 req/hr; a 15s loop over a handful of pages is
@@ -37,13 +52,15 @@ const POLL_LIMIT: usize = 100;
 const MAX_PAGES: usize = 100;
 
 /// Run the daemon forever. Fail-soft: with no token the process idles (a restart picks one up); any per-tick
-/// error is logged and retried.
-pub fn run(cfg: Config) {
+/// error is logged and retried. Returns on SIGTERM/ctrl-c for a clean shutdown under a supervisor.
+pub async fn run(cfg: Config) {
     let Some(token) = cfg.token().map(str::to_string) else {
         tracing::warn!("no github_token in config — idle until provided (a restart picks it up)");
-        loop {
-            thread::sleep(DORMANT_INTERVAL);
+        tokio::select! {
+            _ = async { loop { tokio::time::sleep(DORMANT_INTERVAL).await; } } => {},
+            _ = shutdown_signal() => tracing::info!("shutdown signal — exiting (was dormant)"),
         }
+        return;
     };
 
     let board = BoardClient::new(&cfg.board_api);
@@ -52,7 +69,7 @@ pub fn run(cfg: Config) {
     // Our own GitHub login, fetched once — lets IN comment ingest skip comments the bridge itself posted
     // (loop-safety). Best-effort: a GitHub App token may 403 on /user; then the self-filter is simply off
     // (dedup links still prevent re-posting).
-    let self_login = match gh.viewer_login() {
+    let self_login = match gh.viewer_login().await {
         Ok(l) => {
             tracing::info!(login = %l, "authenticated to GitHub");
             Some(l)
@@ -63,48 +80,113 @@ pub fn run(cfg: Config) {
         }
     };
 
-    let mut state = State::load(&cfg.state_dir);
+    // The cursor state is shared by IN (per-repo `?since=`) and OUT (firehose seq). The two directions touch
+    // disjoint fields, but both persist the one file, so a Mutex keeps the on-disk snapshot consistent. Locked
+    // only briefly around each step — never across an `.await` (see the module doc).
+    let state = Mutex::new(State::load(&cfg.state_dir));
 
     // First run: initialize the firehose cursor at HEAD so OUT skips the board backlog. IN intentionally
     // leaves the per-repo cursors empty so each repo DOES ingest its existing issue backlog (idempotent).
-    if state.firehose_seq.is_none() {
-        let head = initialize_firehose_head(&board);
-        state.firehose_seq = Some(head);
-        persist(&cfg, &state);
-        tracing::info!(head, "initialized firehose cursor at head — skipping board backlog");
+    let needs_head_init = { state.lock().unwrap().firehose_seq.is_none() };
+    if needs_head_init {
+        let head = initialize_firehose_head(&board).await;
+        let snapshot = {
+            let mut s = state.lock().unwrap();
+            s.firehose_seq = Some(head);
+            s.clone()
+        };
+        persist(&cfg, &snapshot).await;
+        tracing::info!(
+            head,
+            "initialized firehose cursor at head — skipping board backlog"
+        );
     }
 
-    tracing::info!(interval_secs = POLL_INTERVAL.as_secs(), "entering poll loop");
+    tracing::info!(
+        interval_secs = POLL_INTERVAL.as_secs(),
+        "entering concurrent IN/OUT poll loops"
+    );
+    // IN and OUT run concurrently forever; `join!` drives both on this task so neither blocks the other. The
+    // select lets a SIGTERM/ctrl-c win over the (never-returning) loops for a clean exit.
+    tokio::select! {
+        _ = async {
+            tokio::join!(
+                in_loop(&cfg, &gh, &board, self_login.as_deref(), &state),
+                out_loop(&cfg, &gh, &board, &state),
+            );
+        } => {},
+        _ = shutdown_signal() => tracing::info!("shutdown signal — exiting poll loops"),
+    }
+}
+
+/// Resolve once a SIGTERM or ctrl-c arrives — the daemon's clean-shutdown trigger (so a supervisor's stop
+/// isn't a hard kill mid-write). Unix-only, matching the deploy target.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install SIGTERM handler — ctrl-c only");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = term.recv() => {},
+    }
+}
+
+/// The IN loop: each tick, scan every configured repo (per-repo cursor), sequentially — a handful of repos on
+/// the ~15s cadence stays well under GitHub's 5000/hr. A per-repo error doesn't stop the others. Runs
+/// concurrently with [`out_loop`]; the awaits yield so OUT keeps flowing.
+async fn in_loop(
+    cfg: &Config,
+    gh: &GithubClient,
+    board: &BoardClient,
+    self_login: Option<&str>,
+    state: &Mutex<State>,
+) {
     loop {
-        // IN: each configured repo scans independently (per-repo cursor), sequentially — a handful of repos
-        // on the ~15s cadence stays well under GitHub's 5000/hr. A per-repo error doesn't stop the others.
         for (repo, project_id) in cfg.ingest_targets() {
-            if let Err(e) =
-                in_tick_repo(&cfg, &gh, &board, repo, project_id, self_login.as_deref(), &mut state)
+            if let Err(e) = in_tick_repo(cfg, gh, board, repo, project_id, self_login, state).await
             {
                 tracing::warn!(error = %e, %repo, "IN tick error for repo (will retry next tick)");
             }
         }
-        if let Err(e) = out_tick(&cfg, &gh, &board, &mut state) {
-            tracing::warn!(error = %e, "OUT tick error (will retry next tick)");
-        }
-        thread::sleep(POLL_INTERVAL);
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
-/// Persist state best-effort (a write failure is logged, not fatal — a restart re-does the last idempotent
-/// step at worst).
-fn persist(cfg: &Config, state: &State) {
-    if let Err(e) = state.save(&cfg.state_dir) {
-        tracing::warn!(error = %e, "failed to persist state");
+/// The OUT loop: each tick, drain the board firehose and reflect authorized comments to GitHub. Runs
+/// concurrently with [`in_loop`].
+async fn out_loop(cfg: &Config, gh: &GithubClient, board: &BoardClient, state: &Mutex<State>) {
+    loop {
+        if let Err(e) = out_tick(cfg, gh, board, state).await {
+            tracing::warn!(error = %e, "OUT tick error (will retry next tick)");
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Persist state best-effort, OFF the runtime: the (tiny, infrequent) local file write runs on a blocking
+/// thread so it never stalls a poll loop. A write failure is logged, not fatal — a restart re-does the last
+/// idempotent step at worst.
+async fn persist(cfg: &Config, state: &State) {
+    let dir = cfg.state_dir.clone();
+    let snapshot = state.clone();
+    match tokio::task::spawn_blocking(move || snapshot.save(&dir)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to persist state"),
+        Err(e) => tracing::warn!(error = %e, "state-persist task failed to join"),
     }
 }
 
 /// Walk the current firehose to its head (first empty page) without acting — the first-run OUT cursor.
-fn initialize_firehose_head(board: &BoardClient) -> i64 {
+async fn initialize_firehose_head(board: &BoardClient) -> i64 {
     let mut since = 0i64;
     loop {
-        match board.poll_events(since, POLL_LIMIT) {
+        match board.poll_events(since, POLL_LIMIT).await {
             Ok(evs) if evs.is_empty() => return since,
             // `since_seq` is exclusive, so a non-empty page always has max > since → this terminates.
             Ok(evs) => since = evs.iter().map(|e| e.seq).max().unwrap_or(since),
@@ -117,10 +199,16 @@ fn initialize_firehose_head(board: &BoardClient) -> i64 {
 }
 
 /// Collect all pages of a paginated GitHub list (stops at the first short page, capped at [`MAX_PAGES`]).
-fn collect_pages<T>(mut fetch: impl FnMut(usize) -> Result<Vec<T>, String>) -> Result<Vec<T>, String> {
+/// `fetch` is an async page-getter — each page is awaited to completion before the next, so a borrowing
+/// closure (e.g. `|page| gh.list_issues(repo, since, page)`) is fine.
+async fn collect_pages<T, F, Fut>(mut fetch: F) -> Result<Vec<T>, String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<T>, String>>,
+{
     let mut all = Vec::new();
     for page in 1..=MAX_PAGES {
-        let batch = fetch(page)?;
+        let batch = fetch(page).await?;
         let full = batch.len() >= PER_PAGE;
         all.extend(batch);
         if !full {
@@ -134,22 +222,31 @@ fn collect_pages<T>(mut fetch: impl FnMut(usize) -> Result<Vec<T>, String>) -> R
 /// The newest `updated_at` across a batch (RFC3339 sorts lexicographically), ignoring empties — the next IN
 /// cursor. `None` when the batch has no usable timestamp.
 fn newest_timestamp(issues: &[Issue]) -> Option<String> {
-    issues.iter().map(|i| i.updated_at.clone()).filter(|s| !s.is_empty()).max()
+    issues
+        .iter()
+        .map(|i| i.updated_at.clone())
+        .filter(|s| !s.is_empty())
+        .max()
 }
 
 /// The bare GitHub login from a `github:<login>` external-author id (empty when absent — a ghost author).
 fn author_login(external_author: Option<&str>) -> &str {
-    external_author.and_then(|a| a.strip_prefix("github:")).unwrap_or("")
+    external_author
+        .and_then(|a| a.strip_prefix("github:"))
+        .unwrap_or("")
 }
 
 /// Best-effort: attach a GitHub author's login as their board external-identity display name (so readers see
 /// a clean name alongside the stable `github:<login>` key). Register-once per tick via `seen`.
-fn register_author(board: &BoardClient, login: &str, seen: &mut HashSet<String>) {
+async fn register_author(board: &BoardClient, login: &str, seen: &mut HashSet<String>) {
     if login.is_empty() || !seen.insert(login.to_string()) {
         return;
     }
     let id = github_external_author(login);
-    if let Err(e) = board.upsert_external_identity(&id, LINK_SOURCE, login) {
+    if let Err(e) = board
+        .upsert_external_identity(&id, LINK_SOURCE, login)
+        .await
+    {
         tracing::debug!(error = %e, %login, "external-identity upsert failed (non-fatal)");
     }
 }
@@ -158,16 +255,22 @@ fn register_author(board: &BoardClient, login: &str, seen: &mut HashSet<String>)
 /// by fetching the Pulls API (the `draft` flag) + the Reviews API (the latest decisive verdict). Best-effort:
 /// on any fetch error the status stays the base `Open` so a transient GitHub failure never wedges the tick or
 /// regresses a review. Only called for PRs whose 2a base status is `Open` (closed PRs are already terminal).
-fn refine_pr_open_status(gh: &GithubClient, repo: &str, number: i64) -> PrReviewStatus {
-    let draft = match gh.get_pull(repo, number) {
+async fn refine_pr_open_status(gh: &GithubClient, repo: &str, number: i64) -> PrReviewStatus {
+    let draft = match gh.get_pull(repo, number).await {
         Ok(p) => p.draft,
         Err(e) => {
             tracing::debug!(error = %e, %repo, number, "2b: get_pull failed; leaving status open");
             return PrReviewStatus::Open;
         }
     };
-    let reviews = collect_pages(|page| gh.list_pull_reviews(repo, number, page)).unwrap_or_default();
-    refine_open_status(PrReviewStatus::Open, draft, latest_review_decision(&reviews))
+    let reviews = collect_pages(|page| gh.list_pull_reviews(repo, number, page))
+        .await
+        .unwrap_or_default();
+    refine_open_status(
+        PrReviewStatus::Open,
+        draft,
+        latest_review_decision(&reviews),
+    )
 }
 
 /// IN, for ONE repo: poll its issues + comments (the issues poll returns PRs too, `state=all`). Real issues
@@ -176,17 +279,17 @@ fn refine_pr_open_status(gh: &GithubClient, repo: &str, number: i64) -> PrReview
 /// APIs into open/in_review/changes_requested, a merged PR → approved, a closed-unmerged PR → closed), its
 /// conversation comments logged to the review, and its inline diff-review comments logged as findings (2b-2).
 /// All idempotent via the board's external_links (#270 / Review entity #372). Advances this repo's cursor.
-fn in_tick_repo(
+async fn in_tick_repo(
     cfg: &Config,
     gh: &GithubClient,
     board: &BoardClient,
     repo: &str,
     project_id: i64,
     self_login: Option<&str>,
-    state: &mut State,
+    state: &Mutex<State>,
 ) -> Result<(), String> {
-    let since = state.since_for(repo).map(str::to_string);
-    let issues = collect_pages(|page| gh.list_issues(repo, since.as_deref(), page))?;
+    let since = { state.lock().unwrap().since_for(repo).map(str::to_string) };
+    let issues = collect_pages(|page| gh.list_issues(repo, since.as_deref(), page)).await?;
     if issues.is_empty() {
         return Ok(());
     }
@@ -196,33 +299,44 @@ fn in_tick_repo(
     // task id is what its comments attach to — no separate link lookup.
     let mut seen_authors = HashSet::new();
     for tc in &plan_issue_ingest(&issues, repo).creates {
-        let (task_id, created) = board.create_task(
-            project_id,
-            &tc.title,
-            &tc.description,
-            &cfg.bridge_agent,
-            tc.external_author.as_deref(),
-            &tc.issue_ref,
-        )?;
+        let (task_id, created) = board
+            .create_task(
+                project_id,
+                &tc.title,
+                &tc.description,
+                &cfg.bridge_agent,
+                tc.external_author.as_deref(),
+                &tc.issue_ref,
+            )
+            .await?;
         if created {
             tracing::info!(issue = %tc.issue_ref, task_id, "ingested GitHub issue → board task");
         }
-        register_author(board, author_login(tc.external_author.as_deref()), &mut seen_authors);
+        register_author(
+            board,
+            author_login(tc.external_author.as_deref()),
+            &mut seen_authors,
+        )
+        .await;
 
         // Sync this issue's comments (the board de-dupes each on its comment link, #270).
-        let comments =
-            collect_pages(|page| gh.list_issue_comments(repo, tc.issue_number, since.as_deref(), page))?;
+        let comments = collect_pages(|page| {
+            gh.list_issue_comments(repo, tc.issue_number, since.as_deref(), page)
+        })
+        .await?;
         for c in &comments {
-            register_author(board, &c.author, &mut seen_authors);
+            register_author(board, &c.author, &mut seen_authors).await;
         }
         for post in &plan_comment_ingest(&comments, repo, task_id, self_login).posts {
-            let created_c = board.comment_task(
-                task_id,
-                &cfg.bridge_agent,
-                &post.body,
-                post.external_author.as_deref(),
-                &post.comment_ref,
-            )?;
+            let created_c = board
+                .comment_task(
+                    task_id,
+                    &cfg.bridge_agent,
+                    &post.body,
+                    post.external_author.as_deref(),
+                    &post.comment_ref,
+                )
+                .await?;
             if created_c {
                 tracing::info!(comment = %post.comment_ref, task_id, "ingested GitHub comment → board comment");
             }
@@ -236,45 +350,56 @@ fn in_tick_repo(
         // BUILD 2b: refine an OPEN PR into draft(→open)/in_review/changes_requested via the Pulls + Reviews
         // APIs. A closed PR's 2a status is already terminal (approved/closed), so skip the extra calls.
         let status = if rc.status == PrReviewStatus::Open {
-            refine_pr_open_status(gh, repo, rc.pr_number)
+            refine_pr_open_status(gh, repo, rc.pr_number).await
         } else {
             rc.status
         };
         let status = status.as_board_status();
-        let (review_id, created) = board.create_review(
-            project_id,
-            "code",
-            &rc.title,
-            &rc.description,
-            &cfg.bridge_agent,
-            rc.external_author.as_deref(),
-            status,
-            &rc.external_id,
-        )?;
+        let (review_id, created) = board
+            .create_review(
+                project_id,
+                "code",
+                &rc.title,
+                &rc.description,
+                &cfg.bridge_agent,
+                rc.external_author.as_deref(),
+                status,
+                &rc.external_id,
+            )
+            .await?;
         if created {
             tracing::info!(pr = %rc.external_id, review_id, status, "ingested GitHub PR → board code review");
         } else {
             // Existing review: advance its status (open → in_review/changes_requested/approved/closed);
             // idempotent no-op if unchanged.
-            board.set_review_status(review_id, status)?;
+            board.set_review_status(review_id, status).await?;
         }
-        register_author(board, author_login(rc.external_author.as_deref()), &mut seen_authors);
+        register_author(
+            board,
+            author_login(rc.external_author.as_deref()),
+            &mut seen_authors,
+        )
+        .await;
 
         // Log this PR's conversation comments to the review (a PR IS an issue, so the same comments endpoint;
         // diff/review comments are BUILD 2b). The board de-dupes each on its entry link.
-        let comments =
-            collect_pages(|page| gh.list_issue_comments(repo, rc.pr_number, since.as_deref(), page))?;
+        let comments = collect_pages(|page| {
+            gh.list_issue_comments(repo, rc.pr_number, since.as_deref(), page)
+        })
+        .await?;
         for c in &comments {
-            register_author(board, &c.author, &mut seen_authors);
+            register_author(board, &c.author, &mut seen_authors).await;
         }
         for entry in &plan_pr_comment_log(&comments, repo, self_login) {
-            let appended = board.append_review_log(
-                review_id,
-                "comment",
-                &entry.body,
-                entry.external_author.as_deref(),
-                &entry.external_id,
-            )?;
+            let appended = board
+                .append_review_log(
+                    review_id,
+                    "comment",
+                    &entry.body,
+                    entry.external_author.as_deref(),
+                    &entry.external_id,
+                )
+                .await?;
             if appended {
                 tracing::info!(comment = %entry.external_id, review_id, "logged GitHub PR comment → review log");
             }
@@ -282,39 +407,52 @@ fn in_tick_repo(
 
         // Inline diff-review comments → finding-type review-log entries (BUILD 2b-2). Distinct endpoint +
         // ref namespace (owner/repo#rc<id>) from the conversation comments above; board de-dupes each.
-        let findings =
-            collect_pages(|page| gh.list_pull_review_comments(repo, rc.pr_number, since.as_deref(), page))?;
+        let findings = collect_pages(|page| {
+            gh.list_pull_review_comments(repo, rc.pr_number, since.as_deref(), page)
+        })
+        .await?;
         for c in &findings {
-            register_author(board, &c.author, &mut seen_authors);
+            register_author(board, &c.author, &mut seen_authors).await;
         }
         for entry in &plan_pr_finding_log(&findings, repo, self_login) {
-            let appended = board.append_review_log(
-                review_id,
-                "finding",
-                &entry.body,
-                entry.external_author.as_deref(),
-                &entry.external_id,
-            )?;
+            let appended = board
+                .append_review_log(
+                    review_id,
+                    "finding",
+                    &entry.body,
+                    entry.external_author.as_deref(),
+                    &entry.external_id,
+                )
+                .await?;
             if appended {
                 tracing::info!(finding = %entry.external_id, review_id, "logged GitHub PR review finding → review log");
             }
         }
     }
 
-    // Advance this repo's IN cursor forward only.
-    if let Some(newest) = newest_timestamp(&issues)
-        && state.advance_repo(repo, &newest)
-    {
-        persist(cfg, state);
+    // Advance this repo's IN cursor forward only (persist off-runtime only on a real advance).
+    if let Some(newest) = newest_timestamp(&issues) {
+        let snapshot = {
+            let mut s = state.lock().unwrap();
+            s.advance_repo(repo, &newest).then(|| s.clone())
+        };
+        if let Some(snapshot) = snapshot {
+            persist(cfg, &snapshot).await;
+        }
     }
     Ok(())
 }
 
 /// OUT: poll the board firehose and post each authorized `task.outbound_reflect` (source=github) as a comment
 /// on the linked GitHub issue, advancing the persisted firehose cursor past terminally-handled events.
-fn out_tick(cfg: &Config, gh: &GithubClient, board: &BoardClient, state: &mut State) -> Result<(), String> {
-    let cursor = state.firehose_seq.unwrap_or(0);
-    let events = board.poll_events(cursor, POLL_LIMIT)?;
+async fn out_tick(
+    cfg: &Config,
+    gh: &GithubClient,
+    board: &BoardClient,
+    state: &Mutex<State>,
+) -> Result<(), String> {
+    let cursor = { state.lock().unwrap().firehose_seq.unwrap_or(0) };
+    let events = board.poll_events(cursor, POLL_LIMIT).await?;
     if events.is_empty() {
         return Ok(());
     }
@@ -322,15 +460,13 @@ fn out_tick(cfg: &Config, gh: &GithubClient, board: &BoardClient, state: &mut St
     for post in &posts {
         let Some((repo, number)) = parse_issue_ref(&post.external_id) else {
             tracing::warn!(external_id = %post.external_id, "OUT: reflect external_id is not an issue ref — skipping past it");
-            state.firehose_seq = Some(post.event_seq); // terminal — don't wedge the queue
-            persist(cfg, state);
+            advance_firehose(cfg, state, post.event_seq).await; // terminal — don't wedge the queue
             continue;
         };
-        match gh.post_issue_comment(&repo, number, &post.body) {
+        match gh.post_issue_comment(&repo, number, &post.body).await {
             Ok(id) => {
                 tracing::info!(issue = %post.external_id, github_comment_id = id, board_comment_id = post.comment_id, "reflected board comment → GitHub issue");
-                state.firehose_seq = Some(post.event_seq);
-                persist(cfg, state);
+                advance_firehose(cfg, state, post.event_seq).await;
             }
             Err(e) => {
                 // Leave the cursor at the last success so this reflect (+ the rest) retries next tick.
@@ -340,9 +476,26 @@ fn out_tick(cfg: &Config, gh: &GithubClient, board: &BoardClient, state: &mut St
         }
     }
     // All posts terminally handled — advance past any trailing non-reflect / other-source events too.
-    if batch_max > state.firehose_seq.unwrap_or(0) {
-        state.firehose_seq = Some(batch_max);
-        persist(cfg, state);
+    let trailing = {
+        let mut s = state.lock().unwrap();
+        (batch_max > s.firehose_seq.unwrap_or(0)).then(|| {
+            s.firehose_seq = Some(batch_max);
+            s.clone()
+        })
+    };
+    if let Some(snapshot) = trailing {
+        persist(cfg, &snapshot).await;
     }
     Ok(())
+}
+
+/// Advance the firehose cursor to `seq` (forward is implicit — OUT handles events in seq order) and persist
+/// the snapshot off-runtime. Factored out so the two OUT advance sites don't hold the lock across the write.
+async fn advance_firehose(cfg: &Config, state: &Mutex<State>, seq: i64) {
+    let snapshot = {
+        let mut s = state.lock().unwrap();
+        s.firehose_seq = Some(seq);
+        s.clone()
+    };
+    persist(cfg, &snapshot).await;
 }
