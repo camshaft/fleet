@@ -19,7 +19,7 @@ mod tts;
 mod wake;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bridge::{SpokenReply, VoiceBridge};
@@ -43,13 +43,15 @@ const REPLY_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// signaled via the error callback, or a default-device latch (task-575). Generous so a slow board poll or
 /// scheduling jitter can't false-trip it.
 const CAPTURE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
-/// Startup readiness deadline (task_762). If the daemon hasn't reached "ready" within this window AND isn't
-/// legitimately waiting for an absent device, a silent init hang is assumed (observed: a post-storm restart
-/// wedging in the PipeWire/ALSA capture open — "active" but 0 frames read, no models loaded, no logs,
-/// forever) and the process hard-exits for a clean systemd restart. Generous enough to cover a cold
-/// capture-open + the wake/STT/TTS model loads + the board session; the legitimate wait-for-an-absent-mic is
-/// exempted (via `awaiting_device`) so it never crash-loops (#239).
-const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(90);
+/// Startup progress-stall deadline (task_762 + task_575). The startup watchdog fires if NO init progress is
+/// made for this long while not yet "ready". Progress = the capture retry loop iterating (its heartbeat) OR
+/// an init milestone (capture open, each model load, the board session). A genuinely-iterating wait for an
+/// absent mic keeps bumping progress, so it is never killed (survive-no-mic, #239); but a HANG — inside
+/// `open()` at startup (task_762), or after ~31 min of retries when the loop wedges (task_575 dormancy) —
+/// stalls progress and trips the watchdog -> clean exit -> systemd relaunch -> fresh enumeration reacquires.
+/// Must exceed the largest NORMAL gap between progress bumps (retry backoff caps ~5s; a single model load is
+/// tens of seconds), with margin.
+const STARTUP_STALL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The assembled engines + config + board session for one running assistant.
 struct Assistant {
@@ -80,21 +82,28 @@ pub fn run(cfg: Config) -> Result<(), String> {
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
-    // Startup readiness watchdog (task_762): a silent init hang — a post-storm restart wedging inside the
-    // PipeWire/ALSA capture open, "active" but never reaching ready — emits no error, so neither the -32
-    // storm hard-exit (#448) nor systemd `Restart=` catches it; it just sits dead forever. Arm a watchdog
-    // that forces a clean exit if we don't reach `ready` in time, so systemd relaunches a fresh process.
-    // `awaiting_device` exempts the legitimate wait-for-an-absent-mic (#239) so that path never crash-loops.
+    // Startup readiness watchdog (task_762 + task_575): a silent init hang — a post-storm restart wedging
+    // inside the PipeWire/ALSA capture open, or the retry loop going dormant after ~31 min — emits no error,
+    // so neither the -32 storm hard-exit (#448) nor systemd `Restart=` catches it; it just sits dead. Arm a
+    // watchdog that hard-exits if init progress STALLS before `ready`, so systemd relaunches a fresh process.
     let ready = Arc::new(AtomicBool::new(false));
-    let awaiting_device = Arc::new(AtomicBool::new(false));
-    spawn_startup_watchdog(ready.clone(), awaiting_device.clone());
+    // A monotonic progress heartbeat the init path bumps: each capture-retry iteration (inside
+    // open_with_retry) + each init milestone below. The watchdog fires only if it STALLS (not ready + no
+    // progress for the timeout), which catches a startup hang (task_762) and the retry-loop dormancy
+    // (task_575) while never killing a genuinely-iterating wait for an absent mic (#239).
+    let progress = Arc::new(AtomicU64::new(0));
+    spawn_startup_watchdog(ready.clone(), progress.clone());
 
     // Open capture with retry-until-present rather than a fatal `?`: the daemon must stay up and wait for
     // the mic (operator requirement #239), never crash-loop when it's absent at startup.
-    let cap = Capture::open_with_retry(&cfg.audio, Some(&*awaiting_device));
+    let cap = Capture::open_with_retry(&cfg.audio, Some(&*progress));
+    progress.fetch_add(1, Ordering::Relaxed); // capture open complete
     let wake = WakeSpotter::new(&cfg.wake, cfg.audio.sample_rate)?;
+    progress.fetch_add(1, Ordering::Relaxed); // wake model loaded
     let stt = Transcriber::new(&cfg.stt, cfg.audio.sample_rate)?;
+    progress.fetch_add(1, Ordering::Relaxed); // STT model loaded
     let tts = TtsWorker::new(&cfg.tts)?;
+    progress.fetch_add(1, Ordering::Relaxed); // TTS model loaded
 
     // Build the board session INSIDE the runtime so reqwest's client binds to this runtime; then merge
     // board-registered voice links with the static config (best-effort), and on a first run advance the
@@ -114,6 +123,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
         b
     });
+    progress.fetch_add(1, Ordering::Relaxed); // board session built
 
     // Install a graceful-shutdown flag. The default SIGTERM action (systemd stop / deploy restart) would
     // terminate abruptly with no snd_pcm_close, so the ALSA device release lags and the next instance can
@@ -149,30 +159,34 @@ pub fn run(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Arm the startup readiness watchdog (task_762). On its own thread: if the daemon hasn't set `ready` within
-/// [`STARTUP_READY_TIMEOUT`] AND isn't legitimately waiting for an absent device, assume a silent init wedge
-/// (e.g. a post-storm restart hung in the PipeWire/ALSA capture open) and hard-exit so systemd relaunches a
-/// fresh process — the same self-recovery the -32 storm hard-exit (#448) gives, for the no-error hang the
-/// storm guard and systemd both miss. Returns once `ready` is observed (startup succeeded); a no-op after.
-fn spawn_startup_watchdog(ready: Arc<AtomicBool>, awaiting_device: Arc<AtomicBool>) {
+/// Arm the startup readiness watchdog (task_762 + task_575). On its own thread it watches the `progress`
+/// heartbeat and `ready`. If `ready` isn't reached AND `progress` hasn't advanced for [`STARTUP_STALL_TIMEOUT`],
+/// a wedge is assumed and the process hard-exits so systemd relaunches a fresh one — the same self-recovery
+/// the -32 storm hard-exit (#448) gives, for the no-error hangs the storm guard and systemd both miss. An
+/// ADVANCING heartbeat (retry loop iterating, or an init milestone) is progress, so a genuine wait for an
+/// absent mic is never killed (#239); a STALL — `open()` hung at startup (task_762), or the retry loop
+/// wedged after many iterations (task_575 dormancy) — trips it. Returns once `ready`; a no-op after.
+fn spawn_startup_watchdog(ready: Arc<AtomicBool>, progress: Arc<AtomicU64>) {
     let spawned = std::thread::Builder::new()
         .name("startup-watchdog".into())
         .spawn(move || {
-            let mut deadline = Instant::now() + STARTUP_READY_TIMEOUT;
+            let mut last_progress = progress.load(Ordering::Relaxed);
+            let mut last_change = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(3));
                 if ready.load(Ordering::Relaxed) {
                     return; // reached ready — startup succeeded, watchdog stands down
                 }
-                if awaiting_device.load(Ordering::Relaxed) {
-                    // Legitimately blocked waiting for an absent/unsettled device (#239): not a wedge, so
-                    // keep pushing the deadline — the daemon may wait for the mic arbitrarily long.
-                    deadline = Instant::now() + STARTUP_READY_TIMEOUT;
-                } else if Instant::now() >= deadline {
+                let p = progress.load(Ordering::Relaxed);
+                if p != last_progress {
+                    // Init is advancing (retry loop iterating, or a milestone passed) — not a wedge.
+                    last_progress = p;
+                    last_change = Instant::now();
+                } else if last_change.elapsed() > STARTUP_STALL_TIMEOUT {
                     eprintln!(
-                        "[voice-assistant] startup wedged: not ready within {STARTUP_READY_TIMEOUT:?} and \
-                         not awaiting a device (likely a silent capture-init hang after a storm restart); \
-                         exiting for a clean systemd restart (task_762)"
+                        "[voice-assistant] startup wedged: no init progress for {STARTUP_STALL_TIMEOUT:?} and \
+                         not ready (a capture-init / retry-loop / model-load hang — e.g. open() stuck); \
+                         exiting for a clean systemd restart (task_762/task_575)"
                     );
                     std::process::exit(1);
                 }

@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -147,14 +147,15 @@ impl Capture {
     /// begin the loop the moment a device appears, instead of exiting and letting the supervisor
     /// crash-loop. Blocks until a device is open.
     ///
-    /// `awaiting_device`, when provided, is a signal for the startup readiness watchdog (task_762): we set
-    /// it TRUE whenever an open ATTEMPT returned (so we are backing off to retry a known-absent/unsettled
-    /// device) and FALSE once we return a healthy capture. The watchdog treats "awaiting_device" as progress
-    /// so it never kills a legitimate wait-for-an-absent-mic (preserving #239), yet still catches a genuine
-    /// init HANG — a hang is inside `open()` itself, which never returns, so the flag is never set and the
-    /// watchdog's stall timer fires. Pass `None` off the startup path (e.g. the mid-run reconnect), where no
-    /// watchdog is watching.
-    pub fn open_with_retry(audio: &Audio, awaiting_device: Option<&AtomicBool>) -> Self {
+    /// `heartbeat`, when provided, is the startup readiness watchdog's progress signal (task_762/task_575):
+    /// we bump it at the TOP of every retry iteration. The watchdog treats an ADVANCING heartbeat as progress
+    /// so it never kills a genuinely-iterating wait for an absent mic (preserving #239) — yet it DOES fire if
+    /// the heartbeat STALLS, catching both a hang INSIDE `open()` at startup (never returns, no bump —
+    /// task_762) AND the dormancy where the loop wedges after many iterations (task_575: ~31 min of fine
+    /// retries, then `open()` hung and the loop stopped bumping). A sticky "awaiting" bool couldn't catch the
+    /// latter (it stayed set through the hang); a heartbeat does. Pass `None` off the startup path (mid-run
+    /// reconnect), where no watchdog is watching.
+    pub fn open_with_retry(audio: &Audio, heartbeat: Option<&AtomicU64>) -> Self {
         // A freshly-opened stream must stay fault-free for this window before we trust it. The NEAR-OPEN
         // race — a successor opening a device that a SIGKILL'd predecessor never released — makes `open`
         // return Ok, then floods faults to the error callback within milliseconds. So `open` succeeding is
@@ -165,24 +166,30 @@ impl Capture {
         // storm, since an in-process reopen can't clear that fault and closing the faulted fd hangs — #448.)
         const SETTLE: Duration = Duration::from_millis(300);
         let mut backoff = Duration::ZERO;
+        let mut attempt: u64 = 0;
         loop {
+            // Bump the progress heartbeat each iteration so the startup watchdog knows this retry loop is
+            // ALIVE (not wedged inside open()); a STALLED heartbeat is exactly what trips the watchdog — that
+            // is how the task_575 dormancy (the loop hanging inside open() after many iterations) and the
+            // task_762 startup hang both self-recover (watchdog -> clean exit -> systemd relaunch).
+            if let Some(hb) = heartbeat {
+                hb.fetch_add(1, Ordering::Relaxed);
+            }
+            // Log each attempt right BEFORE open() so the journal pins where a dormancy wedges: if these lines
+            // stop while no "open failed/faulted" line follows, the hang is INSIDE open() on that attempt
+            // (task_575 root-cause instrumentation — green can't ptrace across the DynamicUser uid, so the
+            // journal is the stall-point signal). Cross-referenced with the heartbeat watchdog's self-restart.
+            attempt += 1;
+            eprintln!("[audio] capture open attempt {attempt} (opening the input device)");
             match Self::open(audio) {
                 Ok(c) => {
                     std::thread::sleep(SETTLE);
                     if c.healthy() {
-                        // Genuinely up: clear the wait signal so the watchdog resumes guarding the rest of
-                        // startup (model loads etc.) against a hang.
-                        if let Some(flag) = awaiting_device {
-                            flag.store(false, Ordering::Relaxed);
-                        }
                         return c;
                     }
                     // Opened but faulted within the grace window: an open race, not a settled device.
                     // Close the faulting stream, then back off before retrying rather than reopening in a
-                    // tight storm. We made an attempt that RETURNED, so this is a legitimate wait, not a hang.
-                    if let Some(flag) = awaiting_device {
-                        flag.store(true, Ordering::Relaxed);
-                    }
+                    // tight storm.
                     drop(c);
                     backoff = next_backoff(backoff);
                     eprintln!(
@@ -192,11 +199,6 @@ impl Capture {
                     std::thread::sleep(backoff);
                 }
                 Err(e) => {
-                    // The open attempt RETURNED an error (device absent/unsettled) — a legitimate wait, not a
-                    // hang; signal it so the startup watchdog does not mistake the wait for a wedge (#239).
-                    if let Some(flag) = awaiting_device {
-                        flag.store(true, Ordering::Relaxed);
-                    }
                     backoff = next_backoff(backoff);
                     eprintln!(
                         "[audio] capture open failed ({e}); retrying in {backoff:?} (waiting for a device)"
