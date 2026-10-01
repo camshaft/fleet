@@ -5102,8 +5102,6 @@ fn wake_audit(verbose: bool) {
 /// The `author` a nudge comment is posted as — also the marker `nudge_last_secs` searches a task's prior
 /// comments for, to find this daemon's own last nudge (the cooldown clock; #478).
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
-/// The operator's board id — an `in_progress` task assigned here is never nudged (#478 exclusion).
-const NUDGE_EXEMPT_ASSIGNEE: &str = "cameron";
 /// #540 inc2: where an unassigned-or-gone-owner stale task is ROUTED — the router that owns assignment. It is
 /// event-woken on the reassignment (task.assigned), so this needs no polling on board-pm's side.
 const NUDGE_ROUTER: &str = "board-pm";
@@ -5333,6 +5331,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     );
 
     let now = time::OffsetDateTime::now_utc();
+    // The operator's own tasks are their work queue, not a stall, so a task assigned to the operator is never
+    // nudged/routed (#478 exclusion). The operator id is a deployment-specific value read from config; absent →
+    // NO exemption (the generic case: a fleet with no designated operator). The fleet code holds no operator id.
+    let operator_id = config::get().operator_id.as_deref();
     let mut nudged = 0usize;
     let mut routed = 0usize;
     for t in &candidates {
@@ -5346,8 +5348,9 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
             .get("assignee")
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty());
-        // The operator's own tasks are never nudged/routed (#478 exclusion).
-        if assignee == Some(NUDGE_EXEMPT_ASSIGNEE) {
+        // The operator's own tasks are never nudged/routed (#478 exclusion). Only when an operator id is
+        // configured — an absent operator_id exempts no one (and must NOT skip an unassigned task here).
+        if operator_id.is_some() && assignee == operator_id {
             continue;
         }
 
@@ -5397,7 +5400,7 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         // must route/nudge on its LIVE owner, closing the read-vs-act race. Re-apply the operator exclusion on
         // the fresh value too (a task just handed to the operator must not be nudged).
         let assignee = full.get("assignee").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
-        if assignee == Some(NUDGE_EXEMPT_ASSIGNEE) {
+        if operator_id.is_some() && assignee == operator_id {
             continue;
         }
         // #540(b): a todo is only a stall once work actually STARTED on it (a real comment) — a bare untouched
