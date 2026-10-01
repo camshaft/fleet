@@ -58,7 +58,7 @@ pub struct Config {
     pub ipfs_url: String,
 
     /// Coordination-board REST base URL for the phase-2 board-driven workers (was `TB_MCP_URL`, now the REST
-    /// API not MCP). The green-resident workers reach the board on green; only the workers use it.
+    /// API not MCP). The deployed workers reach the board on the deployment host; only the workers use it.
     pub board_url: String,
 
     /// Drop-folder the `kb inbox` worker drains (was `KB_INBOX_DIR`). Each file is ingested + IPFS-pinned

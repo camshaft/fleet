@@ -13,13 +13,13 @@
 //! the cutover). IO is async `reqwest`; the CPU work (zstd decompress is tiny; embedding is heavy) keeps the
 //! embedder off the reactor via `spawn_blocking`, matching the inbox worker (#439).
 //!
-//! FIDELITY NOTES (flagged for parity verification against the Python source, which lives on green at
+//! FIDELITY NOTES (flagged for parity verification against the Python source, which lives on the deployment host at
 //! `~/Projects/camshaft/knowledge-base` and is not reachable from this host-a session):
 //! - The resolved `crate_version` from the JSON (not the requested `version`, which may be "latest") names
 //!   the collection AND is the `ver` component of the point id — so ingesting "latest" is idempotent with
 //!   ingesting the explicit version it resolves to.
 //! - The payload `url` is the rendered-docs root `https://docs.rs/<name>/<ver>/<name>/` — the form the live
-//!   Python crate_docs.py stored (confirmed by the task_237 green parity byte-match: ids + vectors + all
+//!   Python crate_docs.py stored (confirmed by the task_237 parity byte-match: ids + vectors + all
 //!   content fields incl. url match the live crate.tokio.1.53.1) and the same form pipeline.rs uses.
 
 // Ported ahead of its pipeline caller (#238); the CLI uses it now. Some helpers read as dead code until then.
@@ -203,7 +203,7 @@ fn dry_run_json(collection: &str, id: &str, vector: &[f32], payload: &Map<String
 
 /// The payload citation `url` for a crate's items: the rendered-docs root `https://docs.rs/<name>/<ver>/<name>/`,
 /// NOT the `/crate/<name>/<ver>` JSON-fetch form. This is the form the live Python crate_docs.py stored AND the
-/// form pipeline.rs's rustdoc branch uses — green-side parity (task_237) confirmed all 599 live tokio points
+/// form pipeline.rs's rustdoc branch uses — deployment-side parity (task_237) confirmed all 599 live tokio points
 /// carry it, so matching it makes crate-docs byte-identical to live (a re-ingest updates the url in place
 /// rather than clobbering it) and aligns the two docs.rs paths for the #238 reconciliation. Pure; unit-tested.
 pub(crate) fn docs_url(name: &str, crate_version: &str) -> String {
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn docs_url_is_the_rendered_docs_root_form() {
         // The LIVE form (matches Python crate_docs.py + pipeline.rs), proven byte-identical by the task_237
-        // green parity run. NOT the `/crate/<name>/<ver>` JSON-fetch form.
+        // parity run. NOT the `/crate/<name>/<ver>` JSON-fetch form.
         assert_eq!(
             docs_url("tokio", "1.53.1"),
             "https://docs.rs/tokio/1.53.1/tokio/"
