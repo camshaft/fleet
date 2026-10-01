@@ -2113,6 +2113,12 @@ enum Cmd {
         /// REMOVE the user unit this installed (the inverse of `--install`) and print the disable command.
         #[arg(long)]
         uninstall: bool,
+        /// The target host this daemon runs on, emitted as `Environment="FLEET_HOST=<host>"` (task_937 Phase A,
+        /// matching watchdog-unit/up-unit) -- the host is a generator ARGUMENT, never baked into the unit text,
+        /// so a flake-managed install passes it in and a later target-swap (Phase B) is a one-value change.
+        /// Omitted when absent (no FLEET_HOST line).
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Print the build provenance — package version + the commit the binary was built from (baked at build
     /// time). Compare the rev to `origin/main` to tell whether a deployed binary is current (a stale binary
@@ -2293,8 +2299,8 @@ fn main() {
         ),
         Cmd::UpUnit { pinned_only, interval_secs, bin, install, uninstall, host } =>
             up_unit(pinned_only, interval_secs, bin, install, uninstall, host),
-        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall } => {
-            daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall)
+        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall, host } => {
+            daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall, host)
         }
         Cmd::Version => println!("{}", version_line()),
         Cmd::Redeploy { apply } => redeploy(apply),
@@ -8628,7 +8634,8 @@ fn enable_argv(unit: &str) -> Vec<Vec<String>> {
 /// `~/.config/systemd/user/` (no sudo). `--enable`: write it AND bring it up in one shot (`daemon-reload` +
 /// `enable --now`) — the #359 launch default, so a host daemon comes up supervised rather than as a bare tmux
 /// window. `--uninstall`: remove it. `exec` is the daemon command; the built-in `notifier` defaults to
-/// `<bin> notify`, any other name requires `--exec`.
+/// `<bin> notify`, any other name requires `--exec`. `host` (task_937 Phase A) emits `FLEET_HOST`.
+#[allow(clippy::too_many_arguments)]
 fn daemon_unit(
     name: &str,
     exec: Option<String>,
@@ -8637,6 +8644,7 @@ fn daemon_unit(
     install: bool,
     enable: bool,
     uninstall: bool,
+    host: Option<String>,
 ) {
     let unit = format!("fleet-{name}.service");
     if uninstall {
@@ -8668,7 +8676,12 @@ fn daemon_unit(
             std::process::exit(1);
         }
     };
-    let body = daemon_unit_file(name, &exec, restart_sec, &captured_daemon_env());
+    // Host-parameterize like watchdog-unit/up-unit (task_937 Phase A): FLEET_HOST first (so the unit names the
+    // host it belongs to; the flake passes --host, making a Phase-B retarget a one-value change), then the
+    // captured PATH so the daemon still resolves tmux/git/curl at runtime.
+    let mut env_block = render_service_env_lines(&[("FLEET_HOST", host)]);
+    env_block.push_str(&captured_daemon_env());
+    let body = daemon_unit_file(name, &exec, restart_sec, &env_block);
     // `--enable` implies the write (it is the one-shot bring-up), so either flag lands the unit file.
     if install || enable {
         let Some(dir) = user_unit_dir() else {
@@ -10918,6 +10931,24 @@ detached
         // The captured PATH is seeded ahead of ExecStart so the daemon resolves tmux/git/curl at runtime (#347/#359).
         let env_at = u.find("Environment=\"PATH=/usr/bin:/bin\"").expect("PATH env line present");
         assert!(env_at < u.find("ExecStart=").expect("ExecStart present"), "env precedes ExecStart");
+    }
+
+    #[test]
+    fn daemon_unit_file_carries_a_declared_fleet_host_before_execstart() {
+        // task_464/task_937 Phase A: daemon-unit --host emits FLEET_HOST so tunnel/notifier are host-parameterized
+        // like watchdog-unit/up-unit — the flake passes --host and a Phase-B retarget is a one-value change. The
+        // FLEET_HOST line is seeded ahead of ExecStart alongside the captured PATH (the env_block daemon_unit builds).
+        let mut env = render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".into()))]);
+        env.push_str(&render_service_env_lines(&[("PATH", Some("/usr/bin".into()))]));
+        let u = daemon_unit_file("tunnel", "/run/fleet/bin/fleet tunnel", 2, &env);
+        assert!(u.contains("Environment=\"FLEET_HOST=dev-dsk-foo\""), "declared host emits a FLEET_HOST line");
+        assert!(
+            u.find("FLEET_HOST").unwrap() < u.find("ExecStart=").expect("ExecStart present"),
+            "FLEET_HOST must precede ExecStart"
+        );
+        // No host → no FLEET_HOST line at all (host-less default, same as watchdog-unit/up-unit).
+        let no_host = render_service_env_lines(&[("FLEET_HOST", None), ("PATH", Some("/usr/bin".into()))]);
+        assert!(!daemon_unit_file("tunnel", "x", 2, &no_host).contains("FLEET_HOST"), "no host arg → no line");
     }
 
     #[test]
