@@ -1737,6 +1737,22 @@ enum Cmd {
         #[arg(long)]
         no_fetch: bool,
     },
+    /// Safeguard-wedge check for an agent (task_582): scan its newest session transcript tail for a run of
+    /// consecutive model-turn REFUSALS (stop_reason=refusal) — the signature of a loop stuck getting rejected
+    /// by model safeguards. This is a DISTINCT failure from the idle stall the watchdog catches (a refused
+    /// agent keeps advancing last_seen, so it reads as healthy while it burns). Exit code gates a supervisor:
+    /// 0 = healthy (no trailing refusal run), 3 = WEDGED (recover via spin-down --force + spin-up), 1 = error
+    /// / no transcript. Report-only — it classifies, it does not restart.
+    SafeguardCheck {
+        /// The agent whose newest session transcript to scan.
+        agent: String,
+        /// How many consecutive trailing refusal turns constitute a wedge.
+        #[arg(long, default_value_t = 3)]
+        threshold: usize,
+        /// How many trailing transcript lines to scan for assistant turns.
+        #[arg(long, default_value_t = 80)]
+        tail: usize,
+    },
     /// Nudge stale in_progress tasks (board task #478, operator: automate what board-follow-up was missing).
     /// A task in `in_progress` whose latest activity (its `updated_at`, or a later comment) is at least
     /// `--threshold-hours` old gets a comment pinging its assignee for a progress update or ETA. Per-task
@@ -1919,6 +1935,7 @@ fn main() {
         Cmd::ServedSet { toml } => served_set(toml),
         Cmd::WakeAudit { verbose } => wake_audit(verbose),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
+        Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::NudgeStale {
             apply,
             threshold_hours,
@@ -3887,6 +3904,33 @@ fn seam_touched<'a>(changed: &'a [String], seams: &[String]) -> Vec<&'a str> {
         .collect()
 }
 
+/// The `stop_reason` of a Claude Code transcript record IF it is a completed assistant turn (`type` ==
+/// `assistant`, `message.stop_reason` present). A model-safeguard REFUSAL surfaces here as stop_reason
+/// `refusal` (verified against a live wedge — v-s2n-quic 2026-09-30, whose refused turns also carried
+/// `isApiErrorMessage:true`). Returns None for any non-assistant record or a turn with no stop_reason. Pure.
+fn assistant_stop_reason(rec: &serde_json::Value) -> Option<String> {
+    if rec.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return None;
+    }
+    rec.get("message")
+        .and_then(|m| m.get("stop_reason"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+}
+
+/// A SAFEGUARD WEDGE (task_582): the agent's loop is stuck submitting turns the model keeps REFUSING.
+/// Signature = a run of at least `threshold` consecutive `refusal` stop_reasons at the TAIL of the
+/// assistant-turn sequence (its most recent turns). This is a DISTINCT failure from the idle/no-output stall
+/// the liveness check catches: a refused agent keeps advancing `last_seen` because it is actively submitting
+/// (and getting refused), so the watchdog reads it as healthy while it burns (v-s2n-quic burned wedged until
+/// a manual spin-down+spin-up). `reasons` is the ordered assistant stop_reasons, oldest-first. Pure —
+/// unit-tested.
+fn safeguard_wedge(reasons: &[String], threshold: usize) -> bool {
+    threshold > 0
+        && reasons.len() >= threshold
+        && reasons.iter().rev().take(threshold).all(|r| r == "refusal")
+}
+
 /// True if a task carries the board's derived `monitor_exempt` flag (v-task-board #167): a genuinely
 /// continuous monitor, marked via `metadata.monitor_exempt = true` and surfaced as a top-level bool on both
 /// `list_tasks` and `get_task` (absent/false by default). A monitor-exempt task is meant to stay `in_progress`
@@ -4575,6 +4619,45 @@ fn seam_check(agent: &str, no_fetch: bool) {
         println!("  {p}");
     }
     std::process::exit(3);
+}
+
+/// task_582: scan an agent's newest session transcript tail for a safeguard wedge (see [`Cmd::SafeguardCheck`]).
+/// Locates the agent's sessions via [`transcripts::locate_sessions`], reads the last `tail` lines of the
+/// newest one, extracts the assistant-turn stop_reasons, and applies [`safeguard_wedge`]. Reports via EXIT
+/// CODE for a supervisor: 0 = healthy, 3 = WEDGED, 1 = error / no transcript. The verdict is pure
+/// ([`safeguard_wedge`] / [`assistant_stop_reason`]); this wrapper is the file IO around it.
+fn safeguard_check(agent: &str, threshold: usize, tail: usize) {
+    let sessions = transcripts::locate_sessions(agent);
+    let Some(path) = sessions.first() else {
+        eprintln!("fleet safeguard-check '{agent}': no session transcript found (nothing to scan)");
+        std::process::exit(1);
+    };
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("fleet safeguard-check '{agent}': reading {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    // Last `tail` lines, back in chronological order, parsed; assistant stop_reasons only.
+    let mut lines: Vec<&str> = content.lines().rev().take(tail).collect();
+    lines.reverse();
+    let reasons: Vec<String> = lines
+        .into_iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|rec| assistant_stop_reason(&rec))
+        .collect();
+    if safeguard_wedge(&reasons, threshold) {
+        println!(
+            "safeguard-check '{agent}': WEDGED — the last {threshold} assistant turns are all stop_reason=refusal \
+             (model-safeguard wedge; last_seen keeps advancing so the liveness check misses it). Recover with \
+             `fleet spin-down {agent} --apply --force` then `fleet spin-up {agent} --apply`."
+        );
+        std::process::exit(3);
+    }
+    let refusals = reasons.iter().filter(|r| r.as_str() == "refusal").count();
+    println!(
+        "safeguard-check '{agent}': OK — {} assistant turn(s) in the last {tail} lines, {refusals} refusal(s), no trailing run >= {threshold}",
+        reasons.len()
+    );
+    std::process::exit(0);
 }
 
 /// Match a bare SESSION ID against a set of located session files by id (`session_id_of`). Returns the file
@@ -6434,6 +6517,39 @@ mod tests {
         assert!(seam_touched(&clean, &seams).is_empty(), "no on-seam change is GREEN");
         // No declared seam -> nothing can match -> GREEN (the command treats 'no seam' separately).
         assert!(seam_touched(&changed, &[]).is_empty());
+    }
+
+    #[test]
+    fn assistant_stop_reason_reads_only_completed_assistant_turns() {
+        assert_eq!(
+            assistant_stop_reason(&serde_json::json!({"type":"assistant","message":{"stop_reason":"refusal"}})),
+            Some("refusal".to_string())
+        );
+        assert_eq!(
+            assistant_stop_reason(&serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn"}})),
+            Some("end_turn".to_string())
+        );
+        // Non-assistant records / missing stop_reason -> None (not counted as a turn).
+        assert_eq!(assistant_stop_reason(&serde_json::json!({"type":"user","message":{"stop_reason":"refusal"}})), None);
+        assert_eq!(assistant_stop_reason(&serde_json::json!({"type":"assistant","message":{"role":"assistant"}})), None);
+        assert_eq!(assistant_stop_reason(&serde_json::json!({"type":"system"})), None);
+    }
+
+    #[test]
+    fn safeguard_wedge_flags_only_a_trailing_run_of_refusals() {
+        let r = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // A trailing run of >= threshold refusals -> WEDGED.
+        assert!(safeguard_wedge(&r(&["end_turn", "refusal", "refusal", "refusal"]), 3));
+        assert!(safeguard_wedge(&r(&["refusal", "refusal"]), 2));
+        // Fewer than threshold trailing refusals -> not wedged.
+        assert!(!safeguard_wedge(&r(&["refusal", "refusal"]), 3));
+        // A refusal run that is NOT at the tail (recovered after) -> not wedged (the agent is working again).
+        assert!(!safeguard_wedge(&r(&["refusal", "refusal", "refusal", "end_turn"]), 3));
+        // Mixed tail -> not wedged.
+        assert!(!safeguard_wedge(&r(&["refusal", "tool_use", "refusal"]), 3));
+        // Empty / threshold 0 -> never wedged (no false positive on a fresh or empty transcript).
+        assert!(!safeguard_wedge(&[], 3));
+        assert!(!safeguard_wedge(&r(&["refusal", "refusal", "refusal"]), 0));
     }
 
     #[test]
