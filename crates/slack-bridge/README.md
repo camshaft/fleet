@@ -62,7 +62,7 @@ exists.
 bot_token    = "xoxb-..."     # Slack bot token (needs chat:write etc.)
 app_token    = "xapp-..."     # Slack app-level token, scope connections:write (Socket Mode)
 # channel    = "C0123ABCD"    # optional default channel
-board_api    = "http://127.0.0.1:8079/api"  # optional; default shown (green board front-door)
+board_api    = "http://127.0.0.1:8079/api"  # optional; default shown (deploy-host board front-door)
 default_to   = "concierge"    # optional; default
 bridge_agent = "slack-bridge" # optional; the board agent id this bridge posts inbound as
 state_dir    = "/var/lib/slack-bridge"  # optional; defaults to the config file's dir. Holds the firehose

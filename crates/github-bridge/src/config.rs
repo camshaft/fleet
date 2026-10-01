@@ -20,8 +20,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The localhost board REST base the firehose subscriber reads, used when the config file omits it. This is
-/// the board loopback on the green deploy host (the same base the deployed slack-bridge uses; green has no
-/// Caddy front-door): the daemon appends `/events`, `/tasks`, `/tasks/:id/comments`, `/external-links`,
+/// the board loopback on the deploy host (the same base the deployed slack-bridge uses; the deploy host has
+/// no Caddy front-door): the daemon appends `/events`, `/tasks`, `/tasks/:id/comments`, `/external-links`,
 /// `/external-identities`. Override per-environment via config `board_api`.
 const DEFAULT_BOARD_API: &str = "http://127.0.0.1:8079/api";
 /// The GitHub REST API base, used when the config omits it. Overridable so the same adapter works against a
@@ -241,7 +241,7 @@ mod tests {
         assert_eq!(cfg.state_dir, base(), "state_dir defaults to the config file's dir");
         assert_eq!(
             cfg.board_api, "http://127.0.0.1:8079/api",
-            "board_api defaults to the green board loopback"
+            "board_api defaults to the deploy-host board loopback"
         );
         assert_eq!(cfg.api_base, "https://api.github.com", "api_base defaults to public GitHub");
     }
