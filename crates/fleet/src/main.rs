@@ -1891,6 +1891,22 @@ enum Cmd {
         #[arg(long)]
         no_fetch: bool,
     },
+    /// Gated-wake tick for an at-rest MONITOR vertical (task_579): run the seam decision and, on GREEN, perform
+    /// the agent's board HEARTBEAT and exit 0 WITHOUT waking the model — so a deterministic "nothing changed"
+    /// tick costs no model turn. On CHANGED (or, fail-safe, a no-seam / error) exit 3 so a kickoff wrapper wakes
+    /// the model with the changed paths. REPORT-ONLY by default; `--apply` performs the green heartbeat. This is
+    /// an OPT-IN mechanism: committing it changes nothing until an agent's loop is switched to call it.
+    MonitorTick {
+        /// The MONITOR agent to gate-tick (reads its `metadata.seam` globs + worktree from the board).
+        agent: String,
+        /// Perform the green-path heartbeat (board set_status). Without it, report only — print the decision,
+        /// write nothing.
+        #[arg(long)]
+        apply: bool,
+        /// Skip `git fetch` and decide against the already-fetched `origin/main` (for tests / rapid re-runs).
+        #[arg(long)]
+        no_fetch: bool,
+    },
     /// Safeguard-wedge check for an agent (task_582): scan its newest session transcript tail for a run of
     /// consecutive model-turn REFUSALS (stop_reason=refusal) — the signature of a loop stuck getting rejected
     /// by model safeguards. This is a DISTINCT failure from the idle stall the watchdog catches (a refused
@@ -2103,6 +2119,7 @@ fn main() {
         Cmd::Gate { clippy_only, isolated } => gate(clippy_only, isolated),
         Cmd::WorktreeCheck { agent, verbose } => worktree_check(agent, verbose),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
+        Cmd::MonitorTick { agent, apply, no_fetch } => monitor_tick(&agent, apply, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::NudgeStale {
             apply,
@@ -5013,12 +5030,91 @@ fn set_interval(fleet: &Fleet, agent: &str, interval: &str) {
     }
 }
 
+/// The seam-gate decision for a monitor agent (task_579): what a pre-wake check concludes after ff-syncing the
+/// agent's worktree to `origin/main`. Shared by `seam-check` (reports it via exit code) and `monitor-tick`
+/// (gates the model wake + heartbeats on green) so both agree on the verdict.
+enum SeamVerdict {
+    /// No incoming commit touched the declared seam — the model turn can be skipped (synced to `head`).
+    Green { incoming: usize, seams: usize, head: String },
+    /// Incoming commits touched the seam — wake the model with these paths.
+    Changed(Vec<String>),
+    /// No `metadata.seam` declared — cannot gate; fail-safe wake.
+    NoSeam,
+    /// A git error — cannot gate; fail-safe wake (message carried).
+    Error(String),
+}
+
+/// Whether the model MUST be woken for a verdict — true unless the seam is provably GREEN. The fail-safe
+/// direction: a no-seam or an error wakes the model, never silently skipping a tick we could not gate. Pure —
+/// unit-tested.
+fn monitor_tick_wakes(verdict: &SeamVerdict) -> bool {
+    !matches!(verdict, SeamVerdict::Green { .. })
+}
+
+/// Compute the seam-gate decision for an agent from its board record: read `metadata.seam` globs + worktree,
+/// ff-sync (unless `no_fetch`) the worktree to `origin/main`, and classify the incoming diff via the pure
+/// [`seam_touched`]. A RELATIVE `metadata.worktree` is resolved against the configured hub (the fleet stores
+/// agent worktrees under the hub, so a bare `.claude/worktrees/<a>` must not be run against the process CWD).
+/// The git IO around the pure verdict; shared by seam-check + monitor-tick so both agree.
+fn seam_decision(rec: &serde_json::Value, no_fetch: bool) -> SeamVerdict {
+    let md = rec.get("metadata");
+    let seams: Vec<String> = md
+        .and_then(|m| m.get("seam"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if seams.is_empty() {
+        return SeamVerdict::NoSeam;
+    }
+    let worktree = md.and_then(|m| m.get("worktree")).and_then(|v| v.as_str()).unwrap_or(".");
+    let wt_path = {
+        let p = std::path::Path::new(worktree);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else if let Some(h) = config::get().hub.as_deref() {
+            std::path::Path::new(h).join(p)
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let git = |args: &[&str]| -> Result<String, String> {
+        let out = std::process::Command::new("git")
+            .current_dir(&wt_path)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git {args:?}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    if !no_fetch
+        && let Err(e) = git(&["fetch", "origin", "main"])
+    {
+        return SeamVerdict::Error(e);
+    }
+    // Files in commits reachable from origin/main but not HEAD = what a ff-sync would bring in.
+    let diff = match git(&["diff", "--name-only", "HEAD..origin/main"]) {
+        Ok(d) => d,
+        Err(e) => return SeamVerdict::Error(e),
+    };
+    let changed: Vec<String> =
+        diff.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    let matched = seam_touched(&changed, &seams);
+    if matched.is_empty() {
+        let head = git(&["rev-parse", "--short", "origin/main"]).unwrap_or_default().trim().to_string();
+        SeamVerdict::Green { incoming: changed.len(), seams: seams.len(), head }
+    } else {
+        SeamVerdict::Changed(matched.iter().map(|s| s.to_string()).collect())
+    }
+}
+
 /// task_579: seam-check a monitor vertical (see [`Cmd::SeamCheck`]). Reads the agent's declared seam globs +
 /// worktree from its board record, ff-syncs the worktree to `origin/main`, and reports whether any incoming
 /// commit touched the seam — via EXIT CODE so a kickoff wrapper can gate the model wake without parsing text:
 /// 0 = GREEN (heartbeat, skip the model), 3 = CHANGED (wake the model; seam paths printed), 1 = error / no
-/// seam declared. The verdict itself is [`seam_touched`] (pure, unit-tested); this wrapper is the git + board
-/// IO around it.
+/// seam declared. The verdict core is [`seam_decision`] (shared with `monitor-tick`); this wrapper maps it to
+/// seam-check's exit-code contract.
 fn seam_check(agent: &str, no_fetch: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet seam-check: {e}");
@@ -5028,57 +5124,81 @@ fn seam_check(agent: &str, no_fetch: bool) {
         eprintln!("fleet seam-check: get_agent '{agent}' failed: {e}");
         std::process::exit(1);
     });
-    let md = rec.get("metadata");
-    let seams: Vec<String> = md
-        .and_then(|m| m.get("seam"))
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    if seams.is_empty() {
-        eprintln!(
-            "fleet seam-check '{agent}': no metadata.seam globs declared — cannot gate this monitor; wake the \
-             model. Declare the vertical's seam file globs in its board metadata.seam to enable gating."
-        );
-        std::process::exit(1);
-    }
-    let worktree = md.and_then(|m| m.get("worktree")).and_then(|v| v.as_str()).unwrap_or(".");
-    let git = |args: &[&str]| -> Result<String, String> {
-        let out = std::process::Command::new("git")
-            .current_dir(worktree)
-            .args(args)
-            .output()
-            .map_err(|e| format!("git {args:?}: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    match seam_decision(&rec, no_fetch) {
+        SeamVerdict::NoSeam => {
+            eprintln!(
+                "fleet seam-check '{agent}': no metadata.seam globs declared — cannot gate this monitor; wake the \
+                 model. Declare the vertical's seam file globs in its board metadata.seam to enable gating."
+            );
+            std::process::exit(1);
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let fetch = if no_fetch { Ok(String::new()) } else { git(&["fetch", "origin", "main"]) };
-    if let Err(e) = fetch {
-        eprintln!("fleet seam-check '{agent}': {e}");
-        std::process::exit(1);
+        SeamVerdict::Error(e) => {
+            eprintln!("fleet seam-check '{agent}': {e}");
+            std::process::exit(1);
+        }
+        SeamVerdict::Green { incoming, seams, .. } => {
+            println!(
+                "seam-check '{agent}': GREEN — {incoming} incoming file(s), none on seam ({seams} glob(s)); heartbeat, do NOT wake the model"
+            );
+            std::process::exit(0);
+        }
+        SeamVerdict::Changed(matched) => {
+            println!("seam-check '{agent}': CHANGED — {} seam-touching path(s), wake the model:", matched.len());
+            for p in &matched {
+                println!("  {p}");
+            }
+            std::process::exit(3);
+        }
     }
-    // Files in commits reachable from origin/main but not HEAD = what a ff-sync would bring in.
-    let diff = git(&["diff", "--name-only", "HEAD..origin/main"]).unwrap_or_else(|e| {
-        eprintln!("fleet seam-check '{agent}': {e}");
+}
+
+/// `fleet monitor-tick <agent>` (task_579): the committed, OPT-IN gated-wake mechanism for an at-rest MONITOR
+/// vertical. It computes the seam decision ([`seam_decision`]) and, on GREEN, performs the agent's board
+/// HEARTBEAT (refreshing last-seen + a canned status) and exits 0 WITHOUT a model wake — so a deterministic
+/// "nothing changed" tick costs no model turn. On CHANGED (or, fail-safe, a no-seam / error) it prints and
+/// exits 3 so a kickoff wrapper injects a model wake with the changed paths in hand. REPORT-ONLY by default
+/// (prints what it would do, no board write); `--apply` performs the green heartbeat. DARK + OPT-IN: committing
+/// it changes nothing until an agent's loop/kickoff is switched to call it — that activation is operator-gated.
+fn monitor_tick(agent: &str, apply: bool, no_fetch: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet monitor-tick: {e}");
         std::process::exit(1);
     });
-    let changed: Vec<String> =
-        diff.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
-    let matched = seam_touched(&changed, &seams);
-    if matched.is_empty() {
-        println!(
-            "seam-check '{agent}': GREEN — {} incoming file(s), none on seam ({} glob(s)); heartbeat, do NOT wake the model",
-            changed.len(),
-            seams.len()
-        );
-        std::process::exit(0);
+    let rec = board.get_agent(agent).unwrap_or_else(|e| {
+        eprintln!("fleet monitor-tick: get_agent '{agent}' failed: {e}");
+        std::process::exit(1);
+    });
+    let status = rec.get("status").and_then(|v| v.as_str()).unwrap_or("online").to_string();
+    let verdict = seam_decision(&rec, no_fetch);
+    match &verdict {
+        SeamVerdict::Green { incoming, seams, head } => {
+            let msg = format!(
+                "MONITOR: seam green — synced to {head}, {incoming} incoming file(s), none on {seams} seam glob(s); model turn gated (skipped)"
+            );
+            if apply {
+                if let Err(e) = board.set_status(agent, &status, &msg) {
+                    eprintln!("monitor-tick '{agent}': GREEN but heartbeat set_status failed ({e}); waking the model fail-safe");
+                    std::process::exit(3);
+                }
+                println!("monitor-tick '{agent}': GREEN — heartbeat set, model NOT woken");
+            } else {
+                println!("monitor-tick '{agent}': GREEN (report-only) — would heartbeat + NOT wake the model (re-run --apply to heartbeat): {msg}");
+            }
+        }
+        SeamVerdict::Changed(matched) => {
+            println!("monitor-tick '{agent}': CHANGED — {} seam-touching path(s), WAKE the model:", matched.len());
+            for p in matched {
+                println!("  {p}");
+            }
+        }
+        SeamVerdict::NoSeam => {
+            eprintln!("monitor-tick '{agent}': no metadata.seam declared — cannot gate; WAKE the model (fail-safe). Declare metadata.seam to enable gating.");
+        }
+        SeamVerdict::Error(e) => {
+            eprintln!("monitor-tick '{agent}': {e} — cannot gate; WAKE the model (fail-safe)");
+        }
     }
-    println!("seam-check '{agent}': CHANGED — {} seam-touching path(s), wake the model:", matched.len());
-    for p in &matched {
-        println!("  {p}");
-    }
-    std::process::exit(3);
+    std::process::exit(if monitor_tick_wakes(&verdict) { 3 } else { 0 });
 }
 
 /// task_582 watchdog-scan tuning. `*_THRESHOLD` / `*_TAIL` MATCH the `Cmd::SafeguardCheck` defaults (3 / 80)
@@ -8638,6 +8758,17 @@ detached
         // Unparseable / missing packages -> empty (the handler treats empty as a hard error, never a silent pass).
         assert!(workspace_members("not json").is_empty());
         assert!(workspace_members(r#"{"other":1}"#).is_empty());
+    }
+
+    #[test]
+    fn monitor_tick_wakes_only_skips_the_model_on_green() {
+        // GREEN is the ONLY verdict that skips the model turn.
+        assert!(!monitor_tick_wakes(&SeamVerdict::Green { incoming: 0, seams: 2, head: "abc123".into() }));
+        // Everything else wakes — including the fail-safe no-seam / error cases (never silently skip a tick we
+        // could not gate).
+        assert!(monitor_tick_wakes(&SeamVerdict::Changed(vec!["crates/x/seam.rs".into()])));
+        assert!(monitor_tick_wakes(&SeamVerdict::NoSeam));
+        assert!(monitor_tick_wakes(&SeamVerdict::Error("git fetch failed".into())));
     }
 
     #[test]
