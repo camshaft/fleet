@@ -1125,7 +1125,7 @@ fn up(fleet: &Fleet, config_path: &Path, provision: bool, launch: bool) {
 /// box ([`agent_host_matches`] — unset/unpinned = managed everywhere, as today), and reports which are already
 /// running, which are intentionally stood down, and which need launching. With `--launch` it spins up each
 /// to-launch agent via the per-agent board-native launch path ([`spin_up`] with apply). Host affinity means a
-/// box brings up exactly its own declared, host-pinned agents — green's reconcile never touches dev-desk
+/// box brings up exactly its own declared, host-pinned agents — green's reconcile never touches host-a
 /// windows and vice-versa. Reads the board only (agents coordinate via their own MCP). NOTE: a hard per-agent
 /// launch failure exits (spin_up's contract), aborting the remaining launches — re-run to continue.
 fn up_board(launch: bool, pinned_only: bool) {
@@ -1692,7 +1692,7 @@ enum Cmd {
         /// The deployed commit sha (a waiter matches its awaited commit against this).
         #[arg(long)]
         sha: String,
-        /// The host the deploy landed on (e.g. `green-machine`).
+        /// The host the deploy landed on (e.g. `host-b`).
         #[arg(long)]
         host: String,
         /// The deploy outcome — `live` (succeeded) or `failed` (a waiter must STOP + escalate, not wait).
@@ -1922,7 +1922,7 @@ enum Cmd {
         #[arg(long)]
         bin: Option<String>,
         /// Drop the `--rearm --stale-only` liveness sweep from the unit — an OBSERVER-ONLY cadence
-        /// (`--observe`) that coexists with an existing rearm watchdog without double-rearming (dev-desk).
+        /// (`--observe`) that coexists with an existing rearm watchdog without double-rearming (host-a).
         #[arg(long)]
         no_rearm: bool,
         /// Include `--self-redeploy` (#388): the installed watchdog rebuilds + restarts the daemons when this
@@ -6524,7 +6524,7 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
 /// The watchdog invocation a cadence unit runs: the liveness sweep (`--rearm --stale-only`) when `rearm`, plus
 /// the observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. An
 /// OBSERVER-ONLY unit (`rearm=false, observe=true` → `watchdog --observe --spawn`) can run alongside an
-/// existing rearm watchdog without double-rearming — the dev-desk coexistence case. Pure — unit-tested.
+/// existing rearm watchdog without double-rearming — the host-a coexistence case. Pure — unit-tested.
 fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool, self_redeploy: bool) -> String {
     let mut args = String::from("watchdog");
     if rearm {
@@ -6644,7 +6644,7 @@ fn user_unit_dir() -> Option<std::path::PathBuf> {
 /// the declarative/nix model translates the text). `--install`: WRITE it into `~/.config/systemd/user/`
 /// (user-level, no sudo) for a host not on that model — a clean, reversible path. `--uninstall`: remove it.
 /// `rearm=false` (`--no-rearm`) installs an OBSERVER-ONLY unit that coexists with an existing rearm watchdog
-/// (the dev-desk go-live: the system rearm service is left untouched, no sudo needed). `bin` defaults to this
+/// (the host-a go-live: the system rearm service is left untouched, no sudo needed). `bin` defaults to this
 /// binary's absolute path.
 #[allow(clippy::too_many_arguments)]
 fn watchdog_unit(
@@ -8078,8 +8078,8 @@ mod tests {
         assert!(p.get("repos").is_none());
         assert_eq!(p["interval"], "30m");
         // host set, and "" clears the pin (JSON null)
-        let p = build_meta_patch(&[], None, Some("green-machine"), None, None).unwrap();
-        assert_eq!(p["host"], "green-machine");
+        let p = build_meta_patch(&[], None, Some("host-b"), None, None).unwrap();
+        assert_eq!(p["host"], "host-b");
         let p = build_meta_patch(&[], None, Some(""), None, None).unwrap();
         assert_eq!(p["host"], serde_json::Value::Null, "empty host clears the pin");
         // native: tri-state — Some(true)/Some(false) emit the bool; None omits the key entirely
@@ -8101,17 +8101,17 @@ mod tests {
     #[test]
     fn agent_host_matches_honors_pin_and_treats_unset_as_run_anywhere() {
         // unpinned (no host / null / empty) → managed everywhere
-        assert!(agent_host_matches(Some(&serde_json::json!({})), "dev-desk"));
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":null})), "dev-desk"));
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":""})), "dev-desk"));
-        assert!(agent_host_matches(None, "dev-desk"));
+        assert!(agent_host_matches(Some(&serde_json::json!({})), "host-a"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":null})), "host-a"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":""})), "host-a"));
+        assert!(agent_host_matches(None, "host-a"));
         // string pin: matches only its host
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":"green-machine"})), "green-machine"));
-        assert!(!agent_host_matches(Some(&serde_json::json!({"host":"green-machine"})), "dev-desk"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":"host-b"})), "host-b"));
+        assert!(!agent_host_matches(Some(&serde_json::json!({"host":"host-b"})), "host-a"));
         // array pin: matches if listed; empty array = unpinned
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
-        assert!(!agent_host_matches(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":["host-b","host-a"]})), "host-a"));
+        assert!(!agent_host_matches(Some(&serde_json::json!({"host":["host-b"]})), "host-a"));
+        assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "host-a"));
     }
 
     #[test]
@@ -8147,7 +8147,7 @@ mod tests {
             watchdog_exec_args(true, true, true, false),
             "watchdog --rearm --stale-only --observe --spawn --pinned-only"
         );
-        // OBSERVER-ONLY (rearm=false): coexists with an existing rearm watchdog without double-rearming (dev-desk).
+        // OBSERVER-ONLY (rearm=false): coexists with an existing rearm watchdog without double-rearming (host-a).
         assert_eq!(watchdog_exec_args(false, true, false, false), "watchdog --observe --spawn");
         // --self-redeploy (#388) appends last: a local-checkout host installs the self-healing watchdog.
         assert_eq!(
@@ -8174,50 +8174,50 @@ mod tests {
     #[test]
     fn classify_observe_coverage_flags_the_host_local_blind_spot() {
         use serde_json::json;
-        let dev = ObserveCadence { host: "dev-desk".to_string(), pinned_only: false };
-        let green = ObserveCadence { host: "green".to_string(), pinned_only: true };
+        let dev = ObserveCadence { host: "host-a".to_string(), pinned_only: false };
+        let green = ObserveCadence { host: "host-b".to_string(), pinned_only: true };
 
-        // task_711: a green-pinned agent, with ONLY dev-desk observing, is covered by nobody → BLIND.
-        let green_pinned = json!({"host": "green"});
+        // task_711: an agent pinned to host-b, with ONLY host-a observing, is covered by nobody → BLIND.
+        let green_pinned = json!({"host": "host-b"});
         assert_eq!(
-            classify_observe_coverage(Some(&green_pinned), std::slice::from_ref(&dev), "dev-desk", None),
+            classify_observe_coverage(Some(&green_pinned), std::slice::from_ref(&dev), "host-a", None),
             ObserveCoverage::Blind
         );
         // Add green's pinned-only cadence and the SAME agent becomes covered (assumed — green is not the local
         // host, so transcript presence is not probed here).
         assert_eq!(
-            classify_observe_coverage(Some(&green_pinned), &[dev.clone(), green.clone()], "dev-desk", None),
+            classify_observe_coverage(Some(&green_pinned), &[dev.clone(), green.clone()], "host-a", None),
             ObserveCoverage::CoveredAssumed
         );
 
         // An agent managed by the LOCAL cadence: transcript present → verified; absent → soft gap.
-        let dev_pinned = json!({"host": "dev-desk"});
+        let dev_pinned = json!({"host": "host-a"});
         assert_eq!(
-            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "dev-desk", Some(true)),
+            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "host-a", Some(true)),
             ObserveCoverage::CoveredLocalTranscript
         );
         assert_eq!(
-            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "dev-desk", Some(false)),
+            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "host-a", Some(false)),
             ObserveCoverage::ManagedNoLocalTranscript
         );
 
         // An UNPINNED agent is covered by the non-pinned local cadence (transcript present here).
         let unpinned = json!({});
         assert_eq!(
-            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&dev), "dev-desk", Some(true)),
+            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&dev), "host-a", Some(true)),
             ObserveCoverage::CoveredLocalTranscript
         );
         // ...but if EVERY declared cadence is pinned-only, an unpinned agent is served by none → BLIND.
         assert_eq!(
-            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&green), "dev-desk", None),
+            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&green), "host-a", None),
             ObserveCoverage::Blind
         );
 
         // A STAGED agent is managed by no cadence (watchdog_manages_agent returns false) → BLIND here, though
         // the handler excludes it upstream via agent_expected_running, so it never reaches this classifier.
-        let staged = json!({"host": "dev-desk", "staged": true});
+        let staged = json!({"host": "host-a", "staged": true});
         assert_eq!(
-            classify_observe_coverage(Some(&staged), std::slice::from_ref(&dev), "dev-desk", None),
+            classify_observe_coverage(Some(&staged), std::slice::from_ref(&dev), "host-a", None),
             ObserveCoverage::Blind
         );
     }
@@ -8231,8 +8231,8 @@ mod tests {
         assert_eq!(host_pin_display(Some(&json!({"host": ""}))), "unpinned");
         assert_eq!(host_pin_display(Some(&json!({"host": "  "}))), "unpinned");
         assert_eq!(host_pin_display(Some(&json!({"host": []}))), "unpinned");
-        assert_eq!(host_pin_display(Some(&json!({"host": "green"}))), "green");
-        assert_eq!(host_pin_display(Some(&json!({"host": ["green", "dev-desk"]}))), "[green, dev-desk]");
+        assert_eq!(host_pin_display(Some(&json!({"host": "host-b"}))), "host-b");
+        assert_eq!(host_pin_display(Some(&json!({"host": ["host-b", "host-a"]}))), "[host-b, host-a]");
     }
 
     #[test]
@@ -8320,7 +8320,7 @@ detached
 
     #[test]
     fn execstart_is_nix_store_detects_a_nix_managed_unit() {
-        // systemctl show renders the resolved exec; a /nix/store path = nix-managed (the dev-desk after task_717).
+        // systemctl show renders the resolved exec; a /nix/store path = nix-managed (the host-a after task_717).
         assert!(execstart_is_nix_store(
             "ExecStart={ path=/nix/store/abc123-fleet-0.0.0/bin/fleet ; argv[]=/nix/store/abc123-fleet-0.0.0/bin/fleet watchdog ; ignore_errors=no }"
         ));
@@ -8407,7 +8407,7 @@ detached
 
     #[test]
     fn watchdog_unit_files_splits_service_and_timer_cleanly() {
-        // Observer-only exec, for the dev-desk coexistence install.
+        // Observer-only exec, for the host-a coexistence install.
         let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false, false), 90, "");
         // The service file has the oneshot + ExecStart, NO timer/header lines.
         assert!(service.contains("Type=oneshot"));
@@ -8475,17 +8475,17 @@ detached
 
     #[test]
     fn watchdog_manages_agent_uses_strict_pin_only_under_pinned_only() {
-        let green = serde_json::json!({ "host": "green-machine" });
+        let green = serde_json::json!({ "host": "host-b" });
         let unpinned = serde_json::json!({});
         // Default (loose): this-host-pinned OR unpinned are managed here.
-        assert!(watchdog_manages_agent(Some(&green), "green-machine", false));
-        assert!(watchdog_manages_agent(Some(&unpinned), "green-machine", false), "unpinned managed everywhere by default");
-        assert!(!watchdog_manages_agent(Some(&green), "dev-desk", false), "other-box pin never managed here");
+        assert!(watchdog_manages_agent(Some(&green), "host-b", false));
+        assert!(watchdog_manages_agent(Some(&unpinned), "host-b", false), "unpinned managed everywhere by default");
+        assert!(!watchdog_manages_agent(Some(&green), "host-a", false), "other-box pin never managed here");
         // --pinned-only: ONLY agents explicitly pinned here — unpinned run-anywhere agents are excluded, so a
         // secondary box never re-arms/observes an agent whose window/transcript is on another box.
-        assert!(watchdog_manages_agent(Some(&green), "green-machine", true));
-        assert!(!watchdog_manages_agent(Some(&unpinned), "green-machine", true), "unpinned EXCLUDED under --pinned-only");
-        assert!(!watchdog_manages_agent(Some(&green), "dev-desk", true));
+        assert!(watchdog_manages_agent(Some(&green), "host-b", true));
+        assert!(!watchdog_manages_agent(Some(&unpinned), "host-b", true), "unpinned EXCLUDED under --pinned-only");
+        assert!(!watchdog_manages_agent(Some(&green), "host-a", true));
     }
 
     #[test]
@@ -8501,26 +8501,26 @@ detached
     fn watchdog_never_manages_a_staged_agent() {
         // A staged reserve helper is not meant to be running, so the watchdog must never re-arm or observe it —
         // even when it is native + pinned to this exact box (which would otherwise be managed).
-        let staged_here = serde_json::json!({ "host": "green-machine", "staged": true });
-        assert!(!watchdog_manages_agent(Some(&staged_here), "green-machine", false));
-        assert!(!watchdog_manages_agent(Some(&staged_here), "green-machine", true));
+        let staged_here = serde_json::json!({ "host": "host-b", "staged": true });
+        assert!(!watchdog_manages_agent(Some(&staged_here), "host-b", false));
+        assert!(!watchdog_manages_agent(Some(&staged_here), "host-b", true));
     }
 
     #[test]
     fn agent_host_is_explicit_requires_a_deliberate_pin_to_this_box() {
         // EXPLICIT pin → true only for the named box (this is the --pinned-only launch predicate).
-        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":"green-machine"})), "green-machine"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":"green-machine"})), "dev-desk"));
-        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":["green-machine","dev-desk"]})), "dev-desk"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":["green-machine"]})), "dev-desk"));
+        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":"host-b"})), "host-b"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":"host-b"})), "host-a"));
+        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":["host-b","host-a"]})), "host-a"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":["host-b"]})), "host-a"));
         // UNPINNED (unset / null / empty string / empty array) → FALSE — the key difference from
         // agent_host_matches: an unpinned run-anywhere agent is NOT an explicit launch candidate here, so a
         // second box's --pinned-only reconcile won't double-launch it.
-        assert!(!agent_host_is_explicit(None, "dev-desk"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({})), "dev-desk"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":null})), "dev-desk"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":""})), "dev-desk"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":[]})), "dev-desk"));
+        assert!(!agent_host_is_explicit(None, "host-a"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({})), "host-a"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":null})), "host-a"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":""})), "host-a"));
+        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":[]})), "host-a"));
     }
 
     #[test]
@@ -8544,8 +8544,8 @@ detached
         // Board roster: two unpinned, one pinned here, one pinned elsewhere.
         let agents = vec![
             ("v-a".to_string(), Some(serde_json::json!({}))),
-            ("v-b".to_string(), Some(serde_json::json!({"host": "dev-desk"}))),
-            ("v-elsewhere".to_string(), Some(serde_json::json!({"host": "green-machine"}))),
+            ("v-b".to_string(), Some(serde_json::json!({"host": "host-a"}))),
+            ("v-elsewhere".to_string(), Some(serde_json::json!({"host": "host-b"}))),
             ("v-nometa".to_string(), None),
         ];
         // tmux windows: some agents, plus daemon/scratch windows that are NOT board agents, plus a board
@@ -8553,7 +8553,7 @@ detached
         let windows = vec![
             "v-a".to_string(),
             "v-b".to_string(),
-            "v-elsewhere".to_string(), // pinned to green-machine → dropped even though a window exists here
+            "v-elsewhere".to_string(), // pinned to host-b → dropped even though a window exists here
             "v-nometa".to_string(),
             "notify".to_string(),   // a daemon window, not a board agent → dropped
             "scratch".to_string(),  // not a board agent → dropped
@@ -8561,11 +8561,11 @@ detached
         // A board agent with NO window here (v-c) must also be absent (nothing to wake on this host).
         let mut with_windowless = agents.clone();
         with_windowless.push(("v-c".to_string(), Some(serde_json::json!({}))));
-        let served = derive_served_set(&windows, &with_windowless, "dev-desk");
+        let served = derive_served_set(&windows, &with_windowless, "host-a");
         assert_eq!(served, vec!["v-a", "v-b", "v-nometa"], "window∩board, minus off-host pins and non-agents");
         // sorted + deduped even if the board lists a duplicate id
         let dupe = vec![("v-a".to_string(), None), ("v-a".to_string(), None)];
-        assert_eq!(derive_served_set(&["v-a".to_string()], &dupe, "dev-desk"), vec!["v-a"]);
+        assert_eq!(derive_served_set(&["v-a".to_string()], &dupe, "host-a"), vec!["v-a"]);
     }
 
     #[test]
@@ -8975,13 +8975,13 @@ detached
     #[test]
     fn deploy_event_body_is_parseable_with_upper_status() {
         assert_eq!(
-            deploy_event_body("camshaft/task-board", "abc123", "green-machine", "live"),
-            "deploy camshaft/task-board@abc123 → green-machine: LIVE"
+            deploy_event_body("camshaft/task-board", "abc123", "host-b", "live"),
+            "deploy camshaft/task-board@abc123 → host-b: LIVE"
         );
         // status is upper-cased + trimmed so a waiter keys on LIVE vs FAILED regardless of caller casing.
         assert_eq!(
-            deploy_event_body("o/r", "deadbeef", "green-machine", " failed "),
-            "deploy o/r@deadbeef → green-machine: FAILED"
+            deploy_event_body("o/r", "deadbeef", "host-b", " failed "),
+            "deploy o/r@deadbeef → host-b: FAILED"
         );
     }
 

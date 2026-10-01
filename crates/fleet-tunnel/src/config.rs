@@ -240,8 +240,8 @@ mod tests {
     fn full_config_parses() {
         let cfg = Config::from_toml_str(
             r#"
-            board_ws = "wss://green-machine.camshaft.dev/tunnel/ws"
-            host_id = "dev-desk"
+            board_ws = "wss://host-b.camshaft.dev/tunnel/ws"
+            host_id = "host-a"
             agents = ["a", "b", "c"]
             token = "sekret"
             upstream = "http://127.0.0.1:9000/"
@@ -250,7 +250,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.host_id_or_hostname(), "dev-desk");
+        assert_eq!(cfg.host_id_or_hostname(), "host-a");
         assert_eq!(cfg.agents, vec!["a", "b", "c"]);
         assert_eq!(cfg.token.as_deref(), Some("sekret"));
         // trailing slash trimmed so `path` (which starts with /) appends cleanly.

@@ -887,7 +887,7 @@ mod tests {
             "the chunk text",
             2,
             "bafkreicid",
-            "http://green-machine.lan:8080/ipfs/bafkreicid",
+            "http://host-b.lan:8080/ipfs/bafkreicid",
         );
         assert_eq!(pl["text"], "the chunk text");
         assert_eq!(pl["chunk"], 2);
@@ -898,7 +898,7 @@ mod tests {
         assert_eq!(pl["ipfs_cid"], "bafkreicid");
         assert_eq!(
             pl["ipfs_url"],
-            "http://green-machine.lan:8080/ipfs/bafkreicid"
+            "http://host-b.lan:8080/ipfs/bafkreicid"
         );
         // base_payload curation defaults are present (authority derived from kind, status active).
         assert_eq!(pl["status"], "active");

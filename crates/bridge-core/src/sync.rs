@@ -275,7 +275,7 @@ mod tests {
         let post = plan_inbound(
             "voice-1",
             "voice",
-            "cameron",
+            "operator",
             "hey assistant",
             None,
             "voice-bridge",
@@ -284,7 +284,7 @@ mod tests {
         .expect("mapped");
         assert_eq!(post.board_channel_id, 88);
         assert_eq!(post.body["sender"], "voice-bridge");
-        assert_eq!(post.body["external_author"], "voice:cameron");
+        assert_eq!(post.body["external_author"], "voice:operator");
     }
 
     #[test]
@@ -312,6 +312,6 @@ mod tests {
     #[test]
     fn external_author_is_stable_source_prefixed() {
         assert_eq!(external_author("slack", "U0ABC"), "slack:U0ABC");
-        assert_eq!(external_author("voice", "cameron"), "voice:cameron");
+        assert_eq!(external_author("voice", "operator"), "voice:operator");
     }
 }

@@ -14,7 +14,7 @@
 //! embedder off the reactor via `spawn_blocking`, matching the inbox worker (#439).
 //!
 //! FIDELITY NOTES (flagged for parity verification against the Python source, which lives on green at
-//! `~/Projects/camshaft/knowledge-base` and is not reachable from this dev-dsk session):
+//! `~/Projects/camshaft/knowledge-base` and is not reachable from this host-a session):
 //! - The resolved `crate_version` from the JSON (not the requested `version`, which may be "latest") names
 //!   the collection AND is the `ver` component of the point id — so ingesting "latest" is idempotent with
 //!   ingesting the explicit version it resolves to.

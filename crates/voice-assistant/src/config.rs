@@ -346,14 +346,14 @@ mod tests {
         let cfg = parse(
             r#"
             [board]
-            speaker = "cameron"
+            speaker = "operator"
 
             [audio]
             vad_rms = 700.0
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.board.speaker, "cameron");
+        assert_eq!(cfg.board.speaker, "operator");
         // untouched keys in a present table keep their defaults
         assert_eq!(cfg.board.bridge_agent, "voice-bridge");
         assert_eq!(cfg.audio.vad_rms, 700.0);
@@ -380,7 +380,7 @@ mod tests {
             [board]
             board_api = "http://board.local/api"
             bridge_agent = "vb"
-            speaker = "cameron"
+            speaker = "operator"
             voice_channel = "voice:green"
             state_dir = "/var/lib/voice-assistant"
             [[board.channel_map]]
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(cfg.tts.speaker_id, 24);
         assert_eq!(cfg.board.board_api, "http://board.local/api");
         assert_eq!(cfg.board.bridge_agent, "vb");
-        assert_eq!(cfg.board.speaker, "cameron");
+        assert_eq!(cfg.board.speaker, "operator");
         assert_eq!(cfg.board.voice_channel, "voice:green");
         assert_eq!(cfg.board.state_dir, PathBuf::from("/var/lib/voice-assistant"));
         assert_eq!(cfg.board.channel_map.len(), 1);
