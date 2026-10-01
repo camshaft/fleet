@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use crate::board::{Board, Task};
+use crate::board::{self, Board, Task};
 use crate::ipfs::Ipfs;
 use crate::store::Store;
 use crate::webhook::{self, BusySet};
@@ -584,7 +584,7 @@ pub async fn run_role(role: &str) -> Result<(), String> {
             ));
         }
     };
-    let board = Arc::new(Board::connect(role));
+    let board = Arc::new(board::connect(role));
     let ipfs = Arc::new(Ipfs::connect());
     let busy = BusySet::new();
 

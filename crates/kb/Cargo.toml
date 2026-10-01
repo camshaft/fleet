@@ -52,6 +52,9 @@ ort-sys = "=2.0.0-rc.9"
 # runtime (#439). `reqwest` is the workspace's async client (bridge-core uses the same version/features), so
 # adding it here pulls no new tree. rustls-tls matches bridge-core; localhost traffic is plain http.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# The shared non-session-daemon board task/agent client (task_355) — board.rs is now a thin config-aware
+# shim over bridge_core::task_client.
+bridge-core = { path = "../bridge-core" }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: payloads round-trip through Qdrant without silently reordering an agent's fields.
 serde_json = { version = "1", features = ["preserve_order"] }

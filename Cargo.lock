@@ -2067,6 +2067,7 @@ name = "kb"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bridge-core",
  "clap",
  "fastembed",
  "image",

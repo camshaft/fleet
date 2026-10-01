@@ -24,6 +24,10 @@
 //! - [`echo`] — a board-origin marker ([`echo::mark_board_origin`] / [`echo::is_board_origin`]): stamp every
 //!   reflected outbound message so the inbound poller drops it and the bridge never re-ingests its own posts
 //!   (#430 echo-loop suppression).
+//! - [`task_client`] — the shared TASK/AGENT REST surface (task_355): register-or-upsert with an optional
+//!   `webhook_url`, subscribe to a project, and task CRUD. Complements [`board::BoardClient`] (the
+//!   channel/firehose surface) — any non-session daemon needs this regardless of whether it bridges a
+//!   channel. Extracted from the `kb` ingest workers so a future daemon port does not re-derive it.
 //!
 //! Source-agnostic on purpose: `external_author = "<source>:<id>"` (e.g. `slack:U123`, `voice:<speaker>`),
 //! and the external channel is an opaque `String`. Slack-, voice-, or GitHub-specifics live in the
@@ -37,6 +41,7 @@ pub mod relay;
 pub mod resolver;
 pub mod sse;
 pub mod sync;
+pub mod task_client;
 
 pub use board::{
     BoardChannel, BoardClient, Event, LINK_KIND_CHANNEL, LINK_SOURCE, OUTBOUND_REFLECT,
@@ -52,3 +57,4 @@ pub use relay::{
 pub use resolver::{ChannelLink, ChannelMap};
 pub use sse::{SseDecoder, SseFrame};
 pub use sync::{InboundPost, OutboundPost, external_author, plan_inbound, plan_outbound};
+pub use task_client::{Board as TaskBoard, Task as BoardTask};
