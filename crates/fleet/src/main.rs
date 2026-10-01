@@ -1667,6 +1667,13 @@ enum Cmd {
         /// opts in via its watchdog unit's `ExecStart` so an auto-restart of the daemons is never a surprise.
         #[arg(long)]
         self_redeploy: bool,
+        /// Reap STALE/leaked observer windows (task_610): an `obs-<target>` tmux window still alive long after a
+        /// healthy observation would have finished — a crashed/hung observer that never reached `observe-record`
+        /// (so it never self-closed), leaking a live model process. OPT-IN so merely shipping this never
+        /// auto-reaps currently-held windows; a window with a RECENT spawn stamp (a healthy in-flight observer)
+        /// is never touched. Honors `--dry-run`: with it, report what WOULD be reaped without killing.
+        #[arg(long)]
+        reap_stale_observers: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -2085,7 +2092,8 @@ fn main() {
             dry_run,
             pinned_only,
             self_redeploy,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy),
+            reap_stale_observers,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -3788,6 +3796,30 @@ fn observe_on_spawn_cooldown(last_spawn: Option<u64>, now: u64, cooldown: u64) -
     last_spawn.is_some_and(|last| now.saturating_sub(last) < cooldown)
 }
 
+/// Reap bound (task_610): an `obs-<target>` window still alive this long after its spawn is a stuck/leaked
+/// observer — a healthy observation of even a large transcript completes well within it, and a completed one
+/// self-closes. `CDZ_OBSERVE_REAP_STALE_SECS` overrides. Comfortably longer than [`OBSERVE_SPAWN_COOLDOWN_SECS`]
+/// so an in-flight observer is never reaped mid-observation.
+const OBSERVE_REAP_STALE_SECS: u64 = 3600; // 1h
+
+/// The per-target observer tmux window name (local only; the board identity stays `observer`). The target's
+/// `/`, `:`, `.` are mangled to `-` so it is a valid single-token window name. Pure — unit-tested.
+fn obs_window_name(target: &str) -> String {
+    format!("obs-{}", target.replace(['/', ':', '.'], "-"))
+}
+
+/// Whether an `obs-<target>` window that is STILL ALIVE should be reaped (task_610). A healthy in-flight
+/// observer has a RECENT spawn stamp (< bound) → never reaped. A stamp older than the bound = the observer
+/// never confirmed (`observe-record` clears the stamp on success), so it crashed/hung → reap. An ABSENT stamp
+/// on a still-open window = the observation already confirmed (stamp cleared) but the window lingered (its
+/// self-close was missed) → also reap; nothing in-flight is lost in either reap case. Pure — unit-tested.
+fn observer_window_is_stale(spawn_stamp: Option<u64>, now: u64, reap_bound: u64) -> bool {
+    match spawn_stamp {
+        None => true,
+        Some(s) => now.saturating_sub(s) >= reap_bound,
+    }
+}
+
 /// The board project that holds the fleet-self-improve lane — observation tasks and their proposal children
 /// (#28). An observation task is the parent; each proposal the observer files is a child, so the lane reads
 /// as a tree and child_rollup counts "proposals from this observation" (#290).
@@ -3989,7 +4021,7 @@ fn spawn_observer(
         build_observer_kickoff(target, obs_session, since_offset, &role_path, &fleet_bin, observation_task);
     // A per-target tmux window (local only — the BOARD identity stays `observer`), so several observations
     // can run at once without a name clash.
-    let window = format!("obs-{}", target.replace(['/', ':', '.'], "-"));
+    let window = obs_window_name(target);
     if dry_run {
         return format!("would-spawn({window}←{obs_session}:{since_offset})");
     }
@@ -4135,6 +4167,7 @@ fn rearm_candidate(
 /// A board that is unreachable does NOT abort the watchdog: the board dimension is skipped with a warning
 /// and the FILE-HUB scan still runs. That resilience is the point — a flaky board is exactly when file-hub
 /// agents (which have NO board delivery) most need the poll, so their liveness must not hinge on it.
+#[allow(clippy::too_many_arguments)]
 fn watchdog(
     stale_only: bool,
     rearm: bool,
@@ -4143,6 +4176,7 @@ fn watchdog(
     spawn_dry_run: bool,
     pinned_only: bool,
     self_redeploy: bool,
+    reap_stale_observers: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -4176,7 +4210,7 @@ fn watchdog(
     let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only);
+            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers);
             native_ids
         }
         Err(e) => {
@@ -4462,6 +4496,7 @@ fn watchdog_board(
     spawn: bool,
     spawn_dry_run: bool,
     pinned_only: bool,
+    reap_stale_observers: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
@@ -4822,6 +4857,53 @@ fn watchdog_board(
         }
         if spawn {
             observe_spawn_pass(board, &fleet, &session, &mut obs, now_unix, spawn_dry_run);
+        }
+    }
+    // task_610 reaper: kill STALE/leaked observer windows. A crashed/hung observer never reaches observe-record,
+    // so it never self-closes — leaking a live model process (30 accumulated in the filed snapshot). A healthy
+    // in-flight observer has a RECENT spawn stamp and is left untouched; one whose stamp is old (crashed) or
+    // absent (confirmed but the self-close was missed) is reaped. Opt-in (--reap-stale-observers) so merely
+    // shipping this never auto-reaps; honors --dry-run (report what WOULD be reaped). Roster-driven, so the
+    // target↔stamp↔window mapping is unambiguous. The re-observation-cost half (watermark durability) is the
+    // task_610 follow-up increment; this closes the leaked-process half.
+    if reap_stale_observers {
+        let reap_bound = std::env::var("CDZ_OBSERVE_REAP_STALE_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(OBSERVE_REAP_STALE_SECS);
+        let live: std::collections::BTreeSet<String> = tmux_window_names(&session).into_iter().collect();
+        let (mut reaped, mut stale_seen) = (0usize, 0usize);
+        for a in agents {
+            let Some(id) = a.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let window = obs_window_name(id);
+            if !live.contains(&window) {
+                continue;
+            }
+            // A recent spawn stamp = a healthy in-flight observer → never reaped.
+            if !observer_window_is_stale(read_observe_spawn_stamp(&fleet, id), now_unix, reap_bound) {
+                continue;
+            }
+            stale_seen += 1;
+            if spawn_dry_run {
+                println!("-- reap: obs window {window} is STALE — would kill-window (dry-run)");
+            } else {
+                match std::process::Command::new("tmux").args(["kill-window", "-t", &window]).status() {
+                    Ok(s) if s.success() => {
+                        reaped += 1;
+                        println!("-- reap: killed STALE obs window {window} (leaked observer — never reached observe-record)");
+                    }
+                    _ => eprintln!("-- reap: kill-window {window} FAILED (remove it manually if it lingers)"),
+                }
+            }
+        }
+        if stale_seen == 0 {
+            println!("-- reap: no stale observer windows (every obs-* window is a healthy in-flight observer, or none exist)");
+        } else if spawn_dry_run {
+            println!("-- reap: {stale_seen} stale observer window(s) WOULD be reaped (re-run without --dry-run to kill)");
+        } else {
+            println!("-- reap: {reaped}/{stale_seen} stale observer window(s) killed");
         }
     }
 }
@@ -9780,6 +9862,28 @@ detached
         assert!(!observe_on_spawn_cooldown(Some(8_000), 10_000, 1800), "2000s ≥ 1800 → lapsed");
         // saturating: a future stamp (clock skew) is treated as just-spawned → on cooldown, never underflows.
         assert!(observe_on_spawn_cooldown(Some(11_000), 10_000, 1800));
+    }
+
+    #[test]
+    fn observer_window_is_stale_spares_a_recent_in_flight_observer_only() {
+        let bound = 3600;
+        // Recent stamp (a healthy in-flight observer) → NOT stale, never reaped.
+        assert!(!observer_window_is_stale(Some(10_000), 10_500, bound), "500s < 3600 → in-flight, spare it");
+        assert!(!observer_window_is_stale(Some(10_000), 13_599, bound), "just under the bound → still spare");
+        // Stamp older than the bound → the observer crashed before observe-record → reap.
+        assert!(observer_window_is_stale(Some(10_000), 13_600, bound), "exactly the bound → stale");
+        assert!(observer_window_is_stale(Some(10_000), 99_999, bound), "long overdue → stale");
+        // No stamp on a still-open window → confirmed-but-self-close-missed (nothing in-flight) → reap.
+        assert!(observer_window_is_stale(None, 10_000, bound));
+        // saturating: a future stamp (clock skew) → treated as just-spawned → not stale (never underflows).
+        assert!(!observer_window_is_stale(Some(20_000), 10_000, bound));
+    }
+
+    #[test]
+    fn obs_window_name_mangles_slashes_colons_dots() {
+        assert_eq!(obs_window_name("v-fleet-tooling"), "obs-v-fleet-tooling");
+        assert_eq!(obs_window_name("camshaft/cadenza"), "obs-camshaft-cadenza");
+        assert_eq!(obs_window_name("a.b:c/d"), "obs-a-b-c-d");
     }
 
     #[test]
