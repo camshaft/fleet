@@ -342,6 +342,13 @@
             type = "app";
             program = "${(fleetDaemons pkgs).installApp}/bin/install-fleet-daemons";
           };
+          # task_717: hot-swap ONLY the fleet-binary units (notify/tunnel/watchdog/nudge-stale) onto a freshly
+          # built fleet binary, leaving the Group B guard timers + crontab untouched. Use this to activate a
+          # merged fleet-binary change without triggering the task_495 guard flag-day. `nix run .#deploy-fleet-binary`.
+          deploy-fleet-binary = {
+            type = "app";
+            program = "${(fleetDaemons pkgs).deployBinaryApp}/bin/deploy-fleet-binary";
+          };
           default = {
             type = "app";
             program = "${fleet}/bin/fleet";
@@ -361,6 +368,9 @@
           # in the unit generator or the install script fails `nix flake check` (task #486/#493).
           fleet-user-units = (fleetDaemons pkgs).unitsDir;
           install-fleet-daemons = (fleetDaemons pkgs).installApp;
+          # Build the binary-only deploy app too (writeShellApplication runs shellcheck), so a break in the
+          # scoped deploy script fails `nix flake check` / CI (task_717).
+          deploy-fleet-binary = (fleetDaemons pkgs).deployBinaryApp;
         }
         # voice-assistant bundles a linux-x64 prebuilt sherpa lib, so it only builds there; gate the
         # check to that system so `nix flake check` on arm/darwin doesn't try (and fail) to build it.

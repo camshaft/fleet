@@ -410,6 +410,37 @@ let
     lib.filter (s: !(lib.elem ((lib.removeSuffix ".service" s) + ".timer") timerUnits)) serviceUnits;
   enableUnits = timerUnits ++ longRunningServices;
 
+  # Fleet-BINARY units: the units whose ExecStart runs the fleet / fleet-tunnel binary (notify, tunnel,
+  # watchdog, nudge-stale). A fleet-binary REBUILD only needs to refresh these -- the Group B guards run hub
+  # shell scripts, materialize runs an external script, litellm runs litellm; none reference the binary. The
+  # `deploy-fleet-binary` app (below) hot-swaps the binary for exactly this set, deliberately EXCLUDING the
+  # guard timers so a binary deploy can never arm the task_495 guard flag-day against the live crontab (that is
+  # install-fleet-daemons' job, at the operator-present cutover).
+  fleetBinaryBaseNames = [
+    "fleet-notify"
+    "fleet-tunnel"
+    "fleet-watchdog"
+    "fleet-nudge-stale"
+  ];
+  isFleetBinaryUnit = fname: lib.any (b: lib.hasPrefix (b + ".") fname) fleetBinaryBaseNames;
+  fleetBinaryUnits = lib.filterAttrs (fname: _: isFleetBinaryUnit fname) units;
+  fleetBinaryUnitsDir = pkgs.runCommand "fleet-binary-units" { } (
+    ''
+      mkdir -p "$out"
+    ''
+    + lib.concatStrings (
+      lib.mapAttrsToList (fname: content: ''
+        cp ${pkgs.writeText fname content} "$out/${fname}"
+      '') fleetBinaryUnits
+    )
+  );
+  fleetBinaryTimers = lib.filter (lib.hasSuffix ".timer") (lib.attrNames fleetBinaryUnits);
+  # Long-running binary services = a binary .service with no sibling binary .timer (notify, tunnel). The
+  # watchdog/nudge-stale .services are timer oneshots, driven by their timer, not restarted directly.
+  fleetBinaryLongRunning = lib.filter (
+    s: !(lib.elem ((lib.removeSuffix ".service" s) + ".timer") fleetBinaryTimers)
+  ) (lib.filter (lib.hasSuffix ".service") (lib.attrNames fleetBinaryUnits));
+
   installDeps = [
     pkgs.systemd
     pkgs.coreutils
@@ -500,7 +531,63 @@ let
       echo "install-fleet-daemons: fleet on PATH -> $HOME/.local/bin/fleet -> $state_dir/current/bin/fleet (gcroot)"
     '';
   };
+
+  # task_717: hot-swap the fleet BINARY for the running services WITHOUT the full reconcile/cutover. Rebuilds
+  # fleet (so ExecStart points at the new store path), refreshes + restarts ONLY the fleet-binary units
+  # (notify/tunnel/watchdog/nudge-stale) with the same task_347 login-PATH injection install-fleet-daemons uses,
+  # and re-pins ~/.local/bin/fleet. It does NOT touch the Group B guard timers, materialize, or litellm, and
+  # does NOT prune -- so a fleet-binary deploy can never prematurely arm the task_495 guard flag-day against the
+  # live crontab. (The full cutover -- guard timers + crontab retirement -- stays install-fleet-daemons.)
+  deployBinaryApp = pkgs.writeShellApplication {
+    name = "deploy-fleet-binary";
+    runtimeInputs = installDeps;
+    text = ''
+      set -euo pipefail
+      UNIT_DIR="''${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+      mkdir -p "$UNIT_DIR"
+      loginctl enable-linger "''${USER:-$(id -un)}" 2>/dev/null || true
+      # Refresh ONLY the fleet-binary units (notify/tunnel/watchdog/nudge-stale). Guards + materialize + litellm
+      # are left untouched; this deliberately does not arm the Group B guard timers (task_495 operator flag-day).
+      cp -f ${fleetBinaryUnitsDir}/* "$UNIT_DIR"/
+      # task_347 login-PATH injection on the watchdog (identical to install-fleet-daemons -- the spawned Claude
+      # sessions need the full known-good PATH). Recover the login PATH by stripping the writeShellApplication prefix.
+      login_path="$PATH"
+      case "$login_path" in
+        '${binPathPrefix}':*) login_path="''${login_path#'${binPathPrefix}':}" ;;
+      esac
+      if [ -e "$UNIT_DIR/fleet-watchdog.service" ]; then
+        chmod u+w "$UNIT_DIR/fleet-watchdog.service" 2>/dev/null || true
+        printf 'Environment=PATH=%s\n' "$login_path" >> "$UNIT_DIR/fleet-watchdog.service"
+      fi
+      systemctl --user daemon-reload
+      # Re-arm the binary timers: their oneshot ExecStart now points at the new store binary, so the next fire
+      # runs it. enable --now is idempotent for an already-armed timer.
+      ${lib.concatStrings (map (u: ''
+        systemctl --user enable --now "${u}"
+      '') fleetBinaryTimers)}
+      # Restart the long-running binary services so the new ExecStart takes effect now (enable --now does NOT
+      # restart an already-running unit, which would leave it on the old binary).
+      ${lib.concatStrings (map (u: ''
+        systemctl --user enable "${u}"
+        systemctl --user restart "${u}"
+      '') fleetBinaryLongRunning)}
+      # Re-pin ~/.local/bin/fleet (the agent-window CLI) + the gcroot onto the new store binary (task_509).
+      state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+      mkdir -p "$state_dir" "$HOME/.local/bin"
+      nix-store --realise ${fleet} --add-root "$state_dir/current" --indirect >/dev/null
+      ln -sfn "$state_dir/current/bin/fleet" "$HOME/.local/bin/fleet"
+      echo "deploy-fleet-binary: refreshed ${toString (lib.length (lib.attrNames fleetBinaryUnits))} fleet-binary unit(s); restarted/re-armed: ${lib.concatStringsSep " " (fleetBinaryTimers ++ fleetBinaryLongRunning)}"
+      echo "deploy-fleet-binary: fleet -> $HOME/.local/bin/fleet -> $state_dir/current/bin/fleet (gcroot); guards + crontab + materialize + litellm untouched"
+    '';
+  };
 in
 {
-  inherit units unitsDir installApp enableUnits;
+  inherit
+    units
+    unitsDir
+    installApp
+    enableUnits
+    deployBinaryApp
+    fleetBinaryUnitsDir
+    ;
 }
