@@ -179,6 +179,74 @@ pub fn parse_events(body: &str) -> Result<Vec<Event>, String> {
         .collect()
 }
 
+/// One board project from `GET /projects`. Only the fields the bridge's repo->project mapping needs are
+/// modeled; `metadata` stays a raw [`Value`] (the board carries arbitrary keys there, e.g. `kind`,
+/// `author_identity`). Unknown top-level keys are ignored (forward compatible — the board adds project fields
+/// the bridge doesn't care about).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Project {
+    /// The numeric project id — the `project_id` an ingested repo's mirrored tasks/reviews are created in.
+    pub id: i64,
+    /// The project's display name (e.g. `fleet`); not used for matching, kept for logging.
+    #[serde(default)]
+    pub name: String,
+    /// Lifecycle status (`active` / `archived`). The mapping ingests ONLY `active` projects, so an archived
+    /// project that still carries a `metadata.repo` (e.g. a consolidated-away project) can't shadow the live
+    /// one for the same repo.
+    #[serde(default)]
+    pub status: String,
+    /// Arbitrary board-assigned metadata; the bridge reads `metadata.repo` (the mapped GitHub repo).
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+impl Project {
+    /// The GitHub repo this project maps to, from `metadata.repo` — a full URL
+    /// (`https://github.com/<owner>/<name>`) or a bare `owner/name`. `None` when the project carries no repo
+    /// (an internal / pipeline project) or an empty one. The raw string; normalizing to `owner/name` for
+    /// matching is the mapper's job (a later slice).
+    pub fn repo(&self) -> Option<&str> {
+        self.metadata
+            .get("repo")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether this project is `active` (the mapping ingests active projects only).
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
+    }
+}
+
+/// Parse the JSON body of `GET /projects` into the project list. Like [`parse_events`], accept either a bare
+/// array or a `{ "projects": [...] }` envelope. Returns the parse error text on a body that is neither.
+pub fn parse_projects(body: &str) -> Result<Vec<Project>, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("board /projects: response was not JSON: {e}"))?;
+    let arr = match v {
+        Value::Array(a) => a,
+        Value::Object(ref o) => match o.get("projects") {
+            Some(Value::Array(a)) => a.clone(),
+            _ => {
+                return Err(format!(
+                    "board /projects: object without a `projects` array: {v}"
+                ));
+            }
+        },
+        other => {
+            return Err(format!(
+                "board /projects: expected an array or {{projects:[…]}}, got {other}"
+            ));
+        }
+    };
+    arr.into_iter()
+        .map(|p| {
+            serde_json::from_value::<Project>(p)
+                .map_err(|err| format!("board /projects: bad project: {err}"))
+        })
+        .collect()
+}
+
 /// Build the JSON body for creating a mirrored board task from an ingested GitHub issue (`POST /tasks`).
 /// `project_id` selects the board project; `created_by` is the bridge's own agent id; `external_author`
 /// attributes the originating GitHub user (e.g. `github:octocat`); `external_id` is the issue ref
@@ -350,6 +418,15 @@ impl BoardClient {
         );
         let raw = self.get_text(&url, "GET /events").await?;
         parse_events(&raw)
+    }
+
+    /// List the board's projects (`GET /projects`) — the source of the dynamic repo->project mapping
+    /// (each project's `metadata.repo`). Meant to be read each IN pass so a newly-created or newly-mapped
+    /// project is picked up WITHOUT a daemon restart (the mapping is nothing hardcoded).
+    pub async fn list_projects(&self) -> Result<Vec<Project>, String> {
+        let url = format!("{}/projects", self.base);
+        let raw = self.get_text(&url, "GET /projects").await?;
+        parse_projects(&raw)
     }
 
     /// Create a mirrored board task from an ingested issue (`POST /tasks`), IDEMPOTENT on the issue link
@@ -604,6 +681,69 @@ mod tests {
     #[test]
     fn parse_events_empty_is_ok() {
         assert!(parse_events("[]").unwrap().is_empty());
+    }
+
+    // ── projects (repo->project mapping source, GET /projects) ────────────────────────────────────
+
+    #[test]
+    fn parse_projects_accepts_bare_array_and_reads_repo_and_status() {
+        let body = r#"[
+            {"id": 21, "name": "fleet", "status": "active",
+             "metadata": {"repo": "https://github.com/camshaft/fleet"}},
+            {"id": 29, "name": "uncategorized", "status": "active", "metadata": {"kind": "pipeline"}}
+        ]"#;
+        let ps = parse_projects(body).unwrap();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].id, 21);
+        assert_eq!(ps[0].name, "fleet");
+        assert_eq!(ps[0].repo(), Some("https://github.com/camshaft/fleet"));
+        assert!(ps[0].is_active());
+        assert_eq!(ps[1].repo(), None, "a pipeline project carries no repo");
+    }
+
+    #[test]
+    fn parse_projects_accepts_envelope_and_tolerates_unknown_keys() {
+        let body = r#"{"projects": [
+            {"id": 7, "name": "etude", "status": "archived",
+             "metadata": {"repo": "https://github.com/camshaft/etude"},
+             "task_counts": {"done": 16}, "ref": "project_7"}
+        ]}"#;
+        let ps = parse_projects(body).unwrap();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].id, 7);
+        assert!(
+            !ps[0].is_active(),
+            "archived is not active — can't shadow the live mapping"
+        );
+        assert_eq!(ps[0].repo(), Some("https://github.com/camshaft/etude"));
+    }
+
+    #[test]
+    fn project_repo_is_none_when_metadata_absent_or_empty() {
+        let body = r#"[
+            {"id": 1, "name": "a", "status": "active", "metadata": {}},
+            {"id": 2, "name": "b", "status": "active", "metadata": {"repo": ""}},
+            {"id": 3, "name": "c", "status": "active"}
+        ]"#;
+        let ps = parse_projects(body).unwrap();
+        assert_eq!(ps[0].repo(), None, "empty metadata object → no repo");
+        assert_eq!(ps[1].repo(), None, "empty repo string is not a repo");
+        assert_eq!(
+            ps[2].repo(),
+            None,
+            "absent metadata defaults to null → no repo"
+        );
+    }
+
+    #[test]
+    fn parse_projects_rejects_non_array_json() {
+        assert!(parse_projects(r#"{"nope": 1}"#).is_err());
+        assert!(parse_projects("not json at all").is_err());
+    }
+
+    #[test]
+    fn parse_projects_empty_is_ok() {
+        assert!(parse_projects("[]").unwrap().is_empty());
     }
 
     // ── issue↔task links (board-core #149 slice 2 / #151) ─────────────────────────────────────────
