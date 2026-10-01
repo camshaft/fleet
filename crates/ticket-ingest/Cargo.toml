@@ -1,0 +1,63 @@
+# `ticket-ingest` — the fleet's ticketing-source -> board ingest bridge daemon (design doc #2706, task #784).
+#
+# A third adapter over the shared board ingest surface (Slack `crates/slack-bridge` and GitHub
+# `crates/github-bridge` are the first two): an external ticketing source's tickets mirror IN to
+# coordination-board tasks so an agent can surface the ticket context around an ops issue an operator is
+# debugging. The board owns the ingest PRIMITIVES (external-links/idempotency, external-identity, project
+# routing); this crate is READ + SYNC only and CONSUMES them via the shared `bridge-core` board client, never
+# reimplements them. It mirrors into the uncategorized intake project UNASSIGNED and never routes/assigns —
+# board-triage owns that.
+#
+# SOURCE-AGNOSTIC on purpose (public-repo boundary, doc #2706 A9): the external ticketing source is an opaque
+# `source` token (`sim`) and the ingest targets are opaque resolver-group strings set in deploy config. No
+# internal hostnames, resolver-group ids, aliases, or ticket content live in this public repo — they stay on
+# the board and in the agenix-decrypted deploy config.
+#
+# The crate is a workspace member so `cargo test` at the workspace root gates its PURE core (config
+# resolution, watermark-cursor advance, new-since-cursor selection). The live daemon binary (the async
+# watermark poll loop) is gated behind the `daemon` feature so the default `cargo test` / `nix flake check`
+# never builds its tokio/clap/tracing tree.
+[package]
+name = "ticket-ingest"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "ticket_ingest"
+path = "src/lib.rs"
+
+# The daemon binary — a thin async poll loop wiring the tested lib together. Gated behind
+# `required-features = ["daemon"]` so the default build never compiles its tokio/clap/tracing tree.
+# Build/run it with `--features daemon`.
+[[bin]]
+name = "ticket-ingest"
+path = "src/main.rs"
+required-features = ["daemon"]
+
+[features]
+# The live daemon: the tokio runtime + CLI parsing + structured logging. Off by default; the lib (and its
+# pure tests) never need it — the async board client compiles without a runtime, only RUNNING it needs tokio.
+daemon = ["dep:tokio", "dep:clap", "dep:tracing", "dep:tracing-subscriber"]
+
+[dependencies]
+# The transport-agnostic bridge core — the async board REST client (register/subscribe + task CRUD +
+# attributed comments) this bridge ingests through, shared with the Slack and GitHub adapters. The board I/O
+# is async (operator directive #370/#439: no blocking IO in rust daemons); its methods are `async fn` and the
+# daemon provides the runtime. reqwest (rustls, no OpenSSL) enters the default build via this dep.
+bridge-core = { path = "../bridge-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# The daemon's config format: a single TOML file (operator mandate #159 — no env-var config). Holds the
+# non-secret wiring (board base, resolver groups, intake project, poll cadence); delivered at deploy time,
+# gitignored in dev.
+toml = "0.8"
+
+# ── The daemon binary's shell — OPTIONAL, pulled only by the `daemon` feature (see above). ──
+# The async runtime the daemon runs on (the watermark poll loop on a tokio timer + shutdown signal).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"], optional = true }
+# `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate #159).
+clap = { version = "4", features = ["derive"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

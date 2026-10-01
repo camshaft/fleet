@@ -3955,6 +3955,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ticket-ingest"
+version = "0.0.0"
+dependencies = [
+ "bridge-core",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tiff"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
