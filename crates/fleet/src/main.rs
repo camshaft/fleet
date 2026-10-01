@@ -1619,6 +1619,27 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Bounce ONE board-native agent's session so its MCP client RECONNECTS and refetches tools/list — the fix
+    /// for the stale-cached-tools/list trap (task_752): a long-lived session caches tools/list at connect, so a
+    /// tool shipped to the board MCP server AFTER it connected (e.g. `pose_question` after the structured-
+    /// questions rollout) stays invisible until the session reconnects, and a redeploy often does NOT drop the
+    /// connection (a tunnel masks it), so the reconnect must be driven from OUTSIDE. This kills the agent's
+    /// tmux window and relaunches it via the normal spin-up path, so the fresh session reconnects to the current
+    /// server process and refetches tools/list; the agent resumes from the board (board-native agents are
+    /// resumable — charter + task state live on the board, not in-session). Reports the plan by default;
+    /// `--apply` performs it. Refuses a non-board-native agent, a windowless (not-running) agent, a busy pane (a
+    /// turn in flight), or an agent bounced within the cooldown window — `--force` overrides the busy + cooldown
+    /// refusals.
+    BounceSession {
+        /// The board agent id to bounce.
+        agent: String,
+        /// Perform the kill + relaunch (default: just report the plan).
+        #[arg(long)]
+        apply: bool,
+        /// Bounce even if the pane shows an in-flight turn or the agent is within the cooldown window.
+        #[arg(long)]
+        force: bool,
+    },
     /// Report every board-declared agent's liveness off its board `last_seen` (the watchdog's read side).
     /// Reads the roster from the board (orchestrator read — agents coordinate via their own MCP) and
     /// classifies each by how stale its heartbeat is: live / quiet / STALE.
@@ -2132,6 +2153,7 @@ fn main() {
         Cmd::UpBoard { launch, pinned_only } => up_board(launch, pinned_only),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::SpinDown { agent, apply, force } => spin_down(&agent, apply, force),
+        Cmd::BounceSession { agent, apply, force } => bounce_session(&fleet, &agent, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
         Cmd::Watchdog {
             stale_only,
@@ -2994,6 +3016,186 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
         }
     }
     println!("  spun down '{agent}' — stood down + resumable.");
+}
+
+/// task_752: the pure selection for `fleet bounce-session`. A bounce RELAUNCHES a board-native agent's session
+/// so its MCP client reconnects and refetches tools/list (the stale-cached-tools/list fix). Pure so the
+/// decision is unit-testable without a live board/tmux.
+#[derive(Debug, PartialEq, Eq)]
+enum BounceAction {
+    /// Not a board-native agent — refuse (only board-native agents launch via the fleet, and the relaunch path
+    /// is the board-native one; a file-hub agent is relaunched via `cargo xtask fleet`).
+    NotBoardNative,
+    /// No live tmux window — nothing to bounce (the session is not running). Use `fleet spin-up` to start it.
+    NoWindow,
+    /// A turn is in flight and `--force` was not given — refuse so a reconnect never interrupts a live turn.
+    RefuseBusy,
+    /// Bounced within the cooldown window and `--force` was not given — skip so a healthy session is not
+    /// thrashed by repeated relaunches.
+    Cooldown,
+    /// Kill the window and relaunch (the fresh session reconnects + refetches tools/list).
+    Bounce,
+}
+
+/// Pure selection for a session-bounce (task_752). Order mirrors [`spin_down_action`]: board-native first,
+/// then window-existence (a bounce needs a live session to relaunch), then the busy fence (never reconnect
+/// through a live turn), then the cooldown fence (never thrash a healthy session). `--force` overrides the
+/// busy + cooldown refusals; it does NOT make a non-native or windowless agent bounceable (nothing to
+/// relaunch). Pure — unit-tested.
+fn bounce_action(is_native: bool, has_window: bool, is_working: bool, on_cooldown: bool, force: bool) -> BounceAction {
+    if !is_native {
+        return BounceAction::NotBoardNative;
+    }
+    if !has_window {
+        return BounceAction::NoWindow;
+    }
+    if is_working && !force {
+        return BounceAction::RefuseBusy;
+    }
+    if on_cooldown && !force {
+        return BounceAction::Cooldown;
+    }
+    BounceAction::Bounce
+}
+
+/// task_752 default session-bounce cooldown: at most one bounce per agent per this window, so a repeated
+/// trigger (or a future watchdog sweep) never thrash-relaunches a healthy session. `CDZ_BOUNCE_COOLDOWN_SECS`
+/// tunes it. A bounce is disruptive (a full session relaunch), so the window is generous.
+const BOUNCE_COOLDOWN_SECS: u64 = 30 * 60;
+
+/// task_752 cooldown gate (pure, unit-testable), mirroring [`hire_signal_on_cooldown`]: a bounce is on cooldown
+/// when the last one for this agent is within `cooldown_secs`. No floor — the cooldown IS the window. `None`
+/// (never bounced) is not on cooldown.
+fn bounce_on_cooldown(last_bounce: Option<u64>, now: u64, cooldown_secs: u64) -> bool {
+    last_bounce.is_some_and(|last| now.saturating_sub(last) < cooldown_secs)
+}
+
+/// The per-agent last-bounce stamp path: `<hub>/.claude/fleet/watchdog/<name>.bounce` (contents = unix secs).
+fn bounce_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("watchdog").join(format!("{name}.bounce"))
+}
+
+/// Read an agent's last-bounce unix time; `None` on an absent/unparseable stamp (never bounced).
+fn read_bounce_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(bounce_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+}
+
+/// Record that an agent was just bounced at `now` (best-effort — a write failure only means the cooldown is not
+/// enforced for that agent on the next trigger).
+fn write_bounce_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = bounce_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
+/// `fleet bounce-session`: relaunch ONE board-native agent's session so its MCP client reconnects to the
+/// current board server process and refetches tools/list (task_752 — the stale-cached-tools/list fix). A
+/// long-lived session caches tools/list at connect, and a redeploy that ships a new tool often does NOT drop
+/// the connection (a tunnel masks it), so a tool like `pose_question` stays invisible to the standing session
+/// until it reconnects — which must be driven from outside. This kills the agent's tmux window and relaunches
+/// it via the normal spin-up path; the fresh session reconnects and sees every shipped tool. The agent resumes
+/// from the board (board-native agents keep charter + task state on the board, not in-session), so a bounce is
+/// non-destructive to its work. Report-only by default; `--apply` performs the kill + relaunch, fenced so it
+/// never interrupts a live turn (busy pane) or thrashes a healthy session (cooldown) — `--force` overrides
+/// those two fences.
+fn bounce_session(fleet: &Fleet, agent: &str, apply: bool, force: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet bounce-session: {e}");
+        std::process::exit(1);
+    });
+    let rec = board.get_agent(agent).unwrap_or_else(|e| {
+        eprintln!("fleet bounce-session: {e}");
+        std::process::exit(1);
+    });
+    let is_native = rec
+        .get("metadata")
+        .and_then(|m| m.get("native"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let session = board_session();
+    let has_window = tmux_window_names(&session).iter().any(|w| w == agent);
+    let is_working = has_window && window_is_working(&session, agent);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cooldown_secs = std::env::var("CDZ_BOUNCE_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BOUNCE_COOLDOWN_SECS);
+    let on_cooldown = bounce_on_cooldown(read_bounce_stamp(fleet, agent), now, cooldown_secs);
+    let action = bounce_action(is_native, has_window, is_working, on_cooldown, force);
+
+    println!("bounce-session '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    match action {
+        BounceAction::NotBoardNative => {
+            eprintln!(
+                "  ✗ '{agent}' is NOT board-native (metadata.native != true) — bounce-session relaunches \
+                 board-native agents only. A file-hub agent reconnects via a `cargo xtask fleet` relaunch."
+            );
+            std::process::exit(1);
+        }
+        BounceAction::NoWindow => {
+            eprintln!(
+                "  ✗ '{agent}' has no live tmux window in session '{session}' — nothing to bounce (the session \
+                 is not running). Start it with `fleet spin-up {agent} --apply`."
+            );
+            std::process::exit(1);
+        }
+        BounceAction::RefuseBusy => {
+            eprintln!(
+                "  ✗ '{agent}' has a turn IN FLIGHT (its pane is working) — refusing so a reconnect never \
+                 interrupts a live turn. Re-run when it's idle, or pass --force to bounce it anyway."
+            );
+            std::process::exit(1);
+        }
+        BounceAction::Cooldown => {
+            eprintln!(
+                "  ✗ '{agent}' was bounced within the last {cooldown_secs}s (cooldown) — skipping so a healthy \
+                 session is not thrashed by repeated relaunches. Pass --force to bounce it anyway."
+            );
+            std::process::exit(1);
+        }
+        BounceAction::Bounce => println!(
+            "  plan: kill tmux window {session}:{agent}, then relaunch via spin-up (the fresh session reconnects \
+             to the board MCP server + refetches tools/list){}",
+            if force && is_working { " [--force: a live turn WILL be interrupted]" } else { "" }
+        ),
+    }
+    println!(
+        "  NON-DESTRUCTIVE to work: board-native agents keep charter + task state on the board, so the \
+         relaunched session resumes from there."
+    );
+    if !apply {
+        println!("  (dry-run — re-run with --apply to perform the kill + relaunch)");
+        return;
+    }
+    // Kill FIRST, then relaunch: launch_board_agent (via spin_up) refuses when a window of the same name
+    // already exists, so the window must be gone before the relaunch. A brief windowless gap is expected.
+    let target = format!("{session}:{agent}");
+    let killed = std::process::Command::new("tmux")
+        .args(["kill-window", "-t", &target])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !killed {
+        eprintln!(
+            "  ✗ tmux kill-window {target} failed — NOT relaunching (a relaunch alongside a surviving window \
+             would run two sessions). Remove the window manually, then re-run."
+        );
+        std::process::exit(1);
+    }
+    println!("  ✓ killed window {target}");
+    // Stamp the cooldown BEFORE the relaunch: the bounce has committed (the window is gone), so the cooldown
+    // must hold even if the relaunch below exits with a launch error — otherwise a retry could double-bounce.
+    write_bounce_stamp(fleet, agent, now);
+    // Relaunch through the normal spin-up path (reuses the full launch: workspace materialize is idempotent,
+    // pre-trust, kickoff). The fresh session reconnects to the current board MCP server and refetches tools/list.
+    println!("  relaunching via spin-up …");
+    spin_up(agent, true);
+    println!("  ✓ bounced '{agent}' — the fresh session will reconnect + refetch tools/list.");
 }
 
 /// A recognizable marker in the fleet-installed fmt pre-commit hook, so a re-install tells OUR hook (safe to
@@ -8912,6 +9114,44 @@ mod tests {
         assert_eq!(spin_down_action(true, false, false, 3, true), OfflineOnly);
         // Zero open assignments → the guard is inert (normal behavior).
         assert_eq!(spin_down_action(true, true, false, 0, false), OfflineAndKill);
+    }
+
+    #[test]
+    fn bounce_action_fences_non_native_windowless_busy_and_cooldown() {
+        use BounceAction::*;
+        // Not board-native → refuse regardless of window/working/cooldown/force (only board-native agents
+        // relaunch via the fleet; there is nothing for a bounce to relaunch otherwise).
+        assert_eq!(bounce_action(false, true, false, false, false), NotBoardNative);
+        assert_eq!(bounce_action(false, true, true, true, true), NotBoardNative);
+        // Native but no live window → nothing to bounce (not running); --force does not conjure a session.
+        assert_eq!(bounce_action(true, false, false, false, false), NoWindow);
+        assert_eq!(bounce_action(true, false, false, false, true), NoWindow);
+        // Native + a working pane + no --force → refuse so a reconnect never interrupts a live turn.
+        assert_eq!(bounce_action(true, true, true, false, false), RefuseBusy);
+        // --force overrides the busy fence → bounce (the owner accepts interrupting the live turn).
+        assert_eq!(bounce_action(true, true, true, false, true), Bounce);
+        // Native + idle + on cooldown + no --force → skip so a healthy session is not thrashed.
+        assert_eq!(bounce_action(true, true, false, true, false), Cooldown);
+        // --force overrides the cooldown fence → bounce.
+        assert_eq!(bounce_action(true, true, false, true, true), Bounce);
+        // Busy takes priority over cooldown (both set, no force → the busy refusal is surfaced first).
+        assert_eq!(bounce_action(true, true, true, true, false), RefuseBusy);
+        // Native + an idle live window + not on cooldown → bounce (the normal case).
+        assert_eq!(bounce_action(true, true, false, false, false), Bounce);
+    }
+
+    #[test]
+    fn bounce_on_cooldown_suppresses_only_within_the_window() {
+        // Never bounced → not on cooldown.
+        assert!(!bounce_on_cooldown(None, 10_000, BOUNCE_COOLDOWN_SECS));
+        // Bounced just now / within the window → on cooldown.
+        assert!(bounce_on_cooldown(Some(10_000), 10_000, 1_800));
+        assert!(bounce_on_cooldown(Some(10_000), 10_000 + 1_799, 1_800));
+        // Exactly at / past the window → no longer on cooldown.
+        assert!(!bounce_on_cooldown(Some(10_000), 10_000 + 1_800, 1_800));
+        assert!(!bounce_on_cooldown(Some(10_000), 20_000, 1_800));
+        // Clock skew (now < last) saturates to 0 elapsed → treated as on cooldown (fail-safe, no thrash).
+        assert!(bounce_on_cooldown(Some(10_000), 9_000, 1_800));
     }
 
     #[test]
