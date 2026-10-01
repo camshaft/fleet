@@ -225,11 +225,12 @@ let
 
   serviceUnits = lib.filter (lib.hasSuffix ".service") (lib.attrNames units);
   timerUnits = lib.filter (lib.hasSuffix ".timer") (lib.attrNames units);
-  # Enable the .timer of a pair (its oneshot .service is timer-triggered, never enabled directly); enable a
-  # standalone long-running .service (one with no sibling .timer).
-  enableUnits =
-    timerUnits
-    ++ lib.filter (s: !(lib.elem ((lib.removeSuffix ".service" s) + ".timer") timerUnits)) serviceUnits;
+  # A long-running service is a .service with NO sibling .timer (a timer's oneshot .service is triggered by the
+  # timer, never enabled/restarted directly). The timers get enable --now; the long-running services get
+  # enable + restart (so a changed ExecStart takes effect immediately).
+  longRunningServices =
+    lib.filter (s: !(lib.elem ((lib.removeSuffix ".service" s) + ".timer") timerUnits)) serviceUnits;
+  enableUnits = timerUnits ++ longRunningServices;
 
   installDeps = [
     pkgs.systemd
@@ -278,9 +279,18 @@ let
         printf 'Environment=PATH=%s\n' "$login_path" >> "$UNIT_DIR/fleet-watchdog.service"
       fi
       systemctl --user daemon-reload
+      # Enable + start the timers (each oneshot .service is triggered by its timer, so it picks up a changed
+      # ExecStart on its next fire -- no restart needed here).
       ${lib.concatStrings (map (u: ''
         systemctl --user enable --now "${u}"
-      '') enableUnits)}
+      '') timerUnits)}
+      # Enable + RESTART each long-running service so a changed ExecStart (e.g. the repoint onto a new store
+      # binary) actually takes effect now: `enable --now` does NOT restart an already-running unit, which would
+      # leave it on the old binary. restart also starts it if it was stopped.
+      ${lib.concatStrings (map (u: ''
+        systemctl --user enable "${u}"
+        systemctl --user restart "${u}"
+      '') longRunningServices)}
       # task_509: put the fleet binary on ~/.local/bin (which agent windows inherit) so no agent runs cargo to
       # reach the fleet CLI. Pin it with an --indirect gcroot so `nix store gc` cannot delete the target, and
       # re-point the stable ~/.local/bin symlink so a rebuilt fleet swaps in live with no window restart. This
