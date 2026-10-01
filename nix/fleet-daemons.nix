@@ -322,6 +322,32 @@ let
       script = "rearm-stale.sh";
       intervalSecs = 240;
       enabled = true;
+    })
+    # Group B batch 3 (task_495): the mid/long-interval hygiene guards. Their crontab forms used off-minute
+    # schedules (warm-keep :17, reap-orphans :7,:37) purely for cron herd-avoidance; a systemd timer's
+    # OnBootSec + OnUnitActiveSec is already offset from the top-of-hour by activation time, so a plain
+    # interval preserves the cadence + the herd-avoidance intent without needing a specific-minute OnCalendar
+    # (which only the daily/6-hourly B4 guards actually require).
+    // (mkGuard {
+      name = "fleet-disk-guard";
+      script = "disk-guard.sh";
+      intervalSecs = 900;
+    })
+    // (mkGuard {
+      name = "fleet-aea-refresh";
+      script = "aea-refresh.sh";
+      intervalSecs = 1800;
+    })
+    // (mkGuard {
+      name = "fleet-warm-keep";
+      script = "warm-keep.sh";
+      intervalSecs = 3600;
+    })
+    // (mkGuard {
+      name = "fleet-reap-orphans";
+      script = "reap-wedged-nix-clients.sh";
+      args = "--orphans-only --apply";
+      intervalSecs = 1800;
     });
 
   unitsDir = pkgs.runCommand "fleet-user-units" { } (
