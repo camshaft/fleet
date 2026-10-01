@@ -1853,6 +1853,22 @@ enum Cmd {
         #[arg(long)]
         clippy_only: bool,
     },
+    /// Audit each board-native agent's `metadata.worktree` for health (task_730): a STALE pointer (the path no
+    /// longer exists — the symptom a worktree migration/retire leaves when it rewrites the charter but not the
+    /// board, so the charter points at a dead tree) is a hard FAIL (exit 1); a worktree holding UNLANDED commits
+    /// (ahead of its mainline) is surfaced as an at-risk notice (lose-able to a disk-reclaim sweep before it is
+    /// landed — the data-loss risk this guards). Checks the REGISTERED worktree path; the deeper cross-clone
+    /// stranding (commits left in an OLD clone a migration abandoned) is prevented by a safe migrate step
+    /// (follow-up) and reclaim-survey already refuses to delete an orphaned worktree with unpushed commits.
+    /// Read-only (no board writes).
+    WorktreeCheck {
+        /// Check only this agent (default: every board-native agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Also list the clean / no-worktree agents (default: print only the stale / unlanded ones plus counts).
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Seam-check a MONITOR vertical (task_579): ff-sync its worktree to origin/main, then report whether any
     /// incoming commit touched the agent's declared SEAM — its `metadata.seam` file globs. A monitor wake is
     /// otherwise 100% deterministic git plumbing, so this lets the kickoff GATE the model wake: exit 0 = GREEN
@@ -2076,6 +2092,7 @@ fn main() {
         } => observe_coverage(cadence, cadence_pinned, verbose),
         Cmd::ReclaimSurvey { root, mainline, verbose } => reclaim_survey(root, mainline, verbose),
         Cmd::Gate { clippy_only } => gate(clippy_only),
+        Cmd::WorktreeCheck { agent, verbose } => worktree_check(agent, verbose),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::NudgeStale {
@@ -5827,6 +5844,180 @@ fn gate(clippy_only: bool) {
     println!("fleet gate: PASS — matches CI's `clippy + test (workspace)` merge gate");
 }
 
+/// The health of an agent's registered `metadata.worktree` (task_730). `MissingPath` is the migration/retire
+/// footgun: the board charter points at a path that no longer exists, so the agent runs against a dead tree.
+/// `UnlandedCommits` is the data-loss risk surface: the worktree holds commits ahead of its mainline that a
+/// disk-reclaim sweep could delete before they land.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WorktreeHealth {
+    /// No `metadata.worktree` set — nothing to check (a non-worktree agent).
+    Unset,
+    /// `metadata.worktree` is a RELATIVE path and there is no hub root to resolve it against — cannot verify,
+    /// so NOT reported as stale (never a false "missing"). A relative path is resolved against the configured
+    /// hub when one exists; this state is only reached when it does not.
+    Indeterminate,
+    /// `metadata.worktree` (resolved to an absolute path) names a path that does not exist — STALE (dangling
+    /// charter pointer).
+    MissingPath,
+    /// The worktree exists and has commits ahead of its mainline not yet landed — at risk if it is reclaimed.
+    UnlandedCommits,
+    /// The worktree exists and is level with / behind its mainline — healthy.
+    Clean,
+}
+
+/// Classify a registered worktree's health from its facts. `resolvable` is false ONLY for a relative path with
+/// no hub to resolve it against — then the verdict is `Indeterminate`, never a false `MissingPath`, so a
+/// relative pointer is never wrongly failed. Otherwise a missing resolved path takes precedence; else commits
+/// ahead of the mainline flag unlanded, at-risk work. Pure — unit-tested.
+fn classify_worktree_health(
+    worktree_set: bool,
+    resolvable: bool,
+    path_exists: bool,
+    commits_ahead: usize,
+) -> WorktreeHealth {
+    if !worktree_set {
+        return WorktreeHealth::Unset;
+    }
+    if !resolvable {
+        return WorktreeHealth::Indeterminate;
+    }
+    if !path_exists {
+        return WorktreeHealth::MissingPath;
+    }
+    if commits_ahead > 0 {
+        return WorktreeHealth::UnlandedCommits;
+    }
+    WorktreeHealth::Clean
+}
+
+/// `fleet worktree-check` (task_730): audit each board-native agent's `metadata.worktree`. A STALE pointer (the
+/// path no longer exists — a migration/retire rewrote the charter but left the board pointing at a dead tree) is
+/// a hard FAIL (exit 1); a worktree holding commits ahead of its mainline is surfaced as an at-risk notice
+/// (lose-able to a disk-reclaim sweep before it lands). Honest limit: this inspects the REGISTERED path, so it
+/// catches a stale pointer and at-risk unlanded work, but not commits stranded in a DIFFERENT (old-clone) tree a
+/// migration abandoned — that is prevented by a safe migrate step (follow-up), and reclaim-survey already
+/// refuses to delete any orphaned worktree with unpushed commits. Read-only.
+fn worktree_check(agent: Option<String>, verbose: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet worktree-check: board unavailable ({e}); cannot audit worktrees");
+        std::process::exit(1);
+    });
+    let roster = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet worktree-check: board roster query failed ({e})");
+        std::process::exit(1);
+    });
+    let mut ids: Vec<String> = roster
+        .iter()
+        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .collect();
+    ids.sort();
+    let mainline_cands = mainline_candidates("origin/main");
+
+    let mut stale: Vec<String> = Vec::new();
+    let (mut n_clean, mut n_unlanded, mut n_unset, mut n_skipped) = (0usize, 0usize, 0usize, 0usize);
+    for id in &ids {
+        if let Some(f) = &agent
+            && f != id
+        {
+            continue;
+        }
+        // The DETAIL record reliably carries metadata (the list projection has dropped it before — task_418).
+        let detail = board.get_agent(id).ok();
+        let md = detail.as_ref().and_then(|r| r.get("metadata"));
+        if matches!(read_native(md), NativeVerdict::NotNative) {
+            n_skipped += 1;
+            if verbose {
+                println!("  - {id}: native:false (skipped)");
+            }
+            continue;
+        }
+        let wt = md
+            .and_then(|m| m.get("worktree"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let worktree_set = wt.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        // Resolve to an absolute path: an absolute metadata.worktree is used as-is; a RELATIVE one is resolved
+        // against the configured hub root (how the fleet stores agent worktrees, e.g. `.claude/worktrees/<a>`).
+        // A relative path with no hub configured is `resolvable=false` → Indeterminate, never a false stale.
+        let hub = config::get().hub.as_deref();
+        let (resolvable, resolved) = match wt.as_deref() {
+            Some(p) if !p.trim().is_empty() => {
+                let path = std::path::Path::new(p);
+                if path.is_absolute() {
+                    (true, Some(path.to_path_buf()))
+                } else if let Some(h) = hub {
+                    (true, Some(std::path::Path::new(h).join(path)))
+                } else {
+                    (false, None)
+                }
+            }
+            _ => (false, None),
+        };
+        let path_exists = resolved.as_deref().map(|p| p.is_dir()).unwrap_or(false);
+        let ahead = if path_exists {
+            let p = resolved.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+            resolve_mainline(p, &mainline_cands)
+                .and_then(|base| git_capture(p, &["rev-list", "--count", &format!("{base}..HEAD")]))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        match classify_worktree_health(worktree_set, resolvable, path_exists, ahead) {
+            WorktreeHealth::Unset => {
+                n_unset += 1;
+                if verbose {
+                    println!("  - {id}: no metadata.worktree (skipped)");
+                }
+            }
+            WorktreeHealth::Indeterminate => {
+                n_unset += 1;
+                if verbose {
+                    println!(
+                        "  - {id}: metadata.worktree is relative ({}) and no hub is configured to resolve it — not verified",
+                        wt.as_deref().unwrap_or("")
+                    );
+                }
+            }
+            WorktreeHealth::MissingPath => {
+                stale.push(id.clone());
+                println!(
+                    "  - {id}: STALE metadata.worktree -> {} (path does not exist; the charter points at a dead tree)",
+                    wt.as_deref().unwrap_or("")
+                );
+            }
+            WorktreeHealth::UnlandedCommits => {
+                n_unlanded += 1;
+                println!(
+                    "  - {id}: {ahead} unlanded commit(s) at {} (ahead of mainline; land/push before this tree is reclaimed)",
+                    wt.as_deref().unwrap_or("")
+                );
+            }
+            WorktreeHealth::Clean => {
+                n_clean += 1;
+                if verbose {
+                    println!("  - {id}: clean ({})", wt.as_deref().unwrap_or(""));
+                }
+            }
+        }
+    }
+
+    println!(
+        "\nsummary: {n_clean} clean, {n_unlanded} with-unlanded-commits, {} stale-metadata, {n_unset} no-worktree, {n_skipped} non-native",
+        stale.len()
+    );
+    if stale.is_empty() {
+        println!("PASS: no agent's metadata.worktree points at a missing path.");
+    } else {
+        eprintln!(
+            "FAIL: {} agent(s) with a STALE metadata.worktree (a migration/retire left the charter pointing at a dead tree) — rewrite the board metadata.worktree: {}",
+            stale.len(),
+            stale.join(", ")
+        );
+        std::process::exit(1);
+    }
+}
+
 /// The `author` a nudge comment is posted as — also the marker `nudge_last_secs` searches a task's prior
 /// comments for, to find this daemon's own last nudge (the cooldown clock; #478).
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
@@ -8346,6 +8537,22 @@ detached
         let clippy_only = gate_steps(true);
         assert_eq!(clippy_only.len(), 1);
         assert_eq!(clippy_only[0].1, vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]);
+    }
+
+    #[test]
+    fn classify_worktree_health_flags_a_stale_pointer_and_unlanded_commits() {
+        // No metadata.worktree -> nothing to check (resolvable/path/ahead irrelevant).
+        assert_eq!(classify_worktree_health(false, false, false, 0), WorktreeHealth::Unset);
+        assert_eq!(classify_worktree_health(false, true, true, 5), WorktreeHealth::Unset);
+        // Relative path with no hub to resolve -> Indeterminate, NEVER a false stale (the false-positive guard).
+        assert_eq!(classify_worktree_health(true, false, false, 0), WorktreeHealth::Indeterminate);
+        // task_730: set + resolvable but the resolved path is gone -> STALE, regardless of commit count.
+        assert_eq!(classify_worktree_health(true, true, false, 0), WorktreeHealth::MissingPath);
+        assert_eq!(classify_worktree_health(true, true, false, 9), WorktreeHealth::MissingPath);
+        // Exists + commits ahead of mainline -> at-risk unlanded work.
+        assert_eq!(classify_worktree_health(true, true, true, 2), WorktreeHealth::UnlandedCommits);
+        // Exists + level/behind -> healthy.
+        assert_eq!(classify_worktree_health(true, true, true, 0), WorktreeHealth::Clean);
     }
 
     #[test]
