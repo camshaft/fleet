@@ -3849,8 +3849,11 @@ fn write_observe_watermark(fleet: &Fleet, name: &str, session: &str, offset: usi
 /// watermark and return the observation DECISION when one should fire (size threshold crossed, or a
 /// stood-down agent has a closing tail). `None` when the agent has no session or is below threshold. The
 /// caller formats the report line and (with `--spawn`) launches an observer scoped to `d.session:since_offset`.
-fn observe_candidate(fleet: &Fleet, agent: &str, stood_down: bool, threshold: usize) -> Option<ObserveDecision> {
-    let sessions = transcripts::locate_sessions(agent);
+fn observe_candidate(fleet: &Fleet, agent: &str, roster: &[String], stood_down: bool, threshold: usize) -> Option<ObserveDecision> {
+    // task_846: roster-aware session location — resolve ONE owner per transcript dir (longest-match) so a
+    // dash-prefix sibling (v-task-board vs v-task-board-helper) does not pick up the other's transcript and
+    // re-fire the same span under a second watermark key forever.
+    let sessions = transcripts::locate_sessions_disambiguated(agent, roster);
     let newest = sessions.first()?;
     let session = transcripts::session_id_of(newest);
     let lines = session_line_count(newest);
@@ -4682,6 +4685,12 @@ fn watchdog_board(
     let mut native = 0usize;
     // task_500: ids whose metadata.native was ABSENT/malformed (NOT an explicit false) — collected to warn.
     let mut unknown_native_ids: Vec<String> = Vec::new();
+    // task_846: the full roster of agent ids — observe_candidate resolves ONE owner per transcript dir from
+    // this (longest-match), so a dash-prefix sibling never gets another agent's span observed under its key.
+    let roster_ids: Vec<String> = agents
+        .iter()
+        .filter_map(|a| a.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect();
     for a in agents {
         let md = a.get("metadata");
         let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -4757,7 +4766,7 @@ fn watchdog_board(
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
-        if observe && let Some(d) = observe_candidate(&fleet, id, stood_down, observe_threshold) {
+        if observe && let Some(d) = observe_candidate(&fleet, id, &roster_ids, stood_down, observe_threshold) {
             obs.push((id.to_string(), stood_down, d));
         }
         // task_786 corrective + task_794: both read the per-agent open_task_count already computed above, and

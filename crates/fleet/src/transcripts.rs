@@ -397,10 +397,22 @@ fn projects_root() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".claude/projects"))
 }
 
-/// Locate an agent's session JSONL files, newest-first (by mtime), across every project dir that belongs to
-/// the agent. Best-effort: an exact target is available via `--session <file>` at the CLI. Returns an empty
-/// vec when nothing matches.
-pub fn locate_sessions(agent: &str) -> Vec<PathBuf> {
+/// The agent that OWNS a project-dir slug = the LONGEST `roster` id for which [`slug_is_for_agent`] matches.
+/// With dash-prefix ids (`v-task-board` vs `v-task-board-helper`) the bare match is true for BOTH, so the
+/// owner is the most specific (longest) one — which maps each transcript dir to exactly one agent. `None`
+/// when no roster id matches. Pure — unit-tested. (task_846: without this, a shorter-prefix agent's observer
+/// also reads the longer agent's transcript, so the span is observed under two keys and re-fires forever.)
+pub fn slug_owner<'a>(slug: &str, roster: &'a [String]) -> Option<&'a str> {
+    roster
+        .iter()
+        .filter(|a| slug_is_for_agent(slug, a))
+        .max_by_key(|a| a.len())
+        .map(String::as_str)
+}
+
+/// Collect every project-dir session JSONL (newest-first by mtime) whose slug satisfies `dir_belongs`.
+/// Shared walk behind [`locate_sessions`] and [`locate_sessions_disambiguated`].
+fn locate_sessions_where(dir_belongs: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     let Some(root) = projects_root() else {
         return Vec::new();
     };
@@ -411,7 +423,7 @@ pub fn locate_sessions(agent: &str) -> Vec<PathBuf> {
     for d in dirs.flatten() {
         let name = d.file_name();
         let slug = name.to_string_lossy();
-        if !slug_is_for_agent(&slug, agent) {
+        if !dir_belongs(&slug) {
             continue;
         }
         if let Ok(entries) = std::fs::read_dir(d.path()) {
@@ -429,6 +441,28 @@ pub fn locate_sessions(agent: &str) -> Vec<PathBuf> {
     }
     files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest-first
     files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Locate an agent's session JSONL files, newest-first (by mtime), across every project dir that belongs to
+/// the agent. Best-effort: an exact target is available via `--session <file>` at the CLI. Returns an empty
+/// vec when nothing matches.
+pub fn locate_sessions(agent: &str) -> Vec<PathBuf> {
+    locate_sessions_where(|slug| slug_is_for_agent(slug, agent))
+}
+
+/// Like [`locate_sessions`], but ROSTER-AWARE: a dir counts for `agent` only when `agent` is its OWNER (the
+/// longest `roster` id matching the slug per [`slug_owner`]). This fixes task_846: when ids are dash-prefixes
+/// of each other (`v-task-board` / `v-task-board-helper`), the bare [`slug_is_for_agent`] claims the longer
+/// agent's transcript dir for the shorter id too, so the shorter agent's observer reads the longer agent's
+/// transcript and the SAME span gets observed (and its watermark advanced) under two different agent keys —
+/// re-firing forever. Resolving one owner per dir makes an advanced watermark actually suppress the re-fire.
+/// Falls back to the bare match for a dir no roster id owns (empty roster / unknown agent), so behavior is
+/// unchanged outside the dash-prefix case.
+pub fn locate_sessions_disambiguated(agent: &str, roster: &[String]) -> Vec<PathBuf> {
+    locate_sessions_where(|slug| match slug_owner(slug, roster) {
+        Some(owner) => owner == agent,
+        None => slug_is_for_agent(slug, agent),
+    })
 }
 
 /// A parsed `--since` watermark: `<session-id>:<line-offset>` (line-offset = how many JSONL lines of that
@@ -603,6 +637,25 @@ mod tests {
         // KNOWN LIMITATION: a dash-prefix id also matches (repo separator == intra-name dash). Documented;
         // callers disambiguate with the longest match or `--session`.
         assert!(slug_is_for_agent(slug, "v-fleet"), "dash-prefix collision is a documented limitation");
+    }
+
+    #[test]
+    fn slug_owner_prefers_the_longest_matching_roster_id() {
+        // task_846: v-task-board and v-task-board-helper are dash-prefixes; the helper's dir slug matches
+        // BOTH via slug_is_for_agent, so the owner must be the longer id so a dir maps to exactly one agent.
+        let roster = [
+            "v-task-board".to_string(),
+            "v-task-board-helper".to_string(),
+            "board-pm".to_string(),
+        ];
+        let helper_slug = "-x--fleet-agents-v-task-board-helper-cadenza";
+        let board_slug = "-x--fleet-agents-v-task-board-cadenza";
+        assert_eq!(slug_owner(helper_slug, &roster), Some("v-task-board-helper"));
+        assert_eq!(slug_owner(board_slug, &roster), Some("v-task-board"));
+        // A slug no roster id matches has no owner.
+        assert_eq!(slug_owner("-x--fleet-agents-v-cdz-smith-cadenza", &roster), None);
+        // Empty roster → no owner (caller falls back to the bare match, preserving prior behavior).
+        assert_eq!(slug_owner(helper_slug, &[]), None);
     }
 
     #[test]
