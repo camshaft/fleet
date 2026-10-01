@@ -2050,6 +2050,11 @@ enum Cmd {
         /// task_495/912 lane) passes it in at build time. Omitted when absent (no FLEET_HOST line at all).
         #[arg(long)]
         host: Option<String>,
+        /// Emit the correctly-named unit files into this DIRECTORY purely (no HOME write, no systemctl guidance)
+        /// instead of printing/installing -- for a nix derivation to point at $out (task_464 flake wiring).
+        /// Takes precedence over --install.
+        #[arg(long)]
+        out_dir: Option<String>,
     },
     /// Emit or install the LAUNCHER as a systemd USER service + timer: `fleet up-board --launch` reconstitutes
     /// every board-native agent pinned to this host from the BOARD roster (not the file-hub / window.sh), so the
@@ -2083,6 +2088,10 @@ enum Cmd {
         /// into the unit text; a flake-managed install passes it in. Omitted when absent.
         #[arg(long)]
         host: Option<String>,
+        /// Emit the correctly-named unit files into this DIRECTORY purely (no HOME write, no systemctl guidance)
+        /// instead of printing/installing -- for a nix derivation to point at $out (task_464 flake wiring).
+        #[arg(long)]
+        out_dir: Option<String>,
     },
     /// Emit or install a systemd USER service that supervises a long-running fleet-host daemon (Type=simple,
     /// Restart=on-failure), so it survives a tmux-window reap and restarts on crash — the durable replacement
@@ -2119,6 +2128,11 @@ enum Cmd {
         /// Omitted when absent (no FLEET_HOST line).
         #[arg(long)]
         host: Option<String>,
+        /// Emit the correctly-named .service file into this DIRECTORY purely (no HOME write, no systemctl
+        /// guidance) instead of printing/installing -- for a nix derivation to point at $out (task_464 flake
+        /// wiring). Takes precedence over --install/--enable.
+        #[arg(long)]
+        out_dir: Option<String>,
     },
     /// Print the build provenance — package version + the commit the binary was built from (baked at build
     /// time). Compare the rev to `origin/main` to tell whether a deployed binary is current (a stale binary
@@ -2285,6 +2299,7 @@ fn main() {
             install,
             uninstall,
             host,
+            out_dir,
         } => watchdog_unit(
             !no_rearm,
             observe,
@@ -2296,11 +2311,12 @@ fn main() {
             install,
             uninstall,
             host,
+            out_dir,
         ),
-        Cmd::UpUnit { pinned_only, interval_secs, bin, install, uninstall, host } =>
-            up_unit(pinned_only, interval_secs, bin, install, uninstall, host),
-        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall, host } => {
-            daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall, host)
+        Cmd::UpUnit { pinned_only, interval_secs, bin, install, uninstall, host, out_dir } =>
+            up_unit(pinned_only, interval_secs, bin, install, uninstall, host, out_dir),
+        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall, host, out_dir } => {
+            daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall, host, out_dir)
         }
         Cmd::Version => println!("{}", version_line()),
         Cmd::Redeploy { apply } => redeploy(apply),
@@ -8304,6 +8320,26 @@ fn render_service_env_lines(vars: &[(&str, Option<String>)]) -> String {
     out
 }
 
+/// Write pre-rendered systemd unit files `(filename, body)` into `dir` for a PURE emit -- `--out-dir` mode
+/// (task_464 flake wiring). Unlike `--install` (which targets the fixed `~/.config/systemd/user`), this writes
+/// correctly-named files to an ARBITRARY dir with NO HOME dependency and NO systemctl guidance, so a nix
+/// derivation can point it at `$out`. Creates `dir`. Fatal on a write error (a derivation must fail loudly).
+fn write_units_to_dir(dir: &str, units: &[(&str, &str)]) {
+    let base = std::path::Path::new(dir);
+    if let Err(e) = std::fs::create_dir_all(base) {
+        eprintln!("fleet unit --out-dir: mkdir {dir}: {e}");
+        std::process::exit(1);
+    }
+    for (name, body) in units {
+        let path = base.join(name);
+        if let Err(e) = std::fs::write(&path, body) {
+            eprintln!("fleet unit --out-dir: write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+        println!("wrote {}", path.display());
+    }
+}
+
 /// The observer runtime-config env block ([`OBSERVER_ENV_ALLOWLIST`]) read from THIS process's environment and
 /// rendered as systemd `Environment=` lines. Run at install time from the working interactive session so the
 /// captured values are the ones under which a Claude session actually launches. Reads the environment (not pure).
@@ -8389,6 +8425,7 @@ fn watchdog_unit(
     install: bool,
     uninstall: bool,
     host: Option<String>,
+    out_dir: Option<String>,
 ) {
     let fleet_bin = bin.unwrap_or_else(|| {
         std::env::current_exe()
@@ -8404,6 +8441,13 @@ fn watchdog_unit(
     let mut env_block = render_service_env_lines(&[("FLEET_HOST", host)]);
     if observe {
         env_block.push_str(&captured_observer_env());
+    }
+    // --out-dir (task_464 flake wiring): emit the correctly-named unit files into a GIVEN dir purely (no HOME,
+    // no systemctl guidance) so a nix derivation can point it at $out. Takes precedence over install/print.
+    if let Some(dir) = out_dir {
+        let (service, timer) = watchdog_unit_files(&fleet_bin, &exec_args, interval_secs, &env_block);
+        write_units_to_dir(&dir, &[("fleet-watchdog.service", &service), ("fleet-watchdog.timer", &timer)]);
+        return;
     }
     if uninstall {
         watchdog_unit_uninstall();
@@ -8526,6 +8570,7 @@ fn up_unit(
     install: bool,
     uninstall: bool,
     host: Option<String>,
+    out_dir: Option<String>,
 ) {
     let fleet_bin = bin.unwrap_or_else(|| {
         std::env::current_exe()
@@ -8535,6 +8580,13 @@ fn up_unit(
     });
     let exec_args = up_exec_args(pinned_only);
     let env_block = render_service_env_lines(&[("FLEET_HOST", host)]);
+    // --out-dir (task_464 flake wiring): emit the named unit files into a GIVEN dir purely so a nix derivation
+    // can point it at $out. Takes precedence over install/print.
+    if let Some(dir) = out_dir {
+        let (service, timer) = up_unit_files(&fleet_bin, &exec_args, interval_secs, &env_block);
+        write_units_to_dir(&dir, &[("fleet-up.service", &service), ("fleet-up.timer", &timer)]);
+        return;
+    }
     if uninstall {
         up_unit_uninstall();
         return;
@@ -8645,6 +8697,7 @@ fn daemon_unit(
     enable: bool,
     uninstall: bool,
     host: Option<String>,
+    out_dir: Option<String>,
 ) {
     let unit = format!("fleet-{name}.service");
     if uninstall {
@@ -8682,6 +8735,12 @@ fn daemon_unit(
     let mut env_block = render_service_env_lines(&[("FLEET_HOST", host)]);
     env_block.push_str(&captured_daemon_env());
     let body = daemon_unit_file(name, &exec, restart_sec, &env_block);
+    // --out-dir (task_464 flake wiring): emit the single .service file into a GIVEN dir purely so a nix
+    // derivation can point it at $out. Takes precedence over install/enable/print.
+    if let Some(dir) = out_dir {
+        write_units_to_dir(&dir, &[(unit.as_str(), body.as_str())]);
+        return;
+    }
     // `--enable` implies the write (it is the one-shot bring-up), so either flag lands the unit file.
     if install || enable {
         let Some(dir) = user_unit_dir() else {
@@ -10949,6 +11008,19 @@ detached
         // No host → no FLEET_HOST line at all (host-less default, same as watchdog-unit/up-unit).
         let no_host = render_service_env_lines(&[("FLEET_HOST", None), ("PATH", Some("/usr/bin".into()))]);
         assert!(!daemon_unit_file("tunnel", "x", 2, &no_host).contains("FLEET_HOST"), "no host arg → no line");
+    }
+
+    #[test]
+    fn write_units_to_dir_writes_named_files_for_a_pure_emit() {
+        // task_464 --out-dir: a nix derivation points this at $out, so it must write correctly-named files with
+        // the exact bodies into an ARBITRARY dir (not HOME), creating the dir.
+        let dir = std::env::temp_dir().join(format!("fleet-out-dir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = dir.to_str().expect("temp dir path is utf8");
+        write_units_to_dir(d, &[("fleet-up.service", "SVC-BODY"), ("fleet-up.timer", "TIMER-BODY")]);
+        assert_eq!(std::fs::read_to_string(dir.join("fleet-up.service")).unwrap(), "SVC-BODY");
+        assert_eq!(std::fs::read_to_string(dir.join("fleet-up.timer")).unwrap(), "TIMER-BODY");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
