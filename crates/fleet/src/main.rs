@@ -6868,12 +6868,101 @@ fn classify_worktree_sync(
     WorktreeSyncVerdict::Fixable(expected.to_string())
 }
 
+/// Whether an OLD worktree a `worktree-sync` fix is about to stop pointing `metadata.worktree` at carries
+/// at-risk work that would otherwise be silently stranded (task_735): local commits never pushed to its
+/// own upstream, an unclean working tree, or both. Pure — unit-tested.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum CommitsCarryVerdict {
+    /// No commits ahead of upstream and a clean working tree — nothing at risk at the old path.
+    Clean,
+    /// Commits ahead of upstream, an unclean working tree, or both.
+    AtRisk { ahead: usize, dirty: bool },
+}
+
+/// Classify commits-carry risk from already-gathered facts: `ahead` is the old worktree's commit count
+/// ahead of its own upstream (0 when there is none, or when there genuinely are no unpushed commits —
+/// both are correctly `Clean`: an old path with no upstream and no new commits carries nothing to strand);
+/// `dirty` is whether its working tree has uncommitted changes. Pure.
+fn classify_commits_carry(ahead: usize, dirty: bool) -> CommitsCarryVerdict {
+    if ahead == 0 && !dirty {
+        CommitsCarryVerdict::Clean
+    } else {
+        CommitsCarryVerdict::AtRisk { ahead, dirty }
+    }
+}
+
+/// `(ahead, dirty)` for the git worktree at `path`, or `None` if `path` is not (or no longer) a real git
+/// worktree — a worktree-sync fix only fires when `current` differs from the real tree, so a stale
+/// `metadata.worktree` may already point at nothing (previously cleaned up, or never real). Guards the
+/// `@{u}` footgun (doc_25 / task_514): on some git versions `rev-parse '@{u}'` prints the LITERAL text
+/// `@{u}` to stdout and exits non-zero when the upstream does not resolve, so a naive stdout-capture would
+/// misread that as a real ahead-count — `--verify` first and only trust the count when it succeeds.
+fn old_worktree_risk(path: &str) -> Option<(usize, bool)> {
+    if !std::path::Path::new(path).join(".git").exists() {
+        return None;
+    }
+    let has_upstream = std::process::Command::new("git")
+        .args(["-C", path, "rev-parse", "--verify", "--quiet", "@{u}"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let ahead = if has_upstream {
+        std::process::Command::new("git")
+            .args(["-C", path, "rev-list", "--count", "@{u}..HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let dirty = std::process::Command::new("git")
+        .args(["-C", path, "status", "--porcelain"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+    Some((ahead, dirty))
+}
+
+/// The durable board notice for an agent whose pre-migration worktree at `old_path` carries at-risk work a
+/// `worktree-sync` fix is about to stop pointing `metadata.worktree` at (task_735: a cross-clone migration
+/// must never silently strand in-flight work). Automatic transplant is NOT attempted here — `old_path` may
+/// be a wholly separate clone with its own object database (e.g. an abandoned personal checkout), so a safe
+/// cherry-pick/`git am` across that boundary is a harder follow-up; this notice is the zero-risk half of the
+/// task's gate (detect-and-notify, not detect-and-silently-drop). Pure — unit-tested.
+fn commits_carry_notice(old_path: &str, ahead: usize, dirty: bool) -> String {
+    let mut risk = Vec::new();
+    if ahead > 0 {
+        risk.push(format!(
+            "{ahead} commit{} ahead of its upstream",
+            if ahead == 1 { "" } else { "s" }
+        ));
+    }
+    if dirty {
+        risk.push("an unclean working tree".to_string());
+    }
+    format!(
+        "fleet worktree-sync just stopped pointing your metadata.worktree at {old_path} (migrating you to \
+         your real per-agent fleet worktree). That old path still has {} that would otherwise be stranded \
+         with nobody looking at it again. Recover it yourself: cd {old_path} && git push (or git \
+         format-patch / git am the commits onto your real worktree) before that path is cleaned up.",
+        risk.join(" and "),
+    )
+}
+
 /// `fleet worktree-sync [--apply]` (task_735 migration residue): correct a STALE board `metadata.worktree` that
 /// still points at a pre-migration path to the agent's real per-agent fleet worktree
 /// (`$FLEET_ROOT/agents/<id>/<repo>`). Report-only by default; `--apply` rewrites via `patch_metadata`. SAFE by
 /// construction (see [`classify_worktree_sync`]): only a single-repo agent whose real fleet worktree EXISTS and
 /// differs from the registered path is corrected; a multi-repo agent (ambiguous primary) and a missing real tree
 /// are reported + left untouched. Exits non-zero only on a board write error.
+///
+/// Also checks the OLD path for at-risk work before stopping anyone from pointing at it (task_735's
+/// commits-carry half, see [`old_worktree_risk`]): under `--apply`, a stranded old path files a durable board
+/// task assigned to the agent naming the old path + the ahead/dirty facts; in dry-run it just prints a
+/// WOULD-FLAG line. No git write ever touches the old path — detect-and-notify, not an automatic transplant
+/// (which would need to cross a possibly-separate clone's object database safely; left as a harder follow-up).
 fn worktree_sync(apply: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet worktree-sync: board unavailable ({e}); cannot sync worktrees");
@@ -6895,6 +6984,7 @@ fn worktree_sync(apply: bool) {
 
     let (mut n_fixed, mut n_already, mut n_ambiguous, mut n_notree, mut n_nowt, mut n_skipped, mut n_err) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut n_stranded = 0usize;
     for id in &ids {
         // The DETAIL record reliably carries metadata (the list projection has dropped it before — task_418).
         let detail = board.get_agent(id).ok();
@@ -6950,6 +7040,42 @@ fn worktree_sync(apply: bool) {
             }
             WorktreeSyncVerdict::AlreadyCorrect => n_already += 1,
             WorktreeSyncVerdict::Fixable(target) => {
+                // task_735: before (apply) or alongside reporting (dry-run) the metadata rewrite, check
+                // whether the OLD path carries at-risk work the rewrite is about to stop pointing anyone
+                // at — the exact cross-clone-migration moment this task is about.
+                let risk = current
+                    .as_deref()
+                    .and_then(old_worktree_risk)
+                    .map(|(ahead, dirty)| classify_commits_carry(ahead, dirty));
+                if let Some(CommitsCarryVerdict::AtRisk { ahead, dirty }) = risk {
+                    n_stranded += 1;
+                    let old_path = current.as_deref().unwrap_or("");
+                    if apply {
+                        let notice = commits_carry_notice(old_path, ahead, dirty);
+                        match board.create_task(
+                            21, // fleet-tooling project — the home of every worktree-sync/task_735 notice
+                            &format!("stranded work at {old_path} (worktree-sync migration)"),
+                            &notice,
+                            "fleet-worktree-sync",
+                            serde_json::json!({"source": "worktree-sync", "old_path": old_path}),
+                            None,
+                        ) {
+                            Ok(task_id) => match board.reassign_task(task_id, id, "fleet-worktree-sync") {
+                                Ok(()) => println!(
+                                    "  - {id}: STRANDED-WORK notice filed as task_{task_id} ({old_path}: {ahead} ahead, dirty={dirty})"
+                                ),
+                                Err(e) => eprintln!(
+                                    "  - {id}: stranded-work task_{task_id} created but reassign FAILED ({e})"
+                                ),
+                            },
+                            Err(e) => eprintln!("  - {id}: stranded-work notice FAILED to file ({e})"),
+                        }
+                    } else {
+                        println!(
+                            "  - {id}: WOULD FLAG stranded work at {old_path} ({ahead} ahead, dirty={dirty})"
+                        );
+                    }
+                }
                 if apply {
                     match board.patch_metadata(id, serde_json::json!({ "worktree": target })) {
                         Ok(()) => {
@@ -6979,8 +7105,9 @@ fn worktree_sync(apply: bool) {
     }
 
     let verb = if apply { "fixed" } else { "would-fix" };
+    let stranded_verb = if apply { "flagged" } else { "would-flag" };
     println!(
-        "\nsummary: {n_fixed} {verb}, {n_already} already-correct, {n_ambiguous} multi-repo-skipped, {n_notree} no-real-tree, {n_nowt} no-worktree, {n_skipped} non-native{}",
+        "\nsummary: {n_fixed} {verb}, {n_already} already-correct, {n_ambiguous} multi-repo-skipped, {n_notree} no-real-tree, {n_nowt} no-worktree, {n_skipped} non-native, {n_stranded} stranded-work-{stranded_verb}{}",
         if n_err > 0 { format!(", {n_err} ERRORED") } else { String::new() }
     );
     if !apply && n_fixed > 0 {
@@ -9883,6 +10010,112 @@ detached
             classify_worktree_sync(1, Some(real), true, Some(".claude/worktrees/a")),
             Fixable(real.to_string())
         );
+    }
+
+    #[test]
+    fn classify_commits_carry_flags_ahead_or_dirty_but_not_a_clean_old_path() {
+        use CommitsCarryVerdict::*;
+        // No upstream (ahead=0 by convention) and clean -> nothing at risk.
+        assert_eq!(classify_commits_carry(0, false), Clean);
+        // Unpushed commits alone are at-risk.
+        assert_eq!(
+            classify_commits_carry(3, false),
+            AtRisk {
+                ahead: 3,
+                dirty: false
+            }
+        );
+        // An unclean working tree alone is at-risk, even with nothing committed-ahead.
+        assert_eq!(
+            classify_commits_carry(0, true),
+            AtRisk {
+                ahead: 0,
+                dirty: true
+            }
+        );
+        // Both at once is still just one AtRisk verdict carrying both facts.
+        assert_eq!(
+            classify_commits_carry(2, true),
+            AtRisk {
+                ahead: 2,
+                dirty: true
+            }
+        );
+    }
+
+    #[test]
+    fn commits_carry_notice_names_the_path_and_the_specific_risk() {
+        let ahead_only = commits_carry_notice("/old/path", 3, false);
+        assert!(
+            ahead_only.contains("/old/path"),
+            "names the old path so the agent can cd there"
+        );
+        assert!(
+            ahead_only.contains("3 commits ahead"),
+            "pluralizes multiple commits"
+        );
+        assert!(
+            !ahead_only.contains("unclean working tree"),
+            "clean tree is not mentioned when not dirty"
+        );
+
+        let singular = commits_carry_notice("/old/path", 1, false);
+        assert!(
+            singular.contains("1 commit ahead") && !singular.contains("1 commits"),
+            "singular commit"
+        );
+
+        let dirty_only = commits_carry_notice("/old/path", 0, true);
+        assert!(dirty_only.contains("an unclean working tree"));
+        assert!(
+            !dirty_only.contains("ahead of its upstream"),
+            "no ahead-count mentioned when ahead is 0"
+        );
+
+        let both = commits_carry_notice("/old/path", 2, true);
+        assert!(
+            both.contains("2 commits ahead")
+                && both.contains("an unclean working tree")
+                && both.contains(" and ")
+        );
+    }
+
+    #[test]
+    fn old_worktree_risk_is_none_for_a_path_that_is_not_a_git_worktree() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-test-not-a-worktree-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert_eq!(old_worktree_risk(dir.to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_worktree_risk_reports_ahead_and_dirty_for_a_real_scratch_repo() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-test-old-worktree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        // No upstream configured yet: ahead=0 by convention (not an error), clean tree.
+        assert_eq!(old_worktree_risk(dir.to_str().unwrap()), Some((0, false)));
+        // Dirty the tree (untracked file): still ahead=0, now dirty=true.
+        std::fs::write(dir.join("g.txt"), "b\n").unwrap();
+        assert_eq!(old_worktree_risk(dir.to_str().unwrap()), Some((0, true)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
