@@ -295,6 +295,12 @@
         # Version-locked libpdfium (build 7881) for the KB ingest workers' PDF path — see pdfiumLib above.
         # The kb-inbox/uploader roles consume this as inputs.fleet.packages.${system}.pdfium on LD_LIBRARY_PATH.
         pdfium = pdfiumLib pkgs;
+        # Pinned Node >=20 for fleet agents' MCP servers (e.g. amazon-sharepoint-mcp requires node
+        # >=20, task_812). Provisioning node through the flake (reproducible, nixpkgs-pinned, drift-
+        # tracked) is the preferred route over a mise global-default bump; v-fleet-tooling consumes
+        # this and puts ${nodejs}/bin ahead of the mise shims on the agent PATH in window.sh, so the
+        # nix node wins regardless of the interactive mise default.
+        nodejs = pkgs.nodejs_22;
         # The generated USER systemd unit files for the flake-managed daemon set (task #486/#493). Build to
         # inspect the rendered units (nix build .#fleet-user-units); `install-fleet-daemons` (an app) installs them.
         fleet-user-units = (fleetDaemons pkgs).unitsDir;
