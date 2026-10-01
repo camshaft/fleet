@@ -103,7 +103,7 @@ fn open_observation_query(project_id: i64, observes: &str) -> String {
     format!("/tasks?project_id={project_id}&status=todo&meta_key=observes&meta_value={observes}")
 }
 
-/// A TRANSIENT board failure worth a brief retry: an origin 5xx (502/503/504 — the green origin's occasional
+/// A TRANSIENT board failure worth a brief retry: an origin 5xx (502/503/504 — the board origin's occasional
 /// blip) or a transport-level error. A 4xx (e.g. a 404) or any other status is NOT transient — surface it so
 /// real errors are not masked. Pure — unit-tested.
 fn is_transient(err: &ureq::Error) -> bool {
@@ -111,7 +111,7 @@ fn is_transient(err: &ureq::Error) -> bool {
 }
 
 /// Run a board request, retrying a TRANSIENT failure (see [`is_transient`]) up to 2 extra times with a short
-/// backoff — so a brief green-origin blip does not hard-fail a one-shot command or skip a whole watchdog
+/// backoff — so a brief origin blip does not hard-fail a one-shot command or skip a whole watchdog
 /// sweep. A sustained outage still surfaces (the error returns once the attempts are spent). `f` rebuilds the
 /// request each try because ureq consumes the `Request` on `call`/`send`.
 fn with_transient_retry<F>(f: F) -> Result<ureq::Response, ureq::Error>

@@ -96,7 +96,7 @@ fn agent_is_staged(md: Option<&serde_json::Value>) -> bool {
 /// Whether the watchdog should manage an agent on this host. A STAGED agent ([`agent_is_staged`]) is never
 /// managed — it is a reserve helper that is not meant to be running, so re-arming or spawning an observer
 /// against it would be a spurious wake of an intentionally-down agent. Otherwise, under `pinned_only` (a
-/// secondary box like green), ONLY agents EXPLICITLY pinned here ([`agent_host_is_explicit`]) — so it never
+/// secondary box), ONLY agents EXPLICITLY pinned here ([`agent_host_is_explicit`]) — so it never
 /// re-arms or spawns an observer against an unpinned agent whose tmux window / transcript lives on another
 /// box. Without it, the loose predicate ([`agent_host_matches`]): this-host-pinned OR unpinned run-anywhere.
 /// Pure — unit-tested.
@@ -1125,7 +1125,7 @@ fn up(fleet: &Fleet, config_path: &Path, provision: bool, launch: bool) {
 /// box ([`agent_host_matches`] — unset/unpinned = managed everywhere, as today), and reports which are already
 /// running, which are intentionally stood down, and which need launching. With `--launch` it spins up each
 /// to-launch agent via the per-agent board-native launch path ([`spin_up`] with apply). Host affinity means a
-/// box brings up exactly its own declared, host-pinned agents — green's reconcile never touches host-a
+/// box brings up exactly its own declared, host-pinned agents — the secondary box's reconcile never touches host-a
 /// windows and vice-versa. Reads the board only (agents coordinate via their own MCP). NOTE: a hard per-agent
 /// launch failure exits (spin_up's contract), aborting the remaining launches — re-run to continue.
 fn up_board(launch: bool, pinned_only: bool) {
@@ -1655,7 +1655,7 @@ enum Cmd {
         /// Restrict the board scan to agents EXPLICITLY pinned to this host (metadata.host names it) — the same
         /// predicate as `up-board --pinned-only`. Excludes unpinned "run-anywhere" agents, so a box running the
         /// watchdog fleet-wide never re-arms or spawns an observer against an agent whose tmux window /
-        /// transcript lives on ANOTHER box. Use this on a secondary box (e.g. green) that should only manage its
+        /// transcript lives on ANOTHER box. Use this on a secondary box that should only manage its
         /// own pinned agents; the primary box runs without it to cover the unpinned roster.
         #[arg(long)]
         pinned_only: bool,
@@ -1684,7 +1684,7 @@ enum Cmd {
     },
     /// Post a deploy-confirmed event to the `deploys` board channel (#171) — the deploy pipeline (#73/#74
     /// deployer role) calls this after a `colmena apply switch`, so agents subscribed to `deploys` (a waiter
-    /// blocked on a green deploy) are woken. Creates the channel if absent.
+    /// blocked on a deploy) are woken. Creates the channel if absent.
     PostDeploy {
         /// The repo that was deployed (e.g. `camshaft/task-board`).
         #[arg(long)]
@@ -1786,7 +1786,7 @@ enum Cmd {
     },
     /// Audit every board agent for a working PUSH-WAKE path (#386, operator: no poll-only agents). Each
     /// EXPECTED-RUNNING agent (not offline / stood-down) must be reachable by a wake: either a non-empty
-    /// `webhook_url` (green-resident agents point it at their local fleet-notify) OR a LIVE reverse tunnel
+    /// `webhook_url` (secondary-host-resident agents point it at their local fleet-notify) OR a LIVE reverse tunnel
     /// (off-LAN agents, keyed on the board by `GET /tunnels`). An agent with NEITHER is POLL-ONLY — it only
     /// sees work on its (slow) loop interval, the exact regression this guards. Prints one line per agent
     /// with its wake class and exits non-zero when any poll-only agent is found, so a supervisor can gate on
@@ -3973,7 +3973,7 @@ fn observe_record(fleet: &Fleet, agent: &str, session: &str, offset: usize) {
 
 // ── post-deploy (#171 deploy-notification channel) ─────────────────────────────────────────────────
 
-/// The board channel deploy events are posted to; agents subscribe while waiting on a green deploy and leave
+/// The board channel deploy events are posted to; agents subscribe while waiting on a deploy and leave
 /// when done (board-pm approved one channel, #171). Created-if-absent on first post.
 const DEPLOYS_CHANNEL: &str = "deploys";
 /// The identity the deploy pipeline authors its posts as.
@@ -5274,7 +5274,7 @@ fn served_set(toml: bool) {
 /// the board has a live reverse tunnel for it. Pure — unit-tested.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum WakePath {
-    /// A non-empty `webhook_url` — the board POSTs events straight to it (green-resident agents point it at
+    /// A non-empty `webhook_url` — the board POSTs events straight to it (secondary-host-resident agents point it at
     /// their local fleet-notify).
     Webhook,
     /// No webhook, but the board has a LIVE tunnel for the agent — an off-LAN agent woken down the tunnel.
@@ -5408,7 +5408,7 @@ fn wake_audit(verbose: bool) {
         println!("PASS: every expected-running agent has a push-wake path (no poll-only agents).");
     } else {
         eprintln!(
-            "FAIL: {} poll-only agent(s) — wire a webhook_url (green-resident) or a tunnel (off-LAN): {}",
+            "FAIL: {} poll-only agent(s) — wire a webhook_url (secondary-host-resident) or a tunnel (off-LAN): {}",
             poll_only.len(),
             poll_only.join(", ")
         );
@@ -8142,7 +8142,7 @@ mod tests {
         assert_eq!(watchdog_exec_args(true, false, false, false), "watchdog --rearm --stale-only");
         assert_eq!(watchdog_exec_args(true, true, false, false), "watchdog --rearm --stale-only --observe --spawn");
         assert_eq!(watchdog_exec_args(true, false, true, false), "watchdog --rearm --stale-only --pinned-only");
-        // The green go-live shape: liveness + observer cadence + host filter.
+        // The secondary-box go-live shape: liveness + observer cadence + host filter.
         assert_eq!(
             watchdog_exec_args(true, true, true, false),
             "watchdog --rearm --stale-only --observe --spawn --pinned-only"
@@ -8183,8 +8183,8 @@ mod tests {
             classify_observe_coverage(Some(&green_pinned), std::slice::from_ref(&dev), "host-a", None),
             ObserveCoverage::Blind
         );
-        // Add green's pinned-only cadence and the SAME agent becomes covered (assumed — green is not the local
-        // host, so transcript presence is not probed here).
+        // Add the host-b pinned-only cadence and the SAME agent becomes covered (assumed — host-b is not the
+        // local host, so transcript presence is not probed here).
         assert_eq!(
             classify_observe_coverage(Some(&green_pinned), &[dev.clone(), green.clone()], "host-a", None),
             ObserveCoverage::CoveredAssumed
@@ -8400,7 +8400,7 @@ detached
         assert!(u.contains("Type=oneshot"), "single-sweep → oneshot, not a loop");
         assert!(u.contains("ExecStart=/run/fleet/bin/fleet watchdog --rearm --stale-only --observe --spawn --pinned-only"));
         assert!(u.contains("OnUnitActiveSec=60"), "the timer re-fires on the cadence");
-        // Ordered after the wake path it complements (green's request), and installable as a user timer.
+        // Ordered after the wake path it complements (the secondary box's request), and installable as a user timer.
         assert!(u.contains("After=fleet-notify.service") && u.contains("Wants=fleet-notify.service"));
         assert!(u.contains("WantedBy=timers.target"));
     }
