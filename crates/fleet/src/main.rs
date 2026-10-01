@@ -2785,6 +2785,28 @@ enum SpinDownAction {
     OfflineOnly,
 }
 
+/// task_786 corrective predicate: is a board-native agent STRANDED — stood down (board `offline`) while it
+/// still holds open actionable assignments (todo/in_progress, non-blocked, as counted by `open_task_count`)?
+/// Such an agent has no live loop to work the tasks, and because it is windowless a watchdog WAKE cannot
+/// revive it (which is why the #506 at-rest re-arm, built on `rearm_candidate`'s pane wake, does not cover
+/// this case — the task_311 class: cr-reviewer sat stood down ~16h still holding a dispatched CR review). It
+/// must be spun up or its tasks reassigned. Pure so the selection is unit-testable without a live board.
+fn agent_is_stranded(stood_down: bool, open_assignments: usize) -> bool {
+    stood_down && open_assignments > 0
+}
+
+/// task_794 default backlog-depth threshold: an agent carrying MORE than this many open actionable
+/// assignments is a hire/route signal to the PM. Overridable per sweep via `CDZ_BACKLOG_DEPTH`.
+const BACKLOG_DEPTH_DEFAULT: usize = 2;
+
+/// task_794 predicate: is a RUNNING agent's open backlog deep enough to signal the PM for a helper? A
+/// stood-down agent is excluded — its unworked queue is the task_786 STRANDED signal (spin it up / reassign),
+/// a different remedy than hiring; counting it here would double-signal. Pure so the threshold is
+/// unit-testable without a live board.
+fn backlog_over_depth(stood_down: bool, open_assignments: usize, threshold: usize) -> bool {
+    !stood_down && open_assignments > threshold
+}
+
 fn spin_down_action(
     is_native: bool,
     has_window: bool,
@@ -4593,6 +4615,16 @@ fn watchdog_board(
     // task_582 safeguard-wedge (report-only this slice): agents whose newest session is stuck in a trailing
     // run of model-safeguard refusals. Collected across the sweep and surfaced in one WARNING below.
     let mut wedged_ids: Vec<String> = Vec::new();
+    // task_786 corrective (report-only this slice): STOOD-DOWN agents still holding open assignments — the
+    // cr-reviewer stranding class a wake cannot fix (windowless). (id, open_count), surfaced in one WARNING.
+    let mut stranded_ids: Vec<(String, usize)> = Vec::new();
+    // task_794 (report-only this slice): RUNNING agents whose open backlog exceeds the depth threshold — the
+    // PM hire/route signal. (id, open_count), surfaced in one WARNING; the auto board-signal is the opt-in next.
+    let backlog_depth = std::env::var("CDZ_BACKLOG_DEPTH")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(BACKLOG_DEPTH_DEFAULT);
+    let mut backlog_overflow_ids: Vec<(String, usize)> = Vec::new();
     let mut native = 0usize;
     // task_500: ids whose metadata.native was ABSENT/malformed (NOT an explicit false) — collected to warn.
     let mut unknown_native_ids: Vec<String> = Vec::new();
@@ -4673,6 +4705,15 @@ fn watchdog_board(
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
         if observe && let Some(d) = observe_candidate(&fleet, id, stood_down, observe_threshold) {
             obs.push((id.to_string(), stood_down, d));
+        }
+        // task_786 corrective + task_794: both read the per-agent open_task_count already computed above, and
+        // both are collected BEFORE the --stale-only skip (a stood-down agent with a quiet queue trips none of
+        // the re-arm gates, so it would otherwise be skipped in a --stale-only sweep and never surface).
+        if agent_is_stranded(stood_down, open_tasks) {
+            stranded_ids.push((id.to_string(), open_tasks));
+        }
+        if backlog_over_depth(stood_down, open_tasks, backlog_depth) {
+            backlog_overflow_ids.push((id.to_string(), open_tasks));
         }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
         // #535 work-driven tight cadence: a work-holder quiet beyond the short work cadence is a candidate even
@@ -4861,6 +4902,33 @@ fn watchdog_board(
             "-- WARNING: {} agent(s) SAFEGUARD-WEDGED (last {SAFEGUARD_WEDGE_THRESHOLD} assistant turns all stop_reason=refusal; last_seen keeps advancing so the liveness check misses it): {}. Recover: `fleet spin-down <agent> --apply --force` then `fleet spin-up <agent> --apply`.",
             wedged_ids.len(),
             wedged_ids.join(", ")
+        );
+    }
+    if !stranded_ids.is_empty() {
+        // task_786 corrective: an agent STOOD DOWN (offline) while still holding open actionable assignment(s)
+        // (todo/in_progress, non-blocked) — the task_311 class (cr-reviewer stood down ~16h still holding a
+        // dispatched CR review). A stood-down agent has no live loop to work them, and because it is windowless
+        // a watchdog wake cannot revive it (so the #506 at-rest re-arm does not cover this) — it must be spun up
+        // or its tasks reassigned. Report-only this slice; auto-revive (spin-up) off this predicate is the opt-in
+        // next increment. The prevention companion is the task_786 spin-down refuse-to-strand guard (PR 266).
+        let list: Vec<String> = stranded_ids.iter().map(|(id, n)| format!("{id}({n})")).collect();
+        println!(
+            "-- WARNING: {} agent(s) STRANDED (task_786): stood down while still holding open assignment(s) [agent(open)]: {}. A stood-down agent has no live loop to work them and a wake cannot revive a windowless agent — spin each up (`fleet spin-up <agent> --apply`) or reassign its tasks.",
+            stranded_ids.len(),
+            list.join(", ")
+        );
+    }
+    if !backlog_overflow_ids.is_empty() {
+        // task_794: a RUNNING agent whose open backlog exceeds the depth threshold ({backlog_depth}) — the PM
+        // hire/route signal (the automated complement to the task_786 don't-strand guard). Report-only this
+        // slice: the WARNING is the human-/PM-readable signal; an auto board-message to the PM on breach
+        // (cooldown-fenced, behind an opt-in flag) is the next increment so merely merging never pings the PM.
+        let list: Vec<String> = backlog_overflow_ids.iter().map(|(id, n)| format!("{id}({n})")).collect();
+        println!(
+            "-- WARNING: {} agent(s) OVER BACKLOG DEPTH (task_794: >{} open) [agent(open)]: {}. A deep backlog is the PM hire/route signal — route a helper or reassign. (Set CDZ_BACKLOG_DEPTH to tune the threshold.)",
+            backlog_overflow_ids.len(),
+            backlog_depth,
+            list.join(", ")
         );
     }
     if !unknown_native_ids.is_empty() {
@@ -8197,6 +8265,32 @@ mod tests {
         assert_eq!(spin_down_action(true, false, false, 3, true), OfflineOnly);
         // Zero open assignments → the guard is inert (normal behavior).
         assert_eq!(spin_down_action(true, true, false, 0, false), OfflineAndKill);
+    }
+
+    #[test]
+    fn agent_is_stranded_flags_a_stood_down_agent_holding_open_work() {
+        // task_786 corrective: stood down + >=1 open assignment → STRANDED (the cr-reviewer class).
+        assert!(agent_is_stranded(true, 1));
+        assert!(agent_is_stranded(true, 4));
+        // A stood-down agent with an empty queue is a legitimate rest — not stranded.
+        assert!(!agent_is_stranded(true, 0));
+        // A RUNNING agent holding work is not stranded (it has a live loop) — that is task_794's lane.
+        assert!(!agent_is_stranded(false, 3));
+        assert!(!agent_is_stranded(false, 0));
+    }
+
+    #[test]
+    fn backlog_over_depth_signals_a_running_agent_above_threshold_only() {
+        // task_794: a RUNNING agent strictly OVER the threshold is the hire/route signal.
+        assert!(backlog_over_depth(false, 3, BACKLOG_DEPTH_DEFAULT)); // 3 > 2
+        assert!(!backlog_over_depth(false, 2, BACKLOG_DEPTH_DEFAULT)); // at threshold, not over
+        assert!(!backlog_over_depth(false, 0, BACKLOG_DEPTH_DEFAULT));
+        // A STOOD-DOWN agent is excluded here (its unworked queue is the task_786 STRANDED signal instead) so
+        // the two mechanisms never double-signal the same agent.
+        assert!(!backlog_over_depth(true, 9, BACKLOG_DEPTH_DEFAULT));
+        // Threshold is tunable.
+        assert!(backlog_over_depth(false, 2, 1)); // 2 > 1
+        assert!(!backlog_over_depth(false, 2, 5));
     }
 
     #[test]
