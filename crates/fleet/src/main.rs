@@ -2051,6 +2051,39 @@ enum Cmd {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Emit or install the LAUNCHER as a systemd USER service + timer: `fleet up-board --launch` reconstitutes
+    /// every board-native agent pinned to this host from the BOARD roster (not the file-hub / window.sh), so the
+    /// fleet comes up on boot and is periodically reconciled WITHOUT the hub (task_464 launcher relocation, the
+    /// counterpart to `watchdog-unit`). Default: PRINT the units (a declarative/nix host translates the text);
+    /// `--install` writes them to `~/.config/systemd/user/` (no sudo); `--uninstall` removes them. `host`
+    /// (task_937 Phase A) is emitted as `Environment="FLEET_HOST=<host>"` so the unit text never hardcodes a box
+    /// -- a flake-managed install passes the target host in, making a later target-swap (Phase B) a one-argument
+    /// change.
+    UpUnit {
+        /// Restrict the launcher to agents EXPLICITLY pinned to this host (metadata.host names it) -- for a
+        /// secondary box that should bring up only its own pinned agents, not the unpinned run-anywhere roster.
+        #[arg(long)]
+        pinned_only: bool,
+        /// Timer cadence in seconds for the periodic reconcile (systemd `OnUnitActiveSec`); the first run is at
+        /// `OnBootSec`, so the fleet comes up shortly after boot and is re-reconciled on this interval.
+        #[arg(long, default_value_t = 300)]
+        interval_secs: u64,
+        /// The fleet binary path to put in `ExecStart` (defaults to this binary's absolute path; set it to the
+        /// installed path on the target host, e.g. the flake output).
+        #[arg(long)]
+        bin: Option<String>,
+        /// INSTALL the units into `~/.config/systemd/user/` (user-level, no sudo) instead of printing them.
+        #[arg(long)]
+        install: bool,
+        /// REMOVE the user units this installed (the inverse of `--install`).
+        #[arg(long)]
+        uninstall: bool,
+        /// The target host whose board-native agents this launcher reconstitutes, emitted as
+        /// `Environment="FLEET_HOST=<host>"` (task_937 Phase A) -- the host is a generator ARGUMENT, never baked
+        /// into the unit text; a flake-managed install passes it in. Omitted when absent.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Emit or install a systemd USER service that supervises a long-running fleet-host daemon (Type=simple,
     /// Restart=on-failure), so it survives a tmux-window reap and restarts on crash — the durable replacement
     /// for a bare keep-alive window (#359). The service captures a known-good PATH so the daemon resolves
@@ -2258,6 +2291,8 @@ fn main() {
             uninstall,
             host,
         ),
+        Cmd::UpUnit { pinned_only, interval_secs, bin, install, uninstall, host } =>
+            up_unit(pinned_only, interval_secs, bin, install, uninstall, host),
         Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall } => {
             daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall)
         }
@@ -8412,6 +8447,136 @@ fn watchdog_unit_uninstall() {
     println!("  then: systemctl --user daemon-reload");
 }
 
+/// The launcher's exec arguments: `up-board --launch` reconstitutes every board-native agent pinned to this host
+/// from the board roster (launching a tmux window for any that is declared-but-missing); `--pinned-only` narrows
+/// it to agents EXPLICITLY pinned here (a secondary box). `--launch` is always present -- a unit that only
+/// reported would never bring the fleet up. Pure -- unit-tested.
+fn up_exec_args(pinned_only: bool) -> String {
+    let mut args = String::from("up-board --launch");
+    if pinned_only {
+        args.push_str(" --pinned-only");
+    }
+    args
+}
+
+/// The systemd USER service + timer for the LAUNCHER cadence as `(service_text, timer_text)` -- pure unit text.
+/// The service is a `oneshot` running `fleet up-board --launch` (reconstitute the board-native fleet from the
+/// board, no file-hub); it needs the network up (the board API) so it is ordered After `network-online.target`.
+/// The timer fires it shortly after boot (`OnBootSec`) and periodically re-reconciles on `OnUnitActiveSec`, so a
+/// rebooted host brings its fleet back up and a window that died between watchdog re-arms is relaunched.
+/// `env_block` is the pre-rendered `Environment=` lines (the FLEET_HOST host-parameterization). Pure -- unit-tested.
+fn up_unit_files(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) -> (String, String) {
+    let service = format!(
+        "[Unit]\n\
+         Description=Fleet launcher — reconstitute board-native agents (up-board) from the board, no file-hub\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         Type=oneshot\n\
+         {env_block}\
+         ExecStart={fleet_bin} {exec_args}\n"
+    );
+    let timer = format!(
+        "[Unit]\n\
+         Description=Fleet launcher cadence (boot + periodic reconcile)\n\n\
+         [Timer]\n\
+         OnBootSec=30\n\
+         OnUnitActiveSec={interval_secs}\n\
+         Persistent=true\n\n\
+         [Install]\n\
+         WantedBy=timers.target\n"
+    );
+    (service, timer)
+}
+
+/// The two launcher units concatenated with display headers, for `fleet up-unit` stdout -- a host installs these
+/// DECLARATIVELY (home-manager); the emitted text is the canonical shape to translate. Pure -- unit-tested.
+fn render_up_units(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) -> String {
+    let (service, timer) = up_unit_files(fleet_bin, exec_args, interval_secs, env_block);
+    format!(
+        "# ---- fleet-up.service (systemd USER oneshot — fleet up-board --launch) ----\n{service}\n\
+         # ---- fleet-up.timer (fires the launcher at boot + every {interval_secs}s) ----\n{timer}"
+    )
+}
+
+/// `fleet up-unit` -- the LAUNCHER's systemd USER service + timer (task_464 launcher relocation off the file-hub,
+/// the counterpart to `watchdog-unit`). It runs `fleet up-board --launch` so the fleet comes up from the BOARD
+/// roster on boot and is periodically reconciled, replacing the hub's window.sh launch path. Default: PRINT the
+/// units (a declarative/nix host translates the text); `--install` writes them to `~/.config/systemd/user/` (no
+/// sudo); `--uninstall` removes them. `host` (task_937 Phase A) is emitted as `Environment="FLEET_HOST=<host>"`
+/// so the unit text never bakes in a box -- the flake-managed install passes the target host as an argument,
+/// making a later target-swap (Phase B) a one-argument change.
+fn up_unit(
+    pinned_only: bool,
+    interval_secs: u64,
+    bin: Option<String>,
+    install: bool,
+    uninstall: bool,
+    host: Option<String>,
+) {
+    let fleet_bin = bin.unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "fleet".to_string())
+    });
+    let exec_args = up_exec_args(pinned_only);
+    let env_block = render_service_env_lines(&[("FLEET_HOST", host)]);
+    if uninstall {
+        up_unit_uninstall();
+        return;
+    }
+    if install {
+        up_unit_install(&fleet_bin, &exec_args, interval_secs, &env_block);
+        return;
+    }
+    print!("{}", render_up_units(&fleet_bin, &exec_args, interval_secs, &env_block));
+}
+
+/// Write the launcher service + timer into `~/.config/systemd/user/` and print the enable command. User-level
+/// (no sudo). Idempotent (overwrites).
+fn up_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) {
+    let Some(dir) = user_unit_dir() else {
+        eprintln!("fleet up-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
+        std::process::exit(1);
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("fleet up-unit --install: mkdir {}: {e}", dir.display());
+        std::process::exit(1);
+    }
+    let (service, timer) = up_unit_files(fleet_bin, exec_args, interval_secs, env_block);
+    for (name, body) in [("fleet-up.service", &service), ("fleet-up.timer", &timer)] {
+        let path = dir.join(name);
+        if let Err(e) = std::fs::write(&path, body) {
+            eprintln!("fleet up-unit --install: write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+        println!("installed {}", path.display());
+    }
+    println!("  ExecStart: {fleet_bin} {exec_args}");
+    println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now fleet-up.timer");
+    println!("  reverse: fleet up-unit --uninstall  (or: systemctl --user disable --now fleet-up.timer)");
+}
+
+/// Remove the user launcher units this installed and print the disable command. Best-effort (a missing file is
+/// fine -- the inverse of an install that never happened).
+fn up_unit_uninstall() {
+    let Some(dir) = user_unit_dir() else {
+        eprintln!("fleet up-unit --uninstall: cannot resolve ~/.config/systemd/user");
+        std::process::exit(1);
+    };
+    println!("  disable FIRST: systemctl --user disable --now fleet-up.timer");
+    for name in ["fleet-up.service", "fleet-up.timer"] {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("absent (ok): {}", path.display()),
+            Err(e) => eprintln!("  WARN: remove {}: {e}", path.display()),
+        }
+    }
+    println!("  then: systemctl --user daemon-reload");
+}
+
 /// A systemd USER service that supervises a long-running fleet-host daemon: `Type=simple` with
 /// `Restart=on-failure` so a crash restarts it, ordered after the network, and enabled into `default.target`
 /// so it comes up on login/boot. `env_block` seeds a known-good environment (a captured `PATH`) so the daemon
@@ -10698,6 +10863,38 @@ detached
         // A rearm-only unit (no observe) is emitted with an empty env block — no launch environment needed.
         let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false, false), 60, "");
         assert!(!rearm_only.contains("Environment="), "rearm-only watchdog spawns nothing → no env block");
+    }
+
+    #[test]
+    fn up_exec_args_always_launches_and_adds_pinned_only() {
+        // task_464 launcher: the unit must actually bring the fleet up (--launch), not just report.
+        assert_eq!(up_exec_args(false), "up-board --launch");
+        assert_eq!(up_exec_args(true), "up-board --launch --pinned-only");
+    }
+
+    #[test]
+    fn up_unit_files_is_a_oneshot_launcher_plus_boot_and_reconcile_timer() {
+        let (service, timer) = up_unit_files("/run/fleet/bin/fleet", &up_exec_args(false), 300, "");
+        // The launcher is a oneshot that reconstitutes the fleet, ordered after the network (it reads the board).
+        assert!(service.contains("Type=oneshot"), "launcher is a single reconcile pass, not long-running");
+        assert!(service.contains("After=network-online.target"), "needs the network/board up");
+        assert!(service.contains("ExecStart=/run/fleet/bin/fleet up-board --launch"));
+        // The timer fires it at boot (bring the fleet up) and periodically (reconcile a died window).
+        assert!(timer.contains("OnBootSec=30") && timer.contains("OnUnitActiveSec=300"), "boot + reconcile");
+        assert!(timer.contains("Persistent=true") && timer.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn up_unit_host_line_is_present_or_omitted_per_the_host_arg() {
+        // task_937 Phase A: a declared host emits Environment="FLEET_HOST=<host>" so the unit text never hardcodes
+        // a box -- the host is a generator argument, making the Phase-B target-swap a one-argument change.
+        let with_host = render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".to_string()))]);
+        let (service, _) = up_unit_files("/bin/fleet", &up_exec_args(true), 300, &with_host);
+        assert!(service.contains("Environment=\"FLEET_HOST=dev-dsk-foo\""));
+        assert!(service.contains("up-board --launch --pinned-only"));
+        // No host declared → no FLEET_HOST line at all (the host-less default, same as the watchdog unit).
+        let (service2, _) = up_unit_files("/bin/fleet", &up_exec_args(false), 300, "");
+        assert!(!service2.contains("FLEET_HOST"), "no host arg → no FLEET_HOST line");
     }
 
     #[test]
