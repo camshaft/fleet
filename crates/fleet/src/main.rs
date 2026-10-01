@@ -6954,6 +6954,11 @@ const ACKED_NUDGE_COOLDOWN_HOURS: f64 = 4.0;
 /// deliberately-sequenced owner goes quiet (pinged ~daily, not hourly) without ever going fully silent.
 const MAX_ACKED_BACKOFF_STEPS: u32 = 3;
 
+/// task_859 facet 2: how much longer a LOW-priority task's nudge threshold is than the base. A priority
+/// downgrade must LENGTHEN the cadence, not zero it (a low-pri task that is still live work must not vanish
+/// from oversight when it goes silent — just surface on a longer interval). Default 3x.
+const LOW_PRIORITY_NUDGE_SCALE: i64 = 3;
+
 /// Whether a task idle for `idle_secs` should be nudged now, given `last_nudge_secs` (the age of this
 /// daemon's own most recent nudge comment on it, if any). Pure — unit-tested. First nudge fires once idle
 /// reaches `threshold_secs`; a re-nudge additionally needs the PRIOR nudge to be at least the cooldown old,
@@ -7145,21 +7150,6 @@ fn format_hm(secs: i64) -> String {
     format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
 }
 
-/// True iff a task is a tracking/epic PARENT whose progress lives in still-open children — it has children
-/// (`total > 0`) and not all are done (`done < total`). Such a parent is not itself stalled: its live work IS
-/// the children, so nudging it is a false positive (board-pm's #294 daemon-tuning class). A leaf task
-/// (`total == 0`) is not a tracking parent, and a parent whose children are ALL done (`done == total`) is not
-/// exempted — an all-children-done parent may itself need a nudge to close. Reads `child_rollup` ({done,total},
-/// returned by `get_task`). Pure — unit-tested.
-fn is_tracking_parent_with_open_children(child_rollup: Option<&serde_json::Value>) -> bool {
-    let Some(cr) = child_rollup else {
-        return false;
-    };
-    let total = cr.get("total").and_then(serde_json::Value::as_i64).unwrap_or(0);
-    let done = cr.get("done").and_then(serde_json::Value::as_i64).unwrap_or(0);
-    total > 0 && done < total
-}
-
 /// #540: whether a task shows WORKER activity — at least one comment from someone OTHER than the nudge daemon
 /// itself. A `todo` task counts as a stalled deliverable (vs untouched backlog) only once real work has been
 /// recorded on it, so the nudge widens to `todo` only when this holds. The daemon's own prior nudges never
@@ -7316,6 +7306,62 @@ fn nudge_run_is_outage(apply: bool, posted: usize, failed: usize) -> bool {
     apply && posted == 0 && failed > 0
 }
 
+/// task_859 facet 2: the nudge threshold scaled by task PRIORITY. A LOW-priority task keeps nudging — on a
+/// longer interval (`low_scale`x the base) — rather than dropping out of oversight entirely; normal / high /
+/// absent priority keep the base threshold. Pure — unit-tested.
+fn priority_scaled_threshold(base_threshold_secs: i64, priority: Option<&str>, low_scale: i64) -> i64 {
+    match priority {
+        Some("low") => base_threshold_secs.saturating_mul(low_scale.max(1)),
+        _ => base_threshold_secs,
+    }
+}
+
+/// task_859 facet 1: the OPEN (non-done, non-cancelled) children of a parent task, each rendered as a rollup
+/// line `task_<id> [<status>[, blocked_on <kind> <ref>]] <title>`, from the `children` projection the board
+/// returns on get_task (id / status / blocked_on_kind / blocked_on_ref / title). Empty when the task has no
+/// open children (so a non-parent, or an all-children-done parent, falls through to the normal nudge). Pure —
+/// unit-tested.
+fn open_children_rollup(task: &serde_json::Value) -> Vec<String> {
+    task.get("children")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let status = c.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+            if status == "done" || status == "cancelled" {
+                return None;
+            }
+            let id = c.get("id").and_then(serde_json::Value::as_i64)?;
+            let title = c.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+            let blocked = c
+                .get("blocked_on_kind")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|k| match c.get("blocked_on_ref").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()) {
+                    Some(r) => format!(", blocked_on {k} {r}"),
+                    None => format!(", blocked_on {k}"),
+                })
+                .unwrap_or_default();
+            Some(format!("task_{id} [{status}{blocked}] {title}"))
+        })
+        .collect()
+}
+
+/// task_859 facet 1: the owner-nudge body for an idle PARENT whose progress lives in still-open children — a
+/// child rollup so the owner posts a status rollup or escalates a blocked child, instead of the parent sitting
+/// silently un-nudged (task_486: a parent read quiet ~16h with its one child blocked_on=operator and nobody
+/// surfaced it). The idle is the parent's OWN activity, never rolled up from children (that would re-suppress
+/// the nudge). Pure — unit-tested.
+fn parent_rollup_body(threshold_hours: f64, assignee: &str, idle_secs: i64, open_children: &[String]) -> String {
+    let kids = open_children.iter().map(|c| format!("  - {c}")).collect::<Vec<_>>().join("\n");
+    format!(
+        "fleet nudge: this parent task has had no activity of its OWN for over {threshold_hours}h (idle {}), \
+         but it has open children whose progress it tracks. {assignee}, please post a rollup of where the \
+         children stand, or escalate any that are blocked:\n{kids}",
+        format_hm(idle_secs)
+    )
+}
+
 fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet nudge-stale: {e}");
@@ -7448,11 +7494,13 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         if status == "todo" && !task_has_worker_activity(&full) {
             continue;
         }
-        // #294 false-positive class: a tracking/epic parent whose progress is in its still-open children is
-        // not itself stalled — its live work IS the children — so skip it to keep nudges high-signal.
-        if is_tracking_parent_with_open_children(full.get("child_rollup")) {
-            continue;
-        }
+        // task_859 facet 1: a tracking/epic parent with still-open children is no longer SKIPPED (#294 used to
+        // skip it to avoid false stalls, which hid an idle parent whose blocked child nobody surfaced —
+        // task_486). Instead, if the parent is idle beyond threshold on its OWN activity (computed just below;
+        // child activity is deliberately NOT rolled up, which would re-suppress the nudge), it is nudged with a
+        // child rollup (open child + status + blocked_on) via `parent_rollup_body`. Empty => not a
+        // parent-with-open-children => the normal owner nudge.
+        let open_children = open_children_rollup(&full);
         let idle_secs = match task_latest_activity_age_secs(&full, now) {
             Some(a) => a,
             None => continue,
@@ -7469,11 +7517,15 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         // going fully silent (the task stays visible, not monitor_exempt). A silent owner (ack not fresher) is
         // unaffected: stale_task_should_nudge then uses the normal cooldown and the escalation ladder proceeds.
         let effective_acked_cooldown = acked_cooldown_with_backoff(acked_cooldown_secs, nudge_comment_count(&full));
+        // task_859 facet 2: scale the first-nudge threshold by priority so a LOW-priority task still surfaces
+        // when it goes silent, just on a longer interval, instead of dropping out of oversight entirely.
+        let priority = full.get("priority").and_then(serde_json::Value::as_str);
+        let eff_threshold_secs = priority_scaled_threshold(threshold_secs, priority, LOW_PRIORITY_NUDGE_SCALE);
         if !stale_task_should_nudge(
             idle_secs,
             last_nudge_secs,
             ack_fresher,
-            threshold_secs,
+            eff_threshold_secs,
             cooldown_secs,
             effective_acked_cooldown,
         ) {
@@ -7527,7 +7579,12 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                 // nudge (ack_fresher) is engaged, so the ladder is capped at the Owner tier (no router PM-tag or
                 // reassign). board-pm's hard requirement.
                 let tier = responsive_capped_tier(nudge_tier(round, pm_tag_round, reassign_round), ack_fresher);
+                // task_859 facet 1: at the Owner tier, a parent with open children gets a child-rollup body
+                // instead of the generic nudge. Higher tiers (the owner has gone silent) keep the escalation
+                // ladder bodies that pull in the router.
+                let parent_rollup = matches!(tier, NudgeTier::Owner) && !open_children.is_empty();
                 let kind = match tier {
+                    NudgeTier::Owner if parent_rollup => "parent-rollup",
                     NudgeTier::Owner if last_nudge_secs.is_some() => "re-nudge",
                     NudgeTier::Owner => "first nudge",
                     NudgeTier::PmTag => "PM-TAG",
@@ -7535,6 +7592,7 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                 };
                 if apply {
                     let body = match tier {
+                        NudgeTier::Owner if parent_rollup => parent_rollup_body(threshold_hours, owner, idle_secs, &open_children),
                         NudgeTier::Owner => nudge_body(threshold_hours, owner, idle_secs),
                         NudgeTier::PmTag => pm_tag_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER),
                         NudgeTier::Reassign => escalation_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER),
@@ -10956,19 +11014,48 @@ detached
     }
 
     #[test]
-    fn is_tracking_parent_with_open_children_skips_only_parents_with_open_kids() {
-        let cr = |body: serde_json::Value| body;
-        // A parent with open children (done < total) → tracking parent, skip the nudge.
-        let open = cr(serde_json::json!({"child_rollup":{"done":1,"total":3}}));
-        assert!(is_tracking_parent_with_open_children(open.get("child_rollup")));
-        // All children done (done == total) → NOT exempted; the parent itself may need a nudge to close.
-        let all_done = cr(serde_json::json!({"child_rollup":{"done":3,"total":3}}));
-        assert!(!is_tracking_parent_with_open_children(all_done.get("child_rollup")));
-        // A leaf task (no children, total == 0) → not a tracking parent, nudge as normal.
-        let leaf = cr(serde_json::json!({"child_rollup":{"done":0,"total":0}}));
-        assert!(!is_tracking_parent_with_open_children(leaf.get("child_rollup")));
-        // Missing child_rollup → not exempted.
-        assert!(!is_tracking_parent_with_open_children(None));
+    fn open_children_rollup_lists_only_open_children_with_status_and_blocker() {
+        // task_859 facet 1: open children (not done/cancelled) are listed with status + blocked_on; done and
+        // cancelled children are excluded; a task with no children yields an empty rollup.
+        let parent = serde_json::json!({"children": [
+            {"id": 816, "status": "done", "title": "designed"},
+            {"id": 841, "status": "in_progress", "title": "authoring"},
+            {"id": 843, "status": "todo", "title": "materialize"},
+            {"id": 845, "status": "cancelled", "title": "dropped"},
+            {"id": 495, "status": "blocked", "blocked_on_kind": "operator", "blocked_on_ref": "", "title": "install window"},
+            {"id": 500, "status": "blocked", "blocked_on_kind": "task", "blocked_on_ref": "task_499", "title": "waits on dep"}
+        ]});
+        let rollup = open_children_rollup(&parent);
+        assert_eq!(rollup.len(), 4, "done + cancelled excluded, 4 open remain");
+        assert!(rollup.iter().any(|l| l == "task_841 [in_progress] authoring"));
+        assert!(rollup.iter().any(|l| l == "task_495 [blocked, blocked_on operator] install window"));
+        assert!(rollup.iter().any(|l| l == "task_500 [blocked, blocked_on task task_499] waits on dep"));
+        assert!(!rollup.iter().any(|l| l.contains("task_816")) && !rollup.iter().any(|l| l.contains("task_845")));
+        // No children → empty (a leaf task falls through to the normal nudge).
+        assert!(open_children_rollup(&serde_json::json!({"title": "leaf"})).is_empty());
+        assert!(open_children_rollup(&serde_json::json!({"children": []})).is_empty());
+    }
+
+    #[test]
+    fn priority_scaled_threshold_lengthens_low_priority_only() {
+        // task_859 facet 2: low priority lengthens the threshold (does not zero it); others keep the base.
+        assert_eq!(priority_scaled_threshold(3600, Some("low"), 3), 10800);
+        assert_eq!(priority_scaled_threshold(3600, Some("normal"), 3), 3600);
+        assert_eq!(priority_scaled_threshold(3600, Some("high"), 3), 3600);
+        assert_eq!(priority_scaled_threshold(3600, None, 3), 3600);
+        // A scale < 1 is floored to 1 so low-pri never nudges SOONER than base.
+        assert_eq!(priority_scaled_threshold(3600, Some("low"), 0), 3600);
+    }
+
+    #[test]
+    fn parent_rollup_body_lists_the_open_children() {
+        let body = parent_rollup_body(4.0, "v-x", 7200, &[
+            "task_495 [blocked, blocked_on operator] install window".to_string(),
+            "task_843 [todo] materialize".to_string(),
+        ]);
+        assert!(body.contains("no activity of its OWN"), "idle is the parent's own, not rolled up from children");
+        assert!(body.contains("v-x"));
+        assert!(body.contains("task_495 [blocked, blocked_on operator]") && body.contains("task_843 [todo]"));
     }
 
     #[test]
