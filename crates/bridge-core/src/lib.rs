@@ -37,6 +37,7 @@ pub mod board;
 pub mod channel_config;
 pub mod echo;
 pub mod mention;
+pub mod refs;
 pub mod relay;
 pub mod resolver;
 pub mod sse;
@@ -51,6 +52,7 @@ pub use board::{
 pub use channel_config::{BridgeConfig, Bridged, bridged_channels};
 pub use echo::{MARK_EMOJI, MARK_EMOJI_SHORTCODE, is_board_origin, mark_board_origin};
 pub use mention::{is_mentioned, mentioned_agent};
+pub use refs::{REF_KINDS, RefMatch, RefScheme, find_refs, linkify};
 pub use relay::{
     RELAY_DEGRADE_AFTER, RELAY_QUARANTINE_AFTER, RELAY_QUEUE_WARN, RelayPlan, relay_plan,
 };
