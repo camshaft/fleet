@@ -25,5 +25,8 @@ toml = "0.8"
 ureq = "2"
 # RFC3339 parse (+ format, for tests) of the board's last_seen for liveness — no macros.
 time = { version = "0.3", features = ["parsing", "formatting"] }
-# Tiny blocking HTTP server for the notifier that receives the board's per-agent webhook POSTs.
-tiny_http = "0.12"
+# Async runtime + minimal hand-rolled HTTP/1.x for the notifier daemon (task_806: a long-running
+# blocking-accept server scales badly across many fleet hosts, the no-blocking-IO policy's clearest
+# target). Scoped to notify.rs only — every other `fleet` subcommand is a one-shot CLI invocation and
+# stays sync (ureq); this does not make the whole binary async.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
