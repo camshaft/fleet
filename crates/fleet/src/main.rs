@@ -2015,6 +2015,22 @@ fn parse_workspace_kind(
     WorkspaceKindPlan { name, description, setup_script, cwd, pre_trust, env }
 }
 
+/// The environment a workspace-kind `setup_script` receives: the agent identity and fleet root, the resolved
+/// per-agent launch directory as `FLEET_WORKSPACE_CWD`, then the kind's own `config.env`. The launch cwd is
+/// exported because several agents can share ONE kind (same `setup_script`) while each launches in its own
+/// workspace directory at an arbitrary host path with no shared convention, so the shared script has no other
+/// way to find the agent's own workspace. Config env is appended last so a kind may override a built-in if it
+/// deliberately must. Pure — unit-tested.
+fn setup_script_env(agent: &str, fleet_root: &str, plan: &WorkspaceKindPlan) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("FLEET_AGENT".to_string(), agent.to_string()),
+        ("FLEET_ROOT".to_string(), fleet_root.to_string()),
+        ("FLEET_WORKSPACE_CWD".to_string(), plan.cwd.clone()),
+    ];
+    env.extend(plan.env.iter().cloned());
+    env
+}
+
 /// Spin up an agent whose workspace is defined by a board workspace-kind resource rather than by `repos`.
 /// Fetches the kind, reports the plan, and on `--apply` runs its setup_script (with `FLEET_AGENT` /
 /// `FLEET_ROOT` and any `config.env` in the environment) to materialize the workspace, pre-trusts the
@@ -2064,7 +2080,7 @@ fn spin_up_workspace_kind(
     println!("  launch cwd: {}", plan.cwd);
     match &plan.setup_script {
         Some(s) => println!(
-            "  setup_script: {} line(s) — runs with FLEET_AGENT/FLEET_ROOT{} in the environment",
+            "  setup_script: {} line(s) — runs with FLEET_AGENT/FLEET_ROOT/FLEET_WORKSPACE_CWD{} in the environment",
             s.lines().count(),
             if plan.env.is_empty() { String::new() } else { format!(" + {} config env var(s)", plan.env.len()) }
         ),
@@ -2088,12 +2104,8 @@ fn spin_up_workspace_kind(
             std::process::exit(1);
         }
         let mut cmd = std::process::Command::new("bash");
-        cmd.arg("-c")
-            .arg(script)
-            .current_dir(fleet_root)
-            .env("FLEET_AGENT", agent)
-            .env("FLEET_ROOT", fleet_root);
-        for (k, v) in &plan.env {
+        cmd.arg("-c").arg(script).current_dir(fleet_root);
+        for (k, v) in setup_script_env(agent, fleet_root, &plan) {
             cmd.env(k, v);
         }
         match cmd.status() {
@@ -6380,6 +6392,32 @@ mod tests {
         // A relative override is taken under the fleet root, same as config.cwd.
         let p3 = parse_workspace_kind("m-c", "/home/u/.fleet", &rec, Some("rel/ws"));
         assert_eq!(p3.cwd, "/home/u/.fleet/rel/ws");
+    }
+
+    #[test]
+    fn setup_script_env_exports_resolved_launch_cwd_and_kind_env() {
+        // A shared kind's setup_script must receive the agent's OWN resolved launch cwd (FLEET_WORKSPACE_CWD)
+        // so it can find src/<package> at an arbitrary host path, plus the kind's own config env, after the
+        // built-in FLEET_AGENT/FLEET_ROOT.
+        let plan = WorkspaceKindPlan {
+            name: "membrain".to_string(),
+            description: None,
+            setup_script: Some("brazil-build\n".to_string()),
+            cwd: "/work/agent-a".to_string(),
+            pre_trust: vec![],
+            env: vec![("K".to_string(), "v".to_string())],
+        };
+        let env = setup_script_env("m-a", "/home/u/.fleet", &plan);
+        assert_eq!(
+            env,
+            vec![
+                ("FLEET_AGENT".to_string(), "m-a".to_string()),
+                ("FLEET_ROOT".to_string(), "/home/u/.fleet".to_string()),
+                ("FLEET_WORKSPACE_CWD".to_string(), "/work/agent-a".to_string()),
+                ("K".to_string(), "v".to_string()),
+            ],
+            "built-ins first (incl. the resolved launch cwd), then the kind's config env"
+        );
     }
 
     #[test]
