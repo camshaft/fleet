@@ -2359,7 +2359,18 @@ fn spin_up(agent: &str, apply: bool) {
 /// inbox, does one unit, then gates the next wake on work-present: it keeps looping soon while it holds
 /// open assigned tasks or unread messages, and only falls back to the long `interval` idle cadence once its
 /// assigned queue is drained AND its inbox is empty — so an agent with assigned work never idle-sleeps.
-fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> String {
+fn build_kickoff(agent: &str, workdir: &str, interval: &str, operator: Option<&str>, reactive: bool) -> String {
+    // The operator-blocked dashboard convention (operator seq-2292) applies only when this deployment names an
+    // operator (config.operator_id); a generic fleet with no designated operator omits it. The id is
+    // interpolated, never hard-coded, so the public fleet code carries no operator name (task_611).
+    let operator_clause = match operator {
+        Some(op) => format!(
+            " If the block is ON THE OPERATOR specifically, ALSO assign the task to '{op}' and stash your own \
+             id in metadata.blocked_owner — so list_tasks(assignee '{op}') is the operator's single 'my asks' \
+             dashboard; when the operator answers, reassign the task back to yourself and clear blocked."
+        ),
+        None => String::new(),
+    };
     // REACTIVE responders (mention-only bots like a Slack channel participant) invert the pacing: the generic
     // work-conserving loop treats ANY unread notification as a reason to re-poll SOON, but a silence-default
     // responder must treat ambient channel chatter as NON-work and only act when EXPLICITLY addressed — else
@@ -2462,10 +2473,7 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
          status=blocked with a blocked_on note. A blocked task is NOT actionable pending work, so if it is \
          your only open task you drop to the long/event-woken cadence — the live actionable-event wake \
          re-tickets you the moment a reply, an assignment, or the dep landing arrives, so short-cadence \
-         polling buys nothing. If the block is ON THE OPERATOR specifically, ALSO assign the task to 'cameron' \
-         and stash your own id in metadata.blocked_owner — so list_tasks(assignee 'cameron') is the operator's \
-         single 'my asks' dashboard; when the operator answers, reassign the task back to yourself and clear \
-         blocked. (If your MCP cannot set a typed blocked_on, ask concierge or board-pm to stamp it.) STATUS \
+         polling buys nothing.{operator_clause} (If your MCP cannot set a typed blocked_on, ask concierge or board-pm to stamp it.) STATUS \
          HONESTY (task_506): never set your presence offline or away while you still hold a live in_progress \
          assigned task — an in_progress task means actively-worked, so before you stand down you MUST either \
          progress it or re-state it as blocked (with a blocked_on note) or done; standing down on a live \
@@ -2742,7 +2750,7 @@ fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, ef
     {
         return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
     }
-    let kickoff = build_kickoff(agent, workdir, interval, reactive);
+    let kickoff = build_kickoff(agent, workdir, interval, config::get().operator_id.as_deref(), reactive);
     let cmd = build_launch_cmd(harness, model, effort, devshell.then_some(workdir))?;
     let status = std::process::Command::new("tmux")
         .args([
@@ -6063,7 +6071,7 @@ mod tests {
 
     #[test]
     fn build_kickoff_is_work_conserving_and_self_discovering() {
-        let k = build_kickoff("v-x", "/wt/v-x", "30m", false);
+        let k = build_kickoff("v-x", "/wt/v-x", "30m", Some("op-x"), false);
         // Identity (#336): the board does NOT bind the session (a fresh unbound board per call), so
         // register_agent can't make later id-less calls work — the kickoff must say pass ids EXPLICITLY on
         // EVERY call, and still register once + self-discover the charter via get_agent.
@@ -6118,10 +6126,17 @@ mod tests {
         assert!(k.contains("BLOCKED ON AN EXTERNAL DEPENDENCY"), "generalizes the block carve-out beyond the operator (#349)");
         assert!(k.contains("another agent") && k.contains("deploy/CI"), "names the non-operator external deps");
         assert!(k.contains("long/event-woken cadence"), "a sole blocked task drops to the long/event-woken cadence, not SOON polling");
-        // Operator-blocked dashboard convention (operator seq-2292) is preserved as a sub-case: reassign to
-        // 'cameron' + typed blocked_on + stash the real owner so list_tasks(assignee cameron) is the one dashboard.
-        assert!(k.contains("ON THE OPERATOR specifically") && k.contains("assign the task to 'cameron'"), "keeps the operator-blocked convention as a sub-case");
+        // Operator-blocked dashboard convention (operator seq-2292) is preserved as a sub-case, with the
+        // operator id INTERPOLATED from config (task_611), not hard-coded: reassign to the configured operator
+        // + typed blocked_on + stash the real owner so list_tasks(assignee <operator>) is the one dashboard.
+        assert!(k.contains("ON THE OPERATOR specifically") && k.contains("assign the task to 'op-x'"), "interpolates the configured operator id into the operator-blocked convention");
+        assert!(k.contains("list_tasks(assignee 'op-x')"), "the operator dashboard clause uses the configured id");
         assert!(k.contains("metadata.blocked_owner"), "stashes the real owner for reassign-back");
+        // No designated operator → the operator-blocked clause is omitted, but the surrounding external-dep
+        // guidance stays intact (generic fleet with no operator; task_611).
+        let k_no_op = build_kickoff("v-x", "/wt/v-x", "30m", None, false);
+        assert!(!k_no_op.contains("ON THE OPERATOR specifically"), "omits the operator-blocked clause when no operator is configured");
+        assert!(k_no_op.contains("buys nothing. (If your MCP cannot set a typed blocked_on"), "the surrounding external-dep clause reads cleanly with the operator clause omitted");
         // Status honesty (task_506 Layer 1): never stand down (offline/away) holding a live in_progress task —
         // progress it or re-state it blocked/done first; the companion watchdog warning flags the violation.
         assert!(k.contains("STATUS HONESTY") && k.contains("in_progress"), "bans standing down on a live in_progress task (task_506 Layer 1)");
@@ -6167,7 +6182,7 @@ mod tests {
 
     #[test]
     fn build_kickoff_reactive_mode_only_acts_when_addressed() {
-        let r = build_kickoff("frank", "/wt/frank", "30m", true);
+        let r = build_kickoff("frank", "/wt/frank", "30m", Some("op-x"), true);
         // Still self-discovering + explicit-identity like every kickoff (the boot contract is shared).
         assert!(r.contains("register_agent") && r.contains("get_agent"), "reactive kickoff still self-discovers");
         assert!(r.contains("'frank'"), "carries the agent id");
@@ -6186,7 +6201,7 @@ mod tests {
         assert!(!r.contains("WORK-CONSERVING PACING"), "reactive mode drops the work-conserving pacing");
         assert!(!r.contains("keep going — schedule your next tick SOON"), "no SOON re-poll on unread chatter");
         // And the default (non-reactive) kickoff must be UNCHANGED — it keeps the work-conserving pacing.
-        let w = build_kickoff("v-x", "/wt/v-x", "30m", false);
+        let w = build_kickoff("v-x", "/wt/v-x", "30m", Some("op-x"), false);
         assert!(w.contains("WORK-CONSERVING PACING") && !w.contains("REACTIVE responder"), "default worker unchanged");
     }
 
