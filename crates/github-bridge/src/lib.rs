@@ -44,9 +44,9 @@ pub mod sync;
 
 pub use board::{
     BoardClient, Event, LINK_SOURCE, Project, REVIEW_LINK_SOURCE, TASK_OUTBOUND_REFLECT,
-    TaskReflect, build_comment_body, build_identity_body, build_review_body, build_review_log_body,
-    build_task_body, comment_ref, issue_ref, parse_events, parse_issue_ref, parse_projects,
-    review_comment_ref,
+    TaskReflect, build_comment_body, build_identity_body, build_repo_project_map,
+    build_review_body, build_review_log_body, build_task_body, comment_ref, issue_ref,
+    normalize_repo_ref, parse_events, parse_issue_ref, parse_projects, review_comment_ref,
 };
 pub use config::{Config, DEFAULT_CONFIG_FILENAME};
 pub use github::{

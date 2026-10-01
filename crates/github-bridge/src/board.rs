@@ -24,6 +24,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// A browser-like User-Agent for every board call. The default base is the loopback proxy (no Cloudflare),
 /// but if `board_api` points at the PUBLIC endpoint, the CF edge 403s a non-browser UA
@@ -245,6 +246,47 @@ pub fn parse_projects(body: &str) -> Result<Vec<Project>, String> {
                 .map_err(|err| format!("board /projects: bad project: {err}"))
         })
         .collect()
+}
+
+/// Normalize a repo reference to canonical lowercase `owner/name` for matching. Accepts a full GitHub URL
+/// (`https://github.com/<owner>/<name>`, with an optional trailing `.git` / slash), an `scp`-style
+/// `git@github.com:owner/name.git`, or a bare `owner/name`. Lowercased because GitHub owner/repo are
+/// case-insensitive, so a config `Camshaft/Fleet` matches a board `camshaft/fleet`. `None` when fewer than two
+/// path segments remain (not a repo). Pure.
+pub fn normalize_repo_ref(s: &str) -> Option<String> {
+    let s = s.trim();
+    // Drop everything up to and including a `github.com` host when present (URL or scp form); the separator
+    // after it is `/` (URL) or `:` (scp), so trim either.
+    let path = match s.find("github.com") {
+        Some(i) => s[i + "github.com".len()..].trim_start_matches(['/', ':']),
+        None => s,
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let segs: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    // The LAST two segments are owner/name (a URL may carry extra leading path we ignore).
+    let [.., owner, name] = segs.as_slice() else {
+        return None;
+    };
+    Some(format!("{}/{}", owner.to_lowercase(), name.to_lowercase()))
+}
+
+/// Build the repo->project_id map from the board's projects: for each ACTIVE project carrying a
+/// [`metadata.repo`](Project::repo), map its normalized `owner/name` to the project id. Active-only so an
+/// archived project that still carries a `repo` can't shadow the live one for the same repo; the FIRST active
+/// project wins on the (rare) duplicate so the result is deterministic. Keyed by normalized lowercase
+/// `owner/name` for case-insensitive lookup. Pure.
+pub fn build_repo_project_map(projects: &[Project]) -> BTreeMap<String, i64> {
+    let mut map = BTreeMap::new();
+    for p in projects {
+        if !p.is_active() {
+            continue;
+        }
+        if let Some(repo) = p.repo().and_then(normalize_repo_ref) {
+            map.entry(repo).or_insert(p.id);
+        }
+    }
+    map
 }
 
 /// Build the JSON body for creating a mirrored board task from an ingested GitHub issue (`POST /tasks`).
@@ -744,6 +786,72 @@ mod tests {
     #[test]
     fn parse_projects_empty_is_ok() {
         assert!(parse_projects("[]").unwrap().is_empty());
+    }
+
+    // ── repo->project mapping (normalize_repo_ref / build_repo_project_map) ────────────────────────
+
+    #[test]
+    fn normalize_repo_ref_handles_urls_bare_and_scp_forms() {
+        let want = Some("camshaft/fleet".to_string());
+        assert_eq!(
+            normalize_repo_ref("https://github.com/camshaft/fleet"),
+            want
+        );
+        assert_eq!(
+            normalize_repo_ref("https://github.com/camshaft/fleet/"),
+            want
+        );
+        assert_eq!(
+            normalize_repo_ref("https://github.com/camshaft/fleet.git"),
+            want
+        );
+        assert_eq!(normalize_repo_ref("http://github.com/camshaft/fleet"), want);
+        assert_eq!(
+            normalize_repo_ref("git@github.com:camshaft/fleet.git"),
+            want
+        );
+        assert_eq!(normalize_repo_ref("camshaft/fleet"), want);
+        assert_eq!(normalize_repo_ref("  camshaft/fleet  "), want, "trimmed");
+    }
+
+    #[test]
+    fn normalize_repo_ref_is_case_insensitive_and_keeps_hyphens() {
+        assert_eq!(
+            normalize_repo_ref("https://github.com/Camshaft/S2N-Quic"),
+            Some("camshaft/s2n-quic".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_repo_ref_rejects_non_repos() {
+        assert_eq!(normalize_repo_ref("justone"), None);
+        assert_eq!(normalize_repo_ref("https://github.com/owner"), None);
+        assert_eq!(normalize_repo_ref(""), None);
+        assert_eq!(normalize_repo_ref("/"), None);
+    }
+
+    #[test]
+    fn build_repo_project_map_active_only_normalized_first_wins() {
+        let projects = parse_projects(
+            r#"[
+            {"id": 21, "name": "fleet", "status": "active",
+             "metadata": {"repo": "https://github.com/camshaft/fleet"}},
+            {"id": 30, "name": "dotfiles", "status": "active",
+             "metadata": {"repo": "https://github.com/camshaft/dotfiles"}},
+            {"id": 23, "name": "fleet-tunnel", "status": "archived",
+             "metadata": {"repo": "https://github.com/camshaft/dotfiles"}},
+            {"id": 29, "name": "uncategorized", "status": "active", "metadata": {"kind": "pipeline"}}
+        ]"#,
+        )
+        .unwrap();
+        let map = build_repo_project_map(&projects);
+        assert_eq!(map.get("camshaft/fleet"), Some(&21));
+        assert_eq!(
+            map.get("camshaft/dotfiles"),
+            Some(&30),
+            "the ACTIVE dotfiles project wins; the archived one carrying the same repo is skipped"
+        );
+        assert_eq!(map.len(), 2, "the pipeline project (no repo) is not mapped");
     }
 
     // ── issue↔task links (board-core #149 slice 2 / #151) ─────────────────────────────────────────

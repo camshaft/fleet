@@ -15,7 +15,9 @@
 //! Unlike the Slack adapter (two tokens, Socket Mode), GitHub authenticates with a SINGLE token (a PAT or a
 //! GitHub App installation token) against a plain REST base — so the run precondition is just that one token.
 
+use crate::board::normalize_repo_ref;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -127,15 +129,39 @@ impl Config {
         self.github_token.as_deref().filter(|s| !s.is_empty())
     }
 
-    /// The ingest targets — one `(repo, project_id)` per configured repo, iff a `project_id` is set and at
-    /// least one repo is configured. Empty when either is absent: a token without repos/project is a valid
-    /// (dormant) config — the bridge is up but mirrors nothing. All repos share the one `project_id` (v1);
-    /// per-repo project mapping is a non-breaking future extension.
+    /// The STATIC ingest targets — one `(repo, project_id)` per configured repo, iff a `project_id` is set and
+    /// at least one repo is configured. All repos share the one `project_id`. This is now the FALLBACK path:
+    /// the daemon prefers the dynamic per-repo mapping from the board's project metadata
+    /// ([`resolve_ingest_targets`](Self::resolve_ingest_targets)) and only falls back here when the board has
+    /// no usable mapping or the projects fetch fails, so the bridge still ingests pre-metadata. Empty when
+    /// either `project_id` or `repos` is absent (a valid dormant config — the bridge is up but mirrors nothing).
     pub fn ingest_targets(&self) -> Vec<(&str, i64)> {
         match self.project_id {
-            Some(p) if !self.repos.is_empty() => self.repos.iter().map(|r| (r.as_str(), p)).collect(),
+            Some(p) if !self.repos.is_empty() => {
+                self.repos.iter().map(|r| (r.as_str(), p)).collect()
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// Resolve the ingest targets from the LIVE board repo->project map (built from each project's
+    /// `metadata.repo`) — the dynamic replacement for the static per-config `project_id`, so nothing is
+    /// hardcoded and a newly-mapped repo is picked up without a redeploy. When [`repos`](Self::repos) is empty
+    /// the bridge ingests EVERY mapped repo; when a subset is configured it ingests only those of them the
+    /// board maps (matched case-insensitively via [`normalize_repo_ref`]). The returned repo strings are the
+    /// normalized `owner/name` (what the issue/PR refs key on). A configured repo the board doesn't map is
+    /// silently skipped here (the daemon logs the gap). Pure.
+    pub fn resolve_ingest_targets(&self, map: &BTreeMap<String, i64>) -> Vec<(String, i64)> {
+        if self.repos.is_empty() {
+            return map.iter().map(|(repo, id)| (repo.clone(), *id)).collect();
+        }
+        self.repos
+            .iter()
+            .filter_map(|r| {
+                let key = normalize_repo_ref(r)?;
+                map.get(&key).map(|id| (key, *id))
+            })
+            .collect()
     }
 
     /// Apply defaults to a parsed [`FileConfig`]. `base_dir` (the config file's directory) is the default
@@ -182,7 +208,10 @@ impl Config {
             match std::fs::read_to_string(&path) {
                 Ok(s) if !s.trim().is_empty() => file.github_token = Some(s.trim().to_string()),
                 Ok(_) => {
-                    eprintln!("github-bridge: token file {} is empty — running dormant", path.display())
+                    eprintln!(
+                        "github-bridge: token file {} is empty — running dormant",
+                        path.display()
+                    )
                 }
                 Err(e) => eprintln!(
                     "github-bridge: cannot read token file {}: {e} — running dormant",
@@ -234,16 +263,26 @@ mod tests {
     fn empty_toml_is_dormant_but_valid() {
         let cfg = Config::from_toml_str("", &base()).unwrap();
         assert!(cfg.token().is_none(), "no token → dormant");
-        assert!(cfg.ingest_targets().is_empty(), "no repo/project → nothing to ingest");
+        assert!(
+            cfg.ingest_targets().is_empty(),
+            "no repo/project → nothing to ingest"
+        );
         assert!(cfg.repos.is_empty());
         assert_eq!(cfg.default_to, "concierge");
         assert_eq!(cfg.bridge_agent, "github-bridge");
-        assert_eq!(cfg.state_dir, base(), "state_dir defaults to the config file's dir");
+        assert_eq!(
+            cfg.state_dir,
+            base(),
+            "state_dir defaults to the config file's dir"
+        );
         assert_eq!(
             cfg.board_api, "http://127.0.0.1:8079/api",
             "board_api defaults to the deploy-host board loopback"
         );
-        assert_eq!(cfg.api_base, "https://api.github.com", "api_base defaults to public GitHub");
+        assert_eq!(
+            cfg.api_base, "https://api.github.com",
+            "api_base defaults to public GitHub"
+        );
     }
 
     #[test]
@@ -261,11 +300,17 @@ mod tests {
             &base(),
         )
         .unwrap();
-        assert!(only_repo.ingest_targets().is_empty(), "repo without project is not a target");
+        assert!(
+            only_repo.ingest_targets().is_empty(),
+            "repo without project is not a target"
+        );
 
         let only_project =
             Config::from_toml_str("github_token = \"ghp_a\"\nproject_id = 16\n", &base()).unwrap();
-        assert!(only_project.ingest_targets().is_empty(), "project without repos is not a target");
+        assert!(
+            only_project.ingest_targets().is_empty(),
+            "project without repos is not a target"
+        );
 
         let both = Config::from_toml_str(
             "github_token = \"ghp_a\"\nrepo = \"camshaft/fleet\"\nproject_id = 16\n",
@@ -283,10 +328,17 @@ mod tests {
             project_id = 16
         "#;
         let cfg = Config::from_toml_str(toml, &base()).unwrap();
-        assert_eq!(cfg.repos, ["camshaft/fleet", "camshaft/dotfiles", "camshaft/s2n-quic"]);
+        assert_eq!(
+            cfg.repos,
+            ["camshaft/fleet", "camshaft/dotfiles", "camshaft/s2n-quic"]
+        );
         assert_eq!(
             cfg.ingest_targets(),
-            vec![("camshaft/fleet", 16), ("camshaft/dotfiles", 16), ("camshaft/s2n-quic", 16)]
+            vec![
+                ("camshaft/fleet", 16),
+                ("camshaft/dotfiles", 16),
+                ("camshaft/s2n-quic", 16)
+            ]
         );
     }
 
@@ -300,7 +352,11 @@ mod tests {
             repo = "o/b"
         "#;
         let cfg = Config::from_toml_str(toml, &base()).unwrap();
-        assert_eq!(cfg.repos, ["o/a", "o/b"], "empties dropped, dups collapsed, first-occurrence order");
+        assert_eq!(
+            cfg.repos,
+            ["o/a", "o/b"],
+            "empties dropped, dups collapsed, first-occurrence order"
+        );
     }
 
     #[test]
@@ -341,17 +397,77 @@ mod tests {
         assert!(Config::from_toml_str("githubtoken = \"ghp_typo\"\n", &base()).is_err());
     }
 
+    // ── resolve_ingest_targets (dynamic repo->project mapping) ────────────────────────────────────
+
+    #[test]
+    fn resolve_ingest_targets_empty_repos_ingests_every_mapped_repo() {
+        let cfg = Config::from_toml_str("github_token = \"ghp_a\"\n", &base()).unwrap();
+        assert!(cfg.repos.is_empty(), "no subset configured");
+        let map: BTreeMap<String, i64> = [
+            ("camshaft/fleet".to_string(), 21),
+            ("camshaft/dotfiles".to_string(), 30),
+        ]
+        .into_iter()
+        .collect();
+        let mut targets = cfg.resolve_ingest_targets(&map);
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                ("camshaft/dotfiles".to_string(), 30),
+                ("camshaft/fleet".to_string(), 21),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_ingest_targets_subset_filters_to_mapped_and_normalizes_case_and_url() {
+        // A configured repo may be a full URL or differ in case; it still matches the normalized map key, and
+        // an unmapped configured repo is skipped.
+        let cfg = Config::from_toml_str(
+            "github_token = \"ghp_a\"\nrepos = [\"https://github.com/Camshaft/Fleet\", \"camshaft/not-mapped\"]\n",
+            &base(),
+        )
+        .unwrap();
+        let map: BTreeMap<String, i64> = [("camshaft/fleet".to_string(), 21)].into_iter().collect();
+        assert_eq!(
+            cfg.resolve_ingest_targets(&map),
+            vec![("camshaft/fleet".to_string(), 21)],
+            "URL+case-normalized match; unmapped repo dropped"
+        );
+    }
+
+    #[test]
+    fn resolve_ingest_targets_empty_map_yields_nothing() {
+        let cfg = Config::from_toml_str(
+            "github_token = \"ghp_a\"\nrepo = \"camshaft/fleet\"\n",
+            &base(),
+        )
+        .unwrap();
+        assert!(
+            cfg.resolve_ingest_targets(&BTreeMap::new()).is_empty(),
+            "no board mapping → no dynamic targets (daemon falls back to static)"
+        );
+    }
+
     // ── load(): fail-soft file handling ──────────────────────────────────────────────────────────
 
     #[test]
     fn load_reads_a_real_file_and_defaults_state_dir_to_its_parent() {
         let dir = tmp_dir("load");
         let path = dir.join("github-bridge.toml");
-        std::fs::write(&path, "github_token = \"ghp_f\"\nrepo = \"o/r\"\nproject_id = 3\n").unwrap();
+        std::fs::write(
+            &path,
+            "github_token = \"ghp_f\"\nrepo = \"o/r\"\nproject_id = 3\n",
+        )
+        .unwrap();
         let cfg = Config::load(&path);
         assert_eq!(cfg.token(), Some("ghp_f"));
         assert_eq!(cfg.ingest_targets(), vec![("o/r", 3)]);
-        assert_eq!(cfg.state_dir, dir, "state_dir defaults to the config file's dir");
+        assert_eq!(
+            cfg.state_dir, dir,
+            "state_dir defaults to the config file's dir"
+        );
     }
 
     #[test]
@@ -385,8 +501,16 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::load(&path);
-        assert_eq!(cfg.token(), Some("ghp_FROMFILE"), "token read + trimmed from the referenced file");
-        assert_eq!(cfg.ingest_targets(), vec![("o/r", 3)], "non-secret settings still apply");
+        assert_eq!(
+            cfg.token(),
+            Some("ghp_FROMFILE"),
+            "token read + trimmed from the referenced file"
+        );
+        assert_eq!(
+            cfg.ingest_targets(),
+            vec![("o/r", 3)],
+            "non-secret settings still apply"
+        );
     }
 
     #[test]
@@ -394,9 +518,16 @@ mod tests {
         let dir = tmp_dir("tokoverride");
         std::fs::write(dir.join("gh.token"), "ghp_FILEWINS").unwrap();
         let path = dir.join("github-bridge.toml");
-        std::fs::write(&path, "github_token = \"ghp_inline\"\ngithub_token_file = \"gh.token\"\n")
-            .unwrap();
-        assert_eq!(Config::load(&path).token(), Some("ghp_FILEWINS"), "the secret file wins over inline");
+        std::fs::write(
+            &path,
+            "github_token = \"ghp_inline\"\ngithub_token_file = \"gh.token\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load(&path).token(),
+            Some("ghp_FILEWINS"),
+            "the secret file wins over inline"
+        );
     }
 
     #[test]
@@ -404,11 +535,17 @@ mod tests {
         let dir = tmp_dir("toknofile");
         let path = dir.join("github-bridge.toml");
         std::fs::write(&path, "github_token_file = \"absent.token\"\n").unwrap();
-        assert!(Config::load(&path).token().is_none(), "missing token file → dormant, no crash");
+        assert!(
+            Config::load(&path).token().is_none(),
+            "missing token file → dormant, no crash"
+        );
 
         std::fs::write(dir.join("empty.token"), "   \n").unwrap();
         std::fs::write(&path, "github_token_file = \"empty.token\"\n").unwrap();
-        assert!(Config::load(&path).token().is_none(), "empty token file → dormant");
+        assert!(
+            Config::load(&path).token().is_none(),
+            "empty token file → dormant"
+        );
     }
 
     // ── SECURITY: redacting Debug ────────────────────────────────────────────────────────────────
@@ -426,9 +563,15 @@ mod tests {
             state_dir: PathBuf::from("/tmp/f"),
         };
         let dbg = format!("{cfg:?}");
-        assert!(!dbg.contains("SECRETBODY"), "config Debug must not leak the token: {dbg}");
+        assert!(
+            !dbg.contains("SECRETBODY"),
+            "config Debug must not leak the token: {dbg}"
+        );
         assert!(dbg.contains("ghp_***"), "prefix kept: {dbg}");
-        assert!(dbg.contains("camshaft/fleet"), "non-secret fields still shown");
+        assert!(
+            dbg.contains("camshaft/fleet"),
+            "non-secret fields still shown"
+        );
     }
 
     #[test]
@@ -437,9 +580,15 @@ mod tests {
         // (no separator, empty prefix, empty string) are the security-critical ones.
         assert_eq!(redact("ghp_SECRET"), "ghp_***");
         assert_eq!(redact("github_pat_SECRET_MORE"), "github_***");
-        assert!(!redact("NOSEPARATORSECRET").contains("SECRET"), "no-separator token redacts to ***");
+        assert!(
+            !redact("NOSEPARATORSECRET").contains("SECRET"),
+            "no-separator token redacts to ***"
+        );
         assert_eq!(redact("NOSEPARATORSECRET"), "***");
-        assert!(!redact("_LEADINGSEP").contains("LEADING"), "empty-prefix token redacts to ***");
+        assert!(
+            !redact("_LEADINGSEP").contains("LEADING"),
+            "empty-prefix token redacts to ***"
+        );
         assert_eq!(redact("_LEADINGSEP"), "***");
         // An EMPTY token is distinguishable as `<unset>` (not a leak) so an operator can tell "not
         // configured" from "configured but redacted".
