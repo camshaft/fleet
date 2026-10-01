@@ -2080,6 +2080,18 @@ enum Cmd {
         #[arg(long)]
         sigkill: bool,
     },
+    /// Print the pids of every LIVE process whose running binary is named `<daemon>`, identified
+    /// shell-agnostically (task_924). The companion to `confirm-kill`: that confirms a KNOWN pid is dead;
+    /// this FINDS the pid in the first place. An agent's Bash-tool shell is zsh, where the `${exe% (deleted)}`
+    /// strip used to find a rebuilt daemon's pid silently fails — the parens in the ` (deleted)` suffix are a
+    /// glob GROUP under zsh, so the strip does nothing and a live daemon on a deleted inode reads as ABSENT,
+    /// so the agent starts a SECOND instance (the double-relay to a live operator channel, task_866). This
+    /// does the suffix-strip + basename match in Rust (immune to any shell) and confirms `kill -0` liveness.
+    /// Use `fleet daemon-pids <name>` to find a daemon before a manual redeploy instead of a zsh exe-scan.
+    DaemonPids {
+        /// The daemon's binary name to match — the `/proc/<pid>/exe` basename, e.g. `membrain-skynet-bridge`.
+        daemon: String,
+    },
     /// INTERNAL: what the installed pre-commit hook (see `fmt_precommit_hook_body`) actually calls — not
     /// meant to be run by hand, but a plain subcommand (no hidden-arg plumbing) so it is easy to invoke
     /// directly for debugging. Finds the owning crate(s) of staged `.rs` files, auto-fixes + restages the
@@ -2202,6 +2214,7 @@ fn main() {
         Cmd::Version => println!("{}", version_line()),
         Cmd::Redeploy { apply } => redeploy(apply),
         Cmd::ConfirmKill { pid, term, timeout, sigkill } => confirm_kill(pid, term, timeout, sigkill),
+        Cmd::DaemonPids { daemon } => daemon_pids(&daemon),
         Cmd::FmtHookRun => fmt_hook_run(),
     }
 }
@@ -8533,6 +8546,43 @@ fn send_signal(sig: &str, pid: i64) {
     let _ = std::process::Command::new("kill").args([sig, &pid.to_string()]).status();
 }
 
+/// Does a `/proc/<pid>/exe` readlink target name the daemon `daemon`? The shell-agnostic core of the
+/// daemon-IDENTIFICATION scan (task_924). A rebuilt binary leaves the old process on a deleted inode, so the
+/// readlink reads `<path> (deleted)`; strip that trailing suffix with a plain `strip_suffix` (NOT a shell
+/// pattern) and match the file name. This replaces the `${exe% (deleted)}` strip an agent reaches for in its
+/// zsh Bash-tool shell, where the parentheses in ` (deleted)` are a glob GROUP so the strip silently fails and
+/// a live rebuilt daemon reads as absent — the false-negative that double-started the bridge (task_866). The
+/// strip is suffix-only, so a mid-path `(deleted)` directory never corrupts the match. Pure — unit-tested.
+fn exe_matches_daemon(exe_target: &str, daemon: &str) -> bool {
+    let stripped = exe_target.strip_suffix(" (deleted)").unwrap_or(exe_target);
+    std::path::Path::new(stripped).file_name().and_then(|n| n.to_str()) == Some(daemon)
+}
+
+/// `fleet daemon-pids <daemon>` (task_924): print the pid of every LIVE process whose running binary is named
+/// `<daemon>`, so an agent finds a daemon shell-agnostically instead of a zsh-fragile `${exe% (deleted)}` scan
+/// (see [`exe_matches_daemon`]). Scans `/proc/<pid>/exe` with a plain readlink (preserving the deleted-inode
+/// ` (deleted)` suffix the way `confirm-kill`'s rationale requires), matches the basename in Rust, and confirms
+/// `kill -0` liveness so a half-exited pid is never reported. Prints one matching pid per line, ascending;
+/// exit 0 whether or not any matched — absence is a valid answer the caller (a guard/redeploy) acts on.
+fn daemon_pids(daemon: &str) {
+    let mut found: Vec<i64> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            // Only numeric /proc/<pid> entries are processes.
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i64>() else { continue };
+            let Ok(target) = std::fs::read_link(entry.path().join("exe")) else { continue };
+            let Some(target) = target.to_str() else { continue };
+            if exe_matches_daemon(target, daemon) && process_is_alive(pid) {
+                found.push(pid);
+            }
+        }
+    }
+    found.sort_unstable();
+    for pid in found {
+        println!("{pid}");
+    }
+}
+
 /// `fleet confirm-kill` (task_866): confirm a pid is dead with `kill -0` polling before a deploy/guard starts
 /// the replacement, so a kill that false-negatived on an exe-scan can never leave two daemon instances
 /// relaying to a live channel. Optionally SIGTERM first, poll until gone or the timeout, and optionally
@@ -8695,6 +8745,25 @@ mod tests {
         assert!(process_is_alive(std::process::id() as i64));
         // A pid at the top of the i32 range is not a live process on this host; kill -0 reports ESRCH.
         assert!(!process_is_alive(i64::from(i32::MAX)));
+    }
+
+    #[test]
+    fn exe_matches_daemon_is_shell_agnostic_about_the_deleted_inode_suffix() {
+        // The exact case the zsh `${exe% (deleted)}` strip false-negatived (task_866/task_924): a rebuilt
+        // binary's /proc/<pid>/exe reads `<path> (deleted)`, which under zsh's parens-glob did NOT strip, so
+        // the live daemon read as absent and a second instance was started. In Rust the suffix strips cleanly.
+        assert!(exe_matches_daemon(
+            "/local/home/u/membrain-skynet-bridge/target/debug/membrain-skynet-bridge (deleted)",
+            "membrain-skynet-bridge"
+        ));
+        // A clean (non-deleted) binary matches by basename too.
+        assert!(exe_matches_daemon("/nix/store/abc/bin/membrain-skynet-bridge", "membrain-skynet-bridge"));
+        // A different binary does not match.
+        assert!(!exe_matches_daemon("/usr/bin/other (deleted)", "membrain-skynet-bridge"));
+        // A sibling whose name merely starts with the daemon is NOT a basename match (no false positive).
+        assert!(!exe_matches_daemon("/x/membrain-skynet-bridge-helper", "membrain-skynet-bridge"));
+        // The strip is SUFFIX-only: a mid-path `(deleted)` directory never corrupts the basename match.
+        assert!(exe_matches_daemon("/x/y (deleted)/membrain-skynet-bridge", "membrain-skynet-bridge"));
     }
 
     #[test]
