@@ -121,7 +121,13 @@ impl Default for Config {
             board_url: "http://127.0.0.1:8079/api".to_string(),
             inbox_dir: "/data/kb-inbox".to_string(),
             inbox_default_collection: "inbox".to_string(),
-            ipfs_gateway: "http://green-machine.lan:8080".to_string(),
+            // Generic loopback default (NOT the host-specific green-machine.lan), matching the other
+            // 127.0.0.1 defaults -- camshaft/fleet is the public-extraction repo and must stay host-neutral
+            // (task_727). This is a citation-URL base, not ranking/vector-affecting, so drifting it from the
+            // host-specific value is safe. The green deployment overrides it to green-machine.lan:8080 in the
+            // kb-inbox/uploader/embedder role TOMLs, so live behavior is unchanged; only a config-less/local
+            // run sees this default.
+            ipfs_gateway: "http://127.0.0.1:8080".to_string(),
             pdf_ocr_min_chars: 0, // OCR disabled by default (opt-in per role)
             mcp_host: "0.0.0.0".to_string(),
             mcp_port: 8077,
@@ -209,6 +215,9 @@ mod tests {
         assert_eq!(c.authority_for("tenet"), 1.0); // operator tenets: top authority, non-decaying
         assert_eq!(c.authority_for("unknown"), 0.5);
         assert_eq!(c.pdf_ocr_min_chars, 0); // OCR off by default (task_40)
+        // Host-neutral default (task_727): the public-extraction repo must not hardcode green-machine.lan.
+        // Deployments override via the role TOML; a config-less run gets loopback.
+        assert_eq!(c.ipfs_gateway, "http://127.0.0.1:8080");
     }
 
     #[test]
