@@ -1674,6 +1674,14 @@ enum Cmd {
         /// is never touched. Honors `--dry-run`: with it, report what WOULD be reaped without killing.
         #[arg(long)]
         reap_stale_observers: bool,
+        /// ACT on the task_794 backlog-depth signal: for each RUNNING agent whose open backlog exceeds the depth
+        /// threshold (CDZ_BACKLOG_DEPTH, default 2), POST a hire/route signal to the dedicated board channel the
+        /// PM subscribes to (so a human/PM mints or routes a helper). Cooldown-fenced per agent
+        /// (CDZ_HIRE_SIGNAL_COOLDOWN_SECS, default 21600 = 6h) so one breach yields one actionable ping, not a
+        /// per-sweep stream. OPT-IN so merely shipping the detection never posts; without it the backlog signal
+        /// stays report-only (a WARNING line).
+        #[arg(long)]
+        hire_signal: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -1990,6 +1998,11 @@ enum Cmd {
         /// builds its daemons from a local checkout (not a hermetic flake deploy).
         #[arg(long)]
         self_redeploy: bool,
+        /// Include `--hire-signal` (task_794): the installed watchdog posts a backlog-depth hire/route signal to
+        /// the PM's board channel when a running agent's open backlog exceeds the threshold (cooldown-fenced per
+        /// agent). Opt-in per host so the always-on sweep never posts until a host deliberately turns it on.
+        #[arg(long)]
+        hire_signal: bool,
         /// INSTALL the units into `~/.config/systemd/user/` (user-level, no sudo) instead of printing them, and
         /// print the `systemctl --user enable` command — a clean, reversible install path for a host not on the
         /// declarative (nix) model. Reverse with `--uninstall`.
@@ -2093,7 +2106,8 @@ fn main() {
             pinned_only,
             self_redeploy,
             reap_stale_observers,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers),
+            hire_signal,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -2154,9 +2168,10 @@ fn main() {
             bin,
             no_rearm,
             self_redeploy,
+            hire_signal,
             install,
             uninstall,
-        } => watchdog_unit(!no_rearm, observe, pinned_only, self_redeploy, interval_secs, bin, install, uninstall),
+        } => watchdog_unit(!no_rearm, observe, pinned_only, self_redeploy, hire_signal, interval_secs, bin, install, uninstall),
         Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall } => {
             daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall)
         }
@@ -3700,6 +3715,40 @@ fn write_rearm_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+/// task_794 default per-agent hire-signal cooldown: at most one backlog-breach post per agent per this window
+/// (6h), so a sustained deep backlog yields one actionable PM ping, not a per-sweep stream. `CDZ_HIRE_SIGNAL_COOLDOWN_SECS` tunes it.
+const HIRE_SIGNAL_COOLDOWN_SECS: u64 = 6 * 3600;
+
+/// task_794 board channel the backlog hire-signal is posted to; the PM subscribes to it (board-pm's choice over
+/// a direct message — simpler, no binary board-client change, and an auditable trail of breaches/hires).
+const HIRE_SIGNAL_CHANNEL: &str = "backlog-watchdog";
+
+/// task_794 cooldown gate (pure, unit-testable): a hire-signal is suppressed when the last one for this agent is
+/// within `cooldown_secs`. Unlike [`rearm_on_cooldown`] there is no floor — the cooldown is the explicit window.
+fn hire_signal_on_cooldown(last_signal: Option<u64>, now: u64, cooldown_secs: u64) -> bool {
+    last_signal.is_some_and(|last| now.saturating_sub(last) < cooldown_secs)
+}
+
+/// The per-agent last-hire-signal stamp path: `<hub>/.claude/fleet/watchdog/<name>.hire-signal` (unix secs).
+fn hire_signal_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("watchdog").join(format!("{name}.hire-signal"))
+}
+
+/// Read an agent's last-hire-signal unix time; `None` on an absent/unparseable stamp (never signalled).
+fn read_hire_signal_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(hire_signal_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+}
+
+/// Record that an agent's hire-signal was just posted at `now` (best-effort — a write failure only means the
+/// cooldown is not enforced for that agent next sweep).
+fn write_hire_signal_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = hire_signal_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
 // ── observation triggers (#187, BUILD 2/5) ─────────────────────────────────────────────────────────
 // The watchdog is also the SPAWNER of ephemeral per-agent observer sessions: it tracks each agent's
 // transcript growth against a per-agent watermark and, when the unobserved increment crosses a threshold
@@ -4234,6 +4283,7 @@ fn watchdog(
     pinned_only: bool,
     self_redeploy: bool,
     reap_stale_observers: bool,
+    hire_signal: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -4267,7 +4317,7 @@ fn watchdog(
     let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers);
+            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers, hire_signal);
             native_ids
         }
         Err(e) => {
@@ -4554,6 +4604,7 @@ fn watchdog_board(
     spawn_dry_run: bool,
     pinned_only: bool,
     reap_stale_observers: bool,
+    hire_signal: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
@@ -4919,10 +4970,9 @@ fn watchdog_board(
         );
     }
     if !backlog_overflow_ids.is_empty() {
-        // task_794: a RUNNING agent whose open backlog exceeds the depth threshold ({backlog_depth}) — the PM
-        // hire/route signal (the automated complement to the task_786 don't-strand guard). Report-only this
-        // slice: the WARNING is the human-/PM-readable signal; an auto board-message to the PM on breach
-        // (cooldown-fenced, behind an opt-in flag) is the next increment so merely merging never pings the PM.
+        // task_794: a RUNNING agent whose open backlog exceeds the depth threshold — the PM hire/route signal
+        // (the automated complement to the task_786 don't-strand guard). The WARNING is always printed (the
+        // human-/PM-readable report); with --hire-signal it ALSO posts each breach to the PM's channel below.
         let list: Vec<String> = backlog_overflow_ids.iter().map(|(id, n)| format!("{id}({n})")).collect();
         println!(
             "-- WARNING: {} agent(s) OVER BACKLOG DEPTH (task_794: >{} open) [agent(open)]: {}. A deep backlog is the PM hire/route signal — route a helper or reassign. (Set CDZ_BACKLOG_DEPTH to tune the threshold.)",
@@ -4930,6 +4980,49 @@ fn watchdog_board(
             backlog_depth,
             list.join(", ")
         );
+        // ACT (task_794, opt-in --hire-signal): post each breach to the dedicated channel the PM subscribes to,
+        // cooldown-fenced per agent so one breach is one actionable ping, not a per-sweep stream. The channel is
+        // resolved ONCE per sweep; a resolve failure degrades to report-only (the WARNING already landed) rather
+        // than failing the watchdog. post_to_channel pushes the PM a notification exactly like a direct message.
+        if hire_signal {
+            let cooldown = std::env::var("CDZ_HIRE_SIGNAL_COOLDOWN_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(HIRE_SIGNAL_COOLDOWN_SECS);
+            match board.create_or_get_channel(HIRE_SIGNAL_CHANNEL, "fleet-watchdog") {
+                Ok(channel_id) => {
+                    let (mut posted, mut cooled, mut failed) = (0usize, 0usize, 0usize);
+                    for (id, open) in &backlog_overflow_ids {
+                        if hire_signal_on_cooldown(read_hire_signal_stamp(&fleet, id), now_unix, cooldown) {
+                            cooled += 1;
+                            continue;
+                        }
+                        let body = format!(
+                            "backlog-depth breach: agent '{id}' holds {open} open actionable task(s) (over the \
+                             depth threshold {backlog_depth}). Hire/route signal -- mint or route a helper, or \
+                             reassign some of its queue. (fleet watchdog, task_794; cooldown {}h per agent.)",
+                            cooldown / 3600
+                        );
+                        match board.post_to_channel(channel_id, "fleet-watchdog", &body) {
+                            Ok(()) => {
+                                write_hire_signal_stamp(&fleet, id, now_unix);
+                                posted += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("  ! hire-signal post for '{id}' failed: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+                    println!(
+                        "-- hire-signal (task_794): posted {posted} breach(es) to #{HIRE_SIGNAL_CHANNEL}, {cooled} on cooldown, {failed} failed"
+                    );
+                }
+                Err(e) => eprintln!(
+                    "  ! hire-signal: could not resolve channel #{HIRE_SIGNAL_CHANNEL} ({e}) — backlog breaches reported above only (not posted)"
+                ),
+            }
+        }
     }
     if !unknown_native_ids.is_empty() {
         // task_500 fail-safe signal: an absent/malformed metadata.native (not an explicit false) means the
@@ -7417,7 +7510,7 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
 /// the observer cadence (`--observe --spawn`) and/or the host filter (`--pinned-only`) when requested. An
 /// OBSERVER-ONLY unit (`rearm=false, observe=true` → `watchdog --observe --spawn`) can run alongside an
 /// existing rearm watchdog without double-rearming — the host-a coexistence case. Pure — unit-tested.
-fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool, self_redeploy: bool) -> String {
+fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool, self_redeploy: bool, hire_signal: bool) -> String {
     let mut args = String::from("watchdog");
     if rearm {
         args.push_str(" --rearm --stale-only");
@@ -7430,6 +7523,9 @@ fn watchdog_exec_args(rearm: bool, observe: bool, pinned_only: bool, self_redepl
     }
     if self_redeploy {
         args.push_str(" --self-redeploy");
+    }
+    if hire_signal {
+        args.push_str(" --hire-signal");
     }
     args
 }
@@ -7544,6 +7640,7 @@ fn watchdog_unit(
     observe: bool,
     pinned_only: bool,
     self_redeploy: bool,
+    hire_signal: bool,
     interval_secs: u64,
     bin: Option<String>,
     install: bool,
@@ -7555,7 +7652,7 @@ fn watchdog_unit(
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| "fleet".to_string())
     });
-    let exec_args = watchdog_exec_args(rearm, observe, pinned_only, self_redeploy);
+    let exec_args = watchdog_exec_args(rearm, observe, pinned_only, self_redeploy, hire_signal);
     // Only an observer-spawning watchdog needs a launch environment (a rearm-only sweep just sends keys to an
     // existing window). Capture it from this (working) session so the installed service can launch Claude.
     let env_block = if observe { captured_observer_env() } else { String::new() };
@@ -8978,6 +9075,18 @@ mod tests {
     }
 
     #[test]
+    fn hire_signal_cooldown_suppresses_within_the_window_and_lapses_after() {
+        // task_794: never signalled → free to post.
+        assert!(!hire_signal_on_cooldown(None, 10_000, HIRE_SIGNAL_COOLDOWN_SECS));
+        // Signalled 1h ago with a 6h cooldown → still suppressed.
+        assert!(hire_signal_on_cooldown(Some(10_000), 10_000 + 3_600, HIRE_SIGNAL_COOLDOWN_SECS));
+        // …free once the full 6h window has elapsed (no floor, unlike the re-arm cooldown).
+        assert!(!hire_signal_on_cooldown(Some(10_000), 10_000 + HIRE_SIGNAL_COOLDOWN_SECS, HIRE_SIGNAL_COOLDOWN_SECS));
+        // The window is exactly `cooldown_secs`: one second short is still suppressed.
+        assert!(hire_signal_on_cooldown(Some(10_000), 10_000 + HIRE_SIGNAL_COOLDOWN_SECS - 1, HIRE_SIGNAL_COOLDOWN_SECS));
+    }
+
+    #[test]
     fn inbox_pending_count_counts_files_not_the_processed_dir() {
         let (base, fleet) = tmp_hub();
         fleet.ensure_inbox("a1"); // creates inbox/a1/processed
@@ -9104,20 +9213,29 @@ mod tests {
     #[test]
     fn watchdog_exec_args_builds_the_liveness_base_plus_opt_ins() {
         // rearm base, opt-in observe + pinned.
-        assert_eq!(watchdog_exec_args(true, false, false, false), "watchdog --rearm --stale-only");
-        assert_eq!(watchdog_exec_args(true, true, false, false), "watchdog --rearm --stale-only --observe --spawn");
-        assert_eq!(watchdog_exec_args(true, false, true, false), "watchdog --rearm --stale-only --pinned-only");
+        assert_eq!(watchdog_exec_args(true, false, false, false, false), "watchdog --rearm --stale-only");
+        assert_eq!(watchdog_exec_args(true, true, false, false, false), "watchdog --rearm --stale-only --observe --spawn");
+        assert_eq!(watchdog_exec_args(true, false, true, false, false), "watchdog --rearm --stale-only --pinned-only");
         // The secondary-box go-live shape: liveness + observer cadence + host filter.
         assert_eq!(
-            watchdog_exec_args(true, true, true, false),
+            watchdog_exec_args(true, true, true, false, false),
             "watchdog --rearm --stale-only --observe --spawn --pinned-only"
         );
         // OBSERVER-ONLY (rearm=false): coexists with an existing rearm watchdog without double-rearming (host-a).
-        assert_eq!(watchdog_exec_args(false, true, false, false), "watchdog --observe --spawn");
+        assert_eq!(watchdog_exec_args(false, true, false, false, false), "watchdog --observe --spawn");
         // --self-redeploy (#388) appends last: a local-checkout host installs the self-healing watchdog.
         assert_eq!(
-            watchdog_exec_args(true, false, false, true),
+            watchdog_exec_args(true, false, false, true, false),
             "watchdog --rearm --stale-only --self-redeploy"
+        );
+        // --hire-signal (task_794) appends after self-redeploy: a host turns on the backlog hire-signal post.
+        assert_eq!(
+            watchdog_exec_args(true, false, false, false, true),
+            "watchdog --rearm --stale-only --hire-signal"
+        );
+        assert_eq!(
+            watchdog_exec_args(true, false, false, true, true),
+            "watchdog --rearm --stale-only --self-redeploy --hire-signal"
         );
     }
 
@@ -9435,7 +9553,7 @@ detached
 
     #[test]
     fn render_watchdog_units_is_a_oneshot_service_plus_timer() {
-        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true, false), 60, "");
+        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true, false, false), 60, "");
         // A oneshot service (the watchdog is single-sweep) driven by a timer — not a Restart loop.
         assert!(u.contains("Type=oneshot"), "single-sweep → oneshot, not a loop");
         assert!(u.contains("ExecStart=/run/fleet/bin/fleet watchdog --rearm --stale-only --observe --spawn --pinned-only"));
@@ -9448,7 +9566,7 @@ detached
     #[test]
     fn watchdog_unit_files_splits_service_and_timer_cleanly() {
         // Observer-only exec, for the host-a coexistence install.
-        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false, false), 90, "");
+        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false, false, false), 90, "");
         // The service file has the oneshot + ExecStart, NO timer/header lines.
         assert!(service.contains("Type=oneshot"));
         assert!(service.contains("ExecStart=/bin/fleet watchdog --observe --spawn"));
@@ -9476,12 +9594,12 @@ detached
         // The captured env block sits in [Service] ahead of ExecStart so the spawned observer inherits PATH
         // (else `exec claude` is not found under the stripped systemd env and the window closes with 127).
         let env = render_service_env_lines(&[("PATH", Some("/home/u/.local/bin".into()))]);
-        let (service, _timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, true, false, false), 60, &env);
+        let (service, _timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, true, false, false, false), 60, &env);
         let env_at = service.find("Environment=\"PATH=").expect("env line present");
         let exec_at = service.find("ExecStart=").expect("ExecStart present");
         assert!(env_at < exec_at, "Environment= must precede ExecStart in the unit");
         // A rearm-only unit (no observe) is emitted with an empty env block — no launch environment needed.
-        let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false), 60, "");
+        let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false, false), 60, "");
         assert!(!rearm_only.contains("Environment="), "rearm-only watchdog spawns nothing → no env block");
     }
 
