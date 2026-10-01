@@ -6446,7 +6446,7 @@ mod tests {
         let plan = WorkspaceKindPlan {
             name: "membrain".to_string(),
             description: None,
-            setup_script: Some("brazil-build\n".to_string()),
+            setup_script: Some("make build\n".to_string()),
             cwd: "/work/agent-a".to_string(),
             pre_trust: vec![],
             env: vec![("K".to_string(), "v".to_string())],

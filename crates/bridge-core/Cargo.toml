@@ -9,8 +9,8 @@
 #     (crates/slack-bridge), audio wake→STT / synth→play (the voice bridge, #316), etc.
 #
 # Consumers today: slack-bridge + the voice bridge, both workspace members. A workspace crate (not
-# crates.io-published) — the Amazon-internal membrain bridge (#312) went self-contained in Brazil, so no
-# external publish is needed; publishing stays an additive later step if a Brazil consumer ever wants it.
+# crates.io-published) — the internal membrain bridge (#312) went self-contained in its own build, so no
+# external publish is needed; publishing stays an additive later step if a downstream consumer ever wants it.
 [package]
 name = "bridge-core"
 version = "0.1.0"
