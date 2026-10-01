@@ -119,6 +119,57 @@ let
       ];
     };
 
+  # Group B cron guard (task_495): a cadenza hub .claude/fleet/<script> run on a timer, migrated from the
+  # crontab. Unit-only -- the flake owns the timer+oneshot, the script stays hub-materialized (change a guard =
+  # cadenza merge + materialize, no flake rebuild). The hub dir is NOT under $HOME, so %h cannot reach it;
+  # install-fleet-daemons resolves FLEET_HUB the same way the materialize script does and injects
+  # Environment=FLEET_RT=<hub>/.claude/fleet into each guard unit at install time (not git-frozen). The oneshot
+  # is FAIL-CLEAN: an un-materialized script exits 0 and the timer retries next interval, never wedging. args /
+  # environment are the exact crontab invocation; WorkingDirectory=%h matches the cron cwd ($HOME).
+  mkGuard =
+    {
+      name,
+      script,
+      intervalSecs,
+      args ? "",
+      onBootSec ? 60,
+      persistent ? true,
+      environment ? { },
+    }:
+    let
+      argSuffix = lib.optionalString (args != "") " ${args}";
+    in
+    {
+      "${name}.service" = renderUnit (
+        [
+          marker
+          "[Unit]"
+          "Description=Fleet guard ${name} (oneshot)"
+          ""
+          "[Service]"
+          "Type=oneshot"
+          "WorkingDirectory=%h"
+        ]
+        ++ (envLines environment)
+        ++ [
+          "ExecStart=/bin/sh -c 'test -x \"$FLEET_RT/${script}\" && exec bash \"$FLEET_RT/${script}\"${argSuffix} || exit 0'"
+        ]
+      );
+      "${name}.timer" = renderUnit [
+        marker
+        "[Unit]"
+        "Description=Fleet guard ${name} cadence"
+        ""
+        "[Timer]"
+        "OnBootSec=${toString onBootSec}"
+        "OnUnitActiveSec=${toString intervalSecs}"
+        "Persistent=${if persistent then "true" else "false"}"
+        ""
+        "[Install]"
+        "WantedBy=timers.target"
+      ];
+    };
+
   fleetBin = "${fleet}/bin/fleet";
   fleetTunnelBin = "${fleetTunnel}/bin/fleet-tunnel";
 
@@ -210,6 +261,28 @@ let
       intervalSecs = 600;
       onBootSec = 60;
       persistent = true;
+    })
+    # Group B batch 1 (task_495): the fast-interval cron guards migrated to flake timers (hub scripts).
+    // (mkGuard {
+      name = "fleet-cpu-monitor";
+      script = "cpu-monitor.sh";
+      intervalSecs = 120;
+    })
+    // (mkGuard {
+      name = "fleet-reap-leases";
+      script = "reap-leases.sh";
+      intervalSecs = 60;
+    })
+    // (mkGuard {
+      name = "fleet-drain-nudge";
+      script = "drain-nudge.sh";
+      intervalSecs = 180;
+    })
+    // (mkGuard {
+      name = "fleet-throttle-unleased-nix";
+      script = "throttle-unleased-nix.sh";
+      args = "--apply";
+      intervalSecs = 180;
     });
 
   unitsDir = pkgs.runCommand "fleet-user-units" { } (
@@ -278,6 +351,17 @@ let
         chmod u+w "$UNIT_DIR/fleet-watchdog.service" 2>/dev/null || true
         printf 'Environment=PATH=%s\n' "$login_path" >> "$UNIT_DIR/fleet-watchdog.service"
       fi
+      # task_495: resolve the cadenza hub the SAME way the materialize script does (FLEET_HUB or its default)
+      # and inject Environment=FLEET_RT=<hub>/.claude/fleet into every Group B guard unit that references it, so
+      # the guard oneshots run the hub-materialized scripts. The hub is not under $HOME (so %h cannot reach it);
+      # this is an install-time injection, not a git-frozen machine path.
+      fleet_rt="''${FLEET_HUB:-/local/home/bythewc/Projects/camshaft/cadenza}/.claude/fleet"
+      for f in "$UNIT_DIR"/*.service; do
+        if grep -q 'FLEET_RT' "$f"; then
+          chmod u+w "$f" 2>/dev/null || true
+          printf 'Environment=FLEET_RT=%s\n' "$fleet_rt" >> "$f"
+        fi
+      done
       systemctl --user daemon-reload
       # Enable + start the timers (each oneshot .service is triggered by its timer, so it picks up a changed
       # ExecStart on its next fire -- no restart needed here).
