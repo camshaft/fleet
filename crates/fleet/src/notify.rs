@@ -33,16 +33,34 @@ use serde_json::Value;
 /// / `message.direct` / `channel.post` stay wake-on-type: their delivery already IS the subscription (a DM in
 /// particular has no subscribable target), and keeping them type-gated also preserves their wake for a
 /// pre-#384 payload that carries no `subscribed` field yet.
+///
+/// `reactive_unaddressed` narrows the wake for a REACTIVE relay/responder agent (task_580). A reactive agent
+/// is a member/subscriber of the channels it bridges and the tasks it watches, so under subscription =
+/// notification (#384) it is woken on EVERY ambient post/comment there — a full harness tick it correctly
+/// concludes "no action" on, during live chatter it is not addressed in (the frank + v-slack-bridge evidence).
+/// This flag suppresses the two AMBIENT-CAPABLE subscription wakes (`channel.post` and `task.commented`) for a
+/// recipient that is reactive AND that the board says this event does NOT address (not an @mention of it, not
+/// a reply in a thread it is engaged in). It never gates `task.assigned` / `message.direct` — those inherently
+/// address the recipient. It defaults false (a non-reactive agent, or a board not yet sending the
+/// reactive/addressed hints), so this is additive and dormant — identical to the pre-task_580 wake set until
+/// the board opts a reactive agent in. The board owns the complementary half (do not auto-subscribe a
+/// bridge-owner to the channels it bridges); the two together cut the waste at both the wake layer and the
+/// subscription source.
 pub fn notification_prompt(
     event_type: &str,
     task_id: Option<i64>,
     event_seq: Option<i64>,
     channel_id: Option<i64>,
     subscribed: bool,
+    reactive_unaddressed: bool,
 ) -> Option<String> {
     match event_type {
         "task.assigned" => task_id.map(|id| format!("[notification] task #{id}")),
         "message.direct" => event_seq.map(|seq| format!("[notification] message #{seq}")),
+        // A reactive relay/responder member of this channel is not addressed by this post (task_580): suppress
+        // the wake so ambient channel chatter it would conclude "no action" on does not cost a harness tick. It
+        // still accrues in the durable inbox for the next poll, so nothing is lost — only the wasted wake is cut.
+        "channel.post" if reactive_unaddressed => None,
         // A post to a channel the agent is a member of: the board only delivers `channel.post` to a channel's
         // subscribers/members (minus the actor), so delivery IS the subscription filter — the agent joined
         // because it cares (e.g. a `deploys`-channel waiter, #171). Wake-on-type for the same reason as above.
@@ -50,7 +68,10 @@ pub fn notification_prompt(
         // A comment wakes when the recipient has a DIRECT subscription to the target (#384, subscription =
         // notification): the collaboration case the zero-polling mandate targets. A firehose-only recipient
         // stays `subscribed=false` and accrues for poll (so a board-wide coordinator isn't woken per ticket).
-        "task.commented" if subscribed => task_id.map(|id| format!("[notification] comment on task #{id}")),
+        // A reactive recipient this comment does not address is suppressed for the same reason as channel.post.
+        "task.commented" if subscribed && !reactive_unaddressed => {
+            task_id.map(|id| format!("[notification] comment on task #{id}"))
+        }
         // A firehose-only task.commented, plus task.status_changed / task.updated / presence.updated and
         // every other type, are INFORMATIONAL here — they accrue for the next poll and never inject a wake.
         _ => None,
@@ -69,7 +90,23 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
     // a pre-#384 payload -> `false`, which leaves every type-gated wake (assign/dm/channel) intact and simply
     // keeps a comment dropping-to-poll.
     let subscribed = v.get("subscribed").and_then(Value::as_bool).unwrap_or(false);
-    let prompt = notification_prompt(event_type, task_id, event_seq, channel_id, subscribed)?;
+    // task_580: the two per-recipient hints that gate a REACTIVE agent's ambient wakes. `reactive` (board
+    // metadata) marks a relay/responder; `addressed` is whether THIS event addresses it (an @mention, a reply
+    // in a thread it is engaged in). We suppress only when the recipient is reactive AND the board EXPLICITLY
+    // says the event does not address it (`addressed == Some(false)`). An absent `addressed` (a board that does
+    // not yet send the signal) stays `None` -> NOT suppressed, so enabling `reactive` without the addressing
+    // signal can never silently drop a legitimate addressed wake — it only narrows once the board sends both.
+    let reactive = v.get("reactive").and_then(Value::as_bool).unwrap_or(false);
+    let addressed = v.get("addressed").and_then(Value::as_bool);
+    let reactive_unaddressed = reactive && addressed == Some(false);
+    let prompt = notification_prompt(
+        event_type,
+        task_id,
+        event_seq,
+        channel_id,
+        subscribed,
+        reactive_unaddressed,
+    )?;
     Some((recipient.to_string(), prompt))
 }
 
@@ -236,26 +273,63 @@ mod tests {
         // Direct-delivery types wake on TYPE — the recipient can't be a passive bystander of them — so they
         // wake regardless of the `subscribed` hint (here `false`). A DM in particular has no subscribable
         // target, so it MUST stay type-gated.
-        assert_eq!(notification_prompt("task.assigned", Some(42), None, None, false).as_deref(), Some("[notification] task #42"));
-        assert_eq!(notification_prompt("message.direct", None, Some(438), None, false).as_deref(), Some("[notification] message #438"));
+        assert_eq!(notification_prompt("task.assigned", Some(42), None, None, false, false).as_deref(), Some("[notification] task #42"));
+        assert_eq!(notification_prompt("message.direct", None, Some(438), None, false, false).as_deref(), Some("[notification] message #438"));
         // A post to a channel the agent is a member of (delivery = membership; #171) wakes on type.
-        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false).as_deref(), Some("[notification] channel #7"));
-        assert_eq!(notification_prompt("channel.post", None, Some(9), None, false), None, "no channel_id → can't form a prompt");
+        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(), Some("[notification] channel #7"));
+        assert_eq!(notification_prompt("channel.post", None, Some(9), None, false, false), None, "no channel_id → can't form a prompt");
         // A comment on a target the recipient DIRECTLY subscribes to wakes (#384, subscription = notification)
         // — the collaboration case the zero-polling mandate targets.
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true).as_deref(), Some("[notification] comment on task #42"));
-        assert_eq!(notification_prompt("task.commented", None, Some(9), None, true), None, "no task_id → can't form a prompt even when subscribed");
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(), Some("[notification] comment on task #42"));
+        assert_eq!(notification_prompt("task.commented", None, Some(9), None, true, false), None, "no task_id → can't form a prompt even when subscribed");
         // NO wake (accrues for the next poll): a comment from a FIREHOSE-only recipient (no direct
         // subscription) must not loop-wake a board-wide coordinator on every ticket; a status change never
         // wakes at all.
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, false), None, "a firehose-only comment accrues for poll, never wakes");
-        assert_eq!(notification_prompt("task.status_changed", Some(42), Some(9), None, true), None, "status change never wakes, even when subscribed");
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, false, false), None, "a firehose-only comment accrues for poll, never wakes");
+        assert_eq!(notification_prompt("task.status_changed", Some(42), Some(9), None, true, false), None, "status change never wakes, even when subscribed");
         // an assignment without a task_id, or a DM without a seq, can't form a prompt
-        assert_eq!(notification_prompt("task.assigned", None, Some(1), None, false), None);
-        assert_eq!(notification_prompt("message.direct", Some(1), None, None, false), None);
+        assert_eq!(notification_prompt("task.assigned", None, Some(1), None, false, false), None);
+        assert_eq!(notification_prompt("message.direct", Some(1), None, None, false, false), None);
         // presence churn and other event types are ignored
-        assert_eq!(notification_prompt("presence.updated", None, Some(3), None, true), None);
-        assert_eq!(notification_prompt("task.updated", Some(5), None, None, true), None);
+        assert_eq!(notification_prompt("presence.updated", None, Some(3), None, true, false), None);
+        assert_eq!(notification_prompt("task.updated", Some(5), None, None, true, false), None);
+    }
+
+    #[test]
+    fn reactive_unaddressed_suppresses_only_ambient_subscription_wakes() {
+        // task_580: a reactive relay/responder is woken on every ambient channel.post / task.commented it is a
+        // member/subscriber of. The reactive_unaddressed gate suppresses exactly those two ambient-capable
+        // subscription wakes — and ONLY those — when the recipient is reactive and the event does not address it.
+        // channel.post: woken when not gated, SUPPRESSED when reactive_unaddressed.
+        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(), Some("[notification] channel #7"), "ungated channel.post still wakes a member");
+        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false, true), None, "a reactive member not addressed by the post is NOT woken (task_580)");
+        // task.commented: a direct-subscribed comment wakes, but is SUPPRESSED when reactive_unaddressed.
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(), Some("[notification] comment on task #42"), "ungated subscribed comment still wakes");
+        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true, true), None, "a reactive subscriber not addressed by the comment is NOT woken (task_580)");
+        // The gate NEVER touches the inherently-addressed direct-delivery types: an assignment or a DM to a
+        // reactive agent still wakes even when reactive_unaddressed is set (those address it by definition).
+        assert_eq!(notification_prompt("task.assigned", Some(42), None, None, false, true).as_deref(), Some("[notification] task #42"), "an assignment addresses the recipient — reactive gate must not suppress it");
+        assert_eq!(notification_prompt("message.direct", None, Some(438), None, false, true).as_deref(), Some("[notification] message #438"), "a DM addresses the recipient — reactive gate must not suppress it");
+    }
+
+    #[test]
+    fn payload_reactive_gate_requires_reactive_and_explicit_not_addressed() {
+        // The suppression engages only when the payload says reactive=true AND addressed=false. A reactive post
+        // the board does NOT mark addressed-either-way (addressed absent) must still wake — so enabling reactive
+        // without the addressing signal never silently drops a legitimate wake; it only narrows once both land.
+        let base = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"recipient":"frank","type":"channel.post","channel_id":7,"event_seq":9});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        // reactive + explicitly not addressed -> suppressed.
+        assert_eq!(payload_to_wake(&base(serde_json::json!({"reactive":true,"addressed":false}))), None, "reactive + addressed=false suppresses the ambient wake");
+        // reactive but addressed -> wakes (an @mention of the reactive agent IS actionable).
+        assert_eq!(payload_to_wake(&base(serde_json::json!({"reactive":true,"addressed":true}))), Some(("frank".into(), "[notification] channel #7".into())), "a reactive agent the post addresses still wakes");
+        // reactive but no addressing signal at all -> wakes (fail-safe: never drop a wake on a half-rolled-out board).
+        assert_eq!(payload_to_wake(&base(serde_json::json!({"reactive":true}))), Some(("frank".into(), "[notification] channel #7".into())), "reactive without an addressed hint falls back to waking");
+        // not reactive, addressed=false -> wakes (a normal member is unaffected by the reactive gate).
+        assert_eq!(payload_to_wake(&base(serde_json::json!({"addressed":false}))), Some(("frank".into(), "[notification] channel #7".into())), "a non-reactive member is never gated by addressing");
     }
 
     #[test]
