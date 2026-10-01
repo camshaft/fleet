@@ -43,7 +43,7 @@ const BATCH: usize = 128;
 /// The embedder's work lock — the Python `_work_lock` (`with _work_lock, embed.gpu_lock()`). The embedder is
 /// a single process, but its reactive webhook runtime dispatches one task per event concurrently, so this
 /// serializes the embed+upsert critical section: one embed job at a time, no model/CPU (or, on a CUDA host,
-/// VRAM) overcommit. On green the embedder runs `embed_device="cpu"` (the GTX 1080 Ti is sm_61, which the
+/// VRAM) overcommit. On the deployment host the embedder runs `embed_device="cpu"` (its GPU is an sm_61 card, which the
 /// bundled onnxruntime CUDA EP has no kernels for), so the Python cross-process `gpu_lock()` flock is a no-op
 /// there; this in-process lock is the meaningful serialization for the single embedder agent.
 static WORK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -565,7 +565,7 @@ pub async fn handle_embed(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<(),
 
 /// The reserved webhook port for each role — the Python `KB_UPLOADER_PORT` / `KB_EMBEDDER_PORT` defaults. The
 /// board POSTs task events to `http://127.0.0.1:<port>/` (loopback: the board and the workers are co-resident
-/// on green).
+/// on the deployment host).
 const UPLOADER_PORT: u16 = 8075;
 const EMBEDDER_PORT: u16 = 8074;
 
@@ -896,10 +896,7 @@ mod tests {
         assert_eq!(pl["path"], "Guide.pdf");
         assert_eq!(pl["page"], 3); // PDF page preserved
         assert_eq!(pl["ipfs_cid"], "bafkreicid");
-        assert_eq!(
-            pl["ipfs_url"],
-            "http://host-b.lan:8080/ipfs/bafkreicid"
-        );
+        assert_eq!(pl["ipfs_url"], "http://host-b.lan:8080/ipfs/bafkreicid");
         // base_payload curation defaults are present (authority derived from kind, status active).
         assert_eq!(pl["status"], "active");
         assert!(pl.contains_key("authority"));

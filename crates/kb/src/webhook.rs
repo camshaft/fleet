@@ -1,6 +1,6 @@
 //! `webhook` — the inbound event receiver for the board-driven workers (the reactive half of #235).
 //!
-//! Each green-resident worker registers a `webhook_url` (see `board::Board::register`) on its reserved port
+//! Each deployed worker registers a `webhook_url` (see `board::Board::register`) on its reserved port
 //! (uploader 8075 / embedder 8074 / crate-docs 8078); the board POSTs task events there. This module runs a
 //! small axum server that parses each event, decides whether it is actionable for this worker, dedups so the
 //! same task is not dispatched twice concurrently (the Python `_busy` lock), and hands the task id to the
@@ -123,8 +123,8 @@ struct AppState {
 }
 
 /// Run the webhook receiver on `port`, delivering actionable, deduped task ids (each paired with a busy
-/// guard the worker drops when done) to `tx`. Binds `0.0.0.0:port` — the board reaches a green-resident
-/// worker on green's own address. Returns when the process is signalled.
+/// guard the worker drops when done) to `tx`. Binds `0.0.0.0:port` — the board reaches a deployed
+/// worker on the host's own address. Returns when the process is signalled.
 pub async fn run_receiver(
     port: u16,
     agent_id: String,

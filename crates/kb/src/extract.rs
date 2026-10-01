@@ -180,7 +180,7 @@ fn nonws(s: &str) -> usize {
 /// mode is a MISS (unchanged behavior), never a false OCR of real text. This catches the BINARY-junk class of
 /// image-only pages (the sparse-only check missed them — see task_40 comment_1922, docs.ldo_awd). The harder
 /// printable-but-high-entropy case (decoded bytes that happen to land in printable ASCII, e.g. "igmJ,di4>i$G")
-/// is NOT separable from real prose by this ratio and is deferred to the fixture-calibrated green-side slice,
+/// is NOT separable from real prose by this ratio and is deferred to the fixture-calibrated deployment-side slice,
 /// where the real docs.ldo_awd / Rapido-Plus page text is available to tune against.
 const OCR_GARBAGE_RATIO: f32 = 0.35;
 
