@@ -662,10 +662,10 @@ mod tests {
 
     #[test]
     fn build_identity_body_shape() {
-        let v = build_identity_body("slack:U0ALLK04G3T", "slack", "Cameron Bytheway");
+        let v = build_identity_body("slack:U0ALLK04G3T", "slack", "Example Operator");
         assert_eq!(v["id"], "slack:U0ALLK04G3T");
         assert_eq!(v["source"], "slack");
-        assert_eq!(v["display_name"], "Cameron Bytheway");
+        assert_eq!(v["display_name"], "Example Operator");
     }
 
     #[test]

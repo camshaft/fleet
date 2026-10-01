@@ -117,7 +117,7 @@ mod tests {
             board_api = "http://board.local/api"
             window_sh = "/opt/fleet/window.sh"
             agent = "v-fleet-tooling"
-            host = "green-machine"
+            host = "host-b"
             tunnel_health_url = "http://127.0.0.1:8898/"
             operator_id = "operator"
             nudge_pm_tag_round = 2
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(cfg.nudge_pm_tag_round, Some(2));
         assert_eq!(cfg.nudge_reassign_round, Some(3));
         assert_eq!(cfg.tunnel_health_url.as_deref(), Some("http://127.0.0.1:8898/"));
-        assert_eq!(cfg.host.as_deref(), Some("green-machine"));
+        assert_eq!(cfg.host.as_deref(), Some("host-b"));
         assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
         assert_eq!(cfg.hub.as_deref(), Some("/srv/hub"));
         assert_eq!(cfg.root.as_deref(), Some("/home/x/.fleet"));

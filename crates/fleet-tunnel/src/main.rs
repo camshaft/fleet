@@ -243,7 +243,7 @@ async fn run_once(cfg: &Arc<Config>, health: &Arc<HealthState>) -> Result<(), Bo
     // #449: re-derive the served set on this LIVE connection and, if it changed, close the socket so
     // run_forever re-dials + re-registers the fresh set. Without this the set only refreshes at an
     // incidental reconnect, so a newly-spun/relocated agent silently gets no event-wakes until then (the
-    // George-on-dev-dsk outage). Only when `agents_cmd` derives the set dynamically; disabled otherwise.
+    // George-on-host-a outage). Only when `agents_cmd` derives the set dynamically; disabled otherwise.
     // The watcher is aborted when this connection ends (below), so watchers never accumulate across reconnects.
     let (reconnect_rx, watcher) = match cfg.served_refresh_interval() {
         Some(interval) => {

@@ -181,7 +181,7 @@ mod tests {
             "http://127.0.0.1:8079/api",
             "voice:green".into(),
             "voice-bridge".into(),
-            "cameron".into(),
+            "operator".into(),
             d,
             &[link(7, "voice:green")],
         );
@@ -196,7 +196,7 @@ mod tests {
             "http://127.0.0.1:8079/api",
             "voice:green".into(),
             "voice-bridge".into(),
-            "cameron".into(),
+            "operator".into(),
             d,
             &[],
         );
