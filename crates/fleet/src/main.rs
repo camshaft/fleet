@@ -3996,6 +3996,33 @@ fn monitor_exempt_task_owners(tasks: &[serde_json::Value]) -> std::collections::
         .collect()
 }
 
+/// How the watchdog reads an agent's `metadata.native`, fail-safe (task_500).
+enum NativeVerdict {
+    /// `native: true` — a board-native agent, managed/observed as normal.
+    Native,
+    /// `native: false` — a deliberately-marked file-hub row; skip it (intended).
+    NotNative,
+    /// `native` absent, `metadata` entirely missing, or `native` present but not a bool — the roster shape is
+    /// unknown. NOT the same as `false`: the task_418 roster compaction dropped `metadata` from the list
+    /// projection, so a hard `unwrap_or(false)` read `native=false` for every agent and silently disabled the
+    /// whole observer cadence. The caller must treat Unknown as fail-safe (process + warn), never as a skip.
+    Unknown,
+}
+
+/// Read `metadata.native` as a tri-state (task_500 fail-safe). An EXPLICIT `native:false` is distinct from an
+/// ABSENT/malformed field: the former is a deliberate file-hub marker to skip, the latter is a roster-shape
+/// unknown the watchdog must not silently treat as not-native. Pure — unit-tested.
+fn read_native(md: Option<&serde_json::Value>) -> NativeVerdict {
+    match md.and_then(|m| m.get("native")) {
+        Some(v) => match v.as_bool() {
+            Some(true) => NativeVerdict::Native,
+            Some(false) => NativeVerdict::NotNative,
+            None => NativeVerdict::Unknown,
+        },
+        None => NativeVerdict::Unknown,
+    }
+}
+
 /// The BOARD dimension of the watchdog: scan the board roster's native agents. Split out of [`watchdog`] so a
 /// board outage skips only this pass, leaving the file-hub scan to run. See [`watchdog`] for the signals.
 #[allow(clippy::too_many_arguments)]
@@ -4062,14 +4089,21 @@ fn watchdog_board(
     // run of model-safeguard refusals. Collected across the sweep and surfaced in one WARNING below.
     let mut wedged_ids: Vec<String> = Vec::new();
     let mut native = 0usize;
+    // task_500: ids whose metadata.native was ABSENT/malformed (NOT an explicit false) — collected to warn.
+    let mut unknown_native_ids: Vec<String> = Vec::new();
     for a in agents {
         let md = a.get("metadata");
-        let is_native = md
-            .and_then(|m| m.get("native"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if !is_native {
-            continue;
+        let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        // task_500 fail-safe native gate. The task_418 roster compaction dropped `metadata` from the list
+        // projection, so a hard `unwrap_or(false)` read `native=false` for every agent and this loop skipped
+        // ALL of them — silently zeroing the observe-candidate set and disabling the whole observer cadence. So
+        // distinguish an EXPLICIT `native:false` (a deliberately-marked file-hub row — skip, as intended) from
+        // an ABSENT/malformed native (roster shape unknown): an UNKNOWN must NOT hard-skip — process it (degrade
+        // to over-observing) and surface it in a loud WARNING below, never a silent zero.
+        match read_native(md) {
+            NativeVerdict::NotNative => continue,
+            NativeVerdict::Unknown => unknown_native_ids.push(id.to_string()),
+            NativeVerdict::Native => {}
         }
         // Host affinity: skip agents this box should not manage — a DIFFERENT-box pin always, and (under
         // --pinned-only) unpinned run-anywhere agents too, so a secondary box never re-arms/observes an agent
@@ -4078,7 +4112,6 @@ fn watchdog_board(
             continue;
         }
         native += 1;
-        let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let interval_str = md
             .and_then(|m| m.get("interval"))
             .and_then(|v| v.as_str())
@@ -4271,6 +4304,17 @@ fn watchdog_board(
             "-- WARNING: {} agent(s) SAFEGUARD-WEDGED (last {SAFEGUARD_WEDGE_THRESHOLD} assistant turns all stop_reason=refusal; last_seen keeps advancing so the liveness check misses it): {}. Recover: `fleet spin-down <agent> --apply --force` then `fleet spin-up <agent> --apply`.",
             wedged_ids.len(),
             wedged_ids.join(", ")
+        );
+    }
+    if !unknown_native_ids.is_empty() {
+        // task_500 fail-safe signal: an absent/malformed metadata.native (not an explicit false) means the
+        // roster projection may have dropped the field — the task_418 class of regression. These agents were
+        // processed anyway (over-observed, not silently skipped), but surface them loudly so the roster shape
+        // gets fixed: stamp each native:true (board-native) or native:false (file-hub) so the gate is explicit.
+        println!(
+            "-- WARNING: {} agent(s) have an ABSENT/malformed metadata.native and were treated as managed (fail-safe over-observe, task_500) — the roster projection may be dropping the field: {}. Fix: stamp each native:true or native:false so the roster is explicit.",
+            unknown_native_ids.len(),
+            unknown_native_ids.join(", ")
         );
     }
     if observe {
@@ -6418,6 +6462,19 @@ mod tests {
             ],
             "built-ins first (incl. the resolved launch cwd), then the kind's config env"
         );
+    }
+
+    #[test]
+    fn read_native_is_tristate_absent_is_unknown_not_false() {
+        use serde_json::json;
+        // Explicit true/false are decisive.
+        assert!(matches!(read_native(Some(&json!({"native": true}))), NativeVerdict::Native));
+        assert!(matches!(read_native(Some(&json!({"native": false}))), NativeVerdict::NotNative));
+        // task_500: an ABSENT native key, entirely missing metadata, and a non-bool native are ALL Unknown
+        // (fail-safe) — the task_418 regression dropped metadata, which must NOT read as a hard not-native.
+        assert!(matches!(read_native(Some(&json!({"interval": "3h"}))), NativeVerdict::Unknown));
+        assert!(matches!(read_native(None), NativeVerdict::Unknown));
+        assert!(matches!(read_native(Some(&json!({"native": "true"}))), NativeVerdict::Unknown));
     }
 
     #[test]
