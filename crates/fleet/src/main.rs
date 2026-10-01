@@ -5300,6 +5300,16 @@ fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
 /// must show worker activity ([`task_has_worker_activity`]) to count — a bare backlog item is not a stall.
 /// Report-only unless `apply` — a dry run prints exactly what it WOULD do without writing (the #478/#540 review
 /// gate).
+/// task_609: whether a nudge-stale run is a total OUTAGE — it attempted at least one post but landed ZERO.
+/// Only meaningful in `apply` mode (a dry run posts nothing by design). `posted` = the nudges + routes that
+/// succeeded; `failed` = posts that were attempted and errored. Since attempted == posted + failed, the
+/// condition "attempted > 0 && posted == 0" reduces to `posted == 0 && failed > 0`. A sweep with nothing to do
+/// (no stale tasks → posted == 0, failed == 0) is NOT an outage — it is a healthy quiet run that must exit 0.
+/// Pure; unit-tested.
+fn nudge_run_is_outage(apply: bool, posted: usize, failed: usize) -> bool {
+    apply && posted == 0 && failed > 0
+}
+
 fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet nudge-stale: {e}");
@@ -5345,6 +5355,11 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     let operator_id = config::get().operator_id.as_deref();
     let mut nudged = 0usize;
     let mut routed = 0usize;
+    // task_609: count posts that were ATTEMPTED but FAILED (apply mode only). A run that tried to post N
+    // nudges/routes and landed zero of them is a total outage (e.g. the board is unreachable) — it must NOT
+    // exit 0, or systemd/the watchdog sees a healthy sweep and nothing chases stale work (the operator then
+    // fills the gap by hand). See the outage check after the loop.
+    let mut failed = 0usize;
     for t in &candidates {
         let id = match t.get("id").and_then(serde_json::Value::as_i64) {
             Some(id) => id,
@@ -5469,7 +5484,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                             routed += 1;
                             println!("  routed #{id} \"{title}\" → {NUDGE_ROUTER} ({reason}, idle={})", format_hm(idle_secs));
                         }
-                        Err(e) => eprintln!("  #{id} \"{title}\": route FAILED: {e}"),
+                        Err(e) => {
+                            failed += 1;
+                            eprintln!("  #{id} \"{title}\": route FAILED: {e}");
+                        }
                     }
                 } else {
                     routed += 1;
@@ -5486,7 +5504,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                             nudged += 1;
                             println!("  nudged #{id} \"{title}\" ({kind}, assignee={owner}, idle={})", format_hm(idle_secs));
                         }
-                        Err(e) => eprintln!("  #{id} \"{title}\": nudge FAILED: {e}"),
+                        Err(e) => {
+                            failed += 1;
+                            eprintln!("  #{id} \"{title}\": nudge FAILED: {e}");
+                        }
                     }
                 } else {
                     nudged += 1;
@@ -5497,12 +5518,25 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     }
 
     println!(
-        "\n{} {} nudge(s) + {} route(s) to {NUDGE_ROUTER}{}",
+        "\n{} {} nudge(s) + {} route(s) to {NUDGE_ROUTER}{}{}",
         if apply { "posted" } else { "would post" },
         nudged,
         routed,
+        if failed > 0 { format!(" ({failed} FAILED)") } else { String::new() },
         if apply { "" } else { " — re-run with --apply to act" }
     );
+    // task_609: a total-outage guard. If this apply run ATTEMPTED posts but landed ZERO (every nudge/route
+    // failed — the board unreachable, auth broken, etc.), exiting 0 would mask the outage: systemd marks the
+    // oneshot succeeded and the push-based accountability loop silently stops chasing stale work (the operator
+    // then fills the PM gap by hand). Exit non-zero so the FAILED unit is itself the signal — visible to
+    // `systemctl --user` and the watchdog health sweep. Posting a board signal is pointless when the board is
+    // the thing that is down, so the exit code is the signal, not a board write.
+    if nudge_run_is_outage(apply, nudged + routed, failed) {
+        eprintln!(
+            "fleet nudge-stale: OUTAGE — attempted {failed} post(s) and landed 0 (every one failed); exiting non-zero so the stale-task accountability loop is not silently down"
+        );
+        std::process::exit(1);
+    }
 }
 
 /// The watchdog invocation a cadence unit runs: the liveness sweep (`--rearm --stale-only`) when `rearm`, plus
@@ -7913,6 +7947,19 @@ mod tests {
         assert_eq!(cfg.agents[0].model, "opus");
         assert_eq!(cfg.agents[1].model, "fable");
         assert_eq!(cfg.agents[1].effort, "high", "default effort");
+    }
+
+    #[test]
+    fn nudge_run_is_outage_only_when_apply_attempted_but_landed_zero() {
+        // task_609: a healthy quiet sweep (no stale tasks → posted 0, failed 0) is NOT an outage, so it exits 0.
+        assert!(!nudge_run_is_outage(true, 0, 0), "no stale tasks is a healthy run, not an outage");
+        // Total outage: posts were attempted and every one failed (posted 0, failed>0) → outage, exit non-zero.
+        assert!(nudge_run_is_outage(true, 0, 3), "attempted>0 && posted==0 is a total outage");
+        // Partial: at least one landed → the path is up, not an outage.
+        assert!(!nudge_run_is_outage(true, 1, 2), "any successful post means the board path is up");
+        assert!(!nudge_run_is_outage(true, 5, 0), "all posts succeeded → not an outage");
+        // A dry run posts nothing by design, so it is never an outage regardless of the counts.
+        assert!(!nudge_run_is_outage(false, 0, 3), "a dry run never posts, so never an outage");
     }
 
     #[test]
