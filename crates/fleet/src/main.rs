@@ -5185,6 +5185,42 @@ fn task_last_nudge_age_secs(task: &serde_json::Value, now: time::OffsetDateTime)
         .min()
 }
 
+/// task_627: how many consecutive UNANSWERED nudge rounds this task has had — the count of this daemon's own
+/// nudge comments that are NEWER than the newest comment from anyone else (the owner's last response/activity).
+/// A fresh owner comment resets the count: the round was answered. Derived purely from the task's comment
+/// history (ages via [`last_seen_age_secs`], mirroring [`task_last_nudge_age_secs`]), so there is no external
+/// round-state to persist or corrupt. Pure — unit-tested.
+fn nudge_round_count(task: &serde_json::Value, now: time::OffsetDateTime) -> usize {
+    let comments = task
+        .get("comments")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    // The owner's last activity = the age of the NEWEST non-daemon comment (smallest age); None if the owner
+    // has never commented. Nudge comments newer than that (smaller age) are the ones that went unanswered.
+    let owner_age = comments
+        .iter()
+        .filter(|c| c.get("author").and_then(serde_json::Value::as_str) != Some(NUDGE_AUTHOR))
+        .filter_map(|c| c.get("created_at").and_then(serde_json::Value::as_str))
+        .filter_map(|ts| last_seen_age_secs(ts, now))
+        .min();
+    comments
+        .iter()
+        .filter(|c| c.get("author").and_then(serde_json::Value::as_str) == Some(NUDGE_AUTHOR))
+        .filter_map(|c| c.get("created_at").and_then(serde_json::Value::as_str))
+        .filter_map(|ts| last_seen_age_secs(ts, now))
+        .filter(|&age| owner_age.is_none_or(|o| age < o))
+        .count()
+}
+
+/// task_627: whether a stale task's next nudge should ESCALATE to the router (the operator-accountable
+/// backstop) instead of nudging the silent owner again — true once at least `escalate_after` prior nudge
+/// rounds have gone unanswered. `escalate_after == 0` would escalate immediately; the use site defaults it to a
+/// sane round count so the owner gets a fair chance first. Pure — unit-tested.
+fn should_escalate(unanswered_rounds: usize, escalate_after: usize) -> bool {
+    unanswered_rounds >= escalate_after
+}
+
 /// task_540: the age in seconds of the task ASSIGNEE's most-recent comment (an ack/ETA), or `None` if the
 /// assignee has never commented on it. Mirrors [`task_last_nudge_age_secs`] but keyed on the assignee rather
 /// than the nudge daemon — the two together tell an acknowledged-queued todo (assignee acked AFTER our last
@@ -5261,6 +5297,22 @@ fn nudge_body(threshold_hours: f64, assignee: &str, idle_secs: i64) -> String {
          do ONE of: post a progress update or ETA; if you cannot progress it now, reassign it to an available \
          agent; or update the status - mark it done, or blocked with a blocked_on note if it is waiting on \
          something (if you are unsure whether it is blocked, say that).",
+        format_hm(idle_secs)
+    )
+}
+
+/// task_627: the body posted when a stale task has gone unanswered for enough nudge rounds that the daemon
+/// ESCALATES to the `router` (the operator-accountable backstop) instead of nudging the silent owner again. It
+/// names the router and spells out the call to make — reassign to a fresh agent, chase an ETA, mark it
+/// explicitly blocked, or close it — so the escalation forces a decision rather than another ignored ping. The
+/// owner is still named so the trail shows who went silent. Pure — unit-tested.
+fn escalation_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswered_rounds: usize, router: &str) -> String {
+    format!(
+        "fleet escalation: this task is still idle (over {threshold_hours}h, idle {}) after {unanswered_rounds} \
+         unanswered nudge(s) to {assignee}. {router}, please make the call: reassign it to an available agent \
+         (mint a helper if needed), chase an ETA, mark it explicitly blocked with a blocked_on note, or close \
+         it. The owner has not responded across {unanswered_rounds} round(s), so this is now an accountability \
+         decision, not another owner ping.",
         format_hm(idle_secs)
     )
 }
@@ -5353,6 +5405,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     // nudged/routed (#478 exclusion). The operator id is a deployment-specific value read from config; absent →
     // NO exemption (the generic case: a fleet with no designated operator). The fleet code holds no operator id.
     let operator_id = config::get().operator_id.as_deref();
+    // task_627: after this many UNANSWERED nudge rounds, the next nudge escalates to the router instead of
+    // pinging the silent owner again. Config-tunable (generic-boundary); default 3 so the owner gets a fair
+    // chance first.
+    let escalate_after = config::get().nudge_escalate_rounds.unwrap_or(3);
     let mut nudged = 0usize;
     let mut routed = 0usize;
     // task_609: count posts that were ATTEMPTED but FAILED (apply mode only). A run that tried to post N
@@ -5496,13 +5552,29 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
             }
             None => {
                 let owner = assignee.expect("Some (a live non-router owner) when not routing");
-                let kind = if last_nudge_secs.is_some() { "re-nudge" } else { "first nudge" };
+                // task_627: count prior unanswered nudge rounds; after `escalate_after` of them, this nudge
+                // ESCALATES to the router (board-pm) for a reassign/ETA/block/close call instead of pinging the
+                // silent owner again. `round` is this nudge's 1-based round number for the report line.
+                let unanswered = nudge_round_count(&full, now);
+                let escalate = should_escalate(unanswered, escalate_after);
+                let round = unanswered + 1;
+                let kind = if escalate {
+                    "ESCALATION"
+                } else if last_nudge_secs.is_some() {
+                    "re-nudge"
+                } else {
+                    "first nudge"
+                };
                 if apply {
-                    let body = nudge_body(threshold_hours, owner, idle_secs);
+                    let body = if escalate {
+                        escalation_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER)
+                    } else {
+                        nudge_body(threshold_hours, owner, idle_secs)
+                    };
                     match board.comment_task(id, NUDGE_AUTHOR, &body) {
                         Ok(()) => {
                             nudged += 1;
-                            println!("  nudged #{id} \"{title}\" ({kind}, assignee={owner}, idle={})", format_hm(idle_secs));
+                            println!("  nudged #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})", format_hm(idle_secs));
                         }
                         Err(e) => {
                             failed += 1;
@@ -5511,7 +5583,7 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                     }
                 } else {
                     nudged += 1;
-                    println!("  would nudge #{id} \"{title}\" ({kind}, assignee={owner}, idle={})", format_hm(idle_secs));
+                    println!("  would nudge #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})", format_hm(idle_secs));
                 }
             }
         }
@@ -8024,6 +8096,63 @@ mod tests {
         assert!((age - 3600).abs() < 2, "newest assignee comment is 1h old, got {age}");
         // An assignee who never commented → None.
         assert_eq!(newest_assignee_comment_age_secs(&task, "v-never", now), None);
+    }
+
+    #[test]
+    fn nudge_round_count_counts_daemon_nudges_since_the_last_owner_comment() {
+        use time::{format_description::well_known::Rfc3339, Duration};
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
+        const DAEMON: &str = "fleet-nudge-daemon";
+        // Owner commented 5h ago, then the daemon nudged at 4h/2h/30m with no owner reply since → 3 unanswered.
+        let unanswered_3 = serde_json::json!({
+            "comments": [
+                { "author": "v-x", "created_at": stamp(Duration::hours(5)) },
+                { "author": DAEMON, "created_at": stamp(Duration::hours(4)) },
+                { "author": DAEMON, "created_at": stamp(Duration::hours(2)) },
+                { "author": DAEMON, "created_at": stamp(Duration::minutes(30)) },
+            ],
+        });
+        assert_eq!(nudge_round_count(&unanswered_3, now), 3);
+        // A fresh owner reply (10m ago) AFTER the nudges resets the count: no nudge is newer than it.
+        let answered = serde_json::json!({
+            "comments": [
+                { "author": DAEMON, "created_at": stamp(Duration::hours(4)) },
+                { "author": DAEMON, "created_at": stamp(Duration::hours(2)) },
+                { "author": "v-x", "created_at": stamp(Duration::minutes(10)) },
+            ],
+        });
+        assert_eq!(nudge_round_count(&answered, now), 0, "an owner reply after the nudges resets the rounds");
+        // No owner comment ever → every daemon nudge counts.
+        let never_answered = serde_json::json!({
+            "comments": [
+                { "author": DAEMON, "created_at": stamp(Duration::hours(3)) },
+                { "author": DAEMON, "created_at": stamp(Duration::hours(1)) },
+            ],
+        });
+        assert_eq!(nudge_round_count(&never_answered, now), 2);
+        // No comments at all → 0 rounds.
+        assert_eq!(nudge_round_count(&serde_json::json!({}), now), 0);
+    }
+
+    #[test]
+    fn should_escalate_fires_at_or_past_the_threshold() {
+        // Threshold of 3 unanswered rounds: 0/1/2 → nudge the owner; 3+ → escalate.
+        assert!(!should_escalate(0, 3));
+        assert!(!should_escalate(2, 3));
+        assert!(should_escalate(3, 3));
+        assert!(should_escalate(5, 3));
+        // Tunable: a threshold of 1 escalates on the first unanswered round.
+        assert!(should_escalate(1, 1));
+        assert!(!should_escalate(0, 1));
+    }
+
+    #[test]
+    fn escalation_body_names_the_router_and_the_call_to_make() {
+        let b = escalation_body(1.0, "v-x", 7200, 3, "board-pm");
+        assert!(b.contains("escalation") && b.contains("board-pm"), "names the escalation + the router");
+        assert!(b.contains("v-x") && b.contains('3'), "names the silent owner + the unanswered round count");
+        assert!(b.contains("reassign") && b.contains("close"), "spells out the accountability call to make");
     }
 
     #[test]
