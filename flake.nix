@@ -349,6 +349,12 @@
             type = "app";
             program = "${(fleetDaemons pkgs).deployBinaryApp}/bin/deploy-fleet-binary";
           };
+          # task_719: the dark-fleet-binary freshness sweep (detect-and-nudge). Normally run hourly by its timer;
+          # `nix run .#fleet-binary-sweep` runs one sweep by hand for testing.
+          fleet-binary-sweep = {
+            type = "app";
+            program = "${(fleetDaemons pkgs).sweepApp}/bin/fleet-binary-sweep";
+          };
           default = {
             type = "app";
             program = "${fleet}/bin/fleet";
@@ -371,6 +377,8 @@
           # Build the binary-only deploy app too (writeShellApplication runs shellcheck), so a break in the
           # scoped deploy script fails `nix flake check` / CI (task_717).
           deploy-fleet-binary = (fleetDaemons pkgs).deployBinaryApp;
+          # Build the binary-freshness sweep (shellcheck) so a break in it fails the gate (task_719).
+          fleet-binary-sweep = (fleetDaemons pkgs).sweepApp;
         }
         # voice-assistant bundles a linux-x64 prebuilt sherpa lib, so it only builds there; gate the
         # check to that system so `nix flake check` on arm/darwin doesn't try (and fail) to build it.
