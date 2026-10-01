@@ -2425,7 +2425,13 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
          ANY board doc OR comment, self-check your wording against the banned-phrases list \
          (wiki guides/banned-phrases) and rephrase anything it flags — that list is maintained/data-driven, so \
          read it rather than a fixed set here; until the pre-submit scanner (#308) lands this self-check is \
-         yours. OWNER-CONFIRM gate: before you EXECUTE, or route to the operator, any DESTRUCTIVE or \
+         yours. When you WRITE content into an MCP tool argument — a comment, a message, or a doc/version \
+         body — pass the ACTUAL content as the argument, NEVER a shell substitution like a $(cat file) token \
+         or a backtick command: the MCP call has no shell, so the literal token is stored VERBATIM and \
+         silently clobbers the target while the write still returns success, so READ BACK what you wrote \
+         (re-get the doc/comment) to confirm the real content landed (task_589). And never put a commit/PR \
+         attribution line — a 'Generated with ...' or a 'Co-Authored-By:' line — in a board task/doc body or \
+         comment; those belong only on git commits and PR descriptions, not board content. OWNER-CONFIRM gate: before you EXECUTE, or route to the operator, any DESTRUCTIVE or \
          operator-directed action (service restart, deploy, data-touching command) that you SYNTHESIZED from \
          another agent's trace or diagnosis of a service you do NOT own, first confirm the exact command with \
          that service's OWNER (the authority on their live unit); if the owner cannot confirm in time, mark it \
@@ -3447,7 +3453,10 @@ fn build_observer_kickoff(
          `observer` by PASSING THE IDENTITY PARAMETER on each call — the board defaults these to NULL, so you \
          MUST set them or the lane's single-author dedup query breaks: create_task with created_by=\"observer\", \
          comment_task / comment_document with author=\"observer\", update_task with actor=\"observer\", and \
-         attribute kb_remember to `observer`. Never leave created_by/author null. This session makes exactly \
+         attribute kb_remember to `observer`. Never leave created_by/author null. Keep board bodies CLEAN: \
+         never append a commit/PR attribution line — a 'Generated with ...' or a 'Co-Authored-By:' line — to a \
+         task body, comment, or proposal; that belongs on git commits and PRs, not board content (board-pm). \
+         This session makes exactly \
          ONE observation and EXITS — \
          do NOT start a /loop. IMPORTANT: for every `fleet` command use THIS binary by its absolute path — \
          `{fleet_bin}` — NOT the `fleet` on PATH (which may be a different build lacking `transcripts` / \
@@ -5901,6 +5910,10 @@ mod tests {
         // Banned-phrases self-check (operator writing policy): reference the maintained list (data-driven),
         // applied to any doc OR comment, until the #308 pre-submit scanner lands.
         assert!(k.contains("banned-phrases") && k.contains("doc OR comment"), "kickoff points authors at the banned-phrases list for docs and comments");
+        // task_589: never pass a shell $(cat file) substitution as an MCP content arg (stored verbatim,
+        // silent clobber) + read back after a write; and no commit/PR attribution lines in board bodies.
+        assert!(k.contains("$(cat file)") && k.contains("READ BACK"), "warns against a $(cat) MCP arg + mandates read-back-after-write (task_589)");
+        assert!(k.contains("Co-Authored-By:") && k.contains("not board content"), "bans commit/PR attribution lines in board bodies");
         // External-dependency blocked → long/event-woken cadence (#349): the block carve-out is generalized
         // beyond the operator to ANY external dep (another agent, a pending deploy/CI), so an agent holding a
         // sole externally-blocked task sets it blocked + drops to the long cadence instead of SOON-polling.
@@ -7414,6 +7427,9 @@ mod tests {
         assert!(k.contains("/repo/target/release/fleet observe-record v-x --session sess-9 --offset"));
         assert!(k.contains("/repo/loops/observer.md"), "points at the full role body");
         assert!(k.contains("project #28"), "files into the fleet-self-improve lane");
+        // No commit/PR attribution lines in the observer's board task bodies (board-pm; the observer was
+        // leaking a "Generated with ..." line into task bodies).
+        assert!(k.contains("Co-Authored-By:") && k.contains("not board content"), "observer kickoff bans attribution lines in board bodies");
     }
 
     #[test]
