@@ -2774,6 +2774,9 @@ fn build_launch_cmd(
 enum SpinDownAction {
     /// Not a board-native agent — refuse (a file-hub agent stands down via `cargo xtask fleet remove`).
     NotBoardNative,
+    /// The agent still holds `open` actionable (todo/in_progress, non-blocked) board assignments and `--force`
+    /// was not given — refuse so dispatched work is never stranded on a stood-down agent (task_786).
+    RefuseHoldsAssignments { open: usize },
     /// A turn is in flight and `--force` was not given — refuse so a working agent is never killed.
     RefuseBusy,
     /// Set the board status offline, then kill the live window (stops the loop).
@@ -2782,9 +2785,21 @@ enum SpinDownAction {
     OfflineOnly,
 }
 
-fn spin_down_action(is_native: bool, has_window: bool, is_working: bool, force: bool) -> SpinDownAction {
+fn spin_down_action(
+    is_native: bool,
+    has_window: bool,
+    is_working: bool,
+    open_assignments: usize,
+    force: bool,
+) -> SpinDownAction {
     if !is_native {
         return SpinDownAction::NotBoardNative;
+    }
+    // task_786: an agent holding dispatched work must not be left stood down (the task_311 class — cr-reviewer
+    // was spun down ~16h still holding a CR review). Refuse BEFORE the busy/window checks so the operator sees
+    // the reassign requirement first; --force overrides (stand down anyway, operator accepts the open tasks).
+    if open_assignments > 0 && !force {
+        return SpinDownAction::RefuseHoldsAssignments { open: open_assignments };
     }
     if has_window && is_working && !force {
         return SpinDownAction::RefuseBusy;
@@ -2800,8 +2815,9 @@ fn spin_down_action(is_native: bool, has_window: bool, is_working: bool, force: 
 /// board `status` `offline` (so `up-board` treats it as stood down: offline + no window → never auto-launched)
 /// then kills its tmux window to stop the loop. RESUMABLE, not a retire — the board record (charter +
 /// metadata) is untouched, so `spin-up` revives it. Refuses a non-board-native agent (a file-hub agent uses
-/// `cargo xtask fleet remove`) and a busy pane (unless `--force`). Sets offline BEFORE the kill so an
-/// interleaved `up-board` cannot see it online-but-windowless and relaunch it.
+/// `cargo xtask fleet remove`), an agent still holding open board assignments (task_786 — so dispatched work
+/// is never stranded on a stood-down agent), and a busy pane; `--force` overrides the last two. Sets offline
+/// BEFORE the kill so an interleaved `up-board` cannot see it online-but-windowless and relaunch it.
 fn spin_down(agent: &str, apply: bool, force: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet spin-down: {e}");
@@ -2819,7 +2835,17 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
     let session = board_session();
     let has_window = tmux_window_names(&session).iter().any(|w| w == agent);
     let is_working = has_window && window_is_working(&session, agent);
-    let action = spin_down_action(is_native, has_window, is_working, force);
+    // task_786: count the agent's OPEN actionable assignments (todo/in_progress, non-blocked). FAIL-OPEN — if
+    // the board /tasks query hiccups we warn and proceed rather than wedge spin-down on a transient error
+    // (connect + get_agent already succeeded above, so this is a narrow window).
+    let open_assignments = match board.open_task_count(agent) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("  ! could not verify open assignments ({e}) — proceeding without the stranding guard");
+            0
+        }
+    };
+    let action = spin_down_action(is_native, has_window, is_working, open_assignments, force);
 
     println!("spin-down '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
     match action {
@@ -2827,6 +2853,15 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
             eprintln!(
                 "  ✗ '{agent}' is NOT board-native (metadata.native != true) — spin-down manages board-native \
                  agents only. A file-hub agent stands down via `cargo xtask fleet remove {agent}`."
+            );
+            std::process::exit(1);
+        }
+        SpinDownAction::RefuseHoldsAssignments { open } => {
+            eprintln!(
+                "  ✗ '{agent}' still holds {open} open assignment(s) (actionable todo/in_progress board \
+                 task(s)) — refusing so dispatched work is not stranded on a stood-down agent. Reassign or \
+                 close them first (list: `fleet` board tasks assigned to '{agent}'), or pass --force to stand \
+                 it down anyway (the open tasks stay assigned to it until you reassign them)."
             );
             std::process::exit(1);
         }
@@ -8134,18 +8169,34 @@ mod tests {
     #[test]
     fn spin_down_action_covers_native_busy_window_and_windowless() {
         use SpinDownAction::*;
-        // Not board-native → refuse regardless of window/force (a file-hub agent uses cargo xtask fleet remove).
-        assert_eq!(spin_down_action(false, true, false, false), NotBoardNative);
-        assert_eq!(spin_down_action(false, false, false, true), NotBoardNative);
+        // Not board-native → refuse regardless of window/assignments/force (file-hub uses cargo xtask fleet remove).
+        assert_eq!(spin_down_action(false, true, false, 0, false), NotBoardNative);
+        assert_eq!(spin_down_action(false, false, false, 3, true), NotBoardNative);
         // Native + a working pane + no --force → refuse so a running agent is never killed mid-turn.
-        assert_eq!(spin_down_action(true, true, true, false), RefuseBusy);
+        assert_eq!(spin_down_action(true, true, true, 0, false), RefuseBusy);
         // --force overrides the busy refusal → offline + kill.
-        assert_eq!(spin_down_action(true, true, true, true), OfflineAndKill);
+        assert_eq!(spin_down_action(true, true, true, 0, true), OfflineAndKill);
         // Native + an IDLE live window → offline then kill (stops the loop).
-        assert_eq!(spin_down_action(true, true, false, false), OfflineAndKill);
+        assert_eq!(spin_down_action(true, true, false, 0, false), OfflineAndKill);
         // Native + no window → offline ONLY (still mark offline so up-board leaves it stood down); force moot.
-        assert_eq!(spin_down_action(true, false, false, false), OfflineOnly);
-        assert_eq!(spin_down_action(true, false, true, true), OfflineOnly);
+        assert_eq!(spin_down_action(true, false, false, 0, false), OfflineOnly);
+        assert_eq!(spin_down_action(true, false, true, 0, true), OfflineOnly);
+    }
+
+    #[test]
+    fn spin_down_action_refuses_an_agent_holding_open_assignments_unless_forced() {
+        use SpinDownAction::*;
+        // task_786: the stranding guard — an agent holding open assignments must not be stood down. Refuse in
+        // BOTH the windowless (the task_311 class — spun down yet still holding dispatched work) and windowed
+        // cases, taking priority over the busy check so the operator sees the reassign requirement first.
+        assert_eq!(spin_down_action(true, false, false, 1, false), RefuseHoldsAssignments { open: 1 });
+        assert_eq!(spin_down_action(true, true, false, 2, false), RefuseHoldsAssignments { open: 2 });
+        assert_eq!(spin_down_action(true, true, true, 5, false), RefuseHoldsAssignments { open: 5 });
+        // --force overrides the stranding refusal → it falls through to the normal window/windowless action.
+        assert_eq!(spin_down_action(true, true, false, 3, true), OfflineAndKill);
+        assert_eq!(spin_down_action(true, false, false, 3, true), OfflineOnly);
+        // Zero open assignments → the guard is inert (normal behavior).
+        assert_eq!(spin_down_action(true, true, false, 0, false), OfflineAndKill);
     }
 
     #[test]
