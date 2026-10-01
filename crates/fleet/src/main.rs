@@ -2411,7 +2411,11 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
          you wake on your OWN comment — use each tool's own field. The board defaults identity to null and a \
          call that omits it fails with 'no identity for this session'. Never PRECOMPUTE or guess a task id: \
          reference a task only by the id create_task RETURNS, because concurrent creation on the shared board \
-         can hand a guessed next-id to a DIFFERENT agent's task. \
+         can hand a guessed next-id to a DIFFERENT agent's task. TYPED REFERENCES (task_584): whenever you \
+         WRITE a task or PR/issue reference into any board body (a comment, a message, or a channel post), \
+         spell it as a TYPED id — 'task_N' for a board task, or 'owner/repo#N' for a GitHub issue/PR — and \
+         NEVER a bare '#N': the board hard-rejects a bare '#N' in posted content, so a bare ref costs you a \
+         reword-and-retry every time. \
          Coordinate through the board (send_message / check_notifications / \
          comment_task / set_status) — there is no file inbox. Any board Document you author (design / \
          proposal / plan) MUST follow the Fleet Doc-Writing Style Guide — wiki guides/doc-writing-style-guide \
@@ -2443,7 +2447,11 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, reactive: bool) -> 
          polling buys nothing. If the block is ON THE OPERATOR specifically, ALSO assign the task to 'cameron' \
          and stash your own id in metadata.blocked_owner — so list_tasks(assignee 'cameron') is the operator's \
          single 'my asks' dashboard; when the operator answers, reassign the task back to yourself and clear \
-         blocked. (If your MCP cannot set a typed blocked_on, ask concierge or board-pm to stamp it.) You work \
+         blocked. (If your MCP cannot set a typed blocked_on, ask concierge or board-pm to stamp it.) STATUS \
+         HONESTY (task_506): never set your presence offline or away while you still hold a live in_progress \
+         assigned task — an in_progress task means actively-worked, so before you stand down you MUST either \
+         progress it or re-state it as blocked (with a blocked_on note) or done; standing down on a live \
+         in_progress task is a status-honesty violation the watchdog flags and re-arms. You work \
          in {workdir}. Start your recurring \
          loop now: /loop {tick}"
     )
@@ -5864,6 +5872,10 @@ mod tests {
         assert!(k.contains("wake on your OWN comment"), "warns that the wrong identity field self-notifies");
         // Never precompute a task id (#526): reference only the id create_task returns.
         assert!(k.contains("Never PRECOMPUTE") && k.contains("id create_task RETURNS"), "bans guessing a task id (#526)");
+        // Typed references (task_584): a bare `#N` is hard-rejected on board bodies, so the kickoff mandates
+        // a TYPED id (`task_N` or `owner/repo#N`) in any comment/message/post — else a reword-retry every time.
+        assert!(k.contains("TYPED REFERENCES") && k.contains("owner/repo#N"), "mandates typed task/PR refs, not a bare #N (task_584)");
+        assert!(k.contains("hard-rejects a bare"), "states the board hard-rejects a bare #N in posted content");
         assert!(k.contains("'v-x'") && k.contains("/wt/v-x"));
         // OWNER-CONFIRM gate (#352): a trace-derived destructive/operator action against a service you don't
         // own must be owner-confirmed before executing or routing (a near-miss almost restarted a stale unit).
@@ -5899,6 +5911,10 @@ mod tests {
         // 'cameron' + typed blocked_on + stash the real owner so list_tasks(assignee cameron) is the one dashboard.
         assert!(k.contains("ON THE OPERATOR specifically") && k.contains("assign the task to 'cameron'"), "keeps the operator-blocked convention as a sub-case");
         assert!(k.contains("metadata.blocked_owner"), "stashes the real owner for reassign-back");
+        // Status honesty (task_506 Layer 1): never stand down (offline/away) holding a live in_progress task —
+        // progress it or re-state it blocked/done first; the companion watchdog warning flags the violation.
+        assert!(k.contains("STATUS HONESTY") && k.contains("in_progress"), "bans standing down on a live in_progress task (task_506 Layer 1)");
+        assert!(k.contains("status-honesty violation the watchdog flags"), "ties the kickoff clause to the watchdog #506 warning");
         // Drained / at-rest → persist a long cadence on the BOARD metadata (#383 + task_566): the lever is the
         // board metadata.interval (update_agent, the cadence the watchdog reads) which works even for a
         // board-only agent — NOT the frozen `cargo xtask fleet set-interval` which only writes the file-hub

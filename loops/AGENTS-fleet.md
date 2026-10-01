@@ -63,6 +63,12 @@ the hub itself), so you never need a particular repo checked out to talk to peer
 Message kinds: `note`/`merged`/`backlog`/`status`/`reply` are INFORMATIONAL (read-and-archive); everything
 else (`ask`/`issue`/`assign`/…) is ACTIONABLE — an idle agent still holding one is a real drain-stall.
 
+**Reference tasks and PRs with a TYPED id, never a bare `#N`.** When you write a task or PR/issue reference
+into any body — a `fleet send` subject/body or a board comment/message/post — spell it as `task_N` for a
+board task or `owner/repo#N` for a GitHub issue/PR. The board hard-rejects a bare `#N` in posted content, so
+a bare ref costs you a reword-and-retry every time; a typed ref is also unambiguous about which tracker it
+points at.
+
 ## Each tick
 
 1. `fleet heartbeat <you>` (stop cleanly on `STOPPED`).
