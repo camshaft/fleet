@@ -283,6 +283,26 @@ let
       script = "throttle-unleased-nix.sh";
       args = "--apply";
       intervalSecs = 180;
+    })
+    # Group B batch 2 (task_495): the mid-interval cron guards migrated to flake timers (hub scripts).
+    // (mkGuard {
+      name = "fleet-compact-nudge";
+      script = "compact-nudge.sh";
+      intervalSecs = 300;
+    })
+    // (mkGuard {
+      name = "fleet-slack-bridge-guard";
+      script = "slack-bridge-guard.sh";
+      intervalSecs = 300;
+    })
+    // (mkGuard {
+      name = "fleet-prune-tmp-inodes";
+      script = "prune-tmp-inodes.sh";
+      args = "--apply";
+      intervalSecs = 900;
+      environment = {
+        INODE_THRESHOLD_PCT = "0";
+      };
     });
 
   unitsDir = pkgs.runCommand "fleet-user-units" { } (
