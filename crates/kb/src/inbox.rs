@@ -36,11 +36,17 @@ pub async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("embed dim task panicked: {e}"))??;
 
-    // Files in a deterministic order, skipping anything already quarantined under `_failed/`.
-    let files: Vec<PathBuf> = extract::iter_files(&inbox)
-        .into_iter()
-        .filter(|f| !f.starts_with(&failed))
-        .collect();
+    // Files in a deterministic order, skipping anything already quarantined under `_failed/`. The walk is a
+    // blocking directory traversal (walkdir), so it runs off-reactor (fleet no-blocking-IO policy, task_809).
+    let files: Vec<PathBuf> = {
+        let inbox = inbox.clone();
+        tokio::task::spawn_blocking(move || extract::iter_files(&inbox))
+            .await
+            .map_err(|e| format!("inbox: file-walk task panicked: {e}"))?
+    }
+    .into_iter()
+    .filter(|f| !f.starts_with(&failed))
+    .collect();
 
     let (mut chunks_ok, mut files_ok, mut failures) = (0usize, 0usize, 0usize);
     for f in files {
@@ -54,7 +60,7 @@ pub async fn run() -> Result<(), String> {
             Ok((0, _)) => {
                 // No extractable text — quarantine (not retryable, but keep for inspection).
                 tracing::warn!("inbox: no text in {rel}; moving to _failed");
-                move_to_failed(&f, &failed, &rel);
+                move_to_failed(&f, &failed, &rel).await;
                 failures += 1;
             }
             Ok((n, None)) => {
@@ -62,24 +68,27 @@ pub async fn run() -> Result<(), String> {
                 tracing::warn!(
                     "inbox: {rel} ingested ({n} chunks) but IPFS pin failed; kept in _failed"
                 );
-                move_to_failed(&f, &failed, &rel);
+                move_to_failed(&f, &failed, &rel).await;
                 chunks_ok += n;
             }
             Ok((n, Some(_cid))) => {
                 chunks_ok += n;
                 files_ok += 1;
-                if let Err(e) = std::fs::remove_file(&f) {
+                if let Err(e) = tokio::fs::remove_file(&f).await {
                     tracing::warn!("inbox: ingested {rel} but could not delete it: {e}");
                 }
             }
             Err(e) => {
                 tracing::error!("inbox: ERROR {rel}: {e}");
-                move_to_failed(&f, &failed, &rel);
+                move_to_failed(&f, &failed, &rel).await;
                 failures += 1;
             }
         }
     }
-    prune_empty_dirs(&inbox, &failed);
+    // Blocking directory walk + rmdir — off-reactor (fleet no-blocking-IO policy, task_809).
+    tokio::task::spawn_blocking(move || prune_empty_dirs(&inbox, &failed))
+        .await
+        .map_err(|e| format!("inbox: prune task panicked: {e}"))?;
     tracing::info!("inbox drain complete: {files_ok} files, {chunks_ok} chunks, {failures} failed");
     Ok(())
 }
@@ -213,12 +222,12 @@ fn sanitize(name: &str, default: &str) -> String {
 
 /// Move a file to `<failed>/<rel>` (creating parents), so a failed ingest is quarantined out of the next
 /// drain rather than reprocessed. Best-effort — a move failure is logged, not fatal.
-fn move_to_failed(f: &Path, failed: &Path, rel: &str) {
+async fn move_to_failed(f: &Path, failed: &Path, rel: &str) {
     let dest = failed.join(rel);
     if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = tokio::fs::create_dir_all(parent).await;
     }
-    if let Err(e) = std::fs::rename(f, &dest) {
+    if let Err(e) = tokio::fs::rename(f, &dest).await {
         tracing::warn!("inbox: could not quarantine {rel} to _failed: {e}");
     }
 }
