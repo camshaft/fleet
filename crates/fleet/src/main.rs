@@ -2332,6 +2332,15 @@ fn normalize_repos(v: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
     }
 }
 
+/// The `metadata.worktree` patch to apply when provisioning an agent, or `None` when the board already points
+/// at `workdir`. task_730: a worktree migration/retire previously left `metadata.worktree` pointing at a
+/// retired tree, so the charter named a dead path; syncing it to the REAL provisioned workdir on every
+/// provision stops that recurrence. Idempotent — `None` when it already matches, so a re-provision is a no-op.
+/// Pure — unit-tested.
+fn worktree_metadata_patch(current: Option<&str>, workdir: &str) -> Option<serde_json::Value> {
+    (current != Some(workdir)).then(|| serde_json::json!({ "worktree": workdir }))
+}
+
 /// Spin up one board-declared agent into its `~/.fleet` workspace. Reads the board record (orchestrator
 /// read — agents coordinate via their own MCP), then reports the materialize + launch plan; `--apply`
 /// materializes each repo's worktree off a shared bare mirror and launches a tmux window running `claude`
@@ -2458,6 +2467,16 @@ fn spin_up(agent: &str, apply: bool) {
         }
         println!("  (dry-run — re-run with --apply to materialize + launch)");
         return;
+    }
+    // Sync the board charter's metadata.worktree to the REAL provisioned tree (task_730): a migration/retire
+    // must never leave the charter pointing at a dead/old path. Done after materialize (the worktree exists)
+    // and before the launch/charter guard, so the pointer is corrected even if the launch is later refused.
+    // Idempotent (no-op when already correct) and NON-FATAL — a metadata blip must not fail a spin-up.
+    if let Some(patch) = worktree_metadata_patch(md.get("worktree").and_then(|v| v.as_str()), &workdir) {
+        match board.patch_metadata(agent, patch) {
+            Ok(()) => println!("  metadata.worktree -> {workdir} (synced so the charter never points at a stale tree)"),
+            Err(e) => eprintln!("  WARN: could not sync metadata.worktree ({e}); run `fleet worktree-check` to catch a stale pointer"),
+        }
     }
     if !has_charter {
         eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
@@ -8553,6 +8572,23 @@ detached
         assert_eq!(classify_worktree_health(true, true, true, 2), WorktreeHealth::UnlandedCommits);
         // Exists + level/behind -> healthy.
         assert_eq!(classify_worktree_health(true, true, true, 0), WorktreeHealth::Clean);
+    }
+
+    #[test]
+    fn worktree_metadata_patch_is_idempotent_and_syncs_a_stale_pointer() {
+        use serde_json::json;
+        // Already pointing at the real workdir -> no patch (idempotent re-provision).
+        assert_eq!(worktree_metadata_patch(Some("/home/u/.fleet/agents/a/repo"), "/home/u/.fleet/agents/a/repo"), None);
+        // Stale pointer (the task_730 symptom: charter names an old/retired tree) -> patch to the real path.
+        assert_eq!(
+            worktree_metadata_patch(Some(".claude/worktrees/a"), "/home/u/.fleet/agents/a/repo"),
+            Some(json!({ "worktree": "/home/u/.fleet/agents/a/repo" }))
+        );
+        // Unset -> patch (first provision records the path).
+        assert_eq!(
+            worktree_metadata_patch(None, "/home/u/.fleet/agents/a/repo"),
+            Some(json!({ "worktree": "/home/u/.fleet/agents/a/repo" }))
+        );
     }
 
     #[test]
