@@ -130,7 +130,8 @@ let
     {
       name,
       script,
-      intervalSecs,
+      intervalSecs ? null,
+      onCalendar ? null,
       args ? "",
       onBootSec ? 60,
       persistent ? true,
@@ -139,7 +140,24 @@ let
     }:
     let
       argSuffix = lib.optionalString (args != "") " ${args}";
+      # A guard fires EITHER on a monotonic interval (OnBootSec + OnUnitActiveSec -- the herd-avoided cadence
+      # most guards use, offset from the top-of-hour by activation time) OR at a wall-clock time-of-day
+      # (OnCalendar), for the quiet-hours daily guards whose exact slot is deliberate: a plain 24h interval
+      # would anchor to whenever install happened and drift the run into daytime fleet activity. Exactly one of
+      # intervalSecs / onCalendar is set (asserted below). Persistent=true applies to both: a missed run (box
+      # asleep past the scheduled time / interval boundary) fires once on the next wake, never a thundering backlog.
+      cadenceLines =
+        if onCalendar != null then
+          [ "OnCalendar=${onCalendar}" ]
+        else
+          [
+            "OnBootSec=${toString onBootSec}"
+            "OnUnitActiveSec=${toString intervalSecs}"
+          ];
     in
+    assert lib.assertMsg (
+      (intervalSecs == null) != (onCalendar == null)
+    ) "mkGuard ${name}: set exactly one of intervalSecs or onCalendar";
     {
       "${name}.service" = renderUnit (
         [
@@ -167,8 +185,9 @@ let
           "Description=Fleet guard ${name} cadence"
           ""
           "[Timer]"
-          "OnBootSec=${toString onBootSec}"
-          "OnUnitActiveSec=${toString intervalSecs}"
+        ]
+        ++ cadenceLines
+        ++ [
           "Persistent=${if persistent then "true" else "false"}"
         ]
         ++ lib.optionals enabled [
@@ -327,7 +346,7 @@ let
     # schedules (warm-keep :17, reap-orphans :7,:37) purely for cron herd-avoidance; a systemd timer's
     # OnBootSec + OnUnitActiveSec is already offset from the top-of-hour by activation time, so a plain
     # interval preserves the cadence + the herd-avoidance intent without needing a specific-minute OnCalendar
-    # (which only the daily/6-hourly B4 guards actually require).
+    # (which only the fixed-time daily B4 guards actually require -- the 6-hourly one is likewise a plain interval).
     // (mkGuard {
       name = "fleet-disk-guard";
       script = "disk-guard.sh";
@@ -348,6 +367,27 @@ let
       script = "reap-wedged-nix-clients.sh";
       args = "--orphans-only --apply";
       intervalSecs = 1800;
+    })
+    # Group B batch 4 (task_495): the daily/6-hourly tail guards -- COMPLETES Group B. prune-stale-targets ran
+    # `0 */6` (every 6h on the hour), a cadence a plain 6h interval reproduces (herd-avoided by activation offset,
+    # same as batch 3). baseline-drift (`23 4`) and oracle-lean (`41 4`) ran at a DELIBERATE early-morning slot
+    # in the quiet window; those keep their wall-clock time-of-day via the new OnCalendar param, since a plain 24h
+    # interval would anchor to install time and drift the heavy jobs into daytime fleet activity.
+    // (mkGuard {
+      name = "fleet-prune-stale-targets";
+      script = "prune-stale-targets.sh";
+      args = "--apply";
+      intervalSecs = 21600;
+    })
+    // (mkGuard {
+      name = "fleet-baseline-drift";
+      script = "baseline-drift-monitor.sh";
+      onCalendar = "*-*-* 04:23:00";
+    })
+    // (mkGuard {
+      name = "fleet-oracle-lean";
+      script = "stage-oracle-lean.sh";
+      onCalendar = "*-*-* 04:41:00";
     });
 
   unitsDir = pkgs.runCommand "fleet-user-units" { } (
