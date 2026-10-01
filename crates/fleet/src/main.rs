@@ -1819,6 +1819,27 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Read-only disk-reclaim safety survey (task_714): classify every git worktree under each --root for
+    /// whether it is SAFE TO RECLAIM (delete). The reclaim gate (v-disk-sweep) deletes only provably-preserved
+    /// checkouts; this bakes out the git `@{u}` footgun — a checkout with NO upstream is NOT safe-by-default
+    /// (absence of an upstream means its commits cannot be proven pushed), so it is reported KEEP (unsafe),
+    /// never reclaimable. A checkout is reclaimable only when clean AND either fully pushed to its upstream or
+    /// already an ancestor of the mainline. Worktrees are enumerated via `git worktree list`, so a bare hub's
+    /// `.claude/worktrees/*` are included. Prints the KEEP set (and, with `--verbose`, the reclaimable set too).
+    /// Read-only — no writes, no deletes.
+    ReclaimSurvey {
+        /// A directory to scan: itself a git checkout, or a container whose direct children are checkouts.
+        /// Repeatable; default = the current directory.
+        #[arg(long = "root")]
+        root: Vec<PathBuf>,
+        /// The mainline ref a checkout must be an ancestor of to count as preserved (its commits already live
+        /// there). Default origin/main.
+        #[arg(long, default_value = "origin/main")]
+        mainline: String,
+        /// Also list the reclaimable checkouts (default: print only the KEEP / unsafe ones plus counts).
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Seam-check a MONITOR vertical (task_579): ff-sync its worktree to origin/main, then report whether any
     /// incoming commit touched the agent's declared SEAM — its `metadata.seam` file globs. A monitor wake is
     /// otherwise 100% deterministic git plumbing, so this lets the kickoff GATE the model wake: exit 0 = GREEN
@@ -2040,6 +2061,7 @@ fn main() {
             cadence_pinned,
             verbose,
         } => observe_coverage(cadence, cadence_pinned, verbose),
+        Cmd::ReclaimSurvey { root, mainline, verbose } => reclaim_survey(root, mainline, verbose),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::NudgeStale {
@@ -5519,6 +5541,202 @@ fn observe_coverage(cadence: Vec<String>, cadence_pinned: Vec<String>, verbose: 
     }
 }
 
+/// The reclaim-safety verdict for one checkout (task_714). A checkout is safe to delete ONLY when its commits
+/// are provably preserved elsewhere; everything else is UNSAFE (keep). The load-bearing rule the whole command
+/// exists to enforce: a checkout with NO upstream is NOT safe-by-default — absence of an upstream means "cannot
+/// prove it is pushed," which must count as unsafe, never fold into reclaimable. (The hand-rolled survey this
+/// replaces used `git rev-parse --abbrev-ref --symbolic-full-name @{u}`, which on a no-upstream branch PRINTS
+/// the literal `@{u}` to stdout and exits 128, so a naive "resolved an upstream → safe" read misreported 92 of
+/// 421 checkouts as reclaimable in a delete-safety gate — the footgun this command bakes out.)
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ReclaimState {
+    /// Uncommitted working-tree changes — unsafe (reclaiming would lose un-committed edits).
+    Dirty,
+    /// Committed but ahead of its upstream (unpushed commits) and not on the mainline — unsafe.
+    Unpushed,
+    /// No upstream configured AND not an ancestor of the mainline — the commits cannot be proven to exist
+    /// anywhere else. UNSAFE (never reclaimable); this is the footgun bucket.
+    NoUpstreamUnmerged,
+    /// HEAD is already an ancestor of the mainline — the commits live on the mainline, so reclaimable even
+    /// without a tracking branch (or when ahead of a stale upstream). Named for the PROOF, not the upstream.
+    MergedIntoMainline,
+    /// Clean, has an upstream, and not ahead of it — fully pushed. Reclaimable.
+    Clean,
+}
+
+impl ReclaimState {
+    /// Whether the checkout is safe to reclaim (delete): only when its commits are provably preserved — fully
+    /// pushed to an upstream, or already an ancestor of the mainline. Every "cannot prove it" state is unsafe.
+    fn reclaimable(self) -> bool {
+        matches!(self, ReclaimState::Clean | ReclaimState::MergedIntoMainline)
+    }
+    fn label(self) -> &'static str {
+        match self {
+            ReclaimState::Dirty => "DIRTY (uncommitted)",
+            ReclaimState::Unpushed => "UNPUSHED (ahead of upstream)",
+            ReclaimState::NoUpstreamUnmerged => "NO-UPSTREAM-UNMERGED (unprovable)",
+            ReclaimState::MergedIntoMainline => "merged (ancestor of mainline)",
+            ReclaimState::Clean => "clean (pushed)",
+        }
+    }
+}
+
+/// Classify a checkout's reclaim-safety from its git facts. SAFE requires PROOF the commits are preserved: a
+/// clean tree that is either fully pushed to its upstream (`has_upstream && ahead == 0`) OR already an ancestor
+/// of the mainline (`merged_into_mainline`). A dirty tree is unsafe outright. A no-upstream, not-merged tree is
+/// the footgun bucket — unprovable, so unsafe. Pure — unit-tested.
+fn classify_reclaim(dirty: bool, has_upstream: bool, ahead: usize, merged_into_mainline: bool) -> ReclaimState {
+    if dirty {
+        return ReclaimState::Dirty;
+    }
+    if has_upstream && ahead == 0 {
+        return ReclaimState::Clean;
+    }
+    if merged_into_mainline {
+        return ReclaimState::MergedIntoMainline;
+    }
+    if has_upstream {
+        ReclaimState::Unpushed
+    } else {
+        ReclaimState::NoUpstreamUnmerged
+    }
+}
+
+/// Parse the `worktree <path>` lines out of `git worktree list --porcelain`, SKIPPING the bare entry (a bare
+/// repo has no working tree to survey). Catches the linked worktrees (e.g. a bare hub's `.claude/worktrees/*`)
+/// that a one-level directory scan would miss. Pure — unit-tested.
+fn parse_worktree_paths(porcelain: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut cur: Option<PathBuf> = None;
+    let mut is_bare = false;
+    let flush = |cur: &mut Option<PathBuf>, is_bare: &mut bool, out: &mut Vec<PathBuf>| {
+        if let Some(p) = cur.take()
+            && !*is_bare
+        {
+            out.push(p);
+        }
+        *is_bare = false;
+    };
+    for line in porcelain.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut cur, &mut is_bare, &mut paths);
+            cur = Some(PathBuf::from(p.trim()));
+        } else if line.trim() == "bare" {
+            is_bare = true;
+        }
+    }
+    flush(&mut cur, &mut is_bare, &mut paths);
+    paths
+}
+
+/// Whether `dir` is the top of a git repository (bare or not). The `.git` presence is the fast path; the
+/// `rev-parse --git-dir` probe is the robust fallback that also recognizes a bare repo (a bare hub has no
+/// `.git` child). Best-effort.
+fn is_git_repo(dir: &Path) -> bool {
+    dir.join(".git").exists() || git_ok(dir, &["rev-parse", "--git-dir"])
+}
+
+/// The git repositories reachable under `root`: `root` itself if it is a repo (its worktrees then cover the
+/// rest), else each direct child directory that is a repo. One level deep — the linked worktrees are then
+/// enumerated per repo via `git worktree list`, so a bare hub's nested `.claude/worktrees/*` are reached
+/// without a deep recursive walk.
+fn discover_repos(root: &Path) -> Vec<PathBuf> {
+    if is_git_repo(root) {
+        return vec![root.to_path_buf()];
+    }
+    let mut repos = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && is_git_repo(&p) {
+                repos.push(p);
+            }
+        }
+    }
+    repos.sort();
+    repos
+}
+
+/// Gather one checkout's git facts (footgun-safe) and classify it. The upstream probe is `rev-parse --verify
+/// -q @{u}`, which prints NOTHING and exits non-zero on a no-upstream branch — unlike the `--abbrev-ref
+/// --symbolic-full-name @{u}` form that prints the literal `@{u}`, the misread that motivated this command.
+fn survey_checkout(dir: &Path, mainline: &str) -> ReclaimState {
+    let dirty = git_capture(dir, &["status", "--porcelain"]).is_some();
+    let has_upstream = git_capture(dir, &["rev-parse", "--verify", "-q", "@{u}"]).is_some();
+    let ahead = if has_upstream {
+        git_capture(dir, &["rev-list", "--count", "@{u}..HEAD"])
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    // `merge-base --is-ancestor HEAD <mainline>` prints nothing: exit 0 = HEAD is reachable from the mainline
+    // (its commits are already there). A missing mainline ref errors → false → conservatively unsafe.
+    let merged = git_ok(dir, &["merge-base", "--is-ancestor", "HEAD", mainline]);
+    classify_reclaim(dirty, has_upstream, ahead, merged)
+}
+
+/// `fleet reclaim-survey` (task_714): a read-only, cross-checkout git-state survey for the disk-reclaim safety
+/// gate (v-disk-sweep is the consumer). For every worktree under each `--root` (discovered via `git worktree
+/// list`, so a bare hub's `.claude/worktrees/*` are included) it classifies reclaim-safety, with the no-upstream
+/// footgun baked out: a checkout is reclaimable ONLY when its commits are provably preserved (fully pushed, or
+/// already an ancestor of the mainline), and a no-upstream unmerged checkout is UNSAFE, never "safe." Prints the
+/// reclaimable set and the keep set separately. Read-only (no writes, no deletes) — same report-first discipline
+/// as `fleet wake-audit` / `fleet watchdog`; exits 0 (a survey is informational, not pass/fail).
+fn reclaim_survey(roots: Vec<PathBuf>, mainline: String, verbose: bool) {
+    let roots = if roots.is_empty() {
+        vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+    } else {
+        roots
+    };
+    println!(
+        "fleet reclaim-survey: {} root(s), mainline {mainline} (read-only; reclaimable = provably preserved)",
+        roots.len()
+    );
+
+    // Dedup worktree paths (a repo reachable from two roots) and keep a stable order.
+    let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut rows: Vec<(PathBuf, ReclaimState)> = Vec::new();
+    for root in &roots {
+        for repo in discover_repos(root) {
+            for wt in parse_worktree_paths(
+                &git_capture(&repo, &["worktree", "list", "--porcelain"]).unwrap_or_default(),
+            ) {
+                if seen.insert(wt.clone()) {
+                    let state = survey_checkout(&wt, &mainline);
+                    rows.push((wt, state));
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let (mut n_reclaimable, mut n_keep) = (0usize, 0usize);
+    for (path, state) in &rows {
+        if state.reclaimable() {
+            n_reclaimable += 1;
+            if verbose {
+                println!("  RECLAIMABLE  {:<34} {}", state.label(), path.display());
+            }
+        } else {
+            n_keep += 1;
+            println!("  KEEP         {:<34} {}", state.label(), path.display());
+        }
+    }
+
+    println!(
+        "\nsummary: {} checkout(s) — {n_reclaimable} reclaimable, {n_keep} keep (unsafe/active)",
+        rows.len()
+    );
+    if rows.is_empty() {
+        println!("no git worktrees found under the given root(s).");
+    } else {
+        println!(
+            "reclaimable = clean+pushed or already-on-mainline; a no-upstream unmerged checkout is KEEP (unprovable), never reclaimable."
+        );
+    }
+}
+
 /// The `author` a nudge comment is posted as — also the marker `nudge_last_secs` searches a task's prior
 /// comments for, to find this daemon's own last nudge (the cooldown clock; #478).
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
@@ -6601,6 +6819,20 @@ fn git_capture(root: &Path, args: &[&str]) -> Option<String> {
     }
     let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
     (!s.is_empty()).then_some(s)
+}
+
+/// Run `git -C <root> <args...>` for its EXIT STATUS only — for commands like `merge-base --is-ancestor` that
+/// signal via the exit code and print NOTHING, so [`git_capture`] (which treats empty stdout as `None`) cannot
+/// tell success from failure. True iff git ran and exited 0; a non-zero exit, a missing ref, or a spawn error
+/// is `false` (the conservative answer for a safety check). Best-effort.
+fn git_ok(root: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// The short HEAD sha of the git checkout the running binary was built from. `None` when there is no source
@@ -7865,6 +8097,70 @@ mod tests {
         assert_eq!(host_pin_display(Some(&json!({"host": []}))), "unpinned");
         assert_eq!(host_pin_display(Some(&json!({"host": "green"}))), "green");
         assert_eq!(host_pin_display(Some(&json!({"host": ["green", "dev-desk"]}))), "[green, dev-desk]");
+    }
+
+    #[test]
+    fn classify_reclaim_never_calls_a_no_upstream_checkout_safe() {
+        // Dirty wins outright — unsafe regardless of upstream / merge state.
+        assert_eq!(classify_reclaim(true, true, 0, true), ReclaimState::Dirty);
+        assert_eq!(classify_reclaim(true, false, 0, false), ReclaimState::Dirty);
+        assert!(!ReclaimState::Dirty.reclaimable());
+
+        // Clean + has upstream + not ahead → fully pushed → reclaimable.
+        let s = classify_reclaim(false, true, 0, false);
+        assert_eq!(s, ReclaimState::Clean);
+        assert!(s.reclaimable());
+
+        // Clean + has upstream + AHEAD + not merged → unpushed commits → unsafe.
+        let s = classify_reclaim(false, true, 3, false);
+        assert_eq!(s, ReclaimState::Unpushed);
+        assert!(!s.reclaimable());
+
+        // THE FOOTGUN (task_714): no upstream + not merged → unprovable → UNSAFE, never reclaimable.
+        let s = classify_reclaim(false, false, 0, false);
+        assert_eq!(s, ReclaimState::NoUpstreamUnmerged);
+        assert!(!s.reclaimable());
+
+        // No upstream BUT already an ancestor of the mainline → commits preserved there → reclaimable.
+        let s = classify_reclaim(false, false, 0, true);
+        assert_eq!(s, ReclaimState::MergedIntoMainline);
+        assert!(s.reclaimable());
+
+        // Ahead of a STALE upstream but already merged into the mainline → preserved there → reclaimable
+        // (the proof is mainline-ancestry, not the upstream).
+        let s = classify_reclaim(false, true, 5, true);
+        assert_eq!(s, ReclaimState::MergedIntoMainline);
+        assert!(s.reclaimable());
+    }
+
+    #[test]
+    fn parse_worktree_paths_collects_paths_and_skips_the_bare_entry() {
+        // A bare hub's porcelain: the bare repo itself (no working tree) + two linked worktrees.
+        let porcelain = "\
+worktree /hub/cadenza.git
+bare
+
+worktree /hub/cadenza/.claude/worktrees/topic-a
+HEAD abc123
+branch refs/heads/topic-a
+
+worktree /hub/cadenza/.claude/worktrees/topic-b
+HEAD def456
+detached
+";
+        let paths = parse_worktree_paths(porcelain);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/hub/cadenza/.claude/worktrees/topic-a"),
+                PathBuf::from("/hub/cadenza/.claude/worktrees/topic-b"),
+            ]
+        );
+        // A normal (non-bare) repo: its own worktree is kept.
+        let paths = parse_worktree_paths("worktree /home/u/repo\nHEAD aaa\nbranch refs/heads/main\n");
+        assert_eq!(paths, vec![PathBuf::from("/home/u/repo")]);
+        // Empty / no worktree lines → empty.
+        assert!(parse_worktree_paths("").is_empty());
     }
 
     #[test]
