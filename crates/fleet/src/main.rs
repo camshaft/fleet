@@ -3905,6 +3905,13 @@ const OBSERVE_SPAWN_CAP_DEFAULT: usize = 3;
 /// target would re-spawn every 60s sweep. `CDZ_OBSERVE_SPAWN_COOLDOWN_SECS` overrides.
 const OBSERVE_SPAWN_COOLDOWN_SECS: u64 = 1800; // 30 min
 
+/// task_610: the max doublings the re-spawn cooldown backs off by while an observation keeps being attempted
+/// WITHOUT the watermark advancing (a crashing/wedging observer re-reading the same span). base, 2x, 4x, 8x =
+/// 30m, 1h, 2h, 4h cap. So a repeatedly-failing full-window re-read drops from ~hourly to ~4-hourly instead
+/// of burning an Opus observer every cooldown; the span stays eligible (the confirmed-observation guardrail is
+/// untouched — only the retry CADENCE backs off), and the backoff resets the moment the watermark advances.
+const OBSERVE_RESPAWN_MAX_BACKOFF_STEPS: u32 = 3;
+
 /// The per-target observer spawn stamp: `<hub>/.claude/fleet/observer/<name>.spawned` (unix secs of the last
 /// spawn). Sibling of the watermark + re-arm stamps.
 fn observe_spawn_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
@@ -3928,6 +3935,47 @@ fn write_observe_spawn_stamp(fleet: &Fleet, name: &str, now: u64) {
 /// Whether a fresh observer spawn for this target is still on cooldown. Pure — unit-tested.
 fn observe_on_spawn_cooldown(last_spawn: Option<u64>, now: u64, cooldown: u64) -> bool {
     last_spawn.is_some_and(|last| now.saturating_sub(last) < cooldown)
+}
+
+/// task_610: the re-spawn cooldown, backed off while an observation keeps being attempted WITHOUT its
+/// watermark advancing. Each prior unconfirmed attempt doubles the base cooldown (30m, 1h, 2h, 4h), capped at
+/// `max_doublings`, so a crashing/wedging observer that re-reads the same full window drops from ~hourly to
+/// ~4-hourly instead of burning an Opus observer every cooldown. `prior_attempts` 0 or 1 → the base (no
+/// backoff yet). A confirmed observation advances the watermark, which resets the attempt count (see the spawn
+/// loop), so this reverts to the base cadence. Mirrors [`acked_cooldown_with_backoff`]. Pure — unit-tested.
+fn observe_respawn_cooldown(base_cooldown_secs: u64, prior_attempts: u32, max_doublings: u32) -> u64 {
+    let steps = prior_attempts.saturating_sub(1).min(max_doublings);
+    base_cooldown_secs.saturating_mul(1u64 << steps)
+}
+
+/// The per-target observer spawn-attempts sidecar: `<hub>/.claude/fleet/observer/<name>.spawn-attempts`
+/// (line 1 = the watermark the attempts are counted against, line 2 = the count). Sibling of the watermark +
+/// spawn stamp. task_610: lets the re-spawn cooldown back off per unconfirmed attempt against the SAME
+/// watermark, and reset when the watermark advances.
+fn observe_spawn_attempts_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("observer").join(format!("{name}.spawn-attempts"))
+}
+
+/// Read `(watermark_the_attempts_are_against, count)`; `("", 0)` when absent/unparseable — so a never-recorded
+/// or corrupt file reads as "no attempts yet", never a spurious backoff.
+fn read_observe_spawn_attempts(fleet: &Fleet, name: &str) -> (String, u32) {
+    std::fs::read_to_string(observe_spawn_attempts_path(fleet, name))
+        .ok()
+        .and_then(|s| {
+            let mut lines = s.lines();
+            let wm = lines.next()?.trim().to_string();
+            let count = lines.next()?.trim().parse().ok()?;
+            Some((wm, count))
+        })
+        .unwrap_or_default()
+}
+
+fn write_observe_spawn_attempts(fleet: &Fleet, name: &str, watermark: &str, count: u32) {
+    let p = observe_spawn_attempts_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, format!("{watermark}\n{count}\n"));
 }
 
 /// Reap bound (task_610): an `obs-<target>` window still alive this long after its spawn is a stuck/leaked
@@ -5225,14 +5273,25 @@ fn observe_spawn_pass(
             actions.push(format!("{id}=cap-deferred"));
             continue;
         }
-        if observe_on_spawn_cooldown(read_observe_spawn_stamp(fleet, id), now_unix, cooldown) {
-            actions.push(format!("{id}=cooldown"));
+        // task_610: back the re-spawn cooldown off while this target's watermark is NOT advancing (a
+        // crashing/wedging observer re-reading the same span). Attempts are counted against the CURRENT
+        // watermark; a confirmed observation advances it, so `cur_wm` changes and the count resets to 0.
+        let (wm_session, wm_offset) = read_observe_watermark(fleet, id);
+        let cur_wm = format!("{wm_session}:{wm_offset}");
+        let (rec_wm, prior_attempts) = read_observe_spawn_attempts(fleet, id);
+        let attempts = if rec_wm == cur_wm { prior_attempts } else { 0 };
+        let eff_cooldown = observe_respawn_cooldown(cooldown, attempts, OBSERVE_RESPAWN_MAX_BACKOFF_STEPS);
+        if observe_on_spawn_cooldown(read_observe_spawn_stamp(fleet, id), now_unix, eff_cooldown) {
+            actions.push(if attempts > 1 { format!("{id}=cooldown(backoff,attempt={attempts})") } else { format!("{id}=cooldown") });
             continue;
         }
         let obs_task = resolve_observation_task(board, id, &d.session, d.since_offset, dry_run);
         let act = spawn_observer(session, id, &d.session, d.since_offset, obs_task, dry_run);
         if !dry_run && act.starts_with("spawned") {
             write_observe_spawn_stamp(fleet, id, now_unix);
+            // Record this attempt against the current watermark; it keeps climbing (lengthening the backoff)
+            // until a confirmed observation advances the watermark and resets the count.
+            write_observe_spawn_attempts(fleet, id, &cur_wm, attempts + 1);
         }
         if act.starts_with("spawned") || act.starts_with("would-spawn") {
             launched += 1;
@@ -10487,6 +10546,32 @@ detached
         assert!(!observe_on_spawn_cooldown(Some(8_000), 10_000, 1800), "2000s ≥ 1800 → lapsed");
         // saturating: a future stamp (clock skew) is treated as just-spawned → on cooldown, never underflows.
         assert!(observe_on_spawn_cooldown(Some(11_000), 10_000, 1800));
+    }
+
+    #[test]
+    fn observe_respawn_cooldown_backs_off_per_unconfirmed_attempt_capped() {
+        // task_610: 0 or 1 prior attempt → base; then doubles per attempt, capped at max_doublings.
+        assert_eq!(observe_respawn_cooldown(1800, 0, 3), 1800, "first spawn → base 30m");
+        assert_eq!(observe_respawn_cooldown(1800, 1, 3), 1800, "1 prior → still base (no backoff yet)");
+        assert_eq!(observe_respawn_cooldown(1800, 2, 3), 3600, "2 prior → 2x = 1h");
+        assert_eq!(observe_respawn_cooldown(1800, 3, 3), 7200, "3 prior → 4x = 2h");
+        assert_eq!(observe_respawn_cooldown(1800, 4, 3), 14400, "4 prior → 8x = 4h");
+        assert_eq!(observe_respawn_cooldown(1800, 9, 3), 14400, "capped at 8x even after many attempts");
+    }
+
+    #[test]
+    fn observe_spawn_attempts_roundtrip_and_reset_on_watermark_change() {
+        let (_base, fleet) = tmp_hub();
+        // Absent → ("", 0): never a spurious backoff.
+        assert_eq!(read_observe_spawn_attempts(&fleet, "v-x"), (String::new(), 0));
+        // Record attempts against a watermark; they read back verbatim.
+        write_observe_spawn_attempts(&fleet, "v-x", "sess-a:100", 2);
+        assert_eq!(read_observe_spawn_attempts(&fleet, "v-x"), ("sess-a:100".to_string(), 2));
+        // The spawn loop treats a DIFFERENT current watermark (a confirmed observation advanced it) as a reset:
+        // rec_wm != cur_wm ⇒ attempts = 0, so the backoff reverts to base. (The loop's own `if rec_wm == cur_wm`.)
+        let (rec_wm, prior) = read_observe_spawn_attempts(&fleet, "v-x");
+        let attempts_after_advance = if rec_wm == "sess-a:200" { prior } else { 0 };
+        assert_eq!(attempts_after_advance, 0, "watermark advanced ⇒ attempts reset ⇒ base cooldown");
     }
 
     #[test]
