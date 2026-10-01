@@ -30,4 +30,4 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # #370: tokio, not a thread-per-blocking-call model) — the BoardClient methods are `async fn`; the caller
 # provides the runtime. The PURE planners (plan_inbound/plan_outbound/ChannelMap/relay_plan) stay sync.
 # rustls (no OpenSSL); no default TLS backend pulled.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
