@@ -1878,6 +1878,18 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Correct a STALE board `metadata.worktree` (task_735 migration residue): rewrite a pre-migration pointer
+    /// (e.g. a `.claude/worktrees/<id>` operator-clone path a worktree-check resolves to the wrong tree) to the
+    /// agent's real per-agent fleet worktree `$FLEET_ROOT/agents/<id>/<repo>`. Report-only by default; `--apply`
+    /// writes via patch_metadata. SAFE by construction: only a SINGLE-repo agent whose real fleet worktree EXISTS
+    /// and differs from the registered path is corrected — a multi-repo agent (ambiguous primary tree) and an
+    /// agent whose real tree is missing are reported + left untouched. The write-side counterpart to the
+    /// read-only worktree-check; complements the spin-up sync that keeps it correct on each provision.
+    WorktreeSync {
+        /// Write the corrections (default: dry-run — only report what WOULD change).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Seam-check a MONITOR vertical (task_579): ff-sync its worktree to origin/main, then report whether any
     /// incoming commit touched the agent's declared SEAM — its `metadata.seam` file globs. A monitor wake is
     /// otherwise 100% deterministic git plumbing, so this lets the kickoff GATE the model wake: exit 0 = GREEN
@@ -2118,6 +2130,7 @@ fn main() {
         Cmd::ReclaimSurvey { root, mainline, verbose } => reclaim_survey(root, mainline, verbose),
         Cmd::Gate { clippy_only, isolated } => gate(clippy_only, isolated),
         Cmd::WorktreeCheck { agent, verbose } => worktree_check(agent, verbose),
+        Cmd::WorktreeSync { apply } => worktree_sync(apply),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::MonitorTick { agent, apply, no_fetch } => monitor_tick(&agent, apply, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
@@ -6229,6 +6242,178 @@ fn worktree_check(agent: Option<String>, verbose: bool) {
     }
 }
 
+/// The outcome of a worktree-sync evaluation for one agent. `Fixable` carries the real per-agent fleet worktree
+/// the stale `metadata.worktree` should be rewritten to.
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum WorktreeSyncVerdict {
+    /// No `metadata.worktree` set — sync only CORRECTS an existing pointer, it never adds one.
+    NoWorktree,
+    /// Not exactly one declared repo — the agent's primary worktree is ambiguous, so it is reported + skipped
+    /// (a multi-repo agent needs an explicit primary-tree designation, not a guess).
+    AmbiguousRepos,
+    /// The agent's real per-agent fleet worktree does not exist on disk — leave the pointer untouched rather
+    /// than rewrite it to point at a missing tree.
+    NoRealTree,
+    /// `metadata.worktree` already points at the real fleet worktree — nothing to do.
+    AlreadyCorrect,
+    /// `metadata.worktree` is stale (differs from the existing real fleet worktree) — rewrite it to this path.
+    Fixable(String),
+}
+
+/// Decide the worktree-sync action for one agent from its facts. `repo_count` is the number of declared repos;
+/// `expected` is the agent's real per-agent fleet worktree for its SOLE repo (the caller passes it only when
+/// `repo_count == 1`); `expected_exists` is whether that tree is present on disk; `current` is the registered
+/// `metadata.worktree`. A multi-repo (or repo-less) agent is `AmbiguousRepos` — its primary tree cannot be
+/// inferred safely. Returns `Fixable` ONLY for a single-repo agent whose real tree exists and differs from
+/// `current`, so the sweep never points a charter at a missing tree and never guesses a multi-repo primary.
+/// Pure — unit-tested.
+fn classify_worktree_sync(
+    repo_count: usize,
+    expected: Option<&str>,
+    expected_exists: bool,
+    current: Option<&str>,
+) -> WorktreeSyncVerdict {
+    if current.map(str::trim).filter(|s| !s.is_empty()).is_none() {
+        return WorktreeSyncVerdict::NoWorktree;
+    }
+    if repo_count != 1 {
+        return WorktreeSyncVerdict::AmbiguousRepos;
+    }
+    let Some(expected) = expected.map(str::trim).filter(|s| !s.is_empty()) else {
+        return WorktreeSyncVerdict::AmbiguousRepos;
+    };
+    if !expected_exists {
+        return WorktreeSyncVerdict::NoRealTree;
+    }
+    if current.map(str::trim) == Some(expected) {
+        return WorktreeSyncVerdict::AlreadyCorrect;
+    }
+    WorktreeSyncVerdict::Fixable(expected.to_string())
+}
+
+/// `fleet worktree-sync [--apply]` (task_735 migration residue): correct a STALE board `metadata.worktree` that
+/// still points at a pre-migration path to the agent's real per-agent fleet worktree
+/// (`$FLEET_ROOT/agents/<id>/<repo>`). Report-only by default; `--apply` rewrites via `patch_metadata`. SAFE by
+/// construction (see [`classify_worktree_sync`]): only a single-repo agent whose real fleet worktree EXISTS and
+/// differs from the registered path is corrected; a multi-repo agent (ambiguous primary) and a missing real tree
+/// are reported + left untouched. Exits non-zero only on a board write error.
+fn worktree_sync(apply: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet worktree-sync: board unavailable ({e}); cannot sync worktrees");
+        std::process::exit(1);
+    });
+    let roster = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet worktree-sync: board roster query failed ({e})");
+        std::process::exit(1);
+    });
+    let fleet_root = config::get()
+        .root
+        .clone()
+        .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
+    let mut ids: Vec<String> = roster
+        .iter()
+        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .collect();
+    ids.sort();
+
+    let (mut n_fixed, mut n_already, mut n_ambiguous, mut n_notree, mut n_nowt, mut n_skipped, mut n_err) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    for id in &ids {
+        // The DETAIL record reliably carries metadata (the list projection has dropped it before — task_418).
+        let detail = board.get_agent(id).ok();
+        let md = detail.as_ref().and_then(|r| r.get("metadata"));
+        if matches!(read_native(md), NativeVerdict::NotNative) {
+            n_skipped += 1;
+            continue;
+        }
+        let current = md
+            .and_then(|m| m.get("worktree"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let repos = normalize_repos(md.and_then(|m| m.get("repos")));
+        // Only a single-repo agent has an unambiguous real tree: $FLEET_ROOT/agents/<id>/<repo>.
+        let expected = if repos.len() == 1 {
+            repos[0]
+                .get("repo")
+                .and_then(serde_json::Value::as_str)
+                .map(|r| workspace::workspace_dir(&fleet_root, id, r))
+        } else {
+            None
+        };
+        // A worktree's `.git` is a gitdir-pointer FILE, so `.join(".git").exists()` is the presence check.
+        let expected_exists = expected
+            .as_deref()
+            .map(|p| std::path::Path::new(p).join(".git").exists())
+            .unwrap_or(false);
+        // Compare + write in CANONICAL form: $HOME here is a symlink (`/home/<u>` -> `/local/home/<u>`), so a raw
+        // string compare would see an already-correct `/local/home/...` pointer as "different" from the `/home/...`
+        // path `workspace_dir` builds, and rewrite a correct entry to the symlink form. `canonicalize` resolves
+        // both to the real path; it needs the path to exist, so fall back to the raw string when it does not (a
+        // stale pointer at a vanished tree stays != the real tree, i.e. still Fixable, which is correct).
+        let canon = |p: &str| std::fs::canonicalize(p).ok().and_then(|c| c.to_str().map(str::to_string));
+        let expected_target = expected.as_deref().map(|p| canon(p).unwrap_or_else(|| p.to_string()));
+        let current_cmp = current.as_deref().map(|c| canon(c).unwrap_or_else(|| c.to_string()));
+        match classify_worktree_sync(repos.len(), expected_target.as_deref(), expected_exists, current_cmp.as_deref()) {
+            WorktreeSyncVerdict::NoWorktree => n_nowt += 1,
+            WorktreeSyncVerdict::AmbiguousRepos => {
+                n_ambiguous += 1;
+                println!(
+                    "  - {id}: {} repo(s) — AMBIGUOUS primary tree, skipped (needs explicit designation); current {}",
+                    repos.len(),
+                    current.as_deref().unwrap_or("")
+                );
+            }
+            WorktreeSyncVerdict::NoRealTree => {
+                n_notree += 1;
+                println!(
+                    "  - {id}: real fleet worktree {} does not exist — left untouched (current {})",
+                    expected.as_deref().unwrap_or(""),
+                    current.as_deref().unwrap_or("")
+                );
+            }
+            WorktreeSyncVerdict::AlreadyCorrect => n_already += 1,
+            WorktreeSyncVerdict::Fixable(target) => {
+                if apply {
+                    match board.patch_metadata(id, serde_json::json!({ "worktree": target })) {
+                        Ok(()) => {
+                            n_fixed += 1;
+                            println!(
+                                "  - {id}: FIXED metadata.worktree {} -> {target}",
+                                current.as_deref().unwrap_or("")
+                            );
+                        }
+                        Err(e) => {
+                            n_err += 1;
+                            eprintln!(
+                                "  - {id}: patch_metadata FAILED ({e}); current {}",
+                                current.as_deref().unwrap_or("")
+                            );
+                        }
+                    }
+                } else {
+                    n_fixed += 1;
+                    println!(
+                        "  - {id}: WOULD FIX metadata.worktree {} -> {target}",
+                        current.as_deref().unwrap_or("")
+                    );
+                }
+            }
+        }
+    }
+
+    let verb = if apply { "fixed" } else { "would-fix" };
+    println!(
+        "\nsummary: {n_fixed} {verb}, {n_already} already-correct, {n_ambiguous} multi-repo-skipped, {n_notree} no-real-tree, {n_nowt} no-worktree, {n_skipped} non-native{}",
+        if n_err > 0 { format!(", {n_err} ERRORED") } else { String::new() }
+    );
+    if !apply && n_fixed > 0 {
+        println!("(dry-run — re-run with --apply to write these corrections)");
+    }
+    if n_err > 0 {
+        std::process::exit(1);
+    }
+}
+
 /// The `author` a nudge comment is posted as — also the marker `nudge_last_secs` searches a task's prior
 /// comments for, to find this daemon's own last nudge (the cooldown clock; #478).
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
@@ -8785,6 +8970,27 @@ detached
         assert_eq!(classify_worktree_health(true, true, true, 2), WorktreeHealth::UnlandedCommits);
         // Exists + level/behind -> healthy.
         assert_eq!(classify_worktree_health(true, true, true, 0), WorktreeHealth::Clean);
+    }
+
+    #[test]
+    fn worktree_sync_only_fixes_a_single_repo_existing_differing_tree() {
+        use WorktreeSyncVerdict::*;
+        let real = "/f/agents/a/cadenza";
+        // No worktree set -> sync never ADDS one (only corrects an existing pointer).
+        assert_eq!(classify_worktree_sync(1, Some(real), true, None), NoWorktree);
+        assert_eq!(classify_worktree_sync(1, Some(real), true, Some("   ")), NoWorktree);
+        // Multi-repo or repo-less -> AMBIGUOUS primary, never guessed.
+        assert_eq!(classify_worktree_sync(2, None, false, Some(".claude/worktrees/a")), AmbiguousRepos);
+        assert_eq!(classify_worktree_sync(0, None, false, Some(".claude/worktrees/a")), AmbiguousRepos);
+        // Single repo but the real fleet tree is missing -> leave the pointer untouched (never point at nothing).
+        assert_eq!(classify_worktree_sync(1, Some(real), false, Some(".claude/worktrees/a")), NoRealTree);
+        // Already pointing at the real tree -> no-op (idempotent).
+        assert_eq!(classify_worktree_sync(1, Some(real), true, Some(real)), AlreadyCorrect);
+        // Stale pointer + real tree exists -> fixable, carrying the correction target.
+        assert_eq!(
+            classify_worktree_sync(1, Some(real), true, Some(".claude/worktrees/a")),
+            Fixable(real.to_string())
+        );
     }
 
     #[test]
