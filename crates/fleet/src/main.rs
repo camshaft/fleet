@@ -2044,6 +2044,12 @@ enum Cmd {
         /// REMOVE the user units this installed (the inverse of `--install`) and print the `disable` command.
         #[arg(long)]
         uninstall: bool,
+        /// The target host this watchdog instance manages, emitted as `Environment="FLEET_HOST=<host>"` in the
+        /// unit (task_948, part of the task_937 Phase-A/B host migration) -- so the generated unit text never
+        /// hardcodes a specific box: the host is a generator ARGUMENT, and a flake-managed install (the
+        /// task_495/912 lane) passes it in at build time. Omitted when absent (no FLEET_HOST line at all).
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Emit or install a systemd USER service that supervises a long-running fleet-host daemon (Type=simple,
     /// Restart=on-failure), so it survives a tmux-window reap and restarts on crash — the durable replacement
@@ -2239,7 +2245,19 @@ fn main() {
             hire_signal,
             install,
             uninstall,
-        } => watchdog_unit(!no_rearm, observe, pinned_only, self_redeploy, hire_signal, interval_secs, bin, install, uninstall),
+            host,
+        } => watchdog_unit(
+            !no_rearm,
+            observe,
+            pinned_only,
+            self_redeploy,
+            hire_signal,
+            interval_secs,
+            bin,
+            install,
+            uninstall,
+            host,
+        ),
         Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall } => {
             daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall)
         }
@@ -8305,7 +8323,12 @@ fn user_unit_dir() -> Option<std::path::PathBuf> {
 /// (user-level, no sudo) for a host not on that model — a clean, reversible path. `--uninstall`: remove it.
 /// `rearm=false` (`--no-rearm`) installs an OBSERVER-ONLY unit that coexists with an existing rearm watchdog
 /// (the host-a go-live: the system rearm service is left untouched, no sudo needed). `bin` defaults to this
-/// binary's absolute path.
+/// binary's absolute path. `host` (task_948) is emitted as `Environment="FLEET_HOST=<host>"` so the unit text
+/// never bakes in a specific box — a flake-managed install (the task_495/912 lane) passes the target host as
+/// a generator argument, making a later target-swap (task_937 Phase B) a one-argument change, not a re-landing.
+/// Mutating flags (`--rearm`/`--observe`/`--spawn`/`--revive-stranded`) stay opt-in regardless of `host`, so
+/// the unit is inert-but-present by default (green-machine-ops's task_711 posture) until a host's own
+/// invocation opts into them explicitly.
 #[allow(clippy::too_many_arguments)]
 fn watchdog_unit(
     rearm: bool,
@@ -8317,6 +8340,7 @@ fn watchdog_unit(
     bin: Option<String>,
     install: bool,
     uninstall: bool,
+    host: Option<String>,
 ) {
     let fleet_bin = bin.unwrap_or_else(|| {
         std::env::current_exe()
@@ -8325,9 +8349,14 @@ fn watchdog_unit(
             .unwrap_or_else(|| "fleet".to_string())
     });
     let exec_args = watchdog_exec_args(rearm, observe, pinned_only, self_redeploy, hire_signal);
-    // Only an observer-spawning watchdog needs a launch environment (a rearm-only sweep just sends keys to an
-    // existing window). Capture it from this (working) session so the installed service can launch Claude.
-    let env_block = if observe { captured_observer_env() } else { String::new() };
+    // The target-host line (task_948) comes first regardless of --observe, so a bare rearm-only unit still
+    // names which host it manages. Only an observer-spawning watchdog ALSO needs a launch environment (a
+    // rearm-only sweep just sends keys to an existing window) -- captured from this (working) session so the
+    // installed service can launch Claude.
+    let mut env_block = render_service_env_lines(&[("FLEET_HOST", host)]);
+    if observe {
+        env_block.push_str(&captured_observer_env());
+    }
     if uninstall {
         watchdog_unit_uninstall();
         return;
@@ -10627,6 +10656,22 @@ detached
         // The timer file drives the cadence + is enable-able.
         assert!(timer.contains("OnUnitActiveSec=90") && timer.contains("WantedBy=timers.target"));
         assert!(!timer.contains("ExecStart"), "no ExecStart in the timer");
+    }
+
+    #[test]
+    fn watchdog_unit_host_line_is_present_or_omitted_per_the_host_arg() {
+        // task_948: a declared host emits Environment="FLEET_HOST=<host>" -- the unit text names the host as
+        // DATA, never a literal baked into the ExecStart/args, so a target-swap (task_937 Phase B) is a
+        // different --host value through the SAME generator, not a re-landing.
+        let with_host = render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".to_string()))]);
+        let (service, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false, false), 60, &with_host);
+        assert!(service.contains("Environment=\"FLEET_HOST=dev-dsk-foo\""));
+
+        // No host declared -> no FLEET_HOST line at all (today's green-machine-less behavior, unchanged).
+        let no_host = render_service_env_lines(&[("FLEET_HOST", None)]);
+        assert_eq!(no_host, "");
+        let (service2, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false, false), 60, &no_host);
+        assert!(!service2.contains("FLEET_HOST"));
     }
 
     #[test]
