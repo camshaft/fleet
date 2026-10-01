@@ -2743,7 +2743,11 @@ fn install_fmt_hook(hooks_dir: &std::path::Path) {
 /// with a `[package]` table, as opposed to a workspace-root manifest (`[workspace]`, no `[package]`). Falls
 /// back to `repo_root/Cargo.toml` if none is found (e.g. a loose top-level .rs file in a single-crate repo).
 /// `is_package_manifest` is injected so this stays pure/unit-testable without touching real files.
-fn owning_manifest(repo_root: &Path, file_dir: &Path, is_package_manifest: impl Fn(&Path) -> bool) -> PathBuf {
+fn owning_manifest(
+    repo_root: &Path,
+    file_dir: &Path,
+    is_package_manifest: impl Fn(&Path) -> bool,
+) -> PathBuf {
     let mut dir = file_dir.to_path_buf();
     loop {
         if is_package_manifest(&dir.join("Cargo.toml")) {
@@ -2794,7 +2798,10 @@ fn is_fully_staged(repo_root: &Path, file: &str) -> bool {
 /// task_617 bug), auto-format + re-stage the ones with no unstaged changes, and warn (fail-open, never
 /// block) on any that are only partially staged, since those cannot be safely auto-restaged.
 fn fmt_hook_run() {
-    let Ok(root_out) = std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]).output() else {
+    let Ok(root_out) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    else {
         return;
     };
     if !root_out.status.success() {
@@ -2805,7 +2812,14 @@ fn fmt_hook_run() {
     let Ok(staged_out) = std::process::Command::new("git")
         .arg("-C")
         .arg(&repo_root)
-        .args(["diff", "--cached", "--name-only", "--diff-filter=ACM", "--", "*.rs"])
+        .args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACM",
+            "--",
+            "*.rs",
+        ])
         .output()
     else {
         return;
@@ -6618,13 +6632,20 @@ mod tests {
     fn owning_manifest_never_walks_above_repo_root() {
         // A pathological file_dir outside repo_root must not escape upward past it looking for a manifest.
         let repo_root = Path::new("/repo");
-        let found = owning_manifest(repo_root, Path::new("/repo"), |p| p == Path::new("/Cargo.toml"));
-        assert_eq!(found, PathBuf::from("/repo/Cargo.toml"), "stops at repo_root, never checks above it");
+        let found = owning_manifest(repo_root, Path::new("/repo"), |p| {
+            p == Path::new("/Cargo.toml")
+        });
+        assert_eq!(
+            found,
+            PathBuf::from("/repo/Cargo.toml"),
+            "stops at repo_root, never checks above it"
+        );
     }
 
     #[test]
     fn is_cargo_package_manifest_distinguishes_crate_from_workspace_root() {
-        let dir = std::env::temp_dir().join(format!("fleet-fmthook-manifest-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("fleet-fmthook-manifest-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let crate_manifest = dir.join("crate-Cargo.toml");
         let workspace_manifest = dir.join("workspace-Cargo.toml");
