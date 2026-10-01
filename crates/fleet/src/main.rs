@@ -3175,6 +3175,17 @@ fn work_driven_rearm(open_tasks: usize, age_secs: Option<i64>, stood_down: bool)
         && matches!(age_secs, Some(a) if a >= WATCHDOG_WORK_CADENCE_SECS)
 }
 
+/// task_506 Phase A.5 (status-driven violation): is an agent's board PRESENCE a "not actively working" one —
+/// `offline` (stood down) or `away`? An agent in an at-rest presence while it still owns a live, non-exempt
+/// `in_progress` task is a status-honesty violation (`in_progress` means actively worked, so declaring away/
+/// offline contradicts it), caught + re-armed the same as the Phase-A offline case. `busy`/`online` are
+/// working presences and never a violation. The free-form `status_message` is deliberately NOT parsed here — a
+/// keyword match ("idle"/"monitoring") on prose is fragile and would false-flag a working agent whose narrative
+/// merely mentions the word; the structured presence is the reliable signal. Pure — unit-tested.
+fn presence_is_at_rest(status: Option<&str>) -> bool {
+    matches!(status, Some("offline") | Some("away"))
+}
+
 /// #544 drained self-poller: a live, at-rest agent that keeps self-scheduling short ticks with NO actionable
 /// work should drop to a long registry cadence + event-wake, but a running `/loop` never picks up a
 /// `build_kickoff` edit (it re-passes its spawn-time prompt), so the watchdog injects the instruction
@@ -4307,11 +4318,14 @@ fn watchdog_board(
         let never_ticked = !agent_is_staged(md)
             && !stood_down
             && agent_never_ticked(created_at, ls, now, WATCHDOG_NEVER_TICKED_GRACE_SECS);
-        // #506 holding-work-while-at-rest violation: the agent stood down (offline) while it still owns a live
-        // `in_progress` task — the v-bolero case (created work, then slept). `in_progress` is actively-worked,
-        // so standing down on it (instead of progressing it or marking it `blocked`/`done`) is a status-honesty
-        // violation, not a legitimate stand-down. Flagged + re-armed below so it re-enters its loop.
-        let holding_work_at_rest = stood_down && inprogress_owners.contains(id);
+        // #506 holding-work-while-at-rest violation (Phase A + A.5): the agent is in a NOT-WORKING presence —
+        // `offline` (stood down, the v-bolero case: created work, then slept) OR `away` (self-declared idle) —
+        // while it still owns a live, non-exempt `in_progress` task. `in_progress` is actively-worked, so an
+        // at-rest presence on it (instead of progressing it or marking it `blocked`/`done`) is a status-honesty
+        // violation, not a legitimate rest. Flagged + re-armed below so it re-enters its loop. A monitor_exempt
+        // in_progress task is already excluded from `inprogress_owners` (Phase B), so a deliberate continuous
+        // monitor never trips this.
+        let holding_work_at_rest = presence_is_at_rest(status) && inprogress_owners.contains(id);
         // task_582 safeguard-wedge scan (report-only). The wedge's signature is that last_seen keeps
         // ADVANCING — the agent LOOKS healthy, so the age/verdict/stale gates never flag it — while its last
         // few assistant turns are all stop_reason=refusal (a model-safeguard reject loop, burning turns). So
@@ -7220,6 +7234,18 @@ mod tests {
         assert_eq!(owners.len(), 2, "deduped, and empty/absent assignees dropped");
         // Empty task list → empty set (a board query error degrades here → no false #506 violations).
         assert!(inprogress_task_assignees(&[]).is_empty());
+    }
+
+    #[test]
+    fn presence_is_at_rest_covers_offline_and_away_only() {
+        // task_506 Phase A.5: a not-working presence while holding a live in_progress task is a violation.
+        assert!(presence_is_at_rest(Some("offline")), "stood down is at-rest (Phase A)");
+        assert!(presence_is_at_rest(Some("away")), "away is a not-working presence (Phase A.5)");
+        // Working presences are never a violation.
+        assert!(!presence_is_at_rest(Some("online")), "online is working");
+        assert!(!presence_is_at_rest(Some("busy")), "busy is working");
+        // Unknown/absent presence is not treated as a violation (fail-safe: no false flag).
+        assert!(!presence_is_at_rest(None), "unknown presence is not a violation");
     }
 
     #[test]
