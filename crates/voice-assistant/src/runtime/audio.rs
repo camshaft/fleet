@@ -146,7 +146,15 @@ impl Capture {
     /// requirement (#239): with no mic present at startup the daemon must stay up and keep trying, then
     /// begin the loop the moment a device appears, instead of exiting and letting the supervisor
     /// crash-loop. Blocks until a device is open.
-    pub fn open_with_retry(audio: &Audio) -> Self {
+    ///
+    /// `awaiting_device`, when provided, is a signal for the startup readiness watchdog (task_762): we set
+    /// it TRUE whenever an open ATTEMPT returned (so we are backing off to retry a known-absent/unsettled
+    /// device) and FALSE once we return a healthy capture. The watchdog treats "awaiting_device" as progress
+    /// so it never kills a legitimate wait-for-an-absent-mic (preserving #239), yet still catches a genuine
+    /// init HANG — a hang is inside `open()` itself, which never returns, so the flag is never set and the
+    /// watchdog's stall timer fires. Pass `None` off the startup path (e.g. the mid-run reconnect), where no
+    /// watchdog is watching.
+    pub fn open_with_retry(audio: &Audio, awaiting_device: Option<&AtomicBool>) -> Self {
         // A freshly-opened stream must stay fault-free for this window before we trust it. The NEAR-OPEN
         // race — a successor opening a device that a SIGKILL'd predecessor never released — makes `open`
         // return Ok, then floods faults to the error callback within milliseconds. So `open` succeeding is
@@ -162,11 +170,19 @@ impl Capture {
                 Ok(c) => {
                     std::thread::sleep(SETTLE);
                     if c.healthy() {
+                        // Genuinely up: clear the wait signal so the watchdog resumes guarding the rest of
+                        // startup (model loads etc.) against a hang.
+                        if let Some(flag) = awaiting_device {
+                            flag.store(false, Ordering::Relaxed);
+                        }
                         return c;
                     }
                     // Opened but faulted within the grace window: an open race, not a settled device.
                     // Close the faulting stream, then back off before retrying rather than reopening in a
-                    // tight storm.
+                    // tight storm. We made an attempt that RETURNED, so this is a legitimate wait, not a hang.
+                    if let Some(flag) = awaiting_device {
+                        flag.store(true, Ordering::Relaxed);
+                    }
                     drop(c);
                     backoff = next_backoff(backoff);
                     eprintln!(
@@ -176,6 +192,11 @@ impl Capture {
                     std::thread::sleep(backoff);
                 }
                 Err(e) => {
+                    // The open attempt RETURNED an error (device absent/unsettled) — a legitimate wait, not a
+                    // hang; signal it so the startup watchdog does not mistake the wait for a wedge (#239).
+                    if let Some(flag) = awaiting_device {
+                        flag.store(true, Ordering::Relaxed);
+                    }
                     backoff = next_backoff(backoff);
                     eprintln!(
                         "[audio] capture open failed ({e}); retrying in {backoff:?} (waiting for a device)"
