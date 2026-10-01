@@ -82,6 +82,9 @@ pub struct Config {
     pub default_collection: String,
     /// Where `kb_remember` / `kb_supersede` write by default (was `KB_MEMORY_COLLECTION`).
     pub memory_collection: String,
+    /// Dedicated collection for dream-promoted shared memories (task_823 / doc_102 A5), kept separate from
+    /// `memory_collection` so durable cross-agent invariants are curated apart from per-agent memories.
+    pub promoted_collection: String,
 
     /// Ranking-blend weights. Relevance dominates; these nudge ordering by curation signals.
     pub w_quality: f64,
@@ -107,6 +110,10 @@ impl Default for Config {
         // law, so kind="tenet" gets top authority 1.0 by default AND is non-decaying (recency_score returns
         // 1.0 for any non-"memory" kind). See the task_538 tenets store; written via kb_remember(kind="tenet").
         authority.insert("tenet".to_string(), 1.0);
+        // Dream-promoted shared memories (task_823 / doc_102): durable, cross-agent invariants — high
+        // authority but below operator tenets, and non-decaying (recency_score returns 1.0 for any
+        // non-"memory" kind). Written via kb_promote.
+        authority.insert("promoted".to_string(), 0.9);
         Self {
             qdrant_url: "http://localhost:6333".to_string(),
             embed_model: "BAAI/bge-large-en-v1.5".to_string(),
@@ -134,6 +141,7 @@ impl Default for Config {
             mcp_allowed_hosts: vec!["*".to_string()],
             default_collection: "voron_manuals".to_string(),
             memory_collection: "memory".to_string(),
+            promoted_collection: "promoted-memory".to_string(),
             w_quality: 0.15,
             w_authority: 0.10,
             w_votes: 0.15,
@@ -213,6 +221,8 @@ mod tests {
         assert_eq!(c.authority_for("doc"), 0.8);
         assert_eq!(c.authority_for("memory"), 0.5);
         assert_eq!(c.authority_for("tenet"), 1.0); // operator tenets: top authority, non-decaying
+        assert_eq!(c.authority_for("promoted"), 0.9); // dream-promoted shared memories (task_823)
+        assert_eq!(c.promoted_collection, "promoted-memory");
         assert_eq!(c.authority_for("unknown"), 0.5);
         assert_eq!(c.pdf_ocr_min_chars, 0); // OCR off by default (task_40)
         // Host-neutral default (task_727): the public-extraction repo must not hardcode green-machine.lan.

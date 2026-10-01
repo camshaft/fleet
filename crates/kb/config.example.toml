@@ -73,6 +73,9 @@ mcp_allowed_hosts = ["*"]
 default_collection = "voron_manuals"
 # Where kb_remember / kb_supersede write by default. (was KB_MEMORY_COLLECTION)
 memory_collection = "memory"
+# Dedicated collection for dream-promoted shared memories (task_823), kept separate from `memory` so durable
+# cross-agent invariants are curated apart from per-agent memories. Written via the kb_promote MCP tool.
+promoted_collection = "promoted-memory"
 
 # --- Ranking blend ---
 # final = relevance + w_quality*tanh(quality) + w_authority*authority + w_votes*tanh(net_votes/3)
@@ -89,3 +92,7 @@ recency_halflife_days = 90.0
 manual = 1.0
 doc = 0.8
 memory = 0.5
+# Additive non-decaying kinds (recency decays only for kind="memory"): operator tenets and dream-promoted
+# shared memories. tenet = top authority; promoted = high but below tenet.
+tenet = 1.0
+promoted = 0.9

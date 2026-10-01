@@ -145,6 +145,32 @@ pub struct RememberArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PromoteArgs {
+    /// The board-canonical source path of the memory being promoted — e.g. `agents/<agent>/<slug>` or
+    /// `repos/<repo>/<slug>`. This is the projection identity: the deterministic point id is keyed on it, so a
+    /// re-promote of the same source UPDATES in place (1:1 with the board canonical, never a drifting copy).
+    pub source_path: String,
+    pub text: String,
+    /// Optional board document reference for the canonical source (e.g. "doc_123"), recorded for traceability.
+    #[serde(default)]
+    pub source_doc: Option<String>,
+    /// Curation kind (default "promoted": non-decaying, authority 0.9). Pass "tenet" for operator
+    /// directives/tenets (authority 1.0). "memory" is rejected — promoted memories are durable invariants that
+    /// must not age out of recall.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Optional display title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional tags.
+    #[serde(default)]
+    pub tags: Option<String>,
+    /// Override the promoted-memory collection (defaults to the configured promoted collection).
+    #[serde(default)]
+    pub collection: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FeedbackArgs {
     pub id: String,
     pub helpful: bool,
@@ -357,6 +383,65 @@ impl Kb {
             .await
             .map_err(map_err)?;
         text_result(format!("Stored memory {pid} in '{collection}'."))
+    }
+
+    #[tool(
+        description = "Promote a durable, broadly-useful agent memory into the shared KB so other agents can recall it. The point is a traceable PROJECTION of its board-canonical source: pass `source_path` (agents/<agent>/<slug> or repos/<repo>/<slug>) and the deterministic id is keyed on it, so re-promoting the same source updates in place. Writes to the dedicated promoted-memory collection with a NON-decaying kind (default \"promoted\"; pass \"tenet\" for operator directives/tenets). Promote only durable, cross-agent, verified-correct, pure-text memories."
+    )]
+    async fn kb_promote(
+        &self,
+        Parameters(a): Parameters<PromoteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let cfg = config::get();
+        let collection = a
+            .collection
+            .unwrap_or_else(|| cfg.promoted_collection.clone());
+        let kind = a.kind.as_deref().unwrap_or("promoted");
+        // Promoted memories are durable invariants; kind="memory" DECAYS, so it is not valid for a promotion.
+        if kind == "memory" {
+            return Err(map_err(
+                "kb_promote: kind \"memory\" decays over time; promote with a non-decaying kind such as \"promoted\" or \"tenet\"".to_string(),
+            ));
+        }
+        let store = Store::connect().map_err(map_err)?;
+        let dim = blocking(embed::dim).await?;
+        store
+            .ensure_collection(&collection, dim)
+            .await
+            .map_err(map_err)?;
+        let text = a.text;
+        let (text, vec) = blocking(move || {
+            let vec = embed::embed_docs(std::slice::from_ref(&text))?
+                .pop()
+                .ok_or("embed produced no vector")?;
+            Ok((text, vec))
+        })
+        .await?;
+        // Deterministic id keyed on the board-canonical source path, so a re-promote of the same source
+        // updates in place rather than duplicating (byte-identical id — the projection stays 1:1 with source).
+        let pid = crate::chunk::id(&["promoted", &a.source_path]);
+        // Citation points back at the board canonical (the doc ref if given, else the source path).
+        let citation = a
+            .source_doc
+            .clone()
+            .unwrap_or_else(|| a.source_path.clone());
+        let mut extra = Map::new();
+        extra.insert("text".into(), Value::from(text));
+        extra.insert("source".into(), Value::from("promoted"));
+        // Source linkage: record the board canonical so the promoted point is a traceable projection.
+        extra.insert("source_path".into(), Value::from(a.source_path));
+        put_opt_str(&mut extra, "source_doc", a.source_doc);
+        extra.insert("url".into(), Value::from(citation));
+        put_opt_str(&mut extra, "title", a.title);
+        put_opt_str(&mut extra, "tags", a.tags);
+        let payload = curate::base_payload(cfg, kind, None, extra);
+        store
+            .upsert(&collection, &[(pid.clone(), vec, payload)])
+            .await
+            .map_err(map_err)?;
+        text_result(format!(
+            "Promoted memory {pid} into '{collection}' as kind '{kind}'."
+        ))
     }
 
     #[tool(
