@@ -29,7 +29,7 @@
 //!   next tick. Inherent to the GitHub API; rare + non-fatal. The firehose cursor advances per
 //!   terminally-handled event so nothing before the last success re-posts.
 
-use github_bridge::board::{BoardClient, LINK_SOURCE, parse_issue_ref};
+use github_bridge::board::{BoardClient, LINK_SOURCE, build_repo_project_map, parse_issue_ref};
 use github_bridge::config::Config;
 use github_bridge::{
     GithubClient, Issue, PER_PAGE, PrReviewStatus, State, github_external_author,
@@ -137,9 +137,10 @@ async fn shutdown_signal() {
     }
 }
 
-/// The IN loop: each tick, scan every configured repo (per-repo cursor), sequentially — a handful of repos on
-/// the ~15s cadence stays well under GitHub's 5000/hr. A per-repo error doesn't stop the others. Runs
-/// concurrently with [`out_loop`]; the awaits yield so OUT keeps flowing.
+/// The IN loop: each tick, resolve the repo->project targets from the LIVE board project map (so a newly
+/// mapped repo/project is picked up without a restart), then scan each target repo (per-repo cursor),
+/// sequentially — a handful of repos on the ~15s cadence stays well under GitHub's 5000/hr. A per-repo error
+/// doesn't stop the others. Runs concurrently with [`out_loop`]; the awaits yield so OUT keeps flowing.
 async fn in_loop(
     cfg: &Config,
     gh: &GithubClient,
@@ -148,14 +149,49 @@ async fn in_loop(
     state: &Mutex<State>,
 ) {
     loop {
-        for (repo, project_id) in cfg.ingest_targets() {
-            if let Err(e) = in_tick_repo(cfg, gh, board, repo, project_id, self_login, state).await
+        for (repo, project_id) in resolve_targets(cfg, board).await {
+            if let Err(e) = in_tick_repo(cfg, gh, board, &repo, project_id, self_login, state).await
             {
                 tracing::warn!(error = %e, %repo, "IN tick error for repo (will retry next tick)");
             }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Resolve this pass's ingest targets from the LIVE board project map (each project's `metadata.repo`), so a
+/// newly-mapped repo/project is picked up without a restart — nothing hardcoded. Falls back to the static
+/// `project_id` config when the board exposes no usable mapping (empty result) or the projects fetch fails, so
+/// the bridge still ingests against a pre-metadata board.
+async fn resolve_targets(cfg: &Config, board: &BoardClient) -> Vec<(String, i64)> {
+    match board.list_projects().await {
+        Ok(projects) => {
+            let targets = cfg.resolve_ingest_targets(&build_repo_project_map(&projects));
+            if !targets.is_empty() {
+                return targets;
+            }
+            let fallback = static_targets(cfg);
+            if !fallback.is_empty() {
+                tracing::warn!(
+                    "no repo matched the board project map; using static project_id config this pass"
+                );
+            }
+            fallback
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "GET /projects failed; using static project_id config this pass");
+            static_targets(cfg)
+        }
+    }
+}
+
+/// The legacy static ingest targets (one `project_id` for all configured repos), as owned tuples — the
+/// fallback when the board project map is unavailable or empty.
+fn static_targets(cfg: &Config) -> Vec<(String, i64)> {
+    cfg.ingest_targets()
+        .into_iter()
+        .map(|(r, id)| (r.to_string(), id))
+        .collect()
 }
 
 /// The OUT loop: each tick, drain the board firehose and reflect authorized comments to GitHub. Runs
