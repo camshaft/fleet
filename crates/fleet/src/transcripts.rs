@@ -586,14 +586,14 @@ mod tests {
     #[test]
     fn session_slug_encodes_slashes_and_dots() {
         assert_eq!(
-            session_slug("/local/home/bythewc/.fleet/agents/v-fleet-tooling/cadenza"),
-            "-local-home-bythewc--fleet-agents-v-fleet-tooling-cadenza"
+            session_slug("/local/home/u/.fleet/agents/v-fleet-tooling/cadenza"),
+            "-local-home-u--fleet-agents-v-fleet-tooling-cadenza"
         );
     }
 
     #[test]
     fn slug_is_for_agent_matches_the_agent_segment() {
-        let slug = "-local-home-bythewc--fleet-agents-v-fleet-tooling-cadenza";
+        let slug = "-local-home-u--fleet-agents-v-fleet-tooling-cadenza";
         assert!(slug_is_for_agent(slug, "v-fleet-tooling"));
         // an unrelated agent id does not appear in the -agents- segment → no match
         assert!(!slug_is_for_agent(slug, "v-cdz-smith"));
