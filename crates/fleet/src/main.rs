@@ -4871,30 +4871,36 @@ fn watchdog_board(
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(OBSERVE_REAP_STALE_SECS);
-        let live: std::collections::BTreeSet<String> = tmux_window_names(&session).into_iter().collect();
+        // Map each roster agent's obs-window NAME -> its id, so a window's target (hence its spawn stamp) is
+        // looked up exactly. Several windows can share a name (duplicate leaks); each is killed by its UNIQUE
+        // window_id, so a kill is never ambiguous and duplicates are all cleared.
+        let name_to_target: std::collections::HashMap<String, String> = agents
+            .iter()
+            .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str))
+            .map(|id| (obs_window_name(id), id.to_string()))
+            .collect();
         let (mut reaped, mut stale_seen) = (0usize, 0usize);
-        for a in agents {
-            let Some(id) = a.get("id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let window = obs_window_name(id);
-            if !live.contains(&window) {
+        for (win_id, win_name) in tmux_windows_with_ids(&session) {
+            if !win_name.starts_with("obs-") {
                 continue;
             }
+            // The window's target's spawn stamp (None for an ORPHAN window whose agent is gone from the roster —
+            // treated as stale, since no live owner means no in-flight observation to protect).
+            let stamp = name_to_target.get(&win_name).and_then(|t| read_observe_spawn_stamp(&fleet, t));
             // A recent spawn stamp = a healthy in-flight observer → never reaped.
-            if !observer_window_is_stale(read_observe_spawn_stamp(&fleet, id), now_unix, reap_bound) {
+            if !observer_window_is_stale(stamp, now_unix, reap_bound) {
                 continue;
             }
             stale_seen += 1;
             if spawn_dry_run {
-                println!("-- reap: obs window {window} is STALE — would kill-window (dry-run)");
+                println!("-- reap: obs window {win_name} ({win_id}) is STALE — would kill-window (dry-run)");
             } else {
-                match std::process::Command::new("tmux").args(["kill-window", "-t", &window]).status() {
+                match std::process::Command::new("tmux").args(["kill-window", "-t", &win_id]).status() {
                     Ok(s) if s.success() => {
                         reaped += 1;
-                        println!("-- reap: killed STALE obs window {window} (leaked observer — never reached observe-record)");
+                        println!("-- reap: killed STALE obs window {win_name} ({win_id}) (leaked observer — never reached observe-record)");
                     }
-                    _ => eprintln!("-- reap: kill-window {window} FAILED (remove it manually if it lingers)"),
+                    _ => eprintln!("-- reap: kill-window {win_name} ({win_id}) FAILED (remove it manually if it lingers)"),
                 }
             }
         }
@@ -5584,6 +5590,25 @@ fn tmux_window_names(session: &str) -> Vec<String> {
                 .lines()
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// List `session`'s windows as `(window_id, window_name)` pairs — `window_id` (`@N`) is UNIQUE even when
+/// several windows share a name, so a kill-window can target exactly one. Used by the task_610 reaper, which
+/// must clear DUPLICATE `obs-<target>` windows (successive stuck observers of one target each opened a fresh
+/// window). Empty when tmux is unreachable. See [`tmux_window_names`] for the name-only variant.
+fn tmux_windows_with_ids(session: &str) -> Vec<(String, String)> {
+    std::process::Command::new("tmux")
+        .args(["list-windows", "-t", session, "-F", "#{window_id}\t#W"])
+        .output()
+        .ok()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().split_once('\t'))
+                .map(|(id, name)| (id.to_string(), name.to_string()))
                 .collect()
         })
         .unwrap_or_default()
