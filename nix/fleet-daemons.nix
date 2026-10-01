@@ -388,6 +388,20 @@ let
       name = "fleet-oracle-lean";
       script = "stage-oracle-lean.sh";
       onCalendar = "*-*-* 04:41:00";
+    })
+    # Binary-freshness sweep (task_719): the Class-2 analogue of fleet-materialize (which keeps the Class-1 hub
+    # SHELL scripts fresh). The fleet RUST binary is a pinned package with no auto-cadence, so merged binary items
+    # silently accumulate DARK between deploys. This hourly oneshot DETECTS a dark binary (deployed `fleet version`
+    # rev vs origin/main, content-diffed over crates/fleet) and NUDGES toward `nix run .#deploy-fleet-binary` --
+    # detect-and-nudge only, nothing deployed unattended (the watchdog is cameron's banned-from-unattended
+    # component). FLEET_REPO (the camshaft/fleet checkout for the read-only git probe) is injected at install time.
+    // (mkTimer {
+      name = "fleet-binary-sweep";
+      description = "Fleet dark-binary freshness sweep (task_719)";
+      exec = "${sweepApp}/bin/fleet-binary-sweep";
+      intervalSecs = 3600;
+      onBootSec = 300;
+      persistent = true;
     });
 
   unitsDir = pkgs.runCommand "fleet-user-units" { } (
@@ -421,6 +435,10 @@ let
     "fleet-tunnel"
     "fleet-watchdog"
     "fleet-nudge-stale"
+    # The binary-freshness sweep (task_719) is included so `deploy-fleet-binary` installs + arms it in the same
+    # scoped step (without the Group B guard flag-day). It is not itself a fleet-binary-ExecStart unit; it runs
+    # the sweep app, which READS `fleet version` + git to detect a dark binary and nudge.
+    "fleet-binary-sweep"
   ];
   isFleetBinaryUnit = fname: lib.any (b: lib.hasPrefix (b + ".") fname) fleetBinaryBaseNames;
   fleetBinaryUnits = lib.filterAttrs (fname: _: isFleetBinaryUnit fname) units;
@@ -498,6 +516,14 @@ let
           printf 'Environment=FLEET_RT=%s\n' "$fleet_rt" >> "$f"
         fi
       done
+      # task_719: inject the camshaft/fleet checkout path into the binary-sweep unit (read-only git probe). The
+      # repo is not under $HOME, so this is an install-time injection, not a git-frozen machine path (same pattern
+      # as FLEET_RT). FLEET_REPO overrides the default.
+      fleet_repo="''${FLEET_REPO:-/local/home/bythewc/Projects/camshaft/fleet}"
+      if [ -e "$UNIT_DIR/fleet-binary-sweep.service" ]; then
+        chmod u+w "$UNIT_DIR/fleet-binary-sweep.service" 2>/dev/null || true
+        printf 'Environment=FLEET_REPO=%s\n' "$fleet_repo" >> "$UNIT_DIR/fleet-binary-sweep.service"
+      fi
       systemctl --user daemon-reload
       # Enable + start the timers (each oneshot .service is triggered by its timer, so it picks up a changed
       # ExecStart on its next fire -- no restart needed here). A guard migrated with `enabled = false` renders a
@@ -559,6 +585,13 @@ let
         chmod u+w "$UNIT_DIR/fleet-watchdog.service" 2>/dev/null || true
         printf 'Environment=PATH=%s\n' "$login_path" >> "$UNIT_DIR/fleet-watchdog.service"
       fi
+      # task_719: inject the camshaft/fleet checkout path into the binary-sweep unit (same as install-fleet-daemons;
+      # the sweep is in this scoped set so it installs without the Group B guard flag-day).
+      fleet_repo="''${FLEET_REPO:-/local/home/bythewc/Projects/camshaft/fleet}"
+      if [ -e "$UNIT_DIR/fleet-binary-sweep.service" ]; then
+        chmod u+w "$UNIT_DIR/fleet-binary-sweep.service" 2>/dev/null || true
+        printf 'Environment=FLEET_REPO=%s\n' "$fleet_repo" >> "$UNIT_DIR/fleet-binary-sweep.service"
+      fi
       systemctl --user daemon-reload
       # Re-arm the binary timers: their oneshot ExecStart now points at the new store binary, so the next fire
       # runs it. enable --now is idempotent for an already-armed timer.
@@ -580,6 +613,92 @@ let
       echo "deploy-fleet-binary: fleet -> $HOME/.local/bin/fleet -> $state_dir/current/bin/fleet (gcroot); guards + crontab + materialize + litellm untouched"
     '';
   };
+
+  # task_719: the dark-fleet-binary freshness sweep (DETECT-AND-NUDGE, concierge-greenlit flavor b). Run hourly
+  # by fleet-binary-sweep.timer. It reuses the binary's own `fleet version` (baked FLEET_BUILD_REV) and
+  # content-diffs that rev against origin/main over the fleet-binary source paths (crates/fleet + Cargo.lock) --
+  # a content diff (not SHA/ancestor) so a squash-merged deploy rev correctly reads as up-to-date. On a dark
+  # binary it NUDGES concierge (who relays) toward `nix run .#deploy-fleet-binary`; it NEVER deploys unattended
+  # (the watchdog is cameron's banned-from-unattended component). Fail-SAFE throughout: any probe it cannot
+  # complete (no checkout, fetch failure, pruned rev) errs toward surfacing/retry, never a false "all current".
+  sweepApp = pkgs.writeShellApplication {
+    name = "fleet-binary-sweep";
+    runtimeInputs = [
+      pkgs.git
+      pkgs.coreutils
+      pkgs.gnugrep
+    ];
+    text = ''
+      set -euo pipefail
+      # FLEET_REPO (the camshaft/fleet checkout) is injected into this unit at install time; the fleet CLI is the
+      # deployed symlink (whose `version` reports what is actually RUNNING). Both overridable for a manual run.
+      repo="''${FLEET_REPO:-/local/home/bythewc/Projects/camshaft/fleet}"
+      fleet_bin="''${FLEET_BIN:-$HOME/.local/bin/fleet}"
+      state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+      mkdir -p "$state_dir"
+      nudged_marker="$state_dir/binary-sweep-last-nudged-main"
+
+      [ -d "$repo/.git" ] || { echo "fleet-binary-sweep: no fleet checkout at $repo; skip"; exit 0; }
+      [ -x "$fleet_bin" ] || { echo "fleet-binary-sweep: no fleet binary at $fleet_bin; skip"; exit 0; }
+
+      # Deployed binary's baked build rev (`fleet version` prints: `fleet <ver> (rev <hex>)`).
+      deployed_rev="$("$fleet_bin" version 2>/dev/null | grep -oE '[0-9a-f]{7,40}' | head -n1 || true)"
+      [ -n "$deployed_rev" ] || { echo "fleet-binary-sweep: could not read deployed rev; skip"; exit 0; }
+
+      # Latest origin/main (read-only fetch; never touches worktrees or local branches).
+      git -C "$repo" fetch --quiet origin main 2>/dev/null || { echo "fleet-binary-sweep: fetch failed; skip"; exit 0; }
+      main_sha="$(git -C "$repo" rev-parse FETCH_HEAD)"
+
+      # The fleet binary's source = the fleet crate (no intra-workspace path deps) + the lockfile (dep versions).
+      # Fail-safe: if the baked rev object is gone (a gc'd feature branch), we cannot prove the binary is current,
+      # so treat it as dark and nudge rather than stay silent.
+      if git -C "$repo" cat-file -e "''${deployed_rev}^{commit}" 2>/dev/null; then
+        changed="$(git -C "$repo" diff --name-only "$deployed_rev" "$main_sha" -- crates/fleet/ Cargo.lock || true)"
+        reason="content-diff ''${deployed_rev}..main over crates/fleet + Cargo.lock"
+      else
+        changed="(deployed rev ''${deployed_rev} not in the checkout -- cannot verify freshness)"
+        reason="deployed rev object absent"
+      fi
+
+      if [ -z "$changed" ]; then
+        echo "fleet-binary-sweep: fleet binary current (rev ''${deployed_rev}); no dark binary changes"
+        exit 0
+      fi
+
+      # Cooldown: nudge once per NEW dark state (don't re-ping while main hasn't advanced). A deploy clears the
+      # dark state (deployed_rev updates -> diff empties), so the nudge stops naturally; the marker is harmless.
+      if [ -f "$nudged_marker" ] && [ "$(cat "$nudged_marker" 2>/dev/null || true)" = "$main_sha" ]; then
+        echo "fleet-binary-sweep: dark binary at main $main_sha already nudged; skip"
+        exit 0
+      fi
+
+      log="$(git -C "$repo" log --oneline "''${deployed_rev}..$main_sha" -- crates/fleet/ Cargo.lock 2>/dev/null | head -n 20 || true)"
+      body_file="$(mktemp)"
+      trap 'rm -f "$body_file"' EXIT
+      {
+        echo "Dark fleet-binary merges detected on camshaft/fleet main ($reason)."
+        echo "Deployed binary rev: $deployed_rev"
+        echo "Current main:        $main_sha"
+        echo ""
+        echo "The deployed fleet binary is MISSING these crates/fleet changes:"
+        echo "$log"
+        echo ""
+        echo "Activate (nix-canonical) on the dev-desk: nix run .#deploy-fleet-binary"
+        echo "Detect-and-nudge only (task_719) -- nothing is deployed unattended."
+      } > "$body_file"
+
+      # Nudge concierge (who relays). Best-effort: on a send failure, do NOT record the marker, so the next sweep
+      # retries rather than going silent.
+      if "$fleet_bin" send --to concierge --from v-nix --kind note \
+           --subject "dark fleet-binary merges pending deploy" --body-file "$body_file" 2>/dev/null; then
+        echo "$main_sha" > "$nudged_marker"
+        echo "fleet-binary-sweep: nudged concierge about dark binary at main $main_sha"
+      else
+        echo "fleet-binary-sweep: nudge send failed; will retry next sweep" >&2
+        exit 0
+      fi
+    '';
+  };
 in
 {
   inherit
@@ -589,5 +708,6 @@ in
     enableUnits
     deployBinaryApp
     fleetBinaryUnitsDir
+    sweepApp
     ;
 }
