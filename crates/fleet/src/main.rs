@@ -2059,6 +2059,27 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Confirm a process is actually dead before a deploy/guard starts its replacement — the kill-verification
+    /// a daemon restart MUST do (task_866). A rebuilt binary leaves the old process on a now-deleted inode, so
+    /// `/proc/<pid>/exe` reads `<path> (deleted)` and an exe-basename scan to confirm the kill momentarily
+    /// returns empty: the kill reads as "succeeded" while the old daemon is still alive, and starting the
+    /// replacement then runs TWO instances (the double-relay task_866 saw on a live operator channel). This
+    /// confirms liveness with `kill -0 <pid>` (does the pid still exist?) — immune to that deleted-inode false
+    /// negative — polling until the pid is gone. A guard runs `fleet confirm-kill <pid> --term --sigkill` and
+    /// starts the replacement ONLY on exit 0. Exit 0 = confirmed gone; exit 1 = still alive at the deadline.
+    ConfirmKill {
+        /// The pid to confirm dead.
+        pid: i64,
+        /// Send SIGTERM first (a graceful stop), then poll. Without it, only polls an already-signalled pid.
+        #[arg(long)]
+        term: bool,
+        /// Seconds to poll for the pid to disappear before giving up (or escalating with `--sigkill`).
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+        /// If still alive at the timeout, escalate to SIGKILL and poll a short grace before giving up.
+        #[arg(long)]
+        sigkill: bool,
+    },
     /// INTERNAL: what the installed pre-commit hook (see `fmt_precommit_hook_body`) actually calls — not
     /// meant to be run by hand, but a plain subcommand (no hidden-arg plumbing) so it is easy to invoke
     /// directly for debugging. Finds the owning crate(s) of staged `.rs` files, auto-fixes + restages the
@@ -2180,6 +2201,7 @@ fn main() {
         }
         Cmd::Version => println!("{}", version_line()),
         Cmd::Redeploy { apply } => redeploy(apply),
+        Cmd::ConfirmKill { pid, term, timeout, sigkill } => confirm_kill(pid, term, timeout, sigkill),
         Cmd::FmtHookRun => fmt_hook_run(),
     }
 }
@@ -8215,6 +8237,86 @@ fn unit_is_nix_managed(unit: &str) -> Option<bool> {
     Some(execstart_is_nix_store(&s))
 }
 
+/// The next step in the `confirm-kill` poll loop (task_866), as a pure decision over the loop's state so the
+/// kill-confirm logic is unit-tested without real processes: whether the pid is still alive, whether the
+/// current deadline has passed, whether `--sigkill` was requested, and whether SIGKILL was already sent.
+#[derive(Debug, PartialEq, Eq)]
+enum KillStep {
+    /// The pid is gone — the kill is confirmed and the caller may start the replacement.
+    ConfirmedGone,
+    /// Still alive and within the deadline — keep polling.
+    KeepPolling,
+    /// Past the deadline, still alive, `--sigkill` requested and not yet sent — send SIGKILL now.
+    EscalateSigkill,
+    /// Past the deadline, still alive, with no (further) escalation available — give up (still alive).
+    GaveUp,
+}
+
+fn kill_confirm_step(alive: bool, deadline_passed: bool, sigkill_enabled: bool, sigkill_sent: bool) -> KillStep {
+    if !alive {
+        return KillStep::ConfirmedGone;
+    }
+    if !deadline_passed {
+        return KillStep::KeepPolling;
+    }
+    if sigkill_enabled && !sigkill_sent {
+        return KillStep::EscalateSigkill;
+    }
+    KillStep::GaveUp
+}
+
+/// Is `pid` still alive? `kill -0 <pid>` sends no signal — it only checks that the pid exists and is
+/// signallable (exit 0), returning non-zero (ESRCH) once the process is gone. Unlike an exe-basename /
+/// `/proc/<pid>/exe` scan it is immune to the deleted-inode false negative a rebuilt binary creates, which is
+/// the whole point (task_866). A not-yet-reaped zombie still reads alive — it holds its pid until reaped —
+/// and for a deploy that is the correct answer: the old daemon has not fully gone.
+fn process_is_alive(pid: i64) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn send_signal(sig: &str, pid: i64) {
+    let _ = std::process::Command::new("kill").args([sig, &pid.to_string()]).status();
+}
+
+/// `fleet confirm-kill` (task_866): confirm a pid is dead with `kill -0` polling before a deploy/guard starts
+/// the replacement, so a kill that false-negatived on an exe-scan can never leave two daemon instances
+/// relaying to a live channel. Optionally SIGTERM first, poll until gone or the timeout, and optionally
+/// escalate to SIGKILL + a short grace. Exits 1 (never returns) if the pid is still alive when it gives up.
+fn confirm_kill(pid: i64, term: bool, timeout: u64, sigkill: bool) {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+    if term {
+        send_signal("-TERM", pid);
+    }
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let mut sigkill_sent = false;
+    loop {
+        let alive = process_is_alive(pid);
+        let passed = std::time::Instant::now() >= deadline;
+        match kill_confirm_step(alive, passed, sigkill, sigkill_sent) {
+            KillStep::ConfirmedGone => {
+                println!("pid {pid} confirmed gone");
+                return;
+            }
+            KillStep::KeepPolling => std::thread::sleep(POLL),
+            KillStep::EscalateSigkill => {
+                eprintln!("pid {pid} still alive after {timeout}s — escalating to SIGKILL");
+                send_signal("-KILL", pid);
+                sigkill_sent = true;
+                deadline = std::time::Instant::now() + GRACE;
+            }
+            KillStep::GaveUp => {
+                eprintln!("pid {pid} STILL ALIVE after kill-confirm — do NOT start a replacement (would double-run)");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8312,6 +8414,31 @@ mod tests {
         assert!(k.contains("metadata.interval") && k.contains("update_agent"), "board metadata.interval via update_agent is the board-native cadence lever (task_566)");
         assert!(k.contains("board-only agent with no file-hub registry row"), "the board lever works for a board-only agent, unlike the frozen cargo xtask set-interval");
         assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the watchdog");
+    }
+
+    #[test]
+    fn kill_confirm_step_covers_the_poll_states() {
+        use KillStep::*;
+        // Gone is confirmed regardless of the other inputs (the whole point: once kill -0 says ESRCH, stop).
+        assert_eq!(kill_confirm_step(false, false, false, false), ConfirmedGone);
+        assert_eq!(kill_confirm_step(false, true, true, true), ConfirmedGone);
+        // Alive and within the deadline -> keep polling.
+        assert_eq!(kill_confirm_step(true, false, true, false), KeepPolling);
+        assert_eq!(kill_confirm_step(true, false, false, false), KeepPolling);
+        // Alive past the deadline, --sigkill requested and not yet sent -> escalate once.
+        assert_eq!(kill_confirm_step(true, true, true, false), EscalateSigkill);
+        // Alive past the deadline, SIGKILL already sent -> give up (no second escalation).
+        assert_eq!(kill_confirm_step(true, true, true, true), GaveUp);
+        // Alive past the deadline, --sigkill NOT requested -> give up (still alive, do not start replacement).
+        assert_eq!(kill_confirm_step(true, true, false, false), GaveUp);
+    }
+
+    #[test]
+    fn process_is_alive_tracks_real_liveness() {
+        // Our own pid is alive right now.
+        assert!(process_is_alive(std::process::id() as i64));
+        // A pid at the top of the i32 range is not a live process on this host; kill -0 reports ESRCH.
+        assert!(!process_is_alive(i64::from(i32::MAX)));
     }
 
     #[test]
