@@ -122,13 +122,12 @@ let
   fleetBin = "${fleet}/bin/fleet";
   fleetTunnelBin = "${fleetTunnel}/bin/fleet-tunnel";
 
-  # The watchdog spawns Claude sessions via window.sh, which depend on this exact captured known-good PATH
-  # and Bedrock env. It is reproduced VERBATIM from the deployed unit (a repoint, not a behavior change) and
-  # NOT derived -- deriving a fresh PATH risks dropping an entry a session needs (the task_347 broken-PATH
-  # failure mode). FLAG: this freezes a dev-desk-specific PATH in the flake; capturing $PATH at install time
-  # is a possible later refinement (owner v-fleet-tooling).
+  # The watchdog spawns Claude sessions via window.sh, which need the full known-good login PATH (dropping an
+  # entry is the task_347 broken-PATH failure mode) plus this Bedrock env. PATH is intentionally NOT set here:
+  # it is a dev-desk-specific absolute path, so freezing it in the flake would bake machine paths into the repo
+  # and not track drift. install-fleet-daemons instead captures the live login PATH at install time and injects
+  # it into the watchdog unit (see below) -- same full PATH (nothing dropped), no git-frozen machine path.
   watchdogEnv = {
-    PATH = "/local/home/bythewc/.aim/mcp-servers:/local/home/bythewc/.aim/mcp-servers:/local/home/bythewc/.aim/mcp-servers:/local/home/bythewc/.aim/mcp-servers:/home/bythewc/.cargo/bin:/home/bythewc/.local/bin:/usr/bin:/bin:/local/home/bythewc/.aim/cc-plugins/AmazonBuilderCoreAIAgents-core/bin:/local/home/bythewc/.aim/cc-plugins/AmazonBuilderCoreAIAgents-pipeline-assistant/bin:/local/home/bythewc/.aim/cc-plugins/AmazonBuilderCoreAIAgents-runtime-configuration-assistant/bin:/local/home/bythewc/.aim/cc-plugins/AmazonBuilderCoreAIAgents-core/bin:/local/home/bythewc/.aim/cc-plugins/AmazonBuilderCoreAIAgents-pipeline-assistant/bin:/local/home/bythewc/.aim/cc-plugins/AmazonBuilderCoreAIAgents-runtime-configuration-assistant/bin";
     AWS_REGION = "us-west-2";
     AWS_PROFILE = "cline-profile";
     CLAUDE_CODE_USE_BEDROCK = "1";
@@ -232,13 +231,20 @@ let
     timerUnits
     ++ lib.filter (s: !(lib.elem ((lib.removeSuffix ".service" s) + ".timer") timerUnits)) serviceUnits;
 
+  installDeps = [
+    pkgs.systemd
+    pkgs.coreutils
+    pkgs.gnugrep
+    pkgs.nix
+  ];
+  # writeShellApplication prepends `makeBinPath installDeps` to PATH, so strip that known prefix to recover
+  # the caller's inherited login PATH (best-effort: if the prefix is absent the PATH is used unchanged -- it
+  # still carries the full login PATH, so nothing is ever dropped per task_347).
+  binPathPrefix = lib.makeBinPath installDeps;
+
   installApp = pkgs.writeShellApplication {
     name = "install-fleet-daemons";
-    runtimeInputs = [
-      pkgs.systemd
-      pkgs.coreutils
-      pkgs.gnugrep
-    ];
+    runtimeInputs = installDeps;
     text = ''
       set -euo pipefail
       UNIT_DIR="''${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -257,13 +263,34 @@ let
           fi
         fi
       done
-      # Install/refresh the current managed set, then reload + enable.
+      # Install/refresh the current managed set.
       cp -f ${unitsDir}/* "$UNIT_DIR"/
+      # task_494: inject the live login PATH into the watchdog unit at INSTALL time (not git-frozen) so the
+      # spawned Claude sessions get the full known-good PATH (task_347) without baking machine paths into the
+      # flake, and so it re-captures on each install (tracks drift). Recover the login PATH by stripping the
+      # writeShellApplication-prepended nix prefix. (Run install-fleet-daemons from a full login PATH.)
+      login_path="$PATH"
+      case "$login_path" in
+        '${binPathPrefix}':*) login_path="''${login_path#'${binPathPrefix}':}" ;;
+      esac
+      if [ -e "$UNIT_DIR/fleet-watchdog.service" ]; then
+        chmod u+w "$UNIT_DIR/fleet-watchdog.service" 2>/dev/null || true
+        printf 'Environment=PATH=%s\n' "$login_path" >> "$UNIT_DIR/fleet-watchdog.service"
+      fi
       systemctl --user daemon-reload
       ${lib.concatStrings (map (u: ''
         systemctl --user enable --now "${u}"
       '') enableUnits)}
+      # task_509: put the fleet binary on ~/.local/bin (which agent windows inherit) so no agent runs cargo to
+      # reach the fleet CLI. Pin it with an --indirect gcroot so `nix store gc` cannot delete the target, and
+      # re-point the stable ~/.local/bin symlink so a rebuilt fleet swaps in live with no window restart. This
+      # supersedes the hub refresh-tools.sh shim (v-fleet-tooling cedes ~/.local/bin/fleet in the cutover).
+      state_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+      mkdir -p "$state_dir" "$HOME/.local/bin"
+      nix-store --realise ${fleet} --add-root "$state_dir/current" --indirect >/dev/null
+      ln -sfn "$state_dir/current/bin/fleet" "$HOME/.local/bin/fleet"
       echo "install-fleet-daemons: installed ${toString (lib.length (lib.attrNames units))} unit file(s); enabled: ${lib.concatStringsSep " " enableUnits}"
+      echo "install-fleet-daemons: fleet on PATH -> $HOME/.local/bin/fleet -> $state_dir/current/bin/fleet (gcroot)"
     '';
   };
 in
