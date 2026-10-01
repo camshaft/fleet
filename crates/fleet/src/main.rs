@@ -1839,7 +1839,10 @@ enum Cmd {
     /// checkouts; this bakes out the git `@{u}` footgun — a checkout with NO upstream is NOT safe-by-default
     /// (absence of an upstream means its commits cannot be proven pushed), so it is reported KEEP (unsafe),
     /// never reclaimable. A checkout is reclaimable only when clean AND either fully pushed to its upstream or
-    /// already an ancestor of the mainline. Worktrees are enumerated via `git worktree list`, so a bare hub's
+    /// already an ancestor of the mainline, AND it clears the task_774 safety overlay: a git-clean checkout is
+    /// still KEPT when it is a LIVE process's home (a /proc cwd at/under it), a PRIMARY clone (its `.git` is a
+    /// directory, not a linked worktree), or an off-tree-agent worktree (`.v-<agent>`) — because git-preserved
+    /// is not the same as safe-to-delete. Worktrees are enumerated via `git worktree list`, so a bare hub's
     /// `.claude/worktrees/*` are included. Prints the KEEP set (and, with `--verbose`, the reclaimable set too).
     /// Read-only — no writes, no deletes.
     ReclaimSurvey {
@@ -6295,6 +6298,66 @@ fn survey_checkout(dir: &Path, mainline_cands: &[String]) -> ReclaimState {
     classify_reclaim(dirty, has_upstream, ahead, merged)
 }
 
+/// task_774: a running process's current-working-directory set, read from `/proc/<pid>/cwd` (Linux). Each is
+/// canonicalized so a `/local/home` vs `/home` symlink alias compares equal to a worktree path. Best-effort: a
+/// non-Linux host or an unreadable `/proc` yields an empty set (the liveness overlay then simply does not fire,
+/// and the primary-root + agent-suffix overlays still apply). The disk-reclaim footgun this guards is that a
+/// git-clean worktree can still be a LIVE agent's home.
+fn live_process_cwds() -> Vec<PathBuf> {
+    let mut cwds = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return cwds;
+    };
+    for e in entries.flatten() {
+        // Only numeric PID directories carry a `cwd` symlink.
+        if e.file_name().to_str().is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            && let Ok(target) = std::fs::read_link(e.path().join("cwd"))
+        {
+            cwds.push(target.canonicalize().unwrap_or(target));
+        }
+    }
+    cwds
+}
+
+/// task_774: is `checkout` the home of a live process — some live cwd IS the checkout or is nested under it?
+/// Both sides are expected pre-canonicalized by the caller. Pure — unit-tested.
+fn path_is_live(checkout: &Path, live_cwds: &[PathBuf]) -> bool {
+    live_cwds.iter().any(|cwd| cwd == checkout || cwd.starts_with(checkout))
+}
+
+/// task_774: a PRIMARY (main) working tree — its `.git` is a real DIRECTORY. A linked `git worktree` has `.git`
+/// as a FILE (a `gitdir:` pointer), so this is false for the disposable linked worktrees that are the reclaim
+/// target. A primary clone (e.g. camshaft/dotfiles with agenix secrets, or a primary camshaft/fleet) is clean +
+/// pushed yet must never be reclaimed. (A bare hub's main entry has no working tree and is already skipped by
+/// [`parse_worktree_paths`], so it never reaches here.) Best-effort filesystem probe.
+fn is_primary_worktree(dir: &Path) -> bool {
+    dir.join(".git").is_dir()
+}
+
+/// task_774: an off-tree-agent worktree, named `<repo>.v-<agent>` (e.g. `backbeat.v-backbeat`). Its directory
+/// name does NOT match the agent's tmux window name, so a window-name liveness match misses it — the `.v-`
+/// infix is the reliable catch. Pure — unit-tested.
+fn is_agent_suffix_worktree(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".v-"))
+}
+
+/// task_774: the disk-reclaim SAFETY overlay on top of the git-state classification. A checkout can be
+/// git-reclaimable (clean + provably pushed) yet still be UNSAFE for a bulk deleter: it is a live process's
+/// home, a primary clone rather than a disposable linked worktree, or an off-tree-agent worktree. Returns the
+/// KEEP reason when any such condition holds, else `None` (truly disposable). Pure — unit-tested. This is the
+/// gap task_774 bakes out: `reclaimable()` proves the COMMITS are preserved, not that the checkout is idle.
+fn reclaim_safety_override(is_live: bool, is_primary: bool, is_agent_suffix: bool) -> Option<&'static str> {
+    if is_live {
+        Some("LIVE (a running process is cwd'd at/under it)")
+    } else if is_primary {
+        Some("PRIMARY-ROOT (main checkout, not a disposable linked worktree)")
+    } else if is_agent_suffix {
+        Some("AGENT-WORKTREE (.v-<agent> off-tree agent)")
+    } else {
+        None
+    }
+}
+
 /// `fleet reclaim-survey` (task_714): a read-only, cross-checkout git-state survey for the disk-reclaim safety
 /// gate (v-disk-sweep is the consumer). For every worktree under each `--root` (discovered via `git worktree
 /// list`, so a bare hub's `.claude/worktrees/*` are included) it classifies reclaim-safety, with the no-upstream
@@ -6334,28 +6397,54 @@ fn reclaim_survey(roots: Vec<PathBuf>, mainline: String, verbose: bool) {
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let (mut n_reclaimable, mut n_keep) = (0usize, 0usize);
+    // task_774 liveness overlay: gather every live process's cwd ONCE, so a git-clean worktree that is still a
+    // running agent's home is marked KEEP, not handed to a deleter.
+    let live_cwds = live_process_cwds();
+
+    let (mut n_reclaimable, mut n_keep, mut n_override) = (0usize, 0usize, 0usize);
     for (path, state) in &rows {
-        if state.reclaimable() {
-            n_reclaimable += 1;
-            if verbose {
-                println!("  RECLAIMABLE  {:<34} {}", state.label(), path.display());
-            }
+        // task_774: a git-reclaimable checkout is only truly disposable when it is NOT live, not a primary
+        // clone, and not an off-tree-agent worktree. Compare the canonicalized path so a /local/home vs /home
+        // symlink alias still matches a live cwd.
+        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let override_reason = if state.reclaimable() {
+            reclaim_safety_override(
+                path_is_live(&canon, &live_cwds),
+                is_primary_worktree(path),
+                is_agent_suffix_worktree(path),
+            )
         } else {
-            n_keep += 1;
-            println!("  KEEP         {:<34} {}", state.label(), path.display());
+            None
+        };
+        match override_reason {
+            None if state.reclaimable() => {
+                n_reclaimable += 1;
+                if verbose {
+                    println!("  RECLAIMABLE  {:<42} {}", state.label(), path.display());
+                }
+            }
+            Some(reason) => {
+                // git-clean but UNSAFE to delete (live / primary / agent) — the task_774 footgun bucket.
+                n_keep += 1;
+                n_override += 1;
+                println!("  KEEP         {reason:<42} {}", path.display());
+            }
+            None => {
+                n_keep += 1;
+                println!("  KEEP         {:<42} {}", state.label(), path.display());
+            }
         }
     }
 
     println!(
-        "\nsummary: {} checkout(s) — {n_reclaimable} reclaimable, {n_keep} keep (unsafe/active)",
+        "\nsummary: {} checkout(s) — {n_reclaimable} reclaimable, {n_keep} keep (unsafe/active), of which {n_override} are git-clean but KEPT by the liveness/primary/agent safety overlay (task_774)",
         rows.len()
     );
     if rows.is_empty() {
         println!("no git worktrees found under the given root(s).");
     } else {
         println!(
-            "reclaimable = clean+pushed or already-on-mainline; a no-upstream unmerged checkout is KEEP (unprovable), never reclaimable."
+            "reclaimable = clean+pushed or already-on-mainline AND not live/primary/agent; a no-upstream unmerged checkout is KEEP (unprovable), never reclaimable."
         );
     }
 }
@@ -9350,6 +9439,60 @@ mod tests {
         let s = classify_reclaim(false, true, 5, true);
         assert_eq!(s, ReclaimState::MergedIntoMainline);
         assert!(s.reclaimable());
+    }
+
+    #[test]
+    fn reclaim_safety_override_keeps_live_primary_and_agent_checkouts() {
+        // task_774: a disposable linked worktree (not live / not primary / not agent) → no override, truly reclaimable.
+        assert_eq!(reclaim_safety_override(false, false, false), None);
+        // LIVE wins (highest priority): a running process is cwd'd here.
+        assert_eq!(
+            reclaim_safety_override(true, false, false),
+            Some("LIVE (a running process is cwd'd at/under it)")
+        );
+        // A primary clone (git-clean + pushed, but the main checkout) is kept.
+        assert_eq!(
+            reclaim_safety_override(false, true, false),
+            Some("PRIMARY-ROOT (main checkout, not a disposable linked worktree)")
+        );
+        // An off-tree-agent worktree is kept even when idle (no live cwd) and a linked (non-primary) worktree.
+        assert_eq!(
+            reclaim_safety_override(false, false, true),
+            Some("AGENT-WORKTREE (.v-<agent> off-tree agent)")
+        );
+        // Live takes precedence over the other reasons when several hold.
+        assert_eq!(
+            reclaim_safety_override(true, true, true),
+            Some("LIVE (a running process is cwd'd at/under it)")
+        );
+    }
+
+    #[test]
+    fn path_is_live_matches_the_checkout_and_nested_cwds_only() {
+        let wt = PathBuf::from("/home/u/.fleet/agents/a1/repo");
+        // A process cwd'd exactly at the worktree → live.
+        assert!(path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1/repo")]));
+        // A process cwd'd in a SUBDIR of the worktree → live.
+        assert!(path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1/repo/crates/fleet")]));
+        // A process elsewhere → not live.
+        assert!(!path_is_live(&wt, &[PathBuf::from("/home/u/other")]));
+        // A PARENT of the worktree is NOT a match (prefix must be the worktree, not the other way round).
+        assert!(!path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1")]));
+        // A sibling that shares a path PREFIX string but not a path component → not live.
+        assert!(!path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1/repo-two")]));
+        // No live cwds → not live.
+        assert!(!path_is_live(&wt, &[]));
+    }
+
+    #[test]
+    fn is_agent_suffix_worktree_matches_the_dot_v_infix() {
+        assert!(is_agent_suffix_worktree(Path::new("/wt/backbeat.v-backbeat")));
+        assert!(is_agent_suffix_worktree(Path::new("/wt/bolero.v-bolero")));
+        // A plain repo or a linked topic worktree is not an off-tree-agent dir.
+        assert!(!is_agent_suffix_worktree(Path::new("/wt/cadenza")));
+        assert!(!is_agent_suffix_worktree(Path::new("/wt/topic-a")));
+        // "v-" without the leading dot (a board agent id, not the off-tree dir pattern) does not match.
+        assert!(!is_agent_suffix_worktree(Path::new("/wt/v-fleet-tooling")));
     }
 
     #[test]
