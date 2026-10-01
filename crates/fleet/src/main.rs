@@ -1848,10 +1848,19 @@ enum Cmd {
     /// -D warnings`, then `cargo test --workspace`, streaming each command's output and exiting non-zero on the
     /// first failure. This is the committed single source of truth for the local gate — run it before requesting
     /// a merge. (Named constants mirror .github/workflows/checks.yml; a unit test asserts they stay identical.)
+    /// With `--isolated` it ALSO runs a per-crate `cargo check -p <crate>` for every workspace member, catching
+    /// the class of bug the workspace gate MASKS via Cargo feature unification (task_729): a crate that uses a
+    /// dependency feature it does not declare still compiles in the workspace because a sibling enables that
+    /// feature, so `--workspace` is green while CI's isolated per-crate build fails. Building each crate alone
+    /// resolves features in isolation, so the missing declaration surfaces locally instead of in a CI round-trip.
     Gate {
         /// Run only the clippy step (skip the slower `cargo test --workspace`).
         #[arg(long)]
         clippy_only: bool,
+        /// Also build each workspace crate IN ISOLATION (`cargo check -p <crate>`) to catch a missing feature
+        /// declaration that workspace feature-unification hides (task_729) — the dimension CI's per-crate build adds.
+        #[arg(long)]
+        isolated: bool,
     },
     /// Audit each board-native agent's `metadata.worktree` for health (task_730): a STALE pointer (the path no
     /// longer exists — the symptom a worktree migration/retire leaves when it rewrites the charter but not the
@@ -2091,7 +2100,7 @@ fn main() {
             verbose,
         } => observe_coverage(cadence, cadence_pinned, verbose),
         Cmd::ReclaimSurvey { root, mainline, verbose } => reclaim_survey(root, mainline, verbose),
-        Cmd::Gate { clippy_only } => gate(clippy_only),
+        Cmd::Gate { clippy_only, isolated } => gate(clippy_only, isolated),
         Cmd::WorktreeCheck { agent, verbose } => worktree_check(agent, verbose),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
@@ -5841,7 +5850,7 @@ fn gate_steps(clippy_only: bool) -> Vec<(&'static str, Vec<&'static str>)> {
 /// bin-only clippy that misses test-target lints. Streams each step's output (inherited stdio) and exits
 /// non-zero on the first failure, so it is usable both by hand and as a pre-push check. Read-only w.r.t. the
 /// repo (clippy + test only).
-fn gate(clippy_only: bool) {
+fn gate(clippy_only: bool, isolated: bool) {
     let Some(root) = checkout_root() else {
         eprintln!("fleet gate: no source checkout found (run it from inside the fleet repo)");
         std::process::exit(1);
@@ -5860,7 +5869,70 @@ fn gate(clippy_only: bool) {
             }
         }
     }
-    println!("fleet gate: PASS — matches CI's `clippy + test (workspace)` merge gate");
+    if isolated {
+        // The isolation dimension CI's per-crate build adds (task_729): build each workspace member ALONE so
+        // its features resolve WITHOUT the sibling-crate unification `--workspace` applies — a crate that uses a
+        // dependency feature it never declared compiles under `--workspace` (a sibling enables it) but fails
+        // alone. `cargo metadata --no-deps` lists exactly the workspace members.
+        let members = std::process::Command::new("cargo")
+            .current_dir(&root)
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| workspace_members(&s))
+            .unwrap_or_default();
+        if members.is_empty() {
+            eprintln!("fleet gate --isolated: could not enumerate workspace members (cargo metadata failed)");
+            std::process::exit(1);
+        }
+        println!("fleet gate --isolated: checking {} crate(s) in isolation", members.len());
+        for m in &members {
+            println!("fleet gate: cargo check -p {m}");
+            match std::process::Command::new("cargo")
+                .current_dir(&root)
+                .args(["check", "-p", m])
+                .status()
+            {
+                Ok(s) if s.success() => println!("  ok: {m} (isolated)"),
+                Ok(s) => {
+                    eprintln!(
+                        "fleet gate --isolated: FAILED checking `{m}` alone (cargo exit {:?}) — likely a feature it uses but does not declare (workspace unification hid it); add the `<dep>/<feature>` to {m}'s Cargo.toml",
+                        s.code()
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("fleet gate --isolated: could not run cargo ({e})");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    println!(
+        "fleet gate: PASS — matches CI's `clippy + test (workspace)` merge gate{}",
+        if isolated { " + per-crate isolation" } else { "" }
+    );
+}
+
+/// The workspace member crate names from `cargo metadata --no-deps --format-version 1` output (its `packages`
+/// array is exactly the workspace members when `--no-deps` is passed). Sorted + deduped for a stable per-crate
+/// gate order. Empty when the JSON is unparseable. Pure — unit-tested.
+fn workspace_members(metadata_json: &str) -> Vec<String> {
+    let mut names: Vec<String> = serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|v| {
+            v.get("packages").and_then(|p| p.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("name").and_then(serde_json::Value::as_str).map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The health of an agent's registered `metadata.worktree` (task_730). `MissingPath` is the migration/retire
@@ -8556,6 +8628,16 @@ detached
         let clippy_only = gate_steps(true);
         assert_eq!(clippy_only.len(), 1);
         assert_eq!(clippy_only[0].1, vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]);
+    }
+
+    #[test]
+    fn workspace_members_parses_sorts_and_dedups_cargo_metadata() {
+        // The shape of `cargo metadata --no-deps --format-version 1` — packages[] is the workspace members.
+        let json = r#"{"packages":[{"name":"fleet"},{"name":"bridge-core"},{"name":"kb"}],"workspace_members":[]}"#;
+        assert_eq!(workspace_members(json), vec!["bridge-core", "fleet", "kb"]);
+        // Unparseable / missing packages -> empty (the handler treats empty as a hard error, never a silent pass).
+        assert!(workspace_members("not json").is_empty());
+        assert!(workspace_members(r#"{"other":1}"#).is_empty());
     }
 
     #[test]
