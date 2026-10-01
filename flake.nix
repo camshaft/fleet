@@ -276,7 +276,11 @@
       # Fleet daemons as flake-managed USER systemd units (task #486/#493): the declarative mirror of the
       # binary's `fleet daemon-unit`/`watchdog-unit` templates + `install-fleet-daemons` (reconcile + enable).
       # Self-contained — ExecStart points at THIS flake's fleet package, no cross-repo input. See nix/fleet-daemons.nix.
-      fleetDaemons = pkgs: import ./nix/fleet-daemons.nix { inherit pkgs; fleet = fleetPackage pkgs; };
+      fleetDaemons = pkgs: import ./nix/fleet-daemons.nix {
+        inherit pkgs;
+        fleet = fleetPackage pkgs;
+        fleetTunnel = fleetTunnelPackage pkgs;
+      };
     in
     {
       packages = forAllSystems (pkgs: rec {
