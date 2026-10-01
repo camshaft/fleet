@@ -18,7 +18,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The localhost board REST base the firehose subscriber reads, used when the config file omits it.
-/// This is the board front-door on the deploy host (green): port 8079, path `/api` (the daemon appends
+/// This is the board front-door on the deploy host: port 8079, path `/api` (the daemon appends
 /// `/events`, `/channels/:id/posts`, `/external-links`). Override per-environment via config `board_api`.
 const DEFAULT_BOARD_API: &str = "http://127.0.0.1:8079/api";
 const DEFAULT_DEFAULT_TO: &str = "concierge";

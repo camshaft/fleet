@@ -68,7 +68,7 @@ github_token      = "ghp_..."     # GitHub PAT or App installation token (issues
 repos        = ["camshaft/fleet", "camshaft/dotfiles"]  # owner/name list — ingested into project_id
 # repo       = "camshaft/fleet"   # singular sugar for a one-repo config (folds into `repos`)
 project_id   = 16                  # board project all ingested issues become tasks in
-board_api    = "http://127.0.0.1:8079/api"        # optional; default shown (green board loopback)
+board_api    = "http://127.0.0.1:8079/api"        # optional; default shown (deploy-host board loopback)
 api_base     = "https://api.github.com"           # optional; override for GitHub Enterprise Server
 default_to   = "concierge"        # optional; default
 bridge_agent = "github-bridge"    # optional; the board agent id this bridge writes as
@@ -85,7 +85,7 @@ state_dir    = "/var/lib/github-bridge"  # optional; defaults to the config file
   dormant), not a silent drop.
 - `Debug` on the config **redacts** the token — it never prints into logs.
 
-## Deploy (camshaft/dotfiles, fleet-tunnel/green-machine-ops)
+## Deploy (camshaft/dotfiles, fleet-tunnel)
 
 - systemd role runs `github-bridge --config <path>`; `Restart=always` (fail-soft startup makes this safe).
 - The config is delivered as the **agenix-decrypted TOML secret** `github-bridge.toml.age` (mode 0400) —
