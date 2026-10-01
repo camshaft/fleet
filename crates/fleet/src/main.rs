@@ -5051,23 +5051,41 @@ const NUDGE_EXEMPT_ASSIGNEE: &str = "cameron";
 /// #540 inc2: where an unassigned-or-gone-owner stale task is ROUTED — the router that owns assignment. It is
 /// event-woken on the reassignment (task.assigned), so this needs no polling on board-pm's side.
 const NUDGE_ROUTER: &str = "board-pm";
+/// task_540 follow-on (board-pm greenlit): the EXTENDED re-nudge cooldown applied when the assignee has
+/// acknowledged a queued todo since the last nudge — a fresh ack/ETA buys this much quiet instead of the
+/// normal ~1h, so an acknowledged-queued backlog is not re-nudged hourly. 4h to start (tune toward 4–6h);
+/// the anti-parking revert to the normal cadence on a stale ack is in [`stale_task_should_nudge`].
+const ACKED_NUDGE_COOLDOWN_HOURS: f64 = 4.0;
 
 /// Whether a task idle for `idle_secs` should be nudged now, given `last_nudge_secs` (the age of this
 /// daemon's own most recent nudge comment on it, if any). Pure — unit-tested. First nudge fires once idle
-/// reaches `threshold_secs`; a re-nudge additionally needs the PRIOR nudge to be at least `cooldown_secs`
-/// old, so a still-idle task is pinged at most once per cooldown window, never every sweep.
+/// reaches `threshold_secs`; a re-nudge additionally needs the PRIOR nudge to be at least the cooldown old,
+/// so a still-idle task is pinged at most once per cooldown window, never every sweep.
+///
+/// task_540 follow-on (board-pm greenlit): the re-nudge cooldown is `acked_cooldown_secs` (longer, e.g. 4h)
+/// instead of `cooldown_secs` (the normal ~1h) when `assignee_ack_fresher` — the assignee has posted a
+/// comment NEWER than our last nudge, i.e. acknowledged/ETA'd this queued todo since we last pinged. A fresh
+/// ack buys the longer quiet; the ANTI-PARKING guard is automatic: once an extended-cooldown nudge fires, our
+/// last nudge is newer than the ack, so `assignee_ack_fresher` goes false and the normal cadence resumes — a
+/// stale ETA stops buying quiet. (The first nudge, `last_nudge_secs == None`, is unaffected: an ack cannot be
+/// "newer than the last nudge" when there is no last nudge, and the extended cooldown is a RE-nudge concept.)
 fn stale_task_should_nudge(
     idle_secs: i64,
     last_nudge_secs: Option<i64>,
+    assignee_ack_fresher: bool,
     threshold_secs: i64,
     cooldown_secs: i64,
+    acked_cooldown_secs: i64,
 ) -> bool {
     if idle_secs < threshold_secs {
         return false;
     }
     match last_nudge_secs {
         None => true,
-        Some(since_last_nudge) => since_last_nudge >= cooldown_secs,
+        Some(since_last_nudge) => {
+            let cooldown = if assignee_ack_fresher { acked_cooldown_secs } else { cooldown_secs };
+            since_last_nudge >= cooldown
+        }
     }
 }
 
@@ -5103,6 +5121,35 @@ fn task_last_nudge_age_secs(task: &serde_json::Value, now: time::OffsetDateTime)
         .filter_map(|c| c.get("created_at").and_then(serde_json::Value::as_str))
         .filter_map(|ts| last_seen_age_secs(ts, now))
         .min()
+}
+
+/// task_540: the age in seconds of the task ASSIGNEE's most-recent comment (an ack/ETA), or `None` if the
+/// assignee has never commented on it. Mirrors [`task_last_nudge_age_secs`] but keyed on the assignee rather
+/// than the nudge daemon — the two together tell an acknowledged-queued todo (assignee acked AFTER our last
+/// nudge) from a neglected one, which drives the extended re-nudge cooldown.
+fn newest_assignee_comment_age_secs(
+    task: &serde_json::Value,
+    assignee: &str,
+    now: time::OffsetDateTime,
+) -> Option<i64> {
+    task.get("comments")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|c| c.get("author").and_then(serde_json::Value::as_str) == Some(assignee))
+        .filter_map(|c| c.get("created_at").and_then(serde_json::Value::as_str))
+        .filter_map(|ts| last_seen_age_secs(ts, now))
+        .min()
+}
+
+/// task_540: is the assignee's latest ack NEWER than the daemon's last nudge? True only when BOTH exist and
+/// the ack is more recent (a smaller age). Pure — unit-tested; this is the signal that extends the re-nudge
+/// cooldown for an acknowledged-queued todo. Never true before the first nudge (no nudge to be newer than).
+fn assignee_ack_fresher_than_last_nudge(
+    ack_age_secs: Option<i64>,
+    last_nudge_age_secs: Option<i64>,
+) -> bool {
+    matches!((ack_age_secs, last_nudge_age_secs), (Some(ack), Some(nudge)) if ack < nudge)
 }
 
 /// A compact `<N>h<M>m` rendering of a duration in seconds, for the report line (e.g. `3h12m`).
@@ -5198,6 +5245,8 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     });
     let threshold_secs = (threshold_hours * 3600.0).round() as i64;
     let cooldown_secs = (cooldown_hours * 3600.0).round() as i64;
+    // task_540: the longer re-nudge cooldown for a todo whose assignee acked since the last nudge.
+    let acked_cooldown_secs = (ACKED_NUDGE_COOLDOWN_HOURS * 3600.0).round() as i64;
     // #540 inc2: the set of currently-registered agent ids, for the gone-owner routing signal (an assignee
     // absent from this set is retired/removed → its stale task is orphaned). Best-effort — a roster query
     // error degrades to an EMPTY set, which would make every owner look "gone"; guard that below by only
@@ -5311,7 +5360,19 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
             None => continue,
         };
         let last_nudge_secs = task_last_nudge_age_secs(&full, now);
-        if !stale_task_should_nudge(idle_secs, last_nudge_secs, threshold_secs, cooldown_secs) {
+        // task_540: a fresh assignee ack (a comment newer than our last nudge) extends the re-nudge cooldown,
+        // so an acknowledged-queued todo is not re-nudged hourly; a stale ack reverts to the normal cadence
+        // (the anti-parking guard, in stale_task_should_nudge).
+        let ack_age_secs = assignee.and_then(|a| newest_assignee_comment_age_secs(&full, a, now));
+        let ack_fresher = assignee_ack_fresher_than_last_nudge(ack_age_secs, last_nudge_secs);
+        if !stale_task_should_nudge(
+            idle_secs,
+            last_nudge_secs,
+            ack_fresher,
+            threshold_secs,
+            cooldown_secs,
+            acked_cooldown_secs,
+        ) {
             continue;
         }
 
@@ -7745,17 +7806,64 @@ mod tests {
     fn stale_task_should_nudge_gates_first_nudge_on_threshold_and_renudge_on_cooldown() {
         let threshold = 3600; // 1h
         let cooldown = 7200; // 2h
+        let acked = 14400; // 4h extended cooldown
+        // Helper: the no-ack (normal cadence) case, so the existing assertions read unchanged.
+        let n = |idle, last| stale_task_should_nudge(idle, last, false, threshold, cooldown, acked);
         // Fresh (under threshold) → never nudge, nudged before or not.
-        assert!(!stale_task_should_nudge(threshold - 1, None, threshold, cooldown));
-        assert!(!stale_task_should_nudge(0, None, threshold, cooldown));
+        assert!(!n(threshold - 1, None));
+        assert!(!n(0, None));
         // At/over threshold with no prior nudge → first nudge fires.
-        assert!(stale_task_should_nudge(threshold, None, threshold, cooldown));
-        assert!(stale_task_should_nudge(threshold * 10, None, threshold, cooldown));
+        assert!(n(threshold, None));
+        assert!(n(threshold * 10, None));
         // Still idle, but the prior nudge is younger than the cooldown → no re-nudge (no spam).
-        assert!(!stale_task_should_nudge(threshold * 5, Some(cooldown - 1), threshold, cooldown));
+        assert!(!n(threshold * 5, Some(cooldown - 1)));
         // Prior nudge at/past the cooldown → re-nudge.
-        assert!(stale_task_should_nudge(threshold * 5, Some(cooldown), threshold, cooldown));
-        assert!(stale_task_should_nudge(threshold * 5, Some(cooldown * 3), threshold, cooldown));
+        assert!(n(threshold * 5, Some(cooldown)));
+        assert!(n(threshold * 5, Some(cooldown * 3)));
+
+        // task_540 acked-cooldown: a fresh assignee ack extends the re-nudge cooldown to `acked`.
+        // Prior nudge past the NORMAL cooldown but within the ACKED cooldown → suppressed WHEN acked, fired
+        // when not (so acking a queued todo buys the longer quiet).
+        assert!(!stale_task_should_nudge(threshold * 5, Some(cooldown + 1), true, threshold, cooldown, acked));
+        assert!(stale_task_should_nudge(threshold * 5, Some(cooldown + 1), false, threshold, cooldown, acked));
+        // Anti-parking: even with a fresh ack, once the prior nudge is past the ACKED cooldown it re-nudges.
+        assert!(stale_task_should_nudge(threshold * 5, Some(acked), true, threshold, cooldown, acked));
+        // The ack flag never overrides the threshold gate, and never fabricates a first nudge early.
+        assert!(!stale_task_should_nudge(threshold - 1, None, true, threshold, cooldown, acked));
+        assert!(stale_task_should_nudge(threshold, None, true, threshold, cooldown, acked));
+    }
+
+    #[test]
+    fn assignee_ack_fresher_than_last_nudge_requires_both_and_a_newer_ack() {
+        // Ack newer than the nudge (smaller age) → fresher.
+        assert!(assignee_ack_fresher_than_last_nudge(Some(10), Some(100)));
+        // Ack older than, or equal to, the nudge → not fresher (a stale ETA stops buying quiet; equal is not newer).
+        assert!(!assignee_ack_fresher_than_last_nudge(Some(100), Some(10)));
+        assert!(!assignee_ack_fresher_than_last_nudge(Some(50), Some(50)));
+        // Missing either side → not fresher (incl. before the first nudge: no nudge to be newer than).
+        assert!(!assignee_ack_fresher_than_last_nudge(None, Some(100)));
+        assert!(!assignee_ack_fresher_than_last_nudge(Some(10), None));
+        assert!(!assignee_ack_fresher_than_last_nudge(None, None));
+    }
+
+    #[test]
+    fn newest_assignee_comment_age_secs_picks_the_assignees_most_recent_comment() {
+        use time::{format_description::well_known::Rfc3339, Duration};
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
+        let task = serde_json::json!({
+            "comments": [
+                { "author": "fleet-nudge-daemon", "created_at": stamp(Duration::minutes(1)) },
+                { "author": "v-x", "created_at": stamp(Duration::hours(3)) },
+                { "author": "someone-else", "created_at": stamp(Duration::minutes(2)) },
+                { "author": "v-x", "created_at": stamp(Duration::hours(1)) },
+            ],
+        });
+        // Picks v-x's MOST RECENT comment (1h), ignoring the daemon's and others' newer comments.
+        let age = newest_assignee_comment_age_secs(&task, "v-x", now).unwrap();
+        assert!((age - 3600).abs() < 2, "newest assignee comment is 1h old, got {age}");
+        // An assignee who never commented → None.
+        assert_eq!(newest_assignee_comment_age_secs(&task, "v-never", now), None);
     }
 
     #[test]
