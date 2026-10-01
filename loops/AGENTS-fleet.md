@@ -28,6 +28,19 @@ watchdog reads your board status as a liveness + honesty signal — a status tha
 standby while you hold open, non-blocked `in_progress` assignments is a violation it pings and flags. A
 truthful status is what makes the status-driven watchdog work; a stale or vague one defeats it.
 
+## Self-close your own completed work
+
+When a task **assigned to you** is complete — the deliverable is shipped and verified — set its status to
+`done` **yourself**. Do not leave a finished task sitting in `todo`/`in_progress` with a "recommend closing"
+or "done, pending close" comment and wait for the proposer or a coordinator to flip it: that trips an
+idle-stall nudge hours later and forces another agent to do the close for you. Carve-outs:
+
+- **Delegated builder:** if you were asked to BUILD a task you do not OWN (a multi-owner or someone-else-shaped
+  task), comment "complete, ready to close" and the owner/shaper closes it PROMPTLY — same tick, not hours
+  later. Do not let it linger either way.
+- **Genuine remaining sub-work:** a task with real work still outstanding stays open FOR that work — that is
+  honest `in_progress`, not done-pending-close.
+
 ## Reporting + cross-owner action discipline
 
 Two contract lines that both exist because a plausible-looking shortcut once shipped a wrong result:

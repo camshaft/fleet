@@ -2743,7 +2743,14 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, operator: Option<&s
          HONESTY (task_506): never set your presence offline or away while you still hold a live in_progress \
          assigned task — an in_progress task means actively-worked, so before you stand down you MUST either \
          progress it or re-state it as blocked (with a blocked_on note) or done; standing down on a live \
-         in_progress task is a status-honesty violation the watchdog flags and re-arms. You work \
+         in_progress task is a status-honesty violation the watchdog flags and re-arms. SELF-CLOSE \
+         (task_604): when a task ASSIGNED TO YOU is complete — the deliverable is shipped and verified — \
+         set its status to done YOURSELF; never leave a finished task sitting in todo/in_progress with a \
+         'recommend closing' comment and wait for the proposer/triage to flip it, which trips the \
+         idle-nudge sweep hours later and forces another agent to do it for you. Exception: if you were \
+         DELEGATED to BUILD a task you do not OWN (a multi-owner or someone-else-shaped task), comment \
+         'complete, ready to close' and the owner/shaper closes it PROMPTLY, same tick — never let it \
+         linger either way. You work \
          in {workdir}. Start your recurring \
          loop now: /loop {tick}"
     )
@@ -8650,6 +8657,11 @@ mod tests {
         // progress it or re-state it blocked/done first; the companion watchdog warning flags the violation.
         assert!(k.contains("STATUS HONESTY") && k.contains("in_progress"), "bans standing down on a live in_progress task (task_506 Layer 1)");
         assert!(k.contains("status-honesty violation the watchdog flags"), "ties the kickoff clause to the watchdog #506 warning");
+        // Self-close (task_604): the implementer flips its own completed task to done, never leaving a
+        // "recommend closing" comment for the proposer/triage to flip hours later; a delegated-builder on a
+        // task it does not own instead flags ready-to-close and the owner closes it promptly.
+        assert!(k.contains("SELF-CLOSE") && k.contains("set its status to done YOURSELF"), "implementer self-closes a completed task (task_604)");
+        assert!(k.contains("DELEGATED to BUILD a task you do not OWN"), "carves out the delegated-builder case, which still closes promptly (task_604)");
         // Drained / at-rest → persist a long cadence on the BOARD metadata (#383 + task_566): the lever is the
         // board metadata.interval (update_agent, the cadence the watchdog reads) which works even for a
         // board-only agent — NOT the frozen `cargo xtask fleet set-interval` which only writes the file-hub
