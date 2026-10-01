@@ -1840,6 +1840,17 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Run the EXACT local gate CI's "clippy + test (workspace)" merge job runs (task_720), so a pre-merge
+    /// check matches CI instead of an ad-hoc bin-only clippy that silently misses TEST-target lints and burns a
+    /// CI round-trip. Runs, in order, from the fleet checkout root: `cargo clippy --workspace --all-targets --
+    /// -D warnings`, then `cargo test --workspace`, streaming each command's output and exiting non-zero on the
+    /// first failure. This is the committed single source of truth for the local gate — run it before requesting
+    /// a merge. (Named constants mirror .github/workflows/checks.yml; a unit test asserts they stay identical.)
+    Gate {
+        /// Run only the clippy step (skip the slower `cargo test --workspace`).
+        #[arg(long)]
+        clippy_only: bool,
+    },
     /// Seam-check a MONITOR vertical (task_579): ff-sync its worktree to origin/main, then report whether any
     /// incoming commit touched the agent's declared SEAM — its `metadata.seam` file globs. A monitor wake is
     /// otherwise 100% deterministic git plumbing, so this lets the kickoff GATE the model wake: exit 0 = GREEN
@@ -2062,6 +2073,7 @@ fn main() {
             verbose,
         } => observe_coverage(cadence, cadence_pinned, verbose),
         Cmd::ReclaimSurvey { root, mainline, verbose } => reclaim_survey(root, mainline, verbose),
+        Cmd::Gate { clippy_only } => gate(clippy_only),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::NudgeStale {
@@ -5737,6 +5749,49 @@ fn reclaim_survey(roots: Vec<PathBuf>, mainline: String, verbose: bool) {
     }
 }
 
+/// The ordered cargo steps `fleet gate` runs — the EXACT commands from the CI `clippy + test (workspace)` merge
+/// job (`.github/workflows/checks.yml`): the whole-workspace, all-targets, deny-warnings clippy, then the
+/// workspace test run. `clippy_only` drops the slower test step. Kept pure + unit-tested so the local gate can
+/// never silently drift from what CI actually runs — the whole point of task_720. Each tuple is
+/// `(human label, cargo argv)`.
+fn gate_steps(clippy_only: bool) -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut steps: Vec<(&'static str, Vec<&'static str>)> = vec![(
+        "clippy (workspace, all targets, deny warnings)",
+        vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+    )];
+    if !clippy_only {
+        steps.push(("test (workspace)", vec!["test", "--workspace"]));
+    }
+    steps
+}
+
+/// `fleet gate` (task_720): run the committed local gate — the SAME commands CI's `clippy + test (workspace)`
+/// merge job runs — from the fleet checkout root, so a pre-merge check matches CI rather than an ad-hoc
+/// bin-only clippy that misses test-target lints. Streams each step's output (inherited stdio) and exits
+/// non-zero on the first failure, so it is usable both by hand and as a pre-push check. Read-only w.r.t. the
+/// repo (clippy + test only).
+fn gate(clippy_only: bool) {
+    let Some(root) = checkout_root() else {
+        eprintln!("fleet gate: no source checkout found (run it from inside the fleet repo)");
+        std::process::exit(1);
+    };
+    for (label, args) in gate_steps(clippy_only) {
+        println!("fleet gate: cargo {}", args.join(" "));
+        match std::process::Command::new("cargo").current_dir(&root).args(&args).status() {
+            Ok(s) if s.success() => println!("  ok: {label}"),
+            Ok(s) => {
+                eprintln!("fleet gate: FAILED at `{label}` (cargo exit {:?}) — fix before requesting a merge", s.code());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fleet gate: could not run cargo ({e})");
+                std::process::exit(1);
+            }
+        }
+    }
+    println!("fleet gate: PASS — matches CI's `clippy + test (workspace)` merge gate");
+}
+
 /// The `author` a nudge comment is posted as — also the marker `nudge_last_secs` searches a task's prior
 /// comments for, to find this daemon's own last nudge (the cooldown clock; #478).
 const NUDGE_AUTHOR: &str = "fleet-nudge-daemon";
@@ -8223,6 +8278,20 @@ detached
         // Empty / absent ExecStart carries no nix signal.
         assert!(!execstart_is_nix_store("ExecStart="));
         assert!(!execstart_is_nix_store(""));
+    }
+
+    #[test]
+    fn gate_steps_match_cis_clippy_test_workspace_commands() {
+        // The clippy step MUST be byte-identical to CI (.github/workflows/checks.yml): a drift here is exactly
+        // the task_720 trap (a local gate that does not match CI).
+        let full = gate_steps(false);
+        assert_eq!(full.len(), 2);
+        assert_eq!(full[0].1, vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]);
+        assert_eq!(full[1].1, vec!["test", "--workspace"]);
+        // --clippy-only drops the test step but keeps the identical clippy command.
+        let clippy_only = gate_steps(true);
+        assert_eq!(clippy_only.len(), 1);
+        assert_eq!(clippy_only[0].1, vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]);
     }
 
     #[test]
