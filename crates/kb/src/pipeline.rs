@@ -495,7 +495,12 @@ pub async fn handle_embed(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<(),
             format!("{gateway}/ipfs/{cid}")
         });
 
-    let items = items_from(&content_type, &data, &meta)?;
+    // Parse + extract OFF the reactor: PDF parsing binds pdfium and may shell out to tesseract (a blocking
+    // native call + subprocess), and rustdoc/text parse is CPU-bound — none of it may run on the async
+    // runtime (fleet no-blocking-IO policy, task_809). The inbox worker wraps the equivalent the same way.
+    let items = tokio::task::spawn_blocking(move || items_from(&content_type, &data, &meta))
+        .await
+        .map_err(|e| format!("pipeline: parse task panicked: {e}"))??;
     let n_items = items.len();
 
     // Build every (id, text, payload) up front; the point id keys on the item's id parts + chunk idx, so
