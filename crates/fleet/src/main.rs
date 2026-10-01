@@ -1854,6 +1854,12 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// INTERNAL: what the installed pre-commit hook (see `fmt_precommit_hook_body`) actually calls — not
+    /// meant to be run by hand, but a plain subcommand (no hidden-arg plumbing) so it is easy to invoke
+    /// directly for debugging. Finds the owning crate(s) of staged `.rs` files, auto-fixes + restages the
+    /// fully-staged ones, and warns (fail-open, never blocks) on any only-partially-staged file it will not
+    /// risk auto-restaging.
+    FmtHookRun,
 }
 
 fn main() {
@@ -1956,6 +1962,7 @@ fn main() {
         }
         Cmd::Version => println!("{}", version_line()),
         Cmd::Redeploy { apply } => redeploy(apply),
+        Cmd::FmtHookRun => fmt_hook_run(),
     }
 }
 
@@ -2658,23 +2665,19 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
 const FMT_HOOK_MARKER: &str = "# fleet:fmt-warn";
 
 /// The generic, repo-agnostic pre-commit hook `spin-up` installs into a materialized worktree's shared mirror
-/// hooks dir: a FAIL-OPEN rustfmt nudge so a board-native agent gets a commit-time warning when its staged
-/// Rust is not `cargo fmt`-clean (the required `checks/rustfmt` CI job / `cargo xtask check` reds otherwise —
-/// the class that bit #10139). NEVER blocks a commit (exit 0), never mutates files, no-ops without staged .rs
-/// or without cargo. Silence with FLEET_SKIP_FMT_HOOK=1. Kept generic (no cadenza-specific checks) so it is
-/// correct for every repo an agent's worktree may be.
+/// hooks dir: a FAIL-OPEN rustfmt nudge, scoped per OWNING CRATE of the staged files rather than the whole
+/// workspace (task_617: a bare `cargo fmt --all --check` tripped on every commit over a pre-existing fmt skew
+/// in an unrelated crate — cry-wolf noise that trains agents to dismiss the warning unexamined, including a
+/// genuine problem in their OWN staged files). Delegates to `fleet fmt-hook-run` (testable Rust, not bash) so
+/// the installed script stays tiny and inert; NEVER blocks a commit (exit 0 unconditionally, ignoring
+/// `fleet`'s own exit code) and no-ops without `fleet` on PATH. Silence with FLEET_SKIP_FMT_HOOK=1. Kept
+/// generic (no cadenza- or fleet-specific checks) so it is correct for every repo an agent's worktree may be.
 fn fmt_precommit_hook_body() -> String {
     format!(
         "#!/usr/bin/env bash\n\
          {FMT_HOOK_MARKER} (installed by `fleet spin-up`; fail-open rustfmt nudge for board-native worktrees)\n\
          [ \"${{FLEET_SKIP_FMT_HOOK:-}}\" = \"1\" ] && exit 0\n\
-         staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' 2>/dev/null)\n\
-         [ -z \"$staged\" ] && exit 0\n\
-         command -v cargo >/dev/null 2>&1 || exit 0\n\
-         if ! cargo fmt --all --check >/dev/null 2>&1; then\n\
-         \x20 echo \"warn pre-commit: staged Rust is not rustfmt-clean — run 'cargo fmt' before landing (the\" >&2\n\
-         \x20 echo \"  required checks/rustfmt CI job / 'cargo xtask check' reds otherwise). Silence: FLEET_SKIP_FMT_HOOK=1.\" >&2\n\
-         fi\n\
+         command -v fleet >/dev/null 2>&1 && fleet fmt-hook-run\n\
          exit 0\n"
     )
 }
@@ -2734,6 +2737,159 @@ fn install_fmt_hook(hooks_dir: &std::path::Path) {
         if existing.is_some() { "refreshed" } else { "installed" },
         hook.display()
     );
+}
+
+/// Finds the crate that OWNS `file_dir` — the nearest ancestor at or below `repo_root` holding a Cargo.toml
+/// with a `[package]` table, as opposed to a workspace-root manifest (`[workspace]`, no `[package]`). Falls
+/// back to `repo_root/Cargo.toml` if none is found (e.g. a loose top-level .rs file in a single-crate repo).
+/// `is_package_manifest` is injected so this stays pure/unit-testable without touching real files.
+fn owning_manifest(
+    repo_root: &Path,
+    file_dir: &Path,
+    is_package_manifest: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let mut dir = file_dir.to_path_buf();
+    loop {
+        if is_package_manifest(&dir.join("Cargo.toml")) {
+            return dir.join("Cargo.toml");
+        }
+        if dir == repo_root {
+            return repo_root.join("Cargo.toml");
+        }
+        match dir.parent() {
+            Some(p) if p.starts_with(repo_root) => dir = p.to_path_buf(),
+            _ => return repo_root.join("Cargo.toml"),
+        }
+    }
+}
+
+/// Whether `path` is a crate-level Cargo.toml (has a `[package]` table) rather than a workspace-root
+/// manifest (`[workspace]` only) or no manifest at all.
+fn is_cargo_package_manifest(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().any(|l| l.trim() == "[package]"))
+        .unwrap_or(false)
+}
+
+fn have_cargo() -> bool {
+    std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Whether `file` (repo-root-relative, as `git diff --cached --name-only` reports it) has NO unstaged
+/// changes — the working tree matches the index for this path. Only a file in this state is safe to
+/// auto-reformat-on-disk-and-restage: otherwise `git add` would silently fold in edits the author never
+/// staged, which the never-surprise-the-author git discipline this fleet runs on cannot allow.
+fn is_fully_staged(repo_root: &Path, file: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["diff", "--quiet", "--", file])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// What `fleet fmt-hook-run` (invoked by the installed pre-commit hook — see [`fmt_precommit_hook_body`])
+/// actually does: group the staged `.rs` files by their OWNING crate (never the whole workspace — the
+/// task_617 bug), auto-format + re-stage the ones with no unstaged changes, and warn (fail-open, never
+/// block) on any that are only partially staged, since those cannot be safely auto-restaged.
+fn fmt_hook_run() {
+    let Ok(root_out) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    else {
+        return;
+    };
+    if !root_out.status.success() {
+        return;
+    }
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
+
+    let Ok(staged_out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACM",
+            "--",
+            "*.rs",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !staged_out.status.success() || !have_cargo() {
+        return;
+    }
+    let staged: Vec<String> = String::from_utf8_lossy(&staged_out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if staged.is_empty() {
+        return;
+    }
+
+    let mut by_manifest: std::collections::BTreeMap<PathBuf, Vec<String>> = std::collections::BTreeMap::new();
+    for file in staged {
+        let file_dir = repo_root.join(&file).parent().unwrap_or(&repo_root).to_path_buf();
+        let manifest = owning_manifest(&repo_root, &file_dir, is_cargo_package_manifest);
+        by_manifest.entry(manifest).or_default().push(file);
+    }
+
+    let mut warned = false;
+    for (manifest, files) in by_manifest {
+        let (safe, unsafe_files): (Vec<String>, Vec<String>) =
+            files.into_iter().partition(|f| is_fully_staged(&repo_root, f));
+
+        if !safe.is_empty() {
+            let _ = std::process::Command::new("cargo")
+                .arg("fmt")
+                .arg("--manifest-path")
+                .arg(&manifest)
+                .arg("--")
+                .args(&safe)
+                .status();
+            let _ = std::process::Command::new("git").arg("-C").arg(&repo_root).arg("add").args(&safe).status();
+        }
+
+        if !unsafe_files.is_empty() {
+            // Silence cargo fmt's own --check diff output - only OUR actionable message below should print.
+            let clean = std::process::Command::new("cargo")
+                .arg("fmt")
+                .arg("--manifest-path")
+                .arg(&manifest)
+                .arg("--check")
+                .arg("--")
+                .args(&unsafe_files)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(true); // can't tell — don't cry wolf on an uncertain result
+            if !clean {
+                eprintln!(
+                    "warn pre-commit: {} also ha{} unstaged changes, so rustfmt was not auto-applied (that \
+                     would risk staging edits you did not stage) — format + stage {} yourself: cargo fmt \
+                     --manifest-path {}",
+                    unsafe_files.join(", "),
+                    if unsafe_files.len() == 1 { "s" } else { "ve" },
+                    if unsafe_files.len() == 1 { "it" } else { "them" },
+                    manifest.display(),
+                );
+                warned = true;
+            }
+        }
+    }
+    if warned {
+        eprintln!("  Silence: FLEET_SKIP_FMT_HOOK=1.");
+    }
 }
 
 /// Open a tmux window running the agent's harness in `workdir` with a SELF-DISCOVERY kickoff (the agent
@@ -6545,8 +6701,12 @@ mod tests {
         let b = fmt_precommit_hook_body();
         assert!(b.contains(FMT_HOOK_MARKER), "carries the ownership marker");
         assert!(b.contains("FLEET_SKIP_FMT_HOOK"), "has the silencer");
-        assert!(b.contains("cargo fmt --all --check"), "checks fmt (read-only)");
-        assert!(b.trim_end().ends_with("exit 0"), "FAIL-OPEN: the hook never blocks a commit");
+        // task_617: no bare `cargo fmt --all --check` left in the installed script — that was the bug (a
+        // pre-existing skew in an unrelated crate tripped it on every commit). The smart per-crate logic now
+        // lives in `fmt_hook_run`, tested separately; the script only delegates to it.
+        assert!(!b.contains("--all"), "no workspace-wide fmt check in the installed script");
+        assert!(b.contains("fleet fmt-hook-run"), "delegates the real logic to the testable Rust subcommand");
+        assert!(b.trim_end().ends_with("exit 0"), "FAIL-OPEN: the hook never blocks a commit regardless of fleet's exit code");
         // Syntax-check with `bash -n` (a broken hook would fail every commit in the shared mirror); skip if absent.
         let dir = std::env::temp_dir().join(format!("fleet-fmthook-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -6557,6 +6717,51 @@ mod tests {
         if let Ok(o) = std::process::Command::new("bash").arg("-n").arg(&f).output() {
             assert!(o.status.success(), "hook bash syntax error:\n{}", String::from_utf8_lossy(&o.stderr));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owning_manifest_finds_the_nearest_package_manifest_above_a_staged_file() {
+        let repo_root = Path::new("/repo");
+        // crates/fleet/src/main.rs owned by crates/fleet/Cargo.toml, not the workspace root.
+        let is_package = |p: &Path| p == Path::new("/repo/crates/fleet/Cargo.toml");
+        let found = owning_manifest(repo_root, Path::new("/repo/crates/fleet/src"), is_package);
+        assert_eq!(found, PathBuf::from("/repo/crates/fleet/Cargo.toml"));
+    }
+
+    #[test]
+    fn owning_manifest_falls_back_to_the_repo_root_when_no_crate_manifest_is_found() {
+        let repo_root = Path::new("/repo");
+        let found = owning_manifest(repo_root, Path::new("/repo/loose/dir"), |_| false);
+        assert_eq!(found, PathBuf::from("/repo/Cargo.toml"));
+    }
+
+    #[test]
+    fn owning_manifest_never_walks_above_repo_root() {
+        // A pathological file_dir outside repo_root must not escape upward past it looking for a manifest.
+        let repo_root = Path::new("/repo");
+        let found = owning_manifest(repo_root, Path::new("/repo"), |p| {
+            p == Path::new("/Cargo.toml")
+        });
+        assert_eq!(
+            found,
+            PathBuf::from("/repo/Cargo.toml"),
+            "stops at repo_root, never checks above it"
+        );
+    }
+
+    #[test]
+    fn is_cargo_package_manifest_distinguishes_crate_from_workspace_root() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-fmthook-manifest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let crate_manifest = dir.join("crate-Cargo.toml");
+        let workspace_manifest = dir.join("workspace-Cargo.toml");
+        std::fs::write(&crate_manifest, "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(&workspace_manifest, "[workspace]\nmembers = []\n").unwrap();
+        assert!(is_cargo_package_manifest(&crate_manifest));
+        assert!(!is_cargo_package_manifest(&workspace_manifest));
+        assert!(!is_cargo_package_manifest(&dir.join("missing-Cargo.toml")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
