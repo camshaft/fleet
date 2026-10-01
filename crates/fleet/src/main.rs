@@ -3624,14 +3624,17 @@ fn build_observer_kickoff(
             "You are working OBSERVATION TASK #{n} in board project #28 (fleet-self-improve). File each \
              above-floor, evidence-cited, deduped finding as a CHILD proposal task of it (create_task with \
              parent_id={n}, created_by=\"observer\") so the lane reads as a tree (#{n} → its proposals). Dedup \
-             against the OPEN proposal children of #{n} and other OPEN `observer` proposals in #28. When you \
-             have filed every proposal (or an explicit no-op finding), CLOSE the observation: update_task {n} \
+             across ALL statuses — todo+in_progress+blocked+done+cancelled, NOT open-only — against the \
+             proposal children of #{n}, other `observer` proposals in #28, AND `kb_search`; a match on a DONE \
+             task means the fix already LANDED, so record a no-op/corroboration instead of re-filing it. When \
+             you have filed every proposal (or an explicit no-op finding), CLOSE the observation: update_task {n} \
              with status=\"done\", actor=\"observer\" — the closed task IS the signal the observation ran."
         ),
         None =>
             "File only above-floor, evidence-cited, deduped proposals into board project #28 \
-             (fleet-self-improve) per that project's template; dedup against OPEN proposals by author \
-             `observer` in #28."
+             (fleet-self-improve) per that project's template; dedup across ALL statuses — \
+             todo+in_progress+blocked+done+cancelled, NOT open-only — against `observer` proposals in #28 \
+             plus `kb_search`; a match on a DONE task means the fix already LANDED, so record a no-op, do not re-file."
                 .to_string(),
     };
     format!(

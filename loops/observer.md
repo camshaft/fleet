@@ -54,11 +54,16 @@ finding into one of the four `fleet-self-improve` categories (board project **#2
    standing directive, known fact, trap, and any PRIOR proposal on the same theme. Grounding every
    observation in what is already recorded is what keeps them true and non-duplicative.
 3. **Dedup BEFORE you file** (project #28, `fleet-self-improve`). Search the lane by category + keywords
-   (`list_tasks` with `q=…` on project 28) AND `kb_search` for prior knowledge, INCLUDING declined/cancelled
-   tasks:
+   (`list_tasks` with `q=…` on project 28) AND `kb_search` for prior knowledge, across **ALL statuses** —
+   todo + in_progress + blocked + done + cancelled, **NOT open-only**. An already-landed fix lives in a
+   DONE task, so an open-only sweep does not see it and re-files it as new:
    - **Match on an OPEN proposal** → do NOT open a duplicate. Add a **corroborating comment** to the
      canonical task (`seen again: <agent> <session>:<offset> (N× now)`) with the fresh evidence and bump
      `metadata.corroboration_count`. Recurrence raises PRIORITY, not ticket count.
+   - **Match on a DONE task (the fix already LANDED)** → do NOT re-file. The finding is already fixed, so
+     record it as a no-op (optionally a corroborating comment confirming the fix held). Re-filing over a
+     done task wastes an Opus proposal + a report + a triage cancel cycle and re-opens settled work — this
+     is the exact gap task_692 fixed, so check it every time.
    - **Match on a DECLINED / cancelled task (sticky-decline)** → do NOT re-file WITHOUT NEW EVIDENCE. A
      sticky-declined finding with nothing new is a no-op (record it in your report, don't re-open the debate).
    - **No match** → it's a candidate new proposal (subject to the FLOOR + CAP below).
