@@ -30,6 +30,21 @@ use crate::{chunk, config, crate_docs, curate, embed, extract};
 pub const RUSTDOC_JSON: &str = "rustdoc-json";
 pub const PDF: &str = "pdf";
 pub const TEXT: &str = "text";
+/// Source/id namespace for an internal crate's rustdoc docs (doc_101/task_828): rustdoc-json that did NOT
+/// come from docs.rs, so it must not be tagged or cited as a docs.rs page.
+const INTERNAL_CRATE: &str = "internal-crate";
+
+/// An explicit `content_type` carried in ticket metadata, honored for `file`/`url` ingests so an externally
+/// produced artifact (e.g. a rustdoc-json blob built outside the fleet — doc_101/task_828) reaches the
+/// matching parse path without the uploader sniffing it. Only a known content type is accepted; anything else
+/// (or its absence) returns `None`, so the caller falls back to sniffing. The docs.rs branch sets its own
+/// content type and is unaffected.
+fn content_type_override(meta: &Map<String, Value>) -> Option<String> {
+    match truthy_str(meta, "content_type") {
+        Some(ct) if ct == RUSTDOC_JSON || ct == PDF || ct == TEXT => Some(ct.to_string()),
+        _ => None,
+    }
+}
 
 /// The two stage-agent roles (also the board agent ids) — the Python `UPLOADER`/`EMBEDDER`.
 pub const UPLOADER: &str = "uploader";
@@ -210,21 +225,49 @@ fn items_from_rustdoc(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item
         .or_else(|| truthy_str(meta, "version"))
         .unwrap_or("latest")
         .to_string();
-    let url = crate_docs::docs_url(&crate_name, &ver);
+    // docs.rs is the default so an existing docs.rs ingest keeps byte-identical ids/url/source (the live
+    // parity guardrail). An internal crate (doc_101/task_828) reaches this path via a content-type override on
+    // a file/url ingest (source_type != "docs.rs"): it has no docs.rs page, so the citation is a
+    // producer-supplied `citation_url` or omitted, the source is tagged internal-crate, and its point ids live
+    // in a distinct namespace rather than the docs.rs one.
+    let is_docs_rs = str_or(meta, "source_type", "docs.rs") == "docs.rs";
+    let (source, url) = if is_docs_rs {
+        (
+            crate_docs::SOURCE,
+            Some(crate_docs::docs_url(&crate_name, &ver)),
+        )
+    } else {
+        (
+            INTERNAL_CRATE,
+            truthy_str(meta, "citation_url").map(String::from),
+        )
+    };
     let out = crate_docs::parse_items(&doc)
         .into_iter()
         .map(|item| {
             let mut extra = Map::new();
             extra.insert("kind".into(), Value::from(crate_docs::KIND));
-            extra.insert("source".into(), Value::from(crate_docs::SOURCE));
+            extra.insert("source".into(), Value::from(source));
             extra.insert("path".into(), Value::from(item.path.clone()));
             extra.insert("title".into(), Value::from(item.path.clone()));
-            extra.insert("url".into(), Value::from(url.clone()));
+            if let Some(u) = &url {
+                extra.insert("url".into(), Value::from(u.clone()));
+            }
             extra.insert("crate".into(), Value::from(crate_name.clone()));
             extra.insert("crate_version".into(), Value::from(ver.clone()));
+            let id_override_parts = if is_docs_rs {
+                crate_docs::item_id_parts(&crate_name, &ver, &item.path)
+            } else {
+                vec![
+                    INTERNAL_CRATE.to_string(),
+                    crate_name.clone(),
+                    ver.clone(),
+                    item.path.clone(),
+                ]
+            };
             Item {
                 body: crate_docs::item_body(&item),
-                id_override_parts: Some(crate_docs::item_id_parts(&crate_name, &ver, &item.path)),
+                id_override_parts: Some(id_override_parts),
                 key: item.path,
                 extra,
             }
@@ -323,10 +366,11 @@ async fn fetch_source(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(src);
-            let ct = content_type_for(name, "", &data);
+            let ct = content_type_override(meta)
+                .unwrap_or_else(|| content_type_for(name, "", &data).to_string());
             let mut extra = Map::new();
             extra.insert("filename".into(), Value::from(name));
-            Ok((data, ct.to_string(), extra))
+            Ok((data, ct, extra))
         }
         "url" => {
             let u = truthy_str(meta, "raw_url").unwrap_or(src);
@@ -347,11 +391,12 @@ async fn fetch_source(
                 .bytes()
                 .await
                 .map_err(|e| format!("pipeline: read {u}: {e}"))?;
-            let ct = content_type_for(u, &header, &bytes);
+            let ct = content_type_override(meta)
+                .unwrap_or_else(|| content_type_for(u, &header, &bytes).to_string());
             let mut extra = Map::new();
             extra.insert("url".into(), Value::from(u));
             extra.insert("filename".into(), Value::from(url_filename(u)));
-            Ok((bytes.to_vec(), ct.to_string(), extra))
+            Ok((bytes.to_vec(), ct, extra))
         }
         other => Err(format!("pipeline: unknown source_type {other:?}")),
     }
@@ -839,6 +884,70 @@ mod tests {
         }"#;
         let items = items_from(RUSTDOC_JSON, data, &m).unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn content_type_override_honors_known_types_else_none() {
+        // An explicit, known content_type on a file/url ingest is honored (so an externally produced
+        // rustdoc-json artifact reaches the rustdoc parse path — task_828).
+        assert_eq!(
+            content_type_override(&meta(json!({ "content_type": "rustdoc-json" }))),
+            Some(RUSTDOC_JSON.to_string())
+        );
+        assert_eq!(
+            content_type_override(&meta(json!({ "content_type": "pdf" }))),
+            Some(PDF.to_string())
+        );
+        assert_eq!(
+            content_type_override(&meta(json!({ "content_type": "text" }))),
+            Some(TEXT.to_string())
+        );
+        // Unknown or absent -> None, so the uploader falls back to sniffing.
+        assert_eq!(
+            content_type_override(&meta(json!({ "content_type": "bogus" }))),
+            None
+        );
+        assert_eq!(content_type_override(&meta(json!({}))), None);
+    }
+
+    #[test]
+    fn items_from_rustdoc_internal_crate_is_not_cited_as_docsrs() {
+        // Same rustdoc JSON, but reached via a non-docs.rs source (an externally produced artifact, task_828):
+        // no docs.rs url, source tagged internal-crate, and a point id in the internal-crate namespace. The
+        // docs.rs path (default) stays byte-identical — see items_from_rustdoc_yields_... above.
+        let data = br#"{
+            "crate_version": "0.3.0",
+            "index": { "10": { "docs": "An internal widget.", "name": "Widget" } },
+            "paths": { "10": { "path": ["membrain_core", "Widget"], "kind": "struct" } }
+        }"#;
+        let m = meta(json!({ "source_type": "file", "crate": "membrain_core" }));
+        let items = items_from(RUSTDOC_JSON, data, &m).unwrap();
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.extra["source"], "internal-crate");
+        assert_eq!(it.extra["crate"], "membrain_core");
+        assert_eq!(it.extra["crate_version"], "0.3.0");
+        assert!(!it.extra.contains_key("url")); // no docs.rs citation, and none supplied
+        assert_eq!(
+            it.id_override_parts,
+            Some(vec![
+                "internal-crate".to_string(),
+                "membrain_core".to_string(),
+                "0.3.0".to_string(),
+                "membrain_core::Widget".to_string(),
+            ])
+        );
+        // A producer-supplied internal citation_url is honored when present.
+        let m2 = meta(json!({
+            "source_type": "file",
+            "crate": "membrain_core",
+            "citation_url": "https://internal.example/membrain_core"
+        }));
+        let items2 = items_from(RUSTDOC_JSON, data, &m2).unwrap();
+        assert_eq!(
+            items2[0].extra["url"],
+            "https://internal.example/membrain_core"
+        );
     }
 
     #[test]
