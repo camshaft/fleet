@@ -5213,12 +5213,30 @@ fn nudge_round_count(task: &serde_json::Value, now: time::OffsetDateTime) -> usi
         .count()
 }
 
-/// task_627: whether a stale task's next nudge should ESCALATE to the router (the operator-accountable
-/// backstop) instead of nudging the silent owner again — true once at least `escalate_after` prior nudge
-/// rounds have gone unanswered. `escalate_after == 0` would escalate immediately; the use site defaults it to a
-/// sane round count so the owner gets a fair chance first. Pure — unit-tested.
-fn should_escalate(unanswered_rounds: usize, escalate_after: usize) -> bool {
-    unanswered_rounds >= escalate_after
+/// task_627: the three tiers a stale-task nudge can take, chosen by the 1-based nudge `round`. The ladder keeps
+/// the operator out of the loop while chasing the owner, then pulls the router (board-pm) in as the owner stays
+/// silent (board-pm seq-9931).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NudgeTier {
+    /// Round 1: ping the owner only.
+    Owner,
+    /// The owner has gone silent: tag the router to make the call — chase an ETA, reassign, block, or close.
+    PmTag,
+    /// Escalate: tag the router to REASSIGN to a fresh agent / mint a helper.
+    Reassign,
+}
+
+/// task_627: which [`NudgeTier`] a nudge at 1-based `round` falls into, given the config-tunable round
+/// thresholds (defaults 2 and 3). `reassign_round` wins when both thresholds are met, so the ladder is
+/// owner (round 1) → pm-tag (round `pm_tag_round`) → reassign (round `reassign_round`). Pure — unit-tested.
+fn nudge_tier(round: usize, pm_tag_round: usize, reassign_round: usize) -> NudgeTier {
+    if round >= reassign_round {
+        NudgeTier::Reassign
+    } else if round >= pm_tag_round {
+        NudgeTier::PmTag
+    } else {
+        NudgeTier::Owner
+    }
 }
 
 /// task_540: the age in seconds of the task ASSIGNEE's most-recent comment (an ack/ETA), or `None` if the
@@ -5301,18 +5319,32 @@ fn nudge_body(threshold_hours: f64, assignee: &str, idle_secs: i64) -> String {
     )
 }
 
-/// task_627: the body posted when a stale task has gone unanswered for enough nudge rounds that the daemon
-/// ESCALATES to the `router` (the operator-accountable backstop) instead of nudging the silent owner again. It
-/// names the router and spells out the call to make — reassign to a fresh agent, chase an ETA, mark it
-/// explicitly blocked, or close it — so the escalation forces a decision rather than another ignored ping. The
-/// owner is still named so the trail shows who went silent. Pure — unit-tested.
-fn escalation_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswered_rounds: usize, router: &str) -> String {
+/// task_627 (PM-TAG tier, round 2+): the body when the owner has gone silent for a round and the daemon pulls
+/// the `router` (the operator-accountable backstop) in to make the call — chase an ETA, reassign, mark it
+/// blocked, or close it — while still giving the owner the chance to respond. Names the owner so the trail
+/// shows who went silent. Pure — unit-tested.
+fn pm_tag_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswered_rounds: usize, router: &str) -> String {
     format!(
         "fleet escalation: this task is still idle (over {threshold_hours}h, idle {}) after {unanswered_rounds} \
-         unanswered nudge(s) to {assignee}. {router}, please make the call: reassign it to an available agent \
-         (mint a helper if needed), chase an ETA, mark it explicitly blocked with a blocked_on note, or close \
-         it. The owner has not responded across {unanswered_rounds} round(s), so this is now an accountability \
-         decision, not another owner ping.",
+         unanswered nudge(s) to {assignee}. {router}, please make the call: chase an ETA, reassign it to an \
+         available agent, mark it explicitly blocked with a blocked_on note, or close it. The owner has not \
+         responded across {unanswered_rounds} round(s), so this is now an accountability decision, not another \
+         owner ping.",
+        format_hm(idle_secs)
+    )
+}
+
+/// task_627 (REASSIGN tier, round 3+ = N): the body when the owner has stayed silent long enough that the
+/// daemon escalates to a REASSIGN — it tags the `router` to hand the task to a fresh agent (mint a helper if
+/// needed) rather than keep waiting on an owner who is not picking it up. The router still makes the call (no
+/// blind auto-reassign). Pure — unit-tested.
+fn escalation_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswered_rounds: usize, router: &str) -> String {
+    format!(
+        "fleet escalation (REASSIGN): this task is still idle (over {threshold_hours}h, idle {}) after \
+         {unanswered_rounds} unanswered nudge(s) to {assignee}, who is not picking it up. {router}, please \
+         REASSIGN it to an available agent (mint a helper if needed); if a reassign is wrong, mark it blocked \
+         with a blocked_on note or close it. The owner has had {unanswered_rounds} round(s) and gone silent, so \
+         it needs a fresh owner, not another ping.",
         format_hm(idle_secs)
     )
 }
@@ -5405,10 +5437,11 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     // nudged/routed (#478 exclusion). The operator id is a deployment-specific value read from config; absent →
     // NO exemption (the generic case: a fleet with no designated operator). The fleet code holds no operator id.
     let operator_id = config::get().operator_id.as_deref();
-    // task_627: after this many UNANSWERED nudge rounds, the next nudge escalates to the router instead of
-    // pinging the silent owner again. Config-tunable (generic-boundary); default 3 so the owner gets a fair
-    // chance first.
-    let escalate_after = config::get().nudge_escalate_rounds.unwrap_or(3);
+    // task_627: the 1-based nudge rounds at which the ladder pulls in the router. Config-tunable
+    // (generic-boundary); defaults keep round 1 the owner's alone, tag board-pm from round 2, and escalate to a
+    // reassign at round 3 (= N).
+    let pm_tag_round = config::get().nudge_pm_tag_round.unwrap_or(2);
+    let reassign_round = config::get().nudge_reassign_round.unwrap_or(3);
     let mut nudged = 0usize;
     let mut routed = 0usize;
     // task_609: count posts that were ATTEMPTED but FAILED (apply mode only). A run that tried to post N
@@ -5552,24 +5585,23 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
             }
             None => {
                 let owner = assignee.expect("Some (a live non-router owner) when not routing");
-                // task_627: count prior unanswered nudge rounds; after `escalate_after` of them, this nudge
-                // ESCALATES to the router (board-pm) for a reassign/ETA/block/close call instead of pinging the
-                // silent owner again. `round` is this nudge's 1-based round number for the report line.
+                // task_627: the nudge ladder by round. Round 1 pings the owner; from pm_tag_round the nudge
+                // also tags the router (board-pm) to make the call; from reassign_round it escalates to a
+                // reassign. `round` is this nudge's 1-based round number (prior unanswered rounds + 1).
                 let unanswered = nudge_round_count(&full, now);
-                let escalate = should_escalate(unanswered, escalate_after);
                 let round = unanswered + 1;
-                let kind = if escalate {
-                    "ESCALATION"
-                } else if last_nudge_secs.is_some() {
-                    "re-nudge"
-                } else {
-                    "first nudge"
+                let tier = nudge_tier(round, pm_tag_round, reassign_round);
+                let kind = match tier {
+                    NudgeTier::Owner if last_nudge_secs.is_some() => "re-nudge",
+                    NudgeTier::Owner => "first nudge",
+                    NudgeTier::PmTag => "PM-TAG",
+                    NudgeTier::Reassign => "ESCALATION/reassign",
                 };
                 if apply {
-                    let body = if escalate {
-                        escalation_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER)
-                    } else {
-                        nudge_body(threshold_hours, owner, idle_secs)
+                    let body = match tier {
+                        NudgeTier::Owner => nudge_body(threshold_hours, owner, idle_secs),
+                        NudgeTier::PmTag => pm_tag_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER),
+                        NudgeTier::Reassign => escalation_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER),
                     };
                     match board.comment_task(id, NUDGE_AUTHOR, &body) {
                         Ok(()) => {
@@ -8136,23 +8168,32 @@ mod tests {
     }
 
     #[test]
-    fn should_escalate_fires_at_or_past_the_threshold() {
-        // Threshold of 3 unanswered rounds: 0/1/2 → nudge the owner; 3+ → escalate.
-        assert!(!should_escalate(0, 3));
-        assert!(!should_escalate(2, 3));
-        assert!(should_escalate(3, 3));
-        assert!(should_escalate(5, 3));
-        // Tunable: a threshold of 1 escalates on the first unanswered round.
-        assert!(should_escalate(1, 1));
-        assert!(!should_escalate(0, 1));
+    fn nudge_tier_climbs_owner_then_pm_tag_then_reassign() {
+        use NudgeTier::{Owner, PmTag, Reassign};
+        // Defaults: pm-tag at round 2, reassign at round 3.
+        assert_eq!(nudge_tier(1, 2, 3), Owner, "round 1 is the owner's alone");
+        assert_eq!(nudge_tier(2, 2, 3), PmTag, "round 2 tags the router to make the call");
+        assert_eq!(nudge_tier(3, 2, 3), Reassign, "round 3 escalates to a reassign");
+        assert_eq!(nudge_tier(9, 2, 3), Reassign, "stays escalated past N");
+        // reassign takes precedence when both thresholds are met.
+        assert_eq!(nudge_tier(5, 2, 2), Reassign);
+        // Tunable: push the thresholds out and round 2 is still the owner's.
+        assert_eq!(nudge_tier(2, 3, 4), Owner);
     }
 
     #[test]
-    fn escalation_body_names_the_router_and_the_call_to_make() {
+    fn pm_tag_body_tags_the_router_with_the_full_set_of_options() {
+        let b = pm_tag_body(1.0, "v-x", 7200, 1, "board-pm");
+        assert!(b.contains("board-pm") && b.contains("make the call"), "tags the router to decide");
+        assert!(b.contains("v-x") && b.contains("reassign") && b.contains("close"), "names the owner + the options");
+    }
+
+    #[test]
+    fn escalation_body_tags_the_router_to_reassign() {
         let b = escalation_body(1.0, "v-x", 7200, 3, "board-pm");
-        assert!(b.contains("escalation") && b.contains("board-pm"), "names the escalation + the router");
+        assert!(b.contains("REASSIGN") && b.contains("board-pm"), "escalation tags the router to reassign");
         assert!(b.contains("v-x") && b.contains('3'), "names the silent owner + the unanswered round count");
-        assert!(b.contains("reassign") && b.contains("close"), "spells out the accountability call to make");
+        assert!(b.contains("mint a helper"), "offers minting a fresh owner");
     }
 
     #[test]

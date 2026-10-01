@@ -45,11 +45,15 @@ pub struct Config {
     /// operator exemption (the generic case: a fleet with no designated operator). The operator id is a
     /// deployment-specific value, so it is named here, never hard-coded in the fleet code.
     pub operator_id: Option<String>,
-    /// task_627: how many UNANSWERED nudge rounds a stale task gets before its next nudge becomes an
-    /// ESCALATION that flags the router (the operator-accountable backstop) to make a call — reassign, chase an
-    /// ETA, mark it explicitly blocked, or close it — instead of nudging the silent owner again. Absent → the
-    /// built-in default at the nudge-stale use site. Config-tunable so the threshold is never hard-coded.
-    pub nudge_escalate_rounds: Option<usize>,
+    /// task_627: the 1-based nudge ROUND at which a stale task's nudge starts also tagging the router (the
+    /// operator-accountable backstop) to make a call — chase an ETA, reassign, mark it blocked, or close it —
+    /// rather than only pinging the owner. Round 1 is the owner's alone; this defaults to round 2 (the first
+    /// unanswered round) at the use site. Config-tunable so the threshold is never hard-coded.
+    pub nudge_pm_tag_round: Option<usize>,
+    /// task_627: the 1-based nudge ROUND at which a stale task ESCALATES — the nudge tags the router to
+    /// REASSIGN it to a fresh agent (mint a helper if needed) rather than wait on the silent owner. Defaults to
+    /// round 3 at the use site (= N). Takes precedence over the pm-tag round when both apply. Config-tunable.
+    pub nudge_reassign_round: Option<usize>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -116,11 +120,13 @@ mod tests {
             host = "green-machine"
             tunnel_health_url = "http://127.0.0.1:8898/"
             operator_id = "operator"
-            nudge_escalate_rounds = 3
+            nudge_pm_tag_round = 2
+            nudge_reassign_round = 3
             "#,
         );
         assert_eq!(cfg.operator_id.as_deref(), Some("operator"));
-        assert_eq!(cfg.nudge_escalate_rounds, Some(3));
+        assert_eq!(cfg.nudge_pm_tag_round, Some(2));
+        assert_eq!(cfg.nudge_reassign_round, Some(3));
         assert_eq!(cfg.tunnel_health_url.as_deref(), Some("http://127.0.0.1:8898/"));
         assert_eq!(cfg.host.as_deref(), Some("green-machine"));
         assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
