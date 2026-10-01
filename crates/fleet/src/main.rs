@@ -6914,6 +6914,26 @@ fn run_redeploy(apply: bool) -> Result<String, String> {
     let Some(root) = checkout_root() else {
         return Err("no source checkout (a deployed/hermetic binary tracks its flake input, not git) — nothing to redeploy".to_string());
     };
+    // On a NIX-MANAGED host the daemon units' ExecStart points into /nix/store (a pinned nix generation), so a
+    // `cargo build --release` + restart would restart them onto the SAME store binary and silently no-op — an
+    // ineffective redeploy that still LOOKS successful (the silent-success footgun). Refuse up front and direct
+    // to the canonical nix path, rather than fetch/rebuild and misreport a deploy that changed nothing.
+    let planned_services: Vec<String> = config::get()
+        .redeploy_services
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REDEPLOY_SERVICES.iter().map(|s| s.to_string()).collect());
+    let nix_units: Vec<String> = planned_services
+        .iter()
+        .filter(|s| unit_is_nix_managed(s) == Some(true))
+        .cloned()
+        .collect();
+    if !nix_units.is_empty() {
+        return Err(format!(
+            "nix-managed host — {} daemon unit(s) run a /nix/store binary ({}); `fleet redeploy`'s cargo rebuild would not take effect (the units keep their pinned nix generation). Use the canonical nix path: `nix run .#deploy-fleet-binary`.",
+            nix_units.len(),
+            nix_units.join(", ")
+        ));
+    }
     // Refresh the remote ref so the comparison is against the current origin/main.
     if git_capture(&root, &["fetch", "--quiet", "origin", "main"]).is_none() {
         // fetch prints nothing on success, so None here can be a clean fetch OR a failure; probe the ref next.
@@ -6973,10 +6993,8 @@ fn run_redeploy(apply: bool) -> Result<String, String> {
             }
         }
     }
-    let services: Vec<String> = config::get()
-        .redeploy_services
-        .clone()
-        .unwrap_or_else(|| DEFAULT_REDEPLOY_SERVICES.iter().map(|s| s.to_string()).collect());
+    // Reuse the set resolved up front for the nix-managed guard (same source of truth).
+    let services = planned_services;
     println!("  restarting {} daemon service(s)…", services.len());
     for svc in &services {
         let st = std::process::Command::new("systemctl")
@@ -6990,6 +7008,34 @@ fn run_redeploy(apply: bool) -> Result<String, String> {
         }
     }
     Ok(format!("now at {remote_sha}, binary rebuilt, daemons restarted."))
+}
+
+/// Whether a systemd unit's `ExecStart` runs a binary out of the nix store — the signal that the unit is
+/// NIX-MANAGED (its binary path is pinned by a nix generation). `systemctl show -p ExecStart` renders the
+/// resolved exec as `ExecStart={ path=/nix/store/…/bin/fleet ; argv[]=… }`, so a `/nix/store/` substring is the
+/// tell. Pure over the `systemctl show` output — unit-tested.
+fn execstart_is_nix_store(show_output: &str) -> bool {
+    show_output.contains("/nix/store/")
+}
+
+/// Query `systemctl --user show <unit> -p ExecStart` and report whether its ExecStart binary lives in the nix
+/// store (nix-managed). `None` when the unit is absent / empty ExecStart / systemctl can't be queried — that is
+/// "unknown", NOT a nix signal, so the caller treats only an explicit `Some(true)` as nix-managed and never
+/// refuses a redeploy on a host it simply couldn't probe. Best-effort.
+fn unit_is_nix_managed(unit: &str) -> Option<bool> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "show", unit, "-p", "ExecStart"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    // An absent/empty ExecStart (`ExecStart=`) means the unit is not installed here — unknown, not nix.
+    if s.trim().is_empty() || s.trim() == "ExecStart=" {
+        return None;
+    }
+    Some(execstart_is_nix_store(&s))
 }
 
 #[cfg(test)]
@@ -8161,6 +8207,22 @@ detached
         assert_eq!(paths, vec![PathBuf::from("/home/u/repo")]);
         // Empty / no worktree lines → empty.
         assert!(parse_worktree_paths("").is_empty());
+    }
+
+    #[test]
+    fn execstart_is_nix_store_detects_a_nix_managed_unit() {
+        // systemctl show renders the resolved exec; a /nix/store path = nix-managed (the dev-desk after task_717).
+        assert!(execstart_is_nix_store(
+            "ExecStart={ path=/nix/store/abc123-fleet-0.0.0/bin/fleet ; argv[]=/nix/store/abc123-fleet-0.0.0/bin/fleet watchdog ; ignore_errors=no }"
+        ));
+        // A local-checkout unit points at the cargo target/release (or a staged run path) binary — NOT nix.
+        assert!(!execstart_is_nix_store(
+            "ExecStart={ path=/home/u/Projects/camshaft/fleet/target/release/fleet ; argv[]=... }"
+        ));
+        assert!(!execstart_is_nix_store("ExecStart={ path=/run/fleet/bin/fleet ; argv[]=... }"));
+        // Empty / absent ExecStart carries no nix signal.
+        assert!(!execstart_is_nix_store("ExecStart="));
+        assert!(!execstart_is_nix_store(""));
     }
 
     #[test]
