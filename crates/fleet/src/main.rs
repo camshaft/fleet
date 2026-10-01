@@ -5280,6 +5280,11 @@ const ACCOUNTABILITY_CHANNEL: &str = "fleet-accountability";
 /// the anti-parking revert to the normal cadence on a stale ack is in [`stale_task_should_nudge`].
 const ACKED_NUDGE_COOLDOWN_HOURS: f64 = 4.0;
 
+/// task_627 (task_499 responsive-owner backoff): the max doubling steps the acked re-nudge cooldown backs off
+/// by as a responsive owner keeps acking — base, 2x, 4x, 8x (e.g. 4h, 8h, 16h, 32h). Capped so a consistently
+/// deliberately-sequenced owner goes quiet (pinged ~daily, not hourly) without ever going fully silent.
+const MAX_ACKED_BACKOFF_STEPS: u32 = 3;
+
 /// Whether a task idle for `idle_secs` should be nudged now, given `last_nudge_secs` (the age of this
 /// daemon's own most recent nudge comment on it, if any). Pure — unit-tested. First nudge fires once idle
 /// reaches `threshold_secs`; a re-nudge additionally needs the PRIOR nudge to be at least the cooldown old,
@@ -5309,6 +5314,42 @@ fn stale_task_should_nudge(
             let cooldown = if assignee_ack_fresher { acked_cooldown_secs } else { cooldown_secs };
             since_last_nudge >= cooldown
         }
+    }
+}
+
+/// task_627 (task_499): the number of this daemon's own nudge comments on the task — the backoff step for the
+/// acked re-nudge cooldown. The more times a responsive owner has already acked a nudge on a still-sequenced
+/// task, the longer the next quiet window. Pure — unit-tested.
+fn nudge_comment_count(task: &serde_json::Value) -> usize {
+    task.get("comments")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|c| c.get("author").and_then(serde_json::Value::as_str) == Some(NUDGE_AUTHOR))
+        .count()
+}
+
+/// task_627 (task_499 responsive-owner backoff): widen the acked re-nudge cooldown progressively — each prior
+/// nudge doubles the quiet window (base, 2x, 4x, 8x), capped at [`MAX_ACKED_BACKOFF_STEPS`]. So a responsive,
+/// deliberately-sequenced owner that keeps acking is re-pinged ever less often (e.g. 4h -> 8h -> 16h -> 32h)
+/// rather than hourly, without going fully silent. `prior_nudges` 0 or 1 -> the base cooldown (no backoff yet).
+/// Only consulted on the acked-cooldown branch of [`stale_task_should_nudge`] (a responsive owner); a silent
+/// owner reverts to the normal cadence and the escalation ladder proceeds. Pure — unit-tested.
+fn acked_cooldown_with_backoff(base_acked_cooldown_secs: i64, prior_nudges: usize) -> i64 {
+    let steps = (prior_nudges.saturating_sub(1) as u32).min(MAX_ACKED_BACKOFF_STEPS);
+    base_acked_cooldown_secs.saturating_mul(1i64 << steps)
+}
+
+/// task_627 (task_499): cap the ladder at the Owner tier for a RESPONSIVE owner — one who has commented since
+/// our last nudge (`ack_fresher`). A responsive owner is engaged, not neglectful, so the ladder never climbs
+/// to a router PM-tag or reassign on them (board-pm's hard requirement). This is normally already true (a fresh
+/// owner comment resets [`nudge_round_count`] to 0 -> round 1 -> Owner), but the explicit cap guarantees the
+/// invariant regardless of how the round count is derived. Pure — unit-tested.
+fn responsive_capped_tier(base: NudgeTier, ack_fresher: bool) -> NudgeTier {
+    if ack_fresher {
+        NudgeTier::Owner
+    } else {
+        base
     }
 }
 
@@ -5753,13 +5794,19 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         // (the anti-parking guard, in stale_task_should_nudge).
         let ack_age_secs = assignee.and_then(|a| newest_assignee_comment_age_secs(&full, a, now));
         let ack_fresher = assignee_ack_fresher_than_last_nudge(ack_age_secs, last_nudge_secs);
+        // task_627 (task_499 responsive-owner backoff): when the owner keeps ACKing (ack_fresher) but the task
+        // stays deliberately sequenced, each prior nudge widens the acked cooldown (4h -> 8h -> 16h -> 32h cap),
+        // so a consistently-responsive owner is pinged progressively less often instead of hourly — without
+        // going fully silent (the task stays visible, not monitor_exempt). A silent owner (ack not fresher) is
+        // unaffected: stale_task_should_nudge then uses the normal cooldown and the escalation ladder proceeds.
+        let effective_acked_cooldown = acked_cooldown_with_backoff(acked_cooldown_secs, nudge_comment_count(&full));
         if !stale_task_should_nudge(
             idle_secs,
             last_nudge_secs,
             ack_fresher,
             threshold_secs,
             cooldown_secs,
-            acked_cooldown_secs,
+            effective_acked_cooldown,
         ) {
             continue;
         }
@@ -5807,7 +5854,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                 // reassign. `round` is this nudge's 1-based round number (prior unanswered rounds + 1).
                 let unanswered = nudge_round_count(&full, now);
                 let round = unanswered + 1;
-                let tier = nudge_tier(round, pm_tag_round, reassign_round);
+                // task_627 (task_499): never escalate a RESPONSIVE owner — one who has commented since our last
+                // nudge (ack_fresher) is engaged, so the ladder is capped at the Owner tier (no router PM-tag or
+                // reassign). board-pm's hard requirement.
+                let tier = responsive_capped_tier(nudge_tier(round, pm_tag_round, reassign_round), ack_fresher);
                 let kind = match tier {
                     NudgeTier::Owner if last_nudge_secs.is_some() => "re-nudge",
                     NudgeTier::Owner => "first nudge",
@@ -8528,6 +8578,45 @@ mod tests {
         assert!(r < p, "reassigns are listed before pm-tags");
         // ASCII-only (board content rule).
         assert!(b.is_ascii(), "digest body must be ASCII");
+    }
+
+    #[test]
+    fn acked_cooldown_backs_off_by_doubling_per_prior_nudge_capped() {
+        let base = 4 * 3600; // 4h
+        // 0 or 1 prior nudge -> base (no backoff yet); then double each step, capped at 8x (32h).
+        assert_eq!(acked_cooldown_with_backoff(base, 0), base);
+        assert_eq!(acked_cooldown_with_backoff(base, 1), base);
+        assert_eq!(acked_cooldown_with_backoff(base, 2), 2 * base, "8h");
+        assert_eq!(acked_cooldown_with_backoff(base, 3), 4 * base, "16h");
+        assert_eq!(acked_cooldown_with_backoff(base, 4), 8 * base, "32h");
+        assert_eq!(acked_cooldown_with_backoff(base, 9), 8 * base, "capped at 8x, never grows unbounded");
+    }
+
+    #[test]
+    fn nudge_comment_count_counts_only_this_daemons_nudges() {
+        let t = serde_json::json!({
+            "comments": [
+                { "author": NUDGE_AUTHOR, "body": "n1" },
+                { "author": "v-x", "body": "ack" },
+                { "author": NUDGE_AUTHOR, "body": "n2" },
+                { "author": "board-pm", "body": "note" },
+                { "author": NUDGE_AUTHOR, "body": "n3" },
+            ],
+        });
+        assert_eq!(nudge_comment_count(&t), 3, "counts the 3 daemon nudges, not the owner/pm comments");
+        assert_eq!(nudge_comment_count(&serde_json::json!({})), 0, "no comments -> 0");
+    }
+
+    #[test]
+    fn responsive_owner_is_never_escalated() {
+        use NudgeTier::{Owner, PmTag, Reassign};
+        // A responsive owner (acked since the last nudge) is capped at the Owner tier regardless of round.
+        assert_eq!(responsive_capped_tier(PmTag, true), Owner, "a responsive owner is never PM-tagged");
+        assert_eq!(responsive_capped_tier(Reassign, true), Owner, "a responsive owner is never reassigned");
+        // A silent owner (ack not fresher) escalates normally.
+        assert_eq!(responsive_capped_tier(PmTag, false), PmTag);
+        assert_eq!(responsive_capped_tier(Reassign, false), Reassign);
+        assert_eq!(responsive_capped_tier(Owner, true), Owner);
     }
 
     #[test]
