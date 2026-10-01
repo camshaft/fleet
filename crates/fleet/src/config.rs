@@ -45,6 +45,11 @@ pub struct Config {
     /// operator exemption (the generic case: a fleet with no designated operator). The operator id is a
     /// deployment-specific value, so it is named here, never hard-coded in the fleet code.
     pub operator_id: Option<String>,
+    /// task_627: how many UNANSWERED nudge rounds a stale task gets before its next nudge becomes an
+    /// ESCALATION that flags the router (the operator-accountable backstop) to make a call — reassign, chase an
+    /// ETA, mark it explicitly blocked, or close it — instead of nudging the silent owner again. Absent → the
+    /// built-in default at the nudge-stale use site. Config-tunable so the threshold is never hard-coded.
+    pub nudge_escalate_rounds: Option<usize>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -111,9 +116,11 @@ mod tests {
             host = "green-machine"
             tunnel_health_url = "http://127.0.0.1:8898/"
             operator_id = "operator"
+            nudge_escalate_rounds = 3
             "#,
         );
         assert_eq!(cfg.operator_id.as_deref(), Some("operator"));
+        assert_eq!(cfg.nudge_escalate_rounds, Some(3));
         assert_eq!(cfg.tunnel_health_url.as_deref(), Some("http://127.0.0.1:8898/"));
         assert_eq!(cfg.host.as_deref(), Some("green-machine"));
         assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
