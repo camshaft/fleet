@@ -10,8 +10,11 @@
 //! #<event_seq>` for a direct message — so the agent reacts to the event instead of polling.
 
 use std::process::Command;
+use std::sync::Arc;
 
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 /// Map a board webhook event to the wake prompt to inject, or `None` to ignore the event. The wake model is
 /// SUBSCRIPTION = NOTIFICATION (operator directive, #386): if an agent is subscribed to a target it is woken
@@ -89,7 +92,10 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
     // #384: the board's per-recipient subscription hint (true = direct subscription to the target). Absent on
     // a pre-#384 payload -> `false`, which leaves every type-gated wake (assign/dm/channel) intact and simply
     // keeps a comment dropping-to-poll.
-    let subscribed = v.get("subscribed").and_then(Value::as_bool).unwrap_or(false);
+    let subscribed = v
+        .get("subscribed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // task_580: the two per-recipient hints that gate a REACTIVE agent's ambient wakes. `reactive` (board
     // metadata) marks a relay/responder; `addressed` is whether THIS event addresses it (an @mention, a reply
     // in a thread it is engaged in). We suppress only when the recipient is reactive AND the board EXPLICITLY
@@ -157,7 +163,9 @@ pub fn tmux_inject(session: &str, window: &str, text: &str) -> Result<(), String
                     .status()
                     .map_err(|e| format!("tmux send-keys -t {target}: {e}"))?;
                 if !sent.success() {
-                    return Err(format!("tmux send-keys -l to {target} failed (window absent?)"));
+                    return Err(format!(
+                        "tmux send-keys -l to {target} failed (window absent?)"
+                    ));
                 }
             }
             InjectStep::Enter => {
@@ -186,47 +194,175 @@ enum Incoming {
 
 /// Classify an incoming request by method + path (query string ignored): a `GET` to `/health`, `/healthz`, or
 /// `/` is a liveness probe; every other request is a webhook. Pure — unit-tested.
-fn classify_request(method: &tiny_http::Method, url: &str) -> Incoming {
+fn classify_request(method: &str, url: &str) -> Incoming {
     let path = url.split('?').next().unwrap_or(url);
-    if *method == tiny_http::Method::Get && matches!(path, "/health" | "/healthz" | "/") {
+    if method.eq_ignore_ascii_case("GET") && matches!(path, "/health" | "/healthz" | "/") {
         Incoming::HealthProbe
     } else {
         Incoming::Webhook
     }
 }
 
-/// Run the notifier: bind a local HTTP endpoint and, for each board webhook POST, inject the wake prompt
-/// into the recipient agent's tmux window in `session`. Blocks (a long-running daemon). Best-effort: every
-/// request is answered `200` immediately, and a payload that is unparseable or not actionable is logged and
-/// dropped (a wake is never worth wedging the endpoint the board POSTs to). A supervisor liveness-probes the
-/// daemon with a `GET` to `/health` (see [`classify_request`]), answered `200` without webhook parsing.
-pub fn serve(port: u16, session: &str) -> Result<(), String> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| format!("fleet notify: bind 127.0.0.1:{port}: {e}"))?;
-    eprintln!("fleet notify: listening on http://127.0.0.1:{port} — waking session '{session}' on board webhooks (GET /health for liveness)");
-    for mut req in server.incoming_requests() {
-        // A supervisor's liveness probe gets a clean 200 and is never read as a webhook.
-        if classify_request(req.method(), req.url()) == Incoming::HealthProbe {
-            let _ = req.respond(tiny_http::Response::from_string("ok"));
-            continue;
+/// Parse an HTTP/1.x request line (`"METHOD SP REQUEST-URI SP HTTP-VERSION"`) into `(method, path)`. `None`
+/// if the line doesn't have at least two whitespace-separated tokens (the HTTP-version token, if present, is
+/// ignored — nothing here branches on HTTP/1.0 vs 1.1). Pure — unit-tested.
+fn parse_request_line(line: &str) -> Option<(String, String)> {
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method.to_string(), path.to_string()))
+}
+
+/// Case-insensitive `Content-Length` lookup from a raw header block (one `Name: value` per line, request
+/// line already stripped). Defaults to 0 when absent or unparseable — the body is empty or the sender is
+/// malformed either way, and 0 just means "read no body" rather than hang waiting for one. Pure — unit-tested.
+fn parse_content_length(headers: &str) -> usize {
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0)
+}
+
+/// Find the `\r\n\r\n` header/body boundary in a raw byte buffer — the index of its first byte, or `None` if
+/// the buffer doesn't contain one yet (more reads are needed). Pure — unit-tested.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// A header block this large (no `\r\n\r\n` found yet) is not a real HTTP client — stop reading rather than
+/// grow the buffer without bound.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Cap a claimed `Content-Length` so a malformed/hostile value can't force an unbounded body read — every
+/// real board webhook payload (a JSON event envelope) is tiny next to this.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Read one HTTP/1.x request off `stream`: the request line, headers (kept only for `Content-Length`), and
+/// exactly that many body bytes. `Content-Length` only — every sender here (the board's webhook POST, a
+/// liveness `GET`) either sets it or has no body; chunked transfer-encoding is unsupported (the board never
+/// sends it, so supporting it would be untested dead code). `Err` on a malformed request line or a read that
+/// ends before the headers/body complete. Generic over `AsyncRead` so it is unit-testable against an in-memory
+/// `tokio::io::duplex` pair, with no real socket needed.
+async fn read_request<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<(String, String, String)> {
+    use std::io::{Error, ErrorKind};
+    let mut buf = Vec::new();
+    let header_end = loop {
+        if let Some(pos) = find_header_end(&buf) {
+            break pos;
         }
-        let mut body = String::new();
-        let _ = req.as_reader().read_to_string(&mut body);
-        let _ = req.respond(tiny_http::Response::from_string("ok")); // ack the best-effort POST first
-        match serde_json::from_str::<Value>(&body) {
-            // presence/comment/other events yield no prompt and are silently dropped
-            Ok(v) => {
-                if let Some((recipient, prompt)) = payload_to_wake(&v) {
-                    match tmux_inject(session, &recipient, &prompt) {
+        if buf.len() >= MAX_HEADER_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "fleet notify: request headers exceeded 64KiB",
+            ));
+        }
+        let mut chunk = [0u8; 4096];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "fleet notify: connection closed before headers completed",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let mut lines = head.lines();
+    let (method, path) = lines.next().and_then(parse_request_line).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "fleet notify: malformed request line",
+        )
+    })?;
+    let headers = lines.collect::<Vec<_>>().join("\n");
+    let content_length = parse_content_length(&headers).min(MAX_BODY_BYTES);
+    let mut body = buf[header_end + 4..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "fleet notify: connection closed before body completed",
+            ));
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+    Ok((method, path, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// Handle one accepted connection end to end: read the request, ack it `200` immediately (best-effort — a
+/// wake is never worth wedging the endpoint the board POSTs to), then — for a webhook, not a liveness probe
+/// — parse the body and inject the wake. `tmux_inject` shells out and sleeps (~600ms per event); running it
+/// via `spawn_blocking` keeps that off this connection's async task so it never delays accepting the board's
+/// next webhook POST or a concurrent liveness probe (the single blocking-accept-loop this replaced could not
+/// overlap those at all).
+async fn handle_connection(mut stream: TcpStream, session: Arc<str>) {
+    let (method, path, body) = match read_request(&mut stream).await {
+        Ok(parts) => parts,
+        Err(e) => {
+            eprintln!("fleet notify: dropping unreadable request: {e}");
+            return;
+        }
+    };
+    let _ = stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        .await;
+    if classify_request(&method, &path) == Incoming::HealthProbe {
+        return;
+    }
+    match serde_json::from_str::<Value>(&body) {
+        // presence/comment/other events yield no prompt and are silently dropped
+        Ok(v) => {
+            if let Some((recipient, prompt)) = payload_to_wake(&v) {
+                tokio::task::spawn_blocking(move || {
+                    match tmux_inject(&session, &recipient, &prompt) {
                         Ok(()) => eprintln!("woke {recipient}: {prompt}"),
                         Err(e) => eprintln!("inject failed for {recipient}: {e}"),
                     }
-                }
+                });
             }
-            Err(e) => eprintln!("fleet notify: dropping unparseable webhook body: {e}"),
         }
+        Err(e) => eprintln!("fleet notify: dropping unparseable webhook body: {e}"),
     }
-    Ok(())
+}
+
+/// Run the notifier: bind a local HTTP endpoint and, for each board webhook POST, inject the wake prompt
+/// into the recipient agent's tmux window in `session`. Blocks (a long-running daemon) — but each connection
+/// runs on its own tokio task ([`handle_connection`]), so a slow wake injection on one event never stalls the
+/// board's next webhook POST or a liveness probe arriving concurrently. Best-effort: every request is
+/// answered `200` immediately, and a payload that is unparseable or not actionable is logged and dropped. A
+/// supervisor liveness-probes the daemon with a `GET` to `/health` (see [`classify_request`]).
+pub fn serve(port: u16, session: &str) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("fleet notify: build tokio runtime: {e}"))?;
+    rt.block_on(serve_async(port, session))
+}
+
+async fn serve_async(port: u16, session: &str) -> Result<(), String> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| format!("fleet notify: bind 127.0.0.1:{port}: {e}"))?;
+    eprintln!(
+        "fleet notify: listening on http://127.0.0.1:{port} — waking session '{session}' on board webhooks (GET /health for liveness)"
+    );
+    let session: Arc<str> = Arc::from(session);
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("fleet notify: accept: {e}"))?;
+        tokio::spawn(handle_connection(stream, session.clone()));
+    }
 }
 
 #[cfg(test)]
@@ -237,35 +373,155 @@ mod tests {
     fn submit_steps_pastes_then_settles_and_double_enters() {
         let steps = submit_steps("[notification] message #5");
         // Paste the literal text first, so no character is read as a key binding.
-        assert_eq!(steps.first(), Some(&InjectStep::Literal("[notification] message #5")));
+        assert_eq!(
+            steps.first(),
+            Some(&InjectStep::Literal("[notification] message #5"))
+        );
         // A settle must separate the paste from the FIRST Enter — the codex composer commits the paste in that
         // window, so the submitting Enter is not dropped racing the async paste.
-        let first_enter = steps.iter().position(|s| *s == InjectStep::Enter).expect("has an Enter");
+        let first_enter = steps
+            .iter()
+            .position(|s| *s == InjectStep::Enter)
+            .expect("has an Enter");
         assert!(
             steps[..first_enter].contains(&InjectStep::Settle),
             "a settle precedes the first Enter so the paste has committed"
         );
         // Two Enters submit: the second is the belt-and-suspenders that lands a codex wake if the first raced,
         // and is a no-op at claude's (now-empty) composer — so a claude wake still fires exactly once.
-        assert_eq!(steps.iter().filter(|s| **s == InjectStep::Enter).count(), 2, "double-Enter submit");
+        assert_eq!(
+            steps.iter().filter(|s| **s == InjectStep::Enter).count(),
+            2,
+            "double-Enter submit"
+        );
         // The very last step is an Enter (the submit), never a trailing settle.
         assert_eq!(steps.last(), Some(&InjectStep::Enter));
     }
 
     #[test]
     fn classify_request_routes_get_health_paths_to_a_probe_else_webhook() {
-        use tiny_http::Method;
         // A GET to a health path (query string ignored) is a liveness probe.
-        assert_eq!(classify_request(&Method::Get, "/health"), Incoming::HealthProbe);
-        assert_eq!(classify_request(&Method::Get, "/healthz"), Incoming::HealthProbe);
-        assert_eq!(classify_request(&Method::Get, "/"), Incoming::HealthProbe);
-        assert_eq!(classify_request(&Method::Get, "/health?probe=1"), Incoming::HealthProbe);
+        assert_eq!(classify_request("GET", "/health"), Incoming::HealthProbe);
+        assert_eq!(classify_request("GET", "/healthz"), Incoming::HealthProbe);
+        assert_eq!(classify_request("GET", "/"), Incoming::HealthProbe);
+        assert_eq!(
+            classify_request("GET", "/health?probe=1"),
+            Incoming::HealthProbe
+        );
+        assert_eq!(
+            classify_request("get", "/health"),
+            Incoming::HealthProbe,
+            "method match is case-insensitive"
+        );
         // The board POSTs webhooks — never a probe, even to a health path.
-        assert_eq!(classify_request(&Method::Post, "/"), Incoming::Webhook);
-        assert_eq!(classify_request(&Method::Post, "/health"), Incoming::Webhook);
+        assert_eq!(classify_request("POST", "/"), Incoming::Webhook);
+        assert_eq!(classify_request("POST", "/health"), Incoming::Webhook);
         // A non-health GET is treated as a webhook (the default), not a probe.
-        assert_eq!(classify_request(&Method::Get, "/webhook"), Incoming::Webhook);
-        assert_eq!(classify_request(&Method::Get, "/events"), Incoming::Webhook);
+        assert_eq!(classify_request("GET", "/webhook"), Incoming::Webhook);
+        assert_eq!(classify_request("GET", "/events"), Incoming::Webhook);
+    }
+
+    #[test]
+    fn parse_request_line_splits_method_and_path_and_ignores_the_version_token() {
+        assert_eq!(
+            parse_request_line("POST /webhook HTTP/1.1"),
+            Some(("POST".into(), "/webhook".into()))
+        );
+        assert_eq!(
+            parse_request_line("GET / HTTP/1.0"),
+            Some(("GET".into(), "/".into()))
+        );
+        // The HTTP-version token is optional for parsing purposes — two tokens are enough.
+        assert_eq!(
+            parse_request_line("GET /health"),
+            Some(("GET".into(), "/health".into()))
+        );
+        assert_eq!(
+            parse_request_line(""),
+            None,
+            "an empty line has no method token"
+        );
+        assert_eq!(
+            parse_request_line("GET"),
+            None,
+            "a lone method has no path token"
+        );
+    }
+
+    #[test]
+    fn parse_content_length_is_case_insensitive_and_defaults_to_zero() {
+        assert_eq!(parse_content_length("Content-Length: 42\r\nOther: x"), 42);
+        assert_eq!(
+            parse_content_length("content-length: 7"),
+            7,
+            "header name match is case-insensitive"
+        );
+        assert_eq!(parse_content_length("CONTENT-LENGTH: 3"), 3);
+        assert_eq!(
+            parse_content_length("Other: x"),
+            0,
+            "absent header defaults to 0"
+        );
+        assert_eq!(
+            parse_content_length("Content-Length: not-a-number"),
+            0,
+            "unparseable value defaults to 0"
+        );
+        assert_eq!(parse_content_length(""), 0);
+    }
+
+    #[test]
+    fn find_header_end_locates_the_crlf_crlf_boundary() {
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some(14));
+        assert_eq!(
+            find_header_end(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Some(23)
+        );
+        assert_eq!(
+            find_header_end(b"GET / HTTP/1.1\r\nHost: x"),
+            None,
+            "no body separator read yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_a_post_with_a_body_by_content_length() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"POST /webhook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n\r\n{\"a\":true}EXTRA")
+            .await
+            .unwrap();
+        let (method, path, body) = read_request(&mut server).await.unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/webhook");
+        // Exactly Content-Length bytes — "EXTRA" (the next pipelined request, if any) is left unread.
+        assert_eq!(body, "{\"a\":true}");
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_a_get_with_no_body() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        drop(client); // close the write end so a short/absent body never hangs the read
+        let (method, path, body) = read_request(&mut server).await.unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/health");
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn read_request_errors_when_the_connection_closes_before_headers_complete() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x")
+            .await
+            .unwrap();
+        drop(client);
+        assert!(read_request(&mut server).await.is_err());
     }
 
     #[test]
@@ -273,26 +529,66 @@ mod tests {
         // Direct-delivery types wake on TYPE — the recipient can't be a passive bystander of them — so they
         // wake regardless of the `subscribed` hint (here `false`). A DM in particular has no subscribable
         // target, so it MUST stay type-gated.
-        assert_eq!(notification_prompt("task.assigned", Some(42), None, None, false, false).as_deref(), Some("[notification] task #42"));
-        assert_eq!(notification_prompt("message.direct", None, Some(438), None, false, false).as_deref(), Some("[notification] message #438"));
+        assert_eq!(
+            notification_prompt("task.assigned", Some(42), None, None, false, false).as_deref(),
+            Some("[notification] task #42")
+        );
+        assert_eq!(
+            notification_prompt("message.direct", None, Some(438), None, false, false).as_deref(),
+            Some("[notification] message #438")
+        );
         // A post to a channel the agent is a member of (delivery = membership; #171) wakes on type.
-        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(), Some("[notification] channel #7"));
-        assert_eq!(notification_prompt("channel.post", None, Some(9), None, false, false), None, "no channel_id → can't form a prompt");
+        assert_eq!(
+            notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(),
+            Some("[notification] channel #7")
+        );
+        assert_eq!(
+            notification_prompt("channel.post", None, Some(9), None, false, false),
+            None,
+            "no channel_id → can't form a prompt"
+        );
         // A comment on a target the recipient DIRECTLY subscribes to wakes (#384, subscription = notification)
         // — the collaboration case the zero-polling mandate targets.
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(), Some("[notification] comment on task #42"));
-        assert_eq!(notification_prompt("task.commented", None, Some(9), None, true, false), None, "no task_id → can't form a prompt even when subscribed");
+        assert_eq!(
+            notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(),
+            Some("[notification] comment on task #42")
+        );
+        assert_eq!(
+            notification_prompt("task.commented", None, Some(9), None, true, false),
+            None,
+            "no task_id → can't form a prompt even when subscribed"
+        );
         // NO wake (accrues for the next poll): a comment from a FIREHOSE-only recipient (no direct
         // subscription) must not loop-wake a board-wide coordinator on every ticket; a status change never
         // wakes at all.
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, false, false), None, "a firehose-only comment accrues for poll, never wakes");
-        assert_eq!(notification_prompt("task.status_changed", Some(42), Some(9), None, true, false), None, "status change never wakes, even when subscribed");
+        assert_eq!(
+            notification_prompt("task.commented", Some(42), Some(9), None, false, false),
+            None,
+            "a firehose-only comment accrues for poll, never wakes"
+        );
+        assert_eq!(
+            notification_prompt("task.status_changed", Some(42), Some(9), None, true, false),
+            None,
+            "status change never wakes, even when subscribed"
+        );
         // an assignment without a task_id, or a DM without a seq, can't form a prompt
-        assert_eq!(notification_prompt("task.assigned", None, Some(1), None, false, false), None);
-        assert_eq!(notification_prompt("message.direct", Some(1), None, None, false, false), None);
+        assert_eq!(
+            notification_prompt("task.assigned", None, Some(1), None, false, false),
+            None
+        );
+        assert_eq!(
+            notification_prompt("message.direct", Some(1), None, None, false, false),
+            None
+        );
         // presence churn and other event types are ignored
-        assert_eq!(notification_prompt("presence.updated", None, Some(3), None, true, false), None);
-        assert_eq!(notification_prompt("task.updated", Some(5), None, None, true, false), None);
+        assert_eq!(
+            notification_prompt("presence.updated", None, Some(3), None, true, false),
+            None
+        );
+        assert_eq!(
+            notification_prompt("task.updated", Some(5), None, None, true, false),
+            None
+        );
     }
 
     #[test]
@@ -301,15 +597,39 @@ mod tests {
         // member/subscriber of. The reactive_unaddressed gate suppresses exactly those two ambient-capable
         // subscription wakes — and ONLY those — when the recipient is reactive and the event does not address it.
         // channel.post: woken when not gated, SUPPRESSED when reactive_unaddressed.
-        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(), Some("[notification] channel #7"), "ungated channel.post still wakes a member");
-        assert_eq!(notification_prompt("channel.post", None, Some(9), Some(7), false, true), None, "a reactive member not addressed by the post is NOT woken (task_580)");
+        assert_eq!(
+            notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(),
+            Some("[notification] channel #7"),
+            "ungated channel.post still wakes a member"
+        );
+        assert_eq!(
+            notification_prompt("channel.post", None, Some(9), Some(7), false, true),
+            None,
+            "a reactive member not addressed by the post is NOT woken (task_580)"
+        );
         // task.commented: a direct-subscribed comment wakes, but is SUPPRESSED when reactive_unaddressed.
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(), Some("[notification] comment on task #42"), "ungated subscribed comment still wakes");
-        assert_eq!(notification_prompt("task.commented", Some(42), Some(9), None, true, true), None, "a reactive subscriber not addressed by the comment is NOT woken (task_580)");
+        assert_eq!(
+            notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(),
+            Some("[notification] comment on task #42"),
+            "ungated subscribed comment still wakes"
+        );
+        assert_eq!(
+            notification_prompt("task.commented", Some(42), Some(9), None, true, true),
+            None,
+            "a reactive subscriber not addressed by the comment is NOT woken (task_580)"
+        );
         // The gate NEVER touches the inherently-addressed direct-delivery types: an assignment or a DM to a
         // reactive agent still wakes even when reactive_unaddressed is set (those address it by definition).
-        assert_eq!(notification_prompt("task.assigned", Some(42), None, None, false, true).as_deref(), Some("[notification] task #42"), "an assignment addresses the recipient — reactive gate must not suppress it");
-        assert_eq!(notification_prompt("message.direct", None, Some(438), None, false, true).as_deref(), Some("[notification] message #438"), "a DM addresses the recipient — reactive gate must not suppress it");
+        assert_eq!(
+            notification_prompt("task.assigned", Some(42), None, None, false, true).as_deref(),
+            Some("[notification] task #42"),
+            "an assignment addresses the recipient — reactive gate must not suppress it"
+        );
+        assert_eq!(
+            notification_prompt("message.direct", None, Some(438), None, false, true).as_deref(),
+            Some("[notification] message #438"),
+            "a DM addresses the recipient — reactive gate must not suppress it"
+        );
     }
 
     #[test]
@@ -319,37 +639,88 @@ mod tests {
         // without the addressing signal never silently drops a legitimate wake; it only narrows once both land.
         let base = |extra: serde_json::Value| {
             let mut v = serde_json::json!({"recipient":"frank","type":"channel.post","channel_id":7,"event_seq":9});
-            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
             v
         };
         // reactive + explicitly not addressed -> suppressed.
-        assert_eq!(payload_to_wake(&base(serde_json::json!({"reactive":true,"addressed":false}))), None, "reactive + addressed=false suppresses the ambient wake");
+        assert_eq!(
+            payload_to_wake(&base(
+                serde_json::json!({"reactive":true,"addressed":false})
+            )),
+            None,
+            "reactive + addressed=false suppresses the ambient wake"
+        );
         // reactive but addressed -> wakes (an @mention of the reactive agent IS actionable).
-        assert_eq!(payload_to_wake(&base(serde_json::json!({"reactive":true,"addressed":true}))), Some(("frank".into(), "[notification] channel #7".into())), "a reactive agent the post addresses still wakes");
+        assert_eq!(
+            payload_to_wake(&base(serde_json::json!({"reactive":true,"addressed":true}))),
+            Some(("frank".into(), "[notification] channel #7".into())),
+            "a reactive agent the post addresses still wakes"
+        );
         // reactive but no addressing signal at all -> wakes (fail-safe: never drop a wake on a half-rolled-out board).
-        assert_eq!(payload_to_wake(&base(serde_json::json!({"reactive":true}))), Some(("frank".into(), "[notification] channel #7".into())), "reactive without an addressed hint falls back to waking");
+        assert_eq!(
+            payload_to_wake(&base(serde_json::json!({"reactive":true}))),
+            Some(("frank".into(), "[notification] channel #7".into())),
+            "reactive without an addressed hint falls back to waking"
+        );
         // not reactive, addressed=false -> wakes (a normal member is unaffected by the reactive gate).
-        assert_eq!(payload_to_wake(&base(serde_json::json!({"addressed":false}))), Some(("frank".into(), "[notification] channel #7".into())), "a non-reactive member is never gated by addressing");
+        assert_eq!(
+            payload_to_wake(&base(serde_json::json!({"addressed":false}))),
+            Some(("frank".into(), "[notification] channel #7".into())),
+            "a non-reactive member is never gated by addressing"
+        );
     }
 
     #[test]
     fn payload_to_wake_pulls_recipient_and_prompt_or_none() {
         let assign = serde_json::json!({"recipient":"v-bolero","type":"task.assigned","task_id":7,"event_seq":100});
-        assert_eq!(payload_to_wake(&assign), Some(("v-bolero".into(), "[notification] task #7".into())));
+        assert_eq!(
+            payload_to_wake(&assign),
+            Some(("v-bolero".into(), "[notification] task #7".into()))
+        );
         let dm = serde_json::json!({"recipient":"v-capmeshd","type":"message.direct","channel_id":1,"event_seq":438});
-        assert_eq!(payload_to_wake(&dm), Some(("v-capmeshd".into(), "[notification] message #438".into())));
+        assert_eq!(
+            payload_to_wake(&dm),
+            Some(("v-capmeshd".into(), "[notification] message #438".into()))
+        );
         // missing recipient / informational type / missing ids -> None (no wake)
-        assert_eq!(payload_to_wake(&serde_json::json!({"type":"task.assigned","task_id":7})), None);
-        assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"presence.updated"})), None);
+        assert_eq!(
+            payload_to_wake(&serde_json::json!({"type":"task.assigned","task_id":7})),
+            None
+        );
+        assert_eq!(
+            payload_to_wake(&serde_json::json!({"recipient":"x","type":"presence.updated"})),
+            None
+        );
         // a comment to a FIREHOSE-only recipient does NOT wake (it accrues for poll). A pre-#384 payload has
         // no `subscribed` field → defaults false → drops-to-poll.
-        assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"task.commented","task_id":7,"event_seq":9})), None);
-        assert_eq!(payload_to_wake(&serde_json::json!({"recipient":"x","type":"task.commented","task_id":7,"event_seq":9,"subscribed":false})), None);
+        assert_eq!(
+            payload_to_wake(
+                &serde_json::json!({"recipient":"x","type":"task.commented","task_id":7,"event_seq":9})
+            ),
+            None
+        );
+        assert_eq!(
+            payload_to_wake(
+                &serde_json::json!({"recipient":"x","type":"task.commented","task_id":7,"event_seq":9,"subscribed":false})
+            ),
+            None
+        );
         // a comment to a recipient with a DIRECT subscription to the task (#384) DOES wake.
         let subbed = serde_json::json!({"recipient":"v-effects","type":"task.commented","task_id":7,"event_seq":9,"subscribed":true});
-        assert_eq!(payload_to_wake(&subbed), Some(("v-effects".into(), "[notification] comment on task #7".into())));
+        assert_eq!(
+            payload_to_wake(&subbed),
+            Some((
+                "v-effects".into(),
+                "[notification] comment on task #7".into()
+            ))
+        );
         // a channel.post (tunnel payload carries recipient + channel_id) wakes the subscriber — #171
         let post = serde_json::json!({"recipient":"waiter","type":"channel.post","channel_id":7,"event_seq":51,"data":{"body":"deploy…","from":"deployer"}});
-        assert_eq!(payload_to_wake(&post), Some(("waiter".into(), "[notification] channel #7".into())));
+        assert_eq!(
+            payload_to_wake(&post),
+            Some(("waiter".into(), "[notification] channel #7".into()))
+        );
     }
 }
