@@ -4046,6 +4046,9 @@ fn watchdog_board(
     let mut rearmed = 0usize;
     let mut never_ticked_count = 0usize;
     let mut holding_work_count = 0usize;
+    // task_582 safeguard-wedge (report-only this slice): agents whose newest session is stuck in a trailing
+    // run of model-safeguard refusals. Collected across the sweep and surfaced in one WARNING below.
+    let mut wedged_ids: Vec<String> = Vec::new();
     let mut native = 0usize;
     for a in agents {
         let md = a.get("metadata");
@@ -4100,6 +4103,18 @@ fn watchdog_board(
         // so standing down on it (instead of progressing it or marking it `blocked`/`done`) is a status-honesty
         // violation, not a legitimate stand-down. Flagged + re-armed below so it re-enters its loop.
         let holding_work_at_rest = stood_down && inprogress_owners.contains(id);
+        // task_582 safeguard-wedge scan (report-only). The wedge's signature is that last_seen keeps
+        // ADVANCING — the agent LOOKS healthy, so the age/verdict/stale gates never flag it — while its last
+        // few assistant turns are all stop_reason=refusal (a model-safeguard reject loop, burning turns). So
+        // scan here, BEFORE the stale-only skip, for every running (not stood-down, not never-ticked) managed
+        // agent. The read is bounded + fail-safe (a non-local or unreadable transcript yields false). Detected
+        // agents are surfaced in one WARNING after the loop; auto spin-down/spin-up is task_582's next slice.
+        if !stood_down
+            && !never_ticked
+            && agent_is_safeguard_wedged(id, SAFEGUARD_WEDGE_THRESHOLD, SAFEGUARD_WEDGE_TAIL)
+        {
+            wedged_ids.push(id.to_string());
+        }
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
@@ -4234,6 +4249,16 @@ fn watchdog_board(
         // blocked/done. The prevention companion is the AGENTS-fleet status-honesty contract line (#506 Layer 1).
         println!(
             "-- WARNING: {holding_work_count} agent(s) STOOD DOWN while holding a live in_progress assigned task (#506 violation) — an in_progress task is actively-worked; they must progress it or mark it blocked/done. Re-armed under --rearm."
+        );
+    }
+    if !wedged_ids.is_empty() {
+        // task_582: a model-safeguard wedge keeps last_seen advancing, so the liveness/age checks above miss
+        // it — surface it loudly. Report-only this slice: recovery is a manual spin-down/spin-up; the next
+        // task_582 increment wires an auto spin-down + spin-up (cooldown-fenced) off this same detection.
+        println!(
+            "-- WARNING: {} agent(s) SAFEGUARD-WEDGED (last {SAFEGUARD_WEDGE_THRESHOLD} assistant turns all stop_reason=refusal; last_seen keeps advancing so the liveness check misses it): {}. Recover: `fleet spin-down <agent> --apply --force` then `fleet spin-up <agent> --apply`.",
+            wedged_ids.len(),
+            wedged_ids.join(", ")
         );
     }
     if observe {
@@ -4638,6 +4663,64 @@ fn seam_check(agent: &str, no_fetch: bool) {
     std::process::exit(3);
 }
 
+/// task_582 watchdog-scan tuning. `*_THRESHOLD` / `*_TAIL` MATCH the `Cmd::SafeguardCheck` defaults (3 / 80)
+/// so the per-sweep scan and the one-shot command agree on what a wedge is. `*_TAIL_BYTES` bounds the per-agent
+/// read: a session transcript can be many MB, so the watchdog reads only the tail (the trailing refusal turns
+/// are small JSONL lines, so 256 KiB comfortably covers the last `TAIL` lines) rather than the whole file.
+const SAFEGUARD_WEDGE_THRESHOLD: usize = 3;
+const SAFEGUARD_WEDGE_TAIL: usize = 80;
+const SAFEGUARD_WEDGE_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Extract the assistant-turn stop_reasons from the last `tail` lines of a JSONL transcript `content`
+/// (chronological order preserved — newest last). Pure over the string so it is unit-tested without files;
+/// task_582 shares it between the one-shot `safeguard_check` command and the per-sweep watchdog wedge scan.
+fn tail_stop_reasons(content: &str, tail: usize) -> Vec<String> {
+    let mut lines: Vec<&str> = content.lines().rev().take(tail).collect();
+    lines.reverse();
+    lines
+        .into_iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|rec| assistant_stop_reason(&rec))
+        .collect()
+}
+
+/// Read the last `max_bytes` of a file as text, dropping a leading partial line when the read started
+/// mid-file. A session transcript can be many MB, so the per-sweep watchdog wedge scan must NOT read the whole
+/// file for each agent each sweep — only the tail carries the recent assistant turns. `None` on an IO error
+/// (the caller treats that as "not wedged", never a false flag).
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    // Only when we started mid-file is the first line a (likely partial) fragment to drop.
+    if start > 0 {
+        Some(text.split_once('\n').map(|(_partial, rest)| rest.to_string()).unwrap_or(text))
+    } else {
+        Some(text)
+    }
+}
+
+/// task_582: is the agent's newest session wedged by a model-safeguard refusal run? The non-printing core the
+/// watchdog calls per managed agent each sweep. Locates the newest session, reads only its bounded tail
+/// ([`read_file_tail`]), and applies [`safeguard_wedge`] to the trailing assistant stop_reasons. FAIL-SAFE: a
+/// missing transcript, a different host (no local session), or an IO error returns `false` — a healthy agent
+/// is never false-flagged, so this is safe to run on every managed agent each sweep.
+fn agent_is_safeguard_wedged(agent: &str, threshold: usize, tail: usize) -> bool {
+    let sessions = transcripts::locate_sessions(agent);
+    let Some(path) = sessions.first() else {
+        return false;
+    };
+    let Some(content) = read_file_tail(path, SAFEGUARD_WEDGE_TAIL_BYTES) else {
+        return false;
+    };
+    safeguard_wedge(&tail_stop_reasons(&content, tail), threshold)
+}
+
 /// task_582: scan an agent's newest session transcript tail for a safeguard wedge (see [`Cmd::SafeguardCheck`]).
 /// Locates the agent's sessions via [`transcripts::locate_sessions`], reads the last `tail` lines of the
 /// newest one, extracts the assistant-turn stop_reasons, and applies [`safeguard_wedge`]. Reports via EXIT
@@ -4653,14 +4736,9 @@ fn safeguard_check(agent: &str, threshold: usize, tail: usize) {
         eprintln!("fleet safeguard-check '{agent}': reading {}: {e}", path.display());
         std::process::exit(1);
     });
-    // Last `tail` lines, back in chronological order, parsed; assistant stop_reasons only.
-    let mut lines: Vec<&str> = content.lines().rev().take(tail).collect();
-    lines.reverse();
-    let reasons: Vec<String> = lines
-        .into_iter()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|rec| assistant_stop_reason(&rec))
-        .collect();
+    // Last `tail` lines, in chronological order, parsed to assistant stop_reasons only (shared with the
+    // per-sweep watchdog scan via `tail_stop_reasons`).
+    let reasons = tail_stop_reasons(&content, tail);
     if safeguard_wedge(&reasons, threshold) {
         println!(
             "safeguard-check '{agent}': WEDGED — the last {threshold} assistant turns are all stop_reason=refusal \
@@ -6579,6 +6657,35 @@ mod tests {
         // Empty / threshold 0 -> never wedged (no false positive on a fresh or empty transcript).
         assert!(!safeguard_wedge(&[], 3));
         assert!(!safeguard_wedge(&r(&["refusal", "refusal", "refusal"]), 0));
+    }
+
+    #[test]
+    fn tail_stop_reasons_parses_only_trailing_assistant_turns() {
+        let line = |t: &str, sr: &str| format!(r#"{{"type":"{t}","message":{{"stop_reason":"{sr}"}}}}"#);
+        // Mixed transcript: a user line (no stop_reason) and a non-JSON line are both dropped; assistant
+        // stop_reasons are returned in chronological order (newest last).
+        let content = [
+            line("assistant", "end_turn"),
+            r#"{"type":"user"}"#.to_string(),
+            "not json".to_string(),
+            line("assistant", "refusal"),
+            line("assistant", "refusal"),
+        ]
+        .join("\n");
+        assert_eq!(tail_stop_reasons(&content, 80), vec!["end_turn", "refusal", "refusal"]);
+        // A small tail window keeps only the LAST N lines (here the two trailing refusals).
+        assert_eq!(tail_stop_reasons(&content, 2), vec!["refusal", "refusal"]);
+    }
+
+    #[test]
+    fn read_file_tail_bounds_the_read_and_drops_a_partial_leading_line() {
+        let path = std::env::temp_dir().join(format!("fleet-tail-{}-{}.txt", std::process::id(), line!()));
+        std::fs::write(&path, "aaaa\nbbbb\ncccc\ndddd\n").unwrap();
+        // A budget covering the whole 20-byte file starts at offset 0 -> returned verbatim (no partial drop).
+        assert_eq!(read_file_tail(&path, 10_000).as_deref(), Some("aaaa\nbbbb\ncccc\ndddd\n"));
+        // A 7-byte budget reads bytes [13..20] = "c\ndddd\n"; starting mid-file drops the partial first line.
+        assert_eq!(read_file_tail(&path, 7).as_deref(), Some("dddd\n"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
