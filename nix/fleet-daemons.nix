@@ -135,6 +135,7 @@ let
       onBootSec ? 60,
       persistent ? true,
       environment ? { },
+      enabled ? true,
     }:
     let
       argSuffix = lib.optionalString (args != "") " ${args}";
@@ -155,19 +156,27 @@ let
           "ExecStart=/bin/sh -c 'test -x \"$FLEET_RT/${script}\" && exec bash \"$FLEET_RT/${script}\"${argSuffix} || exit 0'"
         ]
       );
-      "${name}.timer" = renderUnit [
-        marker
-        "[Unit]"
-        "Description=Fleet guard ${name} cadence"
-        ""
-        "[Timer]"
-        "OnBootSec=${toString onBootSec}"
-        "OnUnitActiveSec=${toString intervalSecs}"
-        "Persistent=${if persistent then "true" else "false"}"
-        ""
-        "[Install]"
-        "WantedBy=timers.target"
-      ];
+      # enabled => [Install]/WantedBy arms the timer into timers.target. disabled => OMIT [Install] so the units
+      # are present-but-INERT: visible + declarative but started by nothing, the flake analogue of a crontab
+      # #DISABLED- line. Flip `enabled` + reinstall to arm/disarm. Used for operator-sensitive send-keys guards
+      # (rearm-stale) whose enable/disable state must stay a first-class, greppable, reversible control.
+      "${name}.timer" = renderUnit (
+        [
+          marker
+          "[Unit]"
+          "Description=Fleet guard ${name} cadence"
+          ""
+          "[Timer]"
+          "OnBootSec=${toString onBootSec}"
+          "OnUnitActiveSec=${toString intervalSecs}"
+          "Persistent=${if persistent then "true" else "false"}"
+        ]
+        ++ lib.optionals enabled [
+          ""
+          "[Install]"
+          "WantedBy=timers.target"
+        ]
+      );
     };
 
   fleetBin = "${fleet}/bin/fleet";
@@ -303,6 +312,16 @@ let
       environment = {
         INODE_THRESHOLD_PCT = "0";
       };
+    })
+    # rearm-stale: SENDS KEYS into agent windows (operator-sensitive, same class as the disabled watchdog). It is
+    # LIVE today (cadenza REARM_STALE_ENABLED=true, operator seq 1251), so `enabled` defaults true here --
+    # behavior-preserving. If the operator decides the send-keys guard should join the watchdog in disabled-land,
+    # flip `enabled = false` + reinstall: the units stay present but inert (no [Install], not armed).
+    // (mkGuard {
+      name = "fleet-rearm-stale";
+      script = "rearm-stale.sh";
+      intervalSecs = 240;
+      enabled = true;
     });
 
   unitsDir = pkgs.runCommand "fleet-user-units" { } (
@@ -384,9 +403,17 @@ let
       done
       systemctl --user daemon-reload
       # Enable + start the timers (each oneshot .service is triggered by its timer, so it picks up a changed
-      # ExecStart on its next fire -- no restart needed here).
+      # ExecStart on its next fire -- no restart needed here). A guard migrated with `enabled = false` renders a
+      # timer with NO [Install] section (present-but-inert, the flake analogue of a #DISABLED- crontab line); for
+      # those, DON'T arm -- stop + disable so a prior-armed state is cleanly removed on a flip to disabled.
       ${lib.concatStrings (map (u: ''
-        systemctl --user enable --now "${u}"
+        if grep -q '^\[Install\]' "$UNIT_DIR/${u}"; then
+          systemctl --user enable --now "${u}"
+        else
+          systemctl --user stop "${u}" 2>/dev/null || true
+          systemctl --user disable "${u}" 2>/dev/null || true
+          echo "inert (enabled=false) timer, not armed: ${u}"
+        fi
       '') timerUnits)}
       # Enable + RESTART each long-running service so a changed ExecStart (e.g. the repoint onto a new store
       # binary) actually takes effect now: `enable --now` does NOT restart an already-running unit, which would
