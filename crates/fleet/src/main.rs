@@ -3573,6 +3573,13 @@ fn inbox_pending_count(fleet: &Fleet, name: &str) -> usize {
 // (the #332 false-nag). "Pending work" covers both paths: open assigned tasks (board) or unread inbox items.
 const WATCHDOG_REARM_WAKE: &str = "[watchdog] you hold pending work and your loop has gone quiet — run a tick NOW: check_notifications, do one unit, set_status, and keep looping until your queue drains (do not idle-sleep while you hold pending work).";
 
+/// The TARGETED switch-wake injected when an agent is idle/at-rest with its CURRENT task blocked on an external
+/// party BUT it still owns at least one OTHER actionable (non-blocked) task (task_736, operator seq-11601). The
+/// generic re-arm ([`WATCHDOG_REARM_WAKE`]) says "you hold pending work"; this names the SPECIFIC situation —
+/// being blocked on one task is never a reason to halt when you own other actionable work — so the agent
+/// switches rather than idling. It keeps the blocked task owned (does not reassign it) and works the others.
+const WATCHDOG_SWITCH_WAKE: &str = "[watchdog] your current task is BLOCKED on an external party (operator/agent/task), but you still own at least one OTHER actionable task that is NOT blocked. Per the fleet rule, do NOT idle or halt while you hold actionable work: run list_tasks for your own id, pick a todo/in_progress task with no blocker, and work it NOW. Keep the blocked task owned (do not reassign it) — just make progress on the others meanwhile. Only idle when ALL your tasks are blocked.";
+
 /// The wake injected to a DRAINED self-poller (#544): an at-rest agent with no actionable work that keeps
 /// self-scheduling short ticks. It cannot pick this up from a `build_kickoff` edit (a running `/loop` re-passes
 /// its spawn-time prompt), so the watchdog injects the instruction directly — the agent then persists a long
@@ -4266,6 +4273,37 @@ fn inprogress_task_assignees(tasks: &[serde_json::Value]) -> std::collections::B
         .collect()
 }
 
+/// The set of agent ids that OWN at least one task PARKED on an external blocker, from a
+/// `list_tasks_by_status("blocked")` projection (task_736). A `blocked` task carries a `blocked_on_kind`
+/// (operator/agent/task/external) — it is legitimately waiting, so it is NOT actionable, but its owner is the
+/// actor the switch-to-actionable rule targets: if it ALSO owns an actionable task it must switch to that
+/// rather than idle on the block. Filters to tasks that genuinely carry a blocker (defensive — a `blocked`
+/// status without a `blocked_on_kind` is malformed and excluded). Pure — unit-tested.
+fn blocked_task_owners(tasks: &[serde_json::Value]) -> std::collections::BTreeSet<String> {
+    tasks
+        .iter()
+        .filter(|t| task_is_parked_on_blocker(t))
+        .filter_map(|t| t.get("assignee").and_then(serde_json::Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Whether the watchdog should fire the TARGETED switch-nudge (task_736, operator seq-11601): the agent owns a
+/// task blocked on an external party AND still owns at least one OTHER actionable (non-blocked) task AND is not
+/// making progress (`at_rest` presence — away/offline — OR `quiet_holding_work`, the #535 work-driven signal
+/// that it has gone quiet while holding actionable work). All three are required: without `owns_blocked` the
+/// plain never-idle guards already apply; without an actionable task there is nothing to switch TO (idling is
+/// then legitimate); without the idle signal the agent is presumed to be working. Pure — unit-tested.
+fn should_switch_to_actionable(
+    at_rest: bool,
+    owns_blocked: bool,
+    actionable_open: usize,
+    quiet_holding_work: bool,
+) -> bool {
+    owns_blocked && actionable_open >= 1 && (at_rest || quiet_holding_work)
+}
+
 /// Match a changed-file PATH against one SEAM glob (task_579). Glob grammar, deliberately small:
 ///   `**` matches any run of characters INCLUDING `/` (recursive — spans path segments);
 ///   `*`  matches any run of characters EXCEPT `/` (a single path segment);
@@ -4466,6 +4504,13 @@ fn watchdog_board(
         Ok(tasks) => (inprogress_task_assignees(&tasks), monitor_exempt_task_owners(&tasks)),
         Err(_) => (std::collections::BTreeSet::new(), std::collections::BTreeSet::new()),
     };
+    // task_736 switch-to-actionable: the owners of a task PARKED on an external blocker. An agent here that
+    // ALSO owns an actionable task must switch to it rather than idle on the block. One extra status query per
+    // sweep (mirrors the in_progress one); a query error degrades to empty (no false switch-nudges).
+    let blocked_owners = match board.list_tasks_by_status("blocked") {
+        Ok(tasks) => blocked_task_owners(&tasks),
+        Err(_) => std::collections::BTreeSet::new(),
+    };
     println!(
         "{:<28} {:<8} {:<7} {:<5} {:<8} {:<12} last_seen",
         "agent", "interval", "age", "open", "verdict", "action"
@@ -4474,6 +4519,7 @@ fn watchdog_board(
     let mut rearmed = 0usize;
     let mut never_ticked_count = 0usize;
     let mut holding_work_count = 0usize;
+    let mut switch_count = 0usize;
     // task_582 safeguard-wedge (report-only this slice): agents whose newest session is stuck in a trailing
     // run of model-safeguard refusals. Collected across the sweep and surfaced in one WARNING below.
     let mut wedged_ids: Vec<String> = Vec::new();
@@ -4585,7 +4631,24 @@ fn watchdog_board(
             patrol,
             verdict,
         );
-        if stale_only && !retighten && !work_driven && !drained_idle && !never_ticked && !holding_work_at_rest {
+        // task_736 switch-to-actionable: the agent owns a task blocked on an external party AND still owns >=1
+        // OTHER actionable (non-blocked) task AND is not progressing (at-rest, or #535-quiet while holding work).
+        // It must SWITCH to the actionable work rather than idle on the block — the targeted complement of the
+        // #506 never-idle guard. `open_tasks` already EXCLUDES blocked/parked tasks, so >=1 is genuine other work.
+        let switch_to_actionable = should_switch_to_actionable(
+            presence_is_at_rest(status),
+            blocked_owners.contains(id),
+            open_tasks,
+            work_driven,
+        );
+        if stale_only
+            && !retighten
+            && !work_driven
+            && !drained_idle
+            && !never_ticked
+            && !holding_work_at_rest
+            && !switch_to_actionable
+        {
             continue;
         }
         // A NEVER-TICKED agent takes priority: a wake cannot recover a loop that never started (no live pane
@@ -4598,6 +4661,29 @@ fn watchdog_board(
             flagged += 1;
             never_ticked_count += 1;
             "NEVER-TICKED"
+        } else if switch_to_actionable {
+            // task_736: blocked on one task, owns another actionable one, idling — the TARGETED switch-nudge
+            // (more specific than the generic re-arm). Re-kicked on the tight work cadence like a work-holder,
+            // pane-fenced by rearm_candidate. Takes priority over the holding-work / retighten branches so the
+            // agent gets the "switch, do not idle on the block" message rather than a generic "run a tick".
+            flagged += 1;
+            switch_count += 1;
+            if rearm {
+                let (_act, did) = rearm_candidate(
+                    &fleet,
+                    &session,
+                    id,
+                    WATCHDOG_WORK_CADENCE_SECS as u64,
+                    now_unix,
+                    WATCHDOG_SWITCH_WAKE,
+                );
+                if did {
+                    rearmed += 1;
+                }
+                "BLOCKED→SWITCH→woke"
+            } else {
+                "BLOCKED→SWITCH"
+            }
         } else if holding_work_at_rest {
             flagged += 1;
             holding_work_count += 1;
@@ -4686,6 +4772,15 @@ fn watchdog_board(
         // blocked/done. The prevention companion is the AGENTS-fleet status-honesty contract line (#506 Layer 1).
         println!(
             "-- WARNING: {holding_work_count} agent(s) STOOD DOWN while holding a live in_progress assigned task (#506 violation) — an in_progress task is actively-worked; they must progress it or mark it blocked/done. Re-armed under --rearm."
+        );
+    }
+    if switch_count > 0 {
+        // task_736: an agent idle/at-rest with its current task blocked on an external party while it still owns
+        // another actionable (non-blocked) task — it must SWITCH to that work rather than idle on the block. The
+        // targeted complement of the #506 never-idle guard; re-armed with the switch-nudge under --rearm. The
+        // prevention companion is the AGENTS-fleet switch-to-actionable contract line (task_736 increment 2).
+        println!(
+            "-- WARNING: {switch_count} agent(s) IDLE while blocked on one task but holding OTHER actionable work (task_736) — they must switch to the actionable task, not idle on the block. Re-armed with the switch-nudge under --rearm."
         );
     }
     if !wedged_ids.is_empty() {
@@ -8461,6 +8556,37 @@ mod tests {
         assert!(owners.contains("v-worker") && owners.contains("v-both"));
         assert!(!owners.contains("v-monitor"), "a purely monitor-exempt owner is not holding work at rest");
         assert_eq!(owners.len(), 2);
+    }
+
+    #[test]
+    fn blocked_task_owners_collects_only_genuinely_parked_task_owners() {
+        let tasks = vec![
+            // Parked on an external party → its owner is a switch-to-actionable candidate (task_736).
+            serde_json::json!({"id":1,"assignee":"v-a","status":"blocked","blocked_on_kind":"operator"}),
+            serde_json::json!({"id":2,"assignee":"v-b","status":"blocked","blocked_on_kind":"task"}),
+            // A `blocked` status with NO blocked_on_kind is malformed → excluded (defensive).
+            serde_json::json!({"id":3,"assignee":"v-c","status":"blocked","blocked_on_kind":""}),
+            serde_json::json!({"id":4,"assignee":"v-d","status":"blocked"}),
+        ];
+        let owners = blocked_task_owners(&tasks);
+        assert!(owners.contains("v-a") && owners.contains("v-b"));
+        assert!(!owners.contains("v-c") && !owners.contains("v-d"), "a blocked task with no blocker is excluded");
+        assert_eq!(owners.len(), 2);
+        assert!(blocked_task_owners(&[]).is_empty());
+    }
+
+    #[test]
+    fn should_switch_to_actionable_requires_blocked_plus_other_actionable_plus_idle() {
+        // The canonical fire: owns a blocked task, owns >=1 actionable other, and is at-rest.
+        assert!(should_switch_to_actionable(true, true, 1, false));
+        // Not at-rest but quiet while holding work (#535 work-driven) also fires.
+        assert!(should_switch_to_actionable(false, true, 2, true));
+        // No OTHER actionable task → nothing to switch to; idling on the block is legitimate.
+        assert!(!should_switch_to_actionable(true, true, 0, false));
+        // Owns actionable work but NO blocked task → the plain never-idle guards handle it, not this nudge.
+        assert!(!should_switch_to_actionable(true, false, 2, true));
+        // Blocked + actionable but actively progressing (not at-rest, not quiet) → presumed working, no nudge.
+        assert!(!should_switch_to_actionable(false, true, 2, false));
     }
 
     #[test]
