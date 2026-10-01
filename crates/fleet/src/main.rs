@@ -1703,6 +1703,15 @@ enum Cmd {
         /// stays report-only (a WARNING line).
         #[arg(long)]
         hire_signal: bool,
+        /// ACT on the task_786 STRANDED signal: for each board-native agent stood down (offline) while it still
+        /// holds open actionable assignment(s), AUTO-SPIN-UP (revive) it so its dispatched work gets worked,
+        /// instead of only flagging it. Cooldown-fenced per agent (CDZ_REVIVE_STRANDED_COOLDOWN_SECS, default
+        /// 3600) so a revive that does not immediately clear the stranded state is not retried every sweep.
+        /// OPT-IN so merely shipping this never auto-revives — a deliberately stood-down agent is revived only
+        /// once a host turns this on; without it the stranded signal stays report-only (a WARNING line). The
+        /// prevention companion is the task_786 spin-down refuse-to-strand guard.
+        #[arg(long)]
+        revive_stranded: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -2165,7 +2174,8 @@ fn main() {
             self_redeploy,
             reap_stale_observers,
             hire_signal,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal),
+            revive_stranded,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal, revive_stranded),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -3996,6 +4006,38 @@ fn write_hire_signal_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+/// task_818 default revive-stranded cooldown: at most one auto-revive (spin-up) per stranded agent per this
+/// window, so a revive that does not immediately clear the stranded state is not retried every sweep.
+/// `CDZ_REVIVE_STRANDED_COOLDOWN_SECS` tunes it.
+const REVIVE_STRANDED_COOLDOWN_SECS: u64 = 3600;
+
+/// task_818 cooldown gate (pure, unit-testable), mirroring [`hire_signal_on_cooldown`]: a revive is on cooldown
+/// when the last one for this agent is within `cooldown_secs`. No floor — the cooldown IS the window. `None`
+/// (never revived) is not on cooldown.
+fn revive_stranded_on_cooldown(last_revive: Option<u64>, now: u64, cooldown_secs: u64) -> bool {
+    last_revive.is_some_and(|last| now.saturating_sub(last) < cooldown_secs)
+}
+
+/// The per-agent last-revive stamp path: `<hub>/.claude/fleet/watchdog/<name>.revive` (contents = unix secs).
+fn revive_stranded_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("watchdog").join(format!("{name}.revive"))
+}
+
+/// Read an agent's last-revive unix time; `None` on an absent/unparseable stamp (never revived).
+fn read_revive_stranded_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(revive_stranded_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+}
+
+/// Record that an agent was just auto-revived at `now` (best-effort — a write failure only means the cooldown
+/// is not enforced for that agent on the next sweep).
+fn write_revive_stranded_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = revive_stranded_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
 // ── observation triggers (#187, BUILD 2/5) ─────────────────────────────────────────────────────────
 // The watchdog is also the SPAWNER of ephemeral per-agent observer sessions: it tracks each agent's
 // transcript growth against a per-agent watermark and, when the unobserved increment crosses a threshold
@@ -4582,6 +4624,7 @@ fn watchdog(
     self_redeploy: bool,
     reap_stale_observers: bool,
     hire_signal: bool,
+    revive_stranded: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -4615,7 +4658,7 @@ fn watchdog(
     let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers, hire_signal);
+            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers, hire_signal, revive_stranded);
             native_ids
         }
         Err(e) => {
@@ -4903,6 +4946,7 @@ fn watchdog_board(
     pinned_only: bool,
     reap_stale_observers: bool,
     hire_signal: bool,
+    revive_stranded: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
@@ -5264,14 +5308,56 @@ fn watchdog_board(
         // (todo/in_progress, non-blocked) — the task_311 class (cr-reviewer stood down ~16h still holding a
         // dispatched CR review). A stood-down agent has no live loop to work them, and because it is windowless
         // a watchdog wake cannot revive it (so the #506 at-rest re-arm does not cover this) — it must be spun up
-        // or its tasks reassigned. Report-only this slice; auto-revive (spin-up) off this predicate is the opt-in
-        // next increment. The prevention companion is the task_786 spin-down refuse-to-strand guard (PR 266).
+        // or its tasks reassigned. The WARNING always prints (the report); with --revive-stranded (task_818) it
+        // ALSO auto-spins-up each stranded agent below, cooldown-fenced. The prevention companion is the
+        // task_786 spin-down refuse-to-strand guard (PR 266).
         let list: Vec<String> = stranded_ids.iter().map(|(id, n)| format!("{id}({n})")).collect();
         println!(
             "-- WARNING: {} agent(s) STRANDED (task_786): stood down while still holding open assignment(s) [agent(open)]: {}. A stood-down agent has no live loop to work them and a wake cannot revive a windowless agent — spin each up (`fleet spin-up <agent> --apply`) or reassign its tasks.",
             stranded_ids.len(),
             list.join(", ")
         );
+        // ACT (task_818, opt-in --revive-stranded): auto-spin-up each stranded agent so its dispatched work
+        // gets worked, cooldown-fenced per agent so a revive that does not immediately clear the stranded state
+        // is not retried every sweep. Reviving a DELIBERATELY stood-down agent could fight an operator decision,
+        // so this is strictly opt-in (the WARNING above is the always-on report). The spin-up runs as a
+        // SUBPROCESS of this binary: spin_up signals a per-agent failure via process::exit, so shelling it
+        // contains that exit in the child and never aborts the sweep. A stranded agent is offline + windowless
+        // (stood down), so spin-up finds no existing window and launches cleanly.
+        if revive_stranded {
+            let cooldown = std::env::var("CDZ_REVIVE_STRANDED_COOLDOWN_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(REVIVE_STRANDED_COOLDOWN_SECS);
+            let self_bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "fleet".to_string());
+            let (mut revived, mut cooled, mut failed) = (0usize, 0usize, 0usize);
+            for (id, _open) in &stranded_ids {
+                if revive_stranded_on_cooldown(read_revive_stranded_stamp(&fleet, id), now_unix, cooldown) {
+                    cooled += 1;
+                    continue;
+                }
+                match std::process::Command::new(&self_bin).args(["spin-up", id, "--apply"]).status() {
+                    Ok(s) if s.success() => {
+                        write_revive_stranded_stamp(&fleet, id, now_unix);
+                        revived += 1;
+                    }
+                    Ok(_) => {
+                        eprintln!("  ! revive-stranded: spin-up '{id}' failed (nonzero exit) — not stamping, will retry next sweep");
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  ! revive-stranded: could not launch spin-up '{id}': {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            println!(
+                "-- revive-stranded (task_818): revived {revived}, {cooled} on cooldown, {failed} failed (opt-in auto-spin-up of stranded agents; cooldown {cooldown}s per agent)"
+            );
+        }
     }
     if !backlog_overflow_ids.is_empty() {
         // task_794: a RUNNING agent whose open backlog exceeds the depth threshold — the PM hire/route signal
@@ -9152,6 +9238,22 @@ mod tests {
         assert!(!bounce_on_cooldown(Some(10_000), 20_000, 1_800));
         // Clock skew (now < last) saturates to 0 elapsed → treated as on cooldown (fail-safe, no thrash).
         assert!(bounce_on_cooldown(Some(10_000), 9_000, 1_800));
+    }
+
+    #[test]
+    fn revive_stranded_on_cooldown_suppresses_only_within_the_window() {
+        // task_818: a stranded agent auto-revive is suppressed only while the last revive is within the window,
+        // so a revive that did not immediately clear the stranded state is not retried every sweep.
+        // Never revived → not on cooldown.
+        assert!(!revive_stranded_on_cooldown(None, 10_000, REVIVE_STRANDED_COOLDOWN_SECS));
+        // Within the window → on cooldown.
+        assert!(revive_stranded_on_cooldown(Some(10_000), 10_000, 3_600));
+        assert!(revive_stranded_on_cooldown(Some(10_000), 10_000 + 3_599, 3_600));
+        // At / past the window → no longer on cooldown (eligible to re-revive if still stranded).
+        assert!(!revive_stranded_on_cooldown(Some(10_000), 10_000 + 3_600, 3_600));
+        assert!(!revive_stranded_on_cooldown(Some(10_000), 20_000, 3_600));
+        // Clock skew (now < last) saturates to 0 elapsed → treated as on cooldown (fail-safe, no re-revive).
+        assert!(revive_stranded_on_cooldown(Some(10_000), 9_000, 3_600));
     }
 
     #[test]
