@@ -67,6 +67,16 @@ finding into one of the four `fleet-self-improve` categories (board project **#2
    - **Match on a DECLINED / cancelled task (sticky-decline)** → do NOT re-file WITHOUT NEW EVIDENCE. A
      sticky-declined finding with nothing new is a no-op (record it in your report, don't re-open the debate).
    - **No match** → it's a candidate new proposal (subject to the FLOOR + CAP below).
+4. **Check charter-scope adherence (task_521).** Cross-reference the target's ACTUAL work in this window
+   (which files/repos it touched, what its commits/PRs/tasks were about) against its OWN declared charter
+   Scope-and-boundaries (`get_agent` → the charter field, or its charter doc if it has migrated to doc_20).
+   Judge by plain reading of the Scope prose — no fixed machine format is required, you already read prose
+   for every other dimension here. If the work plausibly falls OUTSIDE the declared in-scope surface, or
+   inside an explicitly stated "does not own" boundary (the exact seq-6836 misroute class: a backend-scoped
+   agent making frontend/UI changes), flag it as an ADVISORY finding — a comment naming the specific
+   mismatch, routed to board-pm (a routing correction) and the observed agent (a stop/redirect) — never an
+   auto-block. If the agent's charter has not yet migrated to doc_20 and its Scope is vague or absent, SKIP
+   this check rather than guess; it degrades gracefully and tightens automatically as more charters conform.
 
 ## FLOOR + CAP — you do the FIRST-PASS triage (the lane is curated, never a firehose)
 
