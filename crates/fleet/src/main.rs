@@ -1757,8 +1757,8 @@ enum Cmd {
     /// A task in `in_progress` whose latest activity (its `updated_at`, or a later comment) is at least
     /// `--threshold-hours` old gets a comment pinging its assignee for a progress update or ETA. Per-task
     /// COOLDOWN: re-nudges the same task no more than once per `--cooldown-hours` while it stays idle, so it
-    /// never spams. EXCLUSIONS (enforced unconditionally, not flag-gated): tasks assigned to `cameron` (the
-    /// operator is never nudged) and tasks not in `in_progress` (a `blocked` task is parked on a named
+    /// never spams. EXCLUSIONS (enforced unconditionally, not flag-gated): tasks assigned to the configured
+    /// operator id (`config.operator_id`, if set — the operator is never nudged) and tasks not in `in_progress` (a `blocked` task is parked on a named
     /// dependency, not silently stalled — it is excluded by construction, since the board query is scoped to
     /// `in_progress`). An unassigned `in_progress` task is skipped too — there is no one to ping. Report-only
     /// by default (prints who it WOULD nudge and why); `--apply` posts the comments for real.
@@ -5285,7 +5285,7 @@ fn route_body(reason: &str, threshold_hours: f64, idle_secs: i64) -> String {
 /// it stays idle: a task with a live owner gets a comment pinging that owner ([`nudge_body`]); an UNASSIGNED
 /// task, or one whose owner is gone from the roster ([`owner_is_gone`]), is REASSIGNED to the router
 /// ([`NUDGE_ROUTER`]) with an audit comment ([`route_body`]) so it lands in the router's queue for placement.
-/// Always excludes tasks assigned to `cameron` (the operator), `monitor_exempt` tasks (#167 — a deliberate
+/// Always excludes tasks assigned to the configured operator id (`config.operator_id`, if set), `monitor_exempt` tasks (#167 — a deliberate
 /// continuous monitor, and the opt-out for a task the router intentionally leaves unassigned), and tasks PARKED
 /// on a blocker (`blocked_on_kind` — e.g. `external` for an infra wait, task-board#178 — which are legitimately
 /// waiting, not stalled). A `todo` task
