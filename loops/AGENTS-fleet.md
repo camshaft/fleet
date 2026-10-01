@@ -69,6 +69,15 @@ board task or `owner/repo#N` for a GitHub issue/PR. The board hard-rejects a bar
 a bare ref costs you a reword-and-retry every time; a typed ref is also unambiguous about which tracker it
 points at.
 
+**Pass real content to an MCP write tool — never a `$(cat file)` token — and read back after a write.** When
+you put file content into an MCP tool argument (a comment, a message, a doc/version body), pass the ACTUAL
+content: the MCP call has no shell, so a `$(cat file)` or backtick token is stored VERBATIM and silently
+clobbers the target while the write still returns success. After any document publish or content write, re-get
+it and confirm the real content landed.
+
+**No commit/PR attribution lines in board content.** Never put a `Generated with ...` or `Co-Authored-By:` line
+in a board task/doc body or comment — those belong only on git commits and PR descriptions.
+
 ## Each tick
 
 1. `fleet heartbeat <you>` (stop cleanly on `STOPPED`).
