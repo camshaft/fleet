@@ -40,6 +40,11 @@ pub struct Config {
     /// fleet daemons on this host). Absent → the built-in default set (see `redeploy`). A host with a
     /// different daemon set overrides it here.
     pub redeploy_services: Option<Vec<String>>,
+    /// This deployment's operator board-agent id. A stale-task nudge/route never fires on a task assigned to
+    /// this id — the operator's own tasks are their work queue, not a stalled deliverable. Absent → NO
+    /// operator exemption (the generic case: a fleet with no designated operator). The operator id is a
+    /// deployment-specific value, so it is named here, never hard-coded in the fleet code.
+    pub operator_id: Option<String>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -105,8 +110,10 @@ mod tests {
             agent = "v-fleet-tooling"
             host = "green-machine"
             tunnel_health_url = "http://127.0.0.1:8898/"
+            operator_id = "operator"
             "#,
         );
+        assert_eq!(cfg.operator_id.as_deref(), Some("operator"));
         assert_eq!(cfg.tunnel_health_url.as_deref(), Some("http://127.0.0.1:8898/"));
         assert_eq!(cfg.host.as_deref(), Some("green-machine"));
         assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
