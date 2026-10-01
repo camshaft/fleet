@@ -2689,14 +2689,21 @@ fn spin_up(agent: &str, apply: bool) {
 /// open assigned tasks or unread messages, and only falls back to the long `interval` idle cadence once its
 /// assigned queue is drained AND its inbox is empty — so an agent with assigned work never idle-sleeps.
 fn build_kickoff(agent: &str, workdir: &str, interval: &str, operator: Option<&str>, reactive: bool) -> String {
-    // The operator-blocked dashboard convention (operator seq-2292) applies only when this deployment names an
-    // operator (config.operator_id); a generic fleet with no designated operator omits it. The id is
-    // interpolated, never hard-coded, so the public fleet code carries no operator name (task_611).
+    // The operator-blocked dashboard convention (operator seq-2292, re-pointed task_936) applies only when this
+    // deployment names an operator (config.operator_id); a generic fleet with no designated operator omits it.
+    // The id is interpolated, never hard-coded, so the public fleet code carries no operator name (task_611).
+    // task_936: an EARLIER wording here told the agent to ALSO assign the task to the operator and stash
+    // metadata.blocked_owner for a later reassign-back — that contradicts the owner-held model (operator-tenet
+    // 10: the operator never OWNS a task/doc, only approves/answers it) and was the root cause of a recurring
+    // mis-assign-to-operator trip a coordinator had to hand-correct every time. The dashboard signal is the
+    // blocked_on=operator FILTER, not an assignment, so ownership never needs to change hands at all.
     let operator_clause = match operator {
         Some(op) => format!(
-            " If the block is ON THE OPERATOR specifically, ALSO assign the task to '{op}' and stash your own \
-             id in metadata.blocked_owner — so list_tasks(assignee '{op}') is the operator's single 'my asks' \
-             dashboard; when the operator answers, reassign the task back to yourself and clear blocked."
+            " If the block is ON THE OPERATOR specifically, keep the task OWNER-HELD — your assignee stays \
+             YOU, never '{op}' — with blocked_on naming kind=operator and a note on what you need; the \
+             dashboard '{op}' reads is the blocked_on=operator FILTER, so it surfaces there without you \
+             giving up ownership. NEVER assign the task to '{op}'. When '{op}' answers, clear the block and \
+             continue — no reassignment, since you never gave ownership up."
         ),
         None => String::new(),
     };
@@ -9009,12 +9016,13 @@ mod tests {
         assert!(k.contains("BLOCKED ON AN EXTERNAL DEPENDENCY"), "generalizes the block carve-out beyond the operator (#349)");
         assert!(k.contains("another agent") && k.contains("deploy/CI"), "names the non-operator external deps");
         assert!(k.contains("long/event-woken cadence"), "a sole blocked task drops to the long/event-woken cadence, not SOON polling");
-        // Operator-blocked dashboard convention (operator seq-2292) is preserved as a sub-case, with the
-        // operator id INTERPOLATED from config (task_611), not hard-coded: reassign to the configured operator
-        // + typed blocked_on + stash the real owner so list_tasks(assignee <operator>) is the one dashboard.
-        assert!(k.contains("ON THE OPERATOR specifically") && k.contains("assign the task to 'op-x'"), "interpolates the configured operator id into the operator-blocked convention");
-        assert!(k.contains("list_tasks(assignee 'op-x')"), "the operator dashboard clause uses the configured id");
-        assert!(k.contains("metadata.blocked_owner"), "stashes the real owner for reassign-back");
+        // Operator-blocked dashboard convention (operator seq-2292, re-pointed task_936) is preserved as a
+        // sub-case, with the operator id INTERPOLATED from config (task_611), not hard-coded: OWNER-HELD +
+        // typed blocked_on=operator, never a reassignment to the operator (operator-tenet 10).
+        assert!(k.contains("ON THE OPERATOR specifically") && k.contains("OWNER-HELD"), "interpolates the configured operator id into the owner-held operator-blocked convention (task_936)");
+        assert!(k.contains("NEVER assign the task to 'op-x'"), "bans assigning the task to the operator (task_936, operator-tenet 10)");
+        assert!(k.contains("blocked_on=operator FILTER"), "the operator dashboard signal is the blocked_on=operator filter, not an assignment");
+        assert!(!k.contains("metadata.blocked_owner"), "drops the stale blocked_owner reassign-back stash now that ownership never changes (task_936)");
         // No designated operator → the operator-blocked clause is omitted, but the surrounding external-dep
         // guidance stays intact (generic fleet with no operator; task_611).
         let k_no_op = build_kickoff("v-x", "/wt/v-x", "30m", None, false);
