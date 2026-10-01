@@ -1832,8 +1832,10 @@ enum Cmd {
         /// Repeatable; default = the current directory.
         #[arg(long = "root")]
         root: Vec<PathBuf>,
-        /// The mainline ref a checkout must be an ancestor of to count as preserved (its commits already live
-        /// there). Default origin/main.
+        /// The PRIMARY mainline ref a checkout must be an ancestor of to count as preserved (its commits already
+        /// live there). Default origin/main. Per checkout the first ref that EXISTS is used from this primary
+        /// then the brazil/plain-git fallbacks (`mainline`, `origin/mainline`, `main`), so a Brazil package is
+        /// matched against its own `mainline` branch automatically.
         #[arg(long, default_value = "origin/main")]
         mainline: String,
         /// Also list the reclaimable checkouts (default: print only the KEEP / unsafe ones plus counts).
@@ -5669,10 +5671,37 @@ fn discover_repos(root: &Path) -> Vec<PathBuf> {
     repos
 }
 
+/// The ordered mainline-ref candidates to probe per checkout: the operator-specified primary first, then the
+/// Brazil/CRUX conventions (`mainline`, `origin/mainline`) and the plain-git `main` fallbacks — so a Brazil
+/// package, whose mainline branch is NOT origin/main, is matched automatically without a repo-type flag, while
+/// a github checkout still uses origin/main. Deduped, order-preserving. The resolver uses the FIRST candidate
+/// that actually EXISTS in the checkout, so probing a ref a repo lacks is harmless. Pure — unit-tested.
+fn mainline_candidates(primary: &str) -> Vec<String> {
+    let mut cands = vec![primary.to_string()];
+    for fb in ["mainline", "origin/mainline", "main", "origin/main"] {
+        if !cands.iter().any(|c| c == fb) {
+            cands.push(fb.to_string());
+        }
+    }
+    cands
+}
+
+/// The first candidate mainline ref that resolves to a commit in `dir` (via `rev-parse --verify --quiet`), or
+/// `None` when none exists. `None` means "no mainline to compare against" → the checkout is NOT counted as
+/// merged (conservatively unsafe), never wrongly reclaimable. Best-effort.
+fn resolve_mainline(dir: &Path, candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|c| git_ok(dir, &["rev-parse", "--verify", "--quiet", &format!("{c}^{{commit}}")]))
+        .cloned()
+}
+
 /// Gather one checkout's git facts (footgun-safe) and classify it. The upstream probe is `rev-parse --verify
 /// -q @{u}`, which prints NOTHING and exits non-zero on a no-upstream branch — unlike the `--abbrev-ref
 /// --symbolic-full-name @{u}` form that prints the literal `@{u}`, the misread that motivated this command.
-fn survey_checkout(dir: &Path, mainline: &str) -> ReclaimState {
+/// The mainline is resolved per checkout from `mainline_cands` (first ref that exists), so a Brazil package is
+/// compared against its `mainline` branch rather than an origin/main it does not have.
+fn survey_checkout(dir: &Path, mainline_cands: &[String]) -> ReclaimState {
     let dirty = git_capture(dir, &["status", "--porcelain"]).is_some();
     let has_upstream = git_capture(dir, &["rev-parse", "--verify", "-q", "@{u}"]).is_some();
     let ahead = if has_upstream {
@@ -5683,8 +5712,10 @@ fn survey_checkout(dir: &Path, mainline: &str) -> ReclaimState {
         0
     };
     // `merge-base --is-ancestor HEAD <mainline>` prints nothing: exit 0 = HEAD is reachable from the mainline
-    // (its commits are already there). A missing mainline ref errors → false → conservatively unsafe.
-    let merged = git_ok(dir, &["merge-base", "--is-ancestor", "HEAD", mainline]);
+    // (its commits are already there). No resolvable mainline ref → not-merged → conservatively unsafe (KEEP).
+    let merged = resolve_mainline(dir, mainline_cands)
+        .map(|ml| git_ok(dir, &["merge-base", "--is-ancestor", "HEAD", &ml]))
+        .unwrap_or(false);
     classify_reclaim(dirty, has_upstream, ahead, merged)
 }
 
@@ -5701,9 +5732,13 @@ fn reclaim_survey(roots: Vec<PathBuf>, mainline: String, verbose: bool) {
     } else {
         roots
     };
+    // Per checkout, the mainline is the first of these that exists (primary --mainline, then brazil/plain-git
+    // fallbacks), so a github checkout uses origin/main and a brazil package uses its `mainline` branch.
+    let mainline_cands = mainline_candidates(&mainline);
     println!(
-        "fleet reclaim-survey: {} root(s), mainline {mainline} (read-only; reclaimable = provably preserved)",
-        roots.len()
+        "fleet reclaim-survey: {} root(s), mainline candidates [{}] (read-only; reclaimable = provably preserved)",
+        roots.len(),
+        mainline_cands.join(", ")
     );
 
     // Dedup worktree paths (a repo reachable from two roots) and keep a stable order.
@@ -5715,7 +5750,7 @@ fn reclaim_survey(roots: Vec<PathBuf>, mainline: String, verbose: bool) {
                 &git_capture(&repo, &["worktree", "list", "--porcelain"]).unwrap_or_default(),
             ) {
                 if seen.insert(wt.clone()) {
-                    let state = survey_checkout(&wt, &mainline);
+                    let state = survey_checkout(&wt, &mainline_cands);
                     rows.push((wt, state));
                 }
             }
@@ -8262,6 +8297,25 @@ detached
         assert_eq!(paths, vec![PathBuf::from("/home/u/repo")]);
         // Empty / no worktree lines → empty.
         assert!(parse_worktree_paths("").is_empty());
+    }
+
+    #[test]
+    fn mainline_candidates_puts_primary_first_then_brazil_and_plain_git_fallbacks_deduped() {
+        // Default primary (github): origin/main first, then brazil + plain-git fallbacks, no dup of origin/main.
+        assert_eq!(
+            mainline_candidates("origin/main"),
+            vec!["origin/main", "mainline", "origin/mainline", "main"]
+        );
+        // A brazil-primary: "mainline" leads, the rest follow deduped (mainline not repeated).
+        assert_eq!(
+            mainline_candidates("mainline"),
+            vec!["mainline", "origin/mainline", "main", "origin/main"]
+        );
+        // An arbitrary primary is kept first and the full fallback set follows.
+        assert_eq!(
+            mainline_candidates("origin/release"),
+            vec!["origin/release", "mainline", "origin/mainline", "main", "origin/main"]
+        );
     }
 
     #[test]
