@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod board;
+mod concierge_mint;
 mod config;
 mod dream;
 mod dream_apply;
