@@ -3966,7 +3966,11 @@ fn build_kickoff(
          idle-nudge sweep hours later and forces another agent to do it for you. Exception: if you were \
          DELEGATED to BUILD a task you do not OWN (a multi-owner or someone-else-shaped task), comment \
          'complete, ready to close' and the owner/shaper closes it PROMPTLY, same tick — never let it \
-         linger either way. You work \
+         linger either way. CORE TENETS — fleet contract doc_3330 (its CORE section governs how you reason \
+         and how you handle a missing capability) is the AUTHORITATIVE source, never a paraphrase: before \
+         your first action this session you MUST get_document(doc_3330) and read it in full, then operate by \
+         it. Each session check doc_3330's current approved version; if it changed since you last read it, \
+         re-read it in full before acting. You work \
          in {workdir}. Start your recurring \
          loop now: /loop {tick}"
     )
@@ -12854,6 +12858,36 @@ mod tests {
             let v = build_kickoff("v-y", "/wt/y", "30m", Some("op-x"), reactive, proactive);
             assert!(v.contains("OPERATOR COMMS GO THROUGH CONCIERGE"));
             assert!(v.contains("SHELL SAFETY"));
+        }
+    }
+
+    #[test]
+    fn build_kickoff_carries_the_core_tenets() {
+        // task_1192 + task_1230 + task_1200: every agent's kickoff carries a MANDATE to read the CORE
+        // tenets at the single source of truth (fleet contract doc_3330), not a baked verbatim copy that
+        // would drift as the doc versions (operator directive 2026-10-02: pointer + mandate-to-read + a
+        // changed-since-last-read re-read check). Universal across operator/non-operator/reactive/proactive.
+        for (operator, reactive, proactive) in [
+            (Some("op-x"), false, false),
+            (None, false, false),
+            (Some("op-x"), true, false),
+            (None, false, true),
+        ] {
+            let k = build_kickoff("v-x", "/wt/x", "30m", operator, reactive, proactive);
+            assert!(
+                k.contains("CORE TENETS") && k.contains("doc_3330"),
+                "carries the CORE TENETS clause pointing at doc_3330"
+            );
+            // Mandate to read the authoritative doc in full before acting (not a baked paraphrase).
+            assert!(
+                k.contains("get_document(doc_3330)") && k.contains("read it in full"),
+                "mandates reading doc_3330 in full at the source"
+            );
+            // Changed-since-last-read re-read check.
+            assert!(
+                k.contains("if it changed since you last read it"),
+                "mandates re-reading doc_3330 when its approved version has changed"
+            );
         }
     }
 
