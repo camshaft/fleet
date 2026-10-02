@@ -3,9 +3,10 @@
 //! This module is the PURE core of the top-of-tick charter self-check. It classifies a drift SIGNAL and
 //! advances a per-agent drift-state counter that graduates a BEHAVIORAL-drift flag from an injected
 //! return-to-charter directive to a hard stop-and-return once the same drift persists past N ticks
-//! (default N=2). It performs NO I/O: the board query that yields the actionable-task count and the agent
-//! presence, the persistence of [`DriftState`], and the kickoff-directive injection are wired at the edge by
-//! a later slice. Keeping the logic pure makes every rule unit-tested here.
+//! (default N=2). The classification and the counter are pure; the board query that yields the actionable-task
+//! count and the agent presence, and the kickoff-directive injection, are wired at the edge by the notify.rs
+//! wake path (slice 2b). [`DriftStore`] here is the thin persistence edge (per-agent state under the hub dir)
+//! that wake path uses. Keeping the decision logic pure makes every rule unit-tested here.
 //!
 //! Scope (Stage 1): the only live signal is [`DriftClass::SwitchDoNotIdle`] — an agent idle while holding
 //! actionable, non-blocked assigned work (the task_736 condition), machine-checkable now from the board's
@@ -13,12 +14,14 @@
 //! behavioral-off-charter and charter-drift classes (doc_3410 Appendix taxonomy) extend [`DriftClass`] once
 //! their ground truth (task_1117) and detector (task_521) land. Escalation here is behavioral-drift only, so
 //! the hard stop never fires on a stale-charter case (doc_3410 goals 6 and 7).
-#![allow(dead_code)] // slice 1: the pure core; the board/kickoff edge wiring lands in a later slice (task_1325).
+#![allow(dead_code)] // the board/kickoff edge wiring consumes the rest; the notify.rs wake-path wiring is slice 2b.
+
+use serde::{Deserialize, Serialize};
 
 /// A classified drift signal. Stage 1 carries only the switch-do-not-idle behavioral condition; the
 /// behavioral-off-charter and charter-drift classes (doc_3410) are added when their ground truth and detector
 /// land. [`is_behavioral`](DriftClass::is_behavioral) gates whether a class may escalate to a hard stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DriftClass {
     /// task_736: the agent is idle while holding actionable, non-blocked assigned work it should switch to.
     SwitchDoNotIdle,
@@ -69,9 +72,11 @@ pub enum DriftAction {
 /// Per-agent drift state: the current drift class and how many consecutive ticks it has persisted. Persisted
 /// at the edge (a later slice) under the hub state dir, like the heartbeat touch-file. `consecutive` is a
 /// tick count rather than a wall-clock, so the rule has no clock dependency and is deterministically tested.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriftState {
+    #[serde(default)]
     class: Option<DriftClass>,
+    #[serde(default)]
     consecutive: u32,
 }
 
@@ -115,6 +120,72 @@ impl DriftState {
     /// The active drift class, if any.
     pub fn class(&self) -> Option<DriftClass> {
         self.class
+    }
+}
+
+/// Render the correction directive to inject for a [`DriftAction`], or `None` when there is nothing to inject.
+/// Pure - the text is the same wherever it is injected (the launch kickoff or a wake prompt), so the wording
+/// lives here and the injection site only decides when it is appended. A `Directive` is the graceful
+/// return-to-charter / switch-to-actionable nudge the agent processes this tick (doc_3410 goals 1 and 2); an
+/// `Escalate` is the hard stop-and-return wording for behavioral drift that persisted past N ticks (goal 3).
+pub fn directive_text(action: DriftAction) -> Option<String> {
+    match action {
+        DriftAction::None => None,
+        DriftAction::Directive(DriftClass::SwitchDoNotIdle) => Some(
+            "Drift self-check (return to charter): you appear idle while holding actionable, non-blocked \
+             assigned work. Before anything else this tick, either switch to that work now, or - if your \
+             current focus is genuinely in-charter - state in one line why and continue. Do not idle while \
+             actionable assigned work is pending (task_736)."
+                .to_string(),
+        ),
+        DriftAction::Escalate(DriftClass::SwitchDoNotIdle) => Some(
+            "Drift stop-and-return: you have idled past the grace window while holding actionable, \
+             non-blocked assigned work despite the return-to-charter directive. Stop any off-charter \
+             activity now and switch to your actionable assigned work this tick. If you believe this flag \
+             is wrong, pose a question to your lead or the operator before continuing rather than ignoring it."
+                .to_string(),
+        ),
+    }
+}
+
+/// Per-agent persistence for [`DriftState`] across ticks, under `<hub>/drift/<agent>.json` (parallel to the
+/// heartbeat touch-file dir). The wake-path edge (slice 2b) loads the agent's state, calls
+/// [`DriftState::observe`] with this tick's signal, saves it back, and renders [`directive_text`] from the
+/// resulting action. Load is forgiving: a missing or unparseable file is a clean default, so a first wake or a
+/// format change never errors the wake path - it just starts the counter fresh.
+pub struct DriftStore {
+    dir: std::path::PathBuf,
+}
+
+impl DriftStore {
+    /// A store rooted at `<hub_root>/drift`.
+    pub fn new(hub_root: &std::path::Path) -> DriftStore {
+        DriftStore {
+            dir: hub_root.join("drift"),
+        }
+    }
+
+    fn path(&self, agent: &str) -> std::path::PathBuf {
+        self.dir.join(format!("{agent}.json"))
+    }
+
+    /// Load an agent's drift state; a missing or unparseable file yields the default (clean) state.
+    pub fn load(&self, agent: &str) -> DriftState {
+        match std::fs::read_to_string(self.path(agent)) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => DriftState::default(),
+        }
+    }
+
+    /// Persist an agent's drift state, creating the store dir if needed. Best-effort: a write error is
+    /// returned for the caller to log, and never panics the wake path.
+    pub fn save(&self, agent: &str, state: &DriftState) -> Result<(), String> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("create drift dir {}: {e}", self.dir.display()))?;
+        let body =
+            serde_json::to_string(state).map_err(|e| format!("serialize drift state: {e}"))?;
+        std::fs::write(self.path(agent), body)
+            .map_err(|e| format!("write drift state {}: {e}", self.path(agent).display()))
     }
 }
 
@@ -174,6 +245,33 @@ mod tests {
         assert_eq!(s.observe(Some(c), 2), DriftAction::Escalate(c));
         // It stays escalated while the drift persists.
         assert_eq!(s.observe(Some(c), 2), DriftAction::Escalate(c));
+    }
+
+    #[test]
+    fn directive_text_renders_per_action() {
+        assert_eq!(directive_text(DriftAction::None), None);
+        let d = directive_text(DriftAction::Directive(DriftClass::SwitchDoNotIdle)).unwrap();
+        assert!(d.contains("return to charter") && d.contains("task_736"));
+        let e = directive_text(DriftAction::Escalate(DriftClass::SwitchDoNotIdle)).unwrap();
+        assert!(e.contains("stop-and-return"));
+    }
+
+    #[test]
+    fn drift_store_round_trips_and_defaults_when_absent() {
+        let dir = std::env::temp_dir().join(format!("fleet-drift-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = DriftStore::new(&dir);
+        // Absent file -> clean default.
+        assert_eq!(store.load("v-x"), DriftState::default());
+        // Advance a state and persist it, then read it back identically.
+        let mut s = DriftState::default();
+        s.observe(Some(DriftClass::SwitchDoNotIdle), 2);
+        store.save("v-x", &s).unwrap();
+        assert_eq!(store.load("v-x"), s);
+        assert_eq!(store.load("v-x").consecutive(), 1);
+        // A different agent is independent.
+        assert_eq!(store.load("v-y"), DriftState::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
