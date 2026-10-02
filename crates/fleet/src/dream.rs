@@ -948,6 +948,56 @@ fn load_corpus_from_board(board_api: &str, scope: &str) -> Result<Vec<Rec>, Stri
     Ok(recs)
 }
 
+/// Section + rank the proposals for the librarian's review surface: tag each with a `section` -- `actionable`
+/// (within-repo merges + orphan add-links), `cross_repo_twin` (the distinct cross-cutting twins), or `fyi`
+/// (the low-confidence write-later advisories) -- then order by section (actionable, then twins, then FYI),
+/// confidence descending, then id for stability. Mutates each proposal in place; returns the per-section
+/// counts. "Rank, do not suppress" per the librarian.
+fn rank_and_section(proposals: &mut [Value]) -> (usize, usize, usize) {
+    fn section_of(kind: &str) -> &'static str {
+        match kind {
+            "cross_repo_twin" => "cross_repo_twin",
+            "write_later_candidate" => "fyi",
+            _ => "actionable", // near_duplicate (merges) + cross_link (orphan add-links)
+        }
+    }
+    fn rank(section: &str) -> u8 {
+        match section {
+            "actionable" => 0,
+            "cross_repo_twin" => 1,
+            _ => 2,
+        }
+    }
+    for p in proposals.iter_mut() {
+        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("");
+        let section = section_of(kind);
+        if let Some(obj) = p.as_object_mut() {
+            obj.insert("section".to_string(), json!(section));
+        }
+    }
+    proposals.sort_by(|a, b| {
+        let sa = a.get("section").and_then(Value::as_str).unwrap_or("");
+        let sb = b.get("section").and_then(Value::as_str).unwrap_or("");
+        let ca = a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+        let cb = b.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+        rank(sa)
+            .cmp(&rank(sb))
+            .then(cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                a.get("proposal_id")
+                    .and_then(Value::as_str)
+                    .cmp(&b.get("proposal_id").and_then(Value::as_str))
+            })
+    });
+    let count = |s: &str| {
+        proposals
+            .iter()
+            .filter(|p| p.get("section").and_then(Value::as_str) == Some(s))
+            .count()
+    };
+    (count("actionable"), count("cross_repo_twin"), count("fyi"))
+}
+
 /// Run the dream analyzer and write the dream-report JSON to `out`. The corpus comes from either a `--corpus`
 /// JSONL file or, when `from_board` is set, a live-board pull of `scope` (a wiki path prefix). Returns the
 /// process exit code; `sample` prints that many proposals to stderr for a quick eyeball.
@@ -1007,6 +1057,9 @@ pub fn analyze_cmd(
     let catalogued = load_forward_ref_catalogue(&recs);
     proposals.extend(detect_write_later_candidates(&recs, &prot, &backlinks, &catalogued));
 
+    // Section + rank for the librarian's review surface (actionable first, write-later as FYI).
+    let (sec_actionable, sec_twin, sec_fyi) = rank_and_section(&mut proposals);
+
     let standard = proposals.iter().filter(|p| p["lane"] == "standard").count();
     let protected = proposals.iter().filter(|p| p["lane"] == "protected").count();
     let report = json!({
@@ -1017,6 +1070,7 @@ pub fn analyze_cmd(
         "detectors_run": ["exact_duplicate", "orphan_add_links", "near_duplicate_minhash", "write_later_candidate"],
         "proposal_count": proposals.len(),
         "by_lane": { "standard": standard, "protected": protected },
+        "by_section": { "actionable": sec_actionable, "cross_repo_twin": sec_twin, "fyi": sec_fyi },
         "proposals": proposals,
     });
 
@@ -1228,6 +1282,27 @@ mod tests {
             .collect();
         let props = detect_near_duplicates(&recs, &HashMap::new(), &backlinks, &exact);
         assert!(props.is_empty(), "exact-dup pair is skipped by the near-dup detector");
+    }
+
+    #[test]
+    fn rank_and_section_orders_actionable_then_twins_then_fyi_by_confidence() {
+        let mut props = vec![
+            json!({"proposal_id": "w1", "kind": "write_later_candidate", "confidence": 0.2}),
+            json!({"proposal_id": "t1", "kind": "cross_repo_twin", "confidence": 0.9}),
+            json!({"proposal_id": "m1", "kind": "near_duplicate", "confidence": 0.85}),
+            json!({"proposal_id": "m2", "kind": "near_duplicate", "confidence": 1.0}),
+            json!({"proposal_id": "o1", "kind": "cross_link", "confidence": 0.6}),
+        ];
+        let (actionable, twins, fyi) = rank_and_section(&mut props);
+        assert_eq!((actionable, twins, fyi), (3, 1, 1)); // m1,m2,o1 | t1 | w1
+        // sections tagged
+        assert_eq!(props[0]["section"], "actionable");
+        // actionable block first, by confidence desc: m2 (1.0), m1 (0.85), o1 (0.6)
+        let ids: Vec<&str> = props.iter().map(|p| p["proposal_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["m2", "m1", "o1", "t1", "w1"]);
+        // the cross-repo twin is its own section, write-later is FYI last.
+        assert_eq!(props[3]["section"], "cross_repo_twin");
+        assert_eq!(props[4]["section"], "fyi");
     }
 
     #[test]
