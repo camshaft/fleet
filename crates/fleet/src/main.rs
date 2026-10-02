@@ -1836,6 +1836,16 @@ enum Cmd {
         /// timer — a fleet-wide bounce is an owner-triggered act, never an unfenced automatic one.
         #[arg(long)]
         bounce_stale: bool,
+        /// ACT on the task_582 SAFEGUARD-WEDGE signal: for each running board-native agent whose last few
+        /// assistant turns are all `stop_reason=refusal` (a model-safeguard reject loop that keeps `last_seen`
+        /// advancing, so the liveness/age checks miss it), AUTO-RECOVER it — `fleet spin-down <id> --apply
+        /// --force` then `fleet spin-up <id> --apply`, so the fresh session breaks the refusal loop instead of
+        /// burning turns until a human notices. Cooldown-fenced per agent (CDZ_RECOVER_WEDGED_COOLDOWN_SECS,
+        /// default 3600) so a recovery that does not immediately clear the wedge is not retried every sweep, and
+        /// suppressed during a fleet-quiesce (a mass spin-down must not be fought). OPT-IN so merely shipping the
+        /// detection never force-restarts an agent; without it the wedge stays report-only (a WARNING line).
+        #[arg(long)]
+        recover_wedged: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -2365,7 +2375,8 @@ fn main() {
             hire_signal,
             revive_stranded,
             bounce_stale,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal, revive_stranded, bounce_stale),
+            recover_wedged,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal, revive_stranded, bounce_stale, recover_wedged),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -4824,6 +4835,39 @@ fn write_revive_stranded_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+/// task_582 default recover-wedged cooldown: at most one auto-recovery (force spin-down + spin-up) per wedged
+/// agent per this window, so a recovery that does not immediately clear the safeguard-refusal loop is not
+/// retried every sweep (a fresh session that re-wedges on the same input must not be thrashed). 1h matches the
+/// revive-stranded cadence; `CDZ_RECOVER_WEDGED_COOLDOWN_SECS` tunes it.
+const RECOVER_WEDGED_COOLDOWN_SECS: u64 = 3600;
+
+/// task_582 cooldown gate (pure, unit-testable), mirroring [`revive_stranded_on_cooldown`]: a recovery is on
+/// cooldown when the last one for this agent is within `cooldown_secs`. No floor — the cooldown IS the window.
+/// `None` (never recovered) is not on cooldown.
+fn recover_wedged_on_cooldown(last_recover: Option<u64>, now: u64, cooldown_secs: u64) -> bool {
+    last_recover.is_some_and(|last| now.saturating_sub(last) < cooldown_secs)
+}
+
+/// The per-agent last-recovery stamp path: `<hub>/.claude/fleet/watchdog/<name>.recover-wedged` (unix secs).
+fn recover_wedged_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("watchdog").join(format!("{name}.recover-wedged"))
+}
+
+/// Read an agent's last-recovery unix time; `None` on an absent/unparseable stamp (never recovered).
+fn read_recover_wedged_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(recover_wedged_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+}
+
+/// Record that an agent was just auto-recovered at `now` (best-effort — a write failure only means the cooldown
+/// is not enforced for that agent on the next sweep).
+fn write_recover_wedged_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = recover_wedged_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
 // ── observation triggers (#187, BUILD 2/5) ─────────────────────────────────────────────────────────
 // The watchdog is also the SPAWNER of ephemeral per-agent observer sessions: it tracks each agent's
 // transcript growth against a per-agent watermark and, when the unobserved increment crosses a threshold
@@ -5413,6 +5457,7 @@ fn watchdog(
     revive_stranded: bool,
     // Named distinctly from the `bounce_stale` function it gates (a same-name binding would shadow the fn).
     sweep_stale: bool,
+    recover_wedged: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -5446,7 +5491,7 @@ fn watchdog(
     let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers, hire_signal, revive_stranded);
+            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers, hire_signal, revive_stranded, recover_wedged);
             // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
             // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
             // sweep, and in APPLY mode (passing the flag IS the opt-in, like --revive-stranded). The sweep's own
@@ -5744,6 +5789,7 @@ fn watchdog_board(
     reap_stale_observers: bool,
     hire_signal: bool,
     revive_stranded: bool,
+    recover_wedged: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
@@ -6098,13 +6144,64 @@ fn watchdog_board(
     }
     if !wedged_ids.is_empty() {
         // task_582: a model-safeguard wedge keeps last_seen advancing, so the liveness/age checks above miss
-        // it — surface it loudly. Report-only this slice: recovery is a manual spin-down/spin-up; the next
-        // task_582 increment wires an auto spin-down + spin-up (cooldown-fenced) off this same detection.
+        // it — surface it loudly. The WARNING always prints (the report); with --recover-wedged it ALSO
+        // auto-recovers each agent below (force spin-down + spin-up), cooldown-fenced and quiesce-suppressed.
         println!(
             "-- WARNING: {} agent(s) SAFEGUARD-WEDGED (last {SAFEGUARD_WEDGE_THRESHOLD} assistant turns all stop_reason=refusal; last_seen keeps advancing so the liveness check misses it): {}. Recover: `fleet spin-down <agent> --apply --force` then `fleet spin-up <agent> --apply`.",
             wedged_ids.len(),
             wedged_ids.join(", ")
         );
+        // ACT (task_582 auto-recovery, opt-in --recover-wedged): a wedged agent is in a model-safeguard refusal
+        // loop that keeps last_seen advancing, so no wake/re-arm breaks it — only a FRESH session does. Force
+        // spin-down (kill the wedged window; --force overrides the busy fence, since a refusal-looping pane
+        // reads as "working") then spin-up, both as SUBPROCESSES so a per-agent failure (process::exit) is
+        // contained in the child and never aborts the sweep. Cooldown-fenced per agent so a recovery that does
+        // not immediately clear the wedge is not retried every sweep. Suppressed during a fleet-quiesce: a mass
+        // spin-down parks agents deliberately, and force-restarting one then would fight the operator.
+        if recover_wedged && fleet_quiesced {
+            println!(
+                "-- recover-wedged SUPPRESSED (task_1032): fleet-quiesce in effect (mass spin-down) — not force-restarting {} wedged agent(s) into the operator spin-down",
+                wedged_ids.len()
+            );
+        } else if watchdog_action_enabled(recover_wedged, fleet_quiesced) {
+            let cooldown = std::env::var("CDZ_RECOVER_WEDGED_COOLDOWN_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(RECOVER_WEDGED_COOLDOWN_SECS);
+            let self_bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "fleet".to_string());
+            let (mut recovered, mut cooled, mut failed) = (0usize, 0usize, 0usize);
+            for id in &wedged_ids {
+                if recover_wedged_on_cooldown(read_recover_wedged_stamp(&fleet, id), now_unix, cooldown) {
+                    cooled += 1;
+                    continue;
+                }
+                // Force spin-down (break the wedged window past the busy fence), then spin-up a fresh session.
+                let down = std::process::Command::new(&self_bin)
+                    .args(["spin-down", id, "--apply", "--force"])
+                    .status();
+                if !matches!(down, Ok(s) if s.success()) {
+                    eprintln!("  ! recover-wedged: spin-down '{id}' failed — not spinning up / not stamping, will retry next sweep");
+                    failed += 1;
+                    continue;
+                }
+                match std::process::Command::new(&self_bin).args(["spin-up", id, "--apply"]).status() {
+                    Ok(s) if s.success() => {
+                        write_recover_wedged_stamp(&fleet, id, now_unix);
+                        recovered += 1;
+                    }
+                    _ => {
+                        eprintln!("  ! recover-wedged: spin-up '{id}' failed after spin-down — agent left DOWN (spin it up manually); not stamping");
+                        failed += 1;
+                    }
+                }
+            }
+            println!(
+                "-- recover-wedged (task_582): recovered {recovered}, {cooled} on cooldown, {failed} failed (opt-in force spin-down+spin-up of safeguard-wedged agents; cooldown {cooldown}s per agent)"
+            );
+        }
     }
     if !stranded_ids.is_empty() {
         // task_786 corrective: an agent STOOD DOWN (offline) while still holding open actionable assignment(s)
@@ -10509,6 +10606,28 @@ mod tests {
         assert!(!revive_stranded_on_cooldown(Some(10_000), 20_000, 3_600));
         // Clock skew (now < last) saturates to 0 elapsed → treated as on cooldown (fail-safe, no re-revive).
         assert!(revive_stranded_on_cooldown(Some(10_000), 9_000, 3_600));
+    }
+
+    #[test]
+    fn recover_wedged_on_cooldown_suppresses_only_within_the_window() {
+        // task_582: a wedged-agent auto-recovery (force spin-down + spin-up) is suppressed only while the last
+        // recovery is within the window, so a fresh session that re-wedges on the same input is not thrashed.
+        assert!(!recover_wedged_on_cooldown(None, 10_000, RECOVER_WEDGED_COOLDOWN_SECS));
+        assert!(recover_wedged_on_cooldown(Some(10_000), 10_000, 3_600));
+        assert!(recover_wedged_on_cooldown(Some(10_000), 10_000 + 3_599, 3_600));
+        assert!(!recover_wedged_on_cooldown(Some(10_000), 10_000 + 3_600, 3_600));
+        assert!(!recover_wedged_on_cooldown(Some(10_000), 20_000, 3_600));
+        // Clock skew (now < last) saturates to 0 elapsed → on cooldown (fail-safe, no re-recover).
+        assert!(recover_wedged_on_cooldown(Some(10_000), 9_000, 3_600));
+    }
+
+    #[test]
+    fn recover_wedged_gated_by_flag_and_quiesce() {
+        // task_582 + task_1032: auto-recovery runs only when --recover-wedged is set AND the fleet is not
+        // quiesced (force-restarting a parked agent during a mass spin-down would fight the operator).
+        assert!(watchdog_action_enabled(true, false));
+        assert!(!watchdog_action_enabled(true, true));
+        assert!(!watchdog_action_enabled(false, false));
     }
 
     #[test]
