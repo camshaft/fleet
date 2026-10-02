@@ -1640,6 +1640,23 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Watchdog-driven STALE-SESSION sweep (task_752): bounce every running board-native agent whose session
+    /// was launched under an OLDER fleet binary than the current one, so each refetches its MCP tools/list and
+    /// picks up tools shipped since it connected (e.g. `pose_question`). The staleness signal is the per-agent
+    /// launch-rev stamp vs this binary's `FLEET_BUILD_REV`: after a redeploy the sweep runs under the new
+    /// binary, so a session launched under the old one reads as stale. This is the fleet-wide form of
+    /// `bounce-session` — report-only by default (lists which agents would be bounced and why), `--apply`
+    /// bounces each candidate through the fenced per-agent `bounce-session` path (board-native + not-busy +
+    /// cooldown-fenced), so a healthy or mid-turn session is never thrashed. `--force` passes through to
+    /// override the busy + cooldown fences per candidate.
+    BounceStale {
+        /// Bounce the stale candidates (default: just list them).
+        #[arg(long)]
+        apply: bool,
+        /// Pass `--force` to each per-agent bounce (override its busy + cooldown fences).
+        #[arg(long)]
+        force: bool,
+    },
     /// Report every board-declared agent's liveness off its board `last_seen` (the watchdog's read side).
     /// Reads the roster from the board (orchestrator read — agents coordinate via their own MCP) and
     /// classifies each by how stale its heartbeat is: live / quiet / STALE.
@@ -2222,6 +2239,7 @@ fn main() {
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::SpinDown { agent, apply, force } => spin_down(&agent, apply, force),
         Cmd::BounceSession { agent, apply, force } => bounce_session(&fleet, &agent, apply, force),
+        Cmd::BounceStale { apply, force } => bounce_stale(&fleet, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
         Cmd::Watchdog {
             stale_only,
@@ -2503,6 +2521,9 @@ fn spin_up_workspace_kind(
                 Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
                 Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
             }
+            // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
+            // from one that connected under an older binary (task_752).
+            stamp_launch_rev(agent);
         }
         Err(e) => {
             eprintln!("  launch FAILED: {e}");
@@ -2729,6 +2750,9 @@ fn spin_up(agent: &str, apply: bool) {
                 Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
                 Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
             }
+            // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
+            // from one that connected under an older binary (task_752).
+            stamp_launch_rev(agent);
         }
         Err(e) => {
             eprintln!("  launch FAILED: {e}");
@@ -3219,6 +3243,53 @@ fn write_bounce_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+/// The per-agent launch-rev stamp path: `<hub>/.claude/fleet/watchdog/<name>.launchrev` (contents = the
+/// `FLEET_BUILD_REV` of the fleet binary that launched the agent's session). task_752: the watchdog-driven
+/// stale-session selection reads this to tell whether a running session connected under an OLDER binary (so
+/// its cached MCP tools/list predates the current deploy) and is a bounce candidate.
+fn launch_rev_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("watchdog").join(format!("{name}.launchrev"))
+}
+
+/// Read the build rev an agent's session was launched under; `None` on an absent/empty stamp (a session that
+/// predates launch-rev stamping, or was launched outside `spin-up`).
+fn read_launch_rev(fleet: &Fleet, name: &str) -> Option<String> {
+    let s = std::fs::read_to_string(launch_rev_stamp_path(fleet, name)).ok()?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Record that an agent's session was launched under `rev` (best-effort — a write failure only means the next
+/// stale-session sweep treats it as unknown-rev, i.e. a bounce candidate, which is self-healing).
+fn write_launch_rev(fleet: &Fleet, name: &str, rev: &str) {
+    let p = launch_rev_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, rev);
+}
+
+/// Stamp the CURRENT fleet-binary build rev as the launch rev for `agent` — called at every `spin-up`
+/// launch-success site so a later (post-redeploy) binary can tell a stale session from a fresh one (task_752).
+/// A bounce relaunches through `spin-up`, so a bounced session re-stamps the new rev and drops off the
+/// stale-candidate list.
+fn stamp_launch_rev(agent: &str) {
+    write_launch_rev(&Fleet::resolve(), agent, env!("FLEET_BUILD_REV"));
+}
+
+/// Pure stale-session selection for the watchdog-driven bounce sweep (task_752). A running board-native
+/// session is STALE — a bounce candidate to refresh its cached MCP tools/list — when it was launched under a
+/// build rev other than the current one. `None` (no recorded launch rev: a session that predates stamping or
+/// was launched outside `spin-up`) counts as STALE: bouncing it once establishes the stamp and refreshes its
+/// tools/list, and the cooldown fence plus the report-only-first default keep that one-time catch-up safe.
+/// Pure — unit-tested without a board or tmux.
+fn stale_launch_for_deploy(launch_rev: Option<&str>, current_rev: &str) -> bool {
+    match launch_rev {
+        None => true,
+        Some(rev) => rev != current_rev,
+    }
+}
+
 /// `fleet bounce-session`: relaunch ONE board-native agent's session so its MCP client reconnects to the
 /// current board server process and refetches tools/list (task_752 — the stale-cached-tools/list fix). A
 /// long-lived session caches tools/list at connect, and a redeploy that ships a new tool often does NOT drop
@@ -3325,6 +3396,83 @@ fn bounce_session(fleet: &Fleet, agent: &str, apply: bool, force: bool) {
     println!("  relaunching via spin-up …");
     spin_up(agent, true);
     println!("  ✓ bounced '{agent}' — the fresh session will reconnect + refetch tools/list.");
+}
+
+/// `fleet bounce-stale`: the watchdog-driven, fleet-wide form of `bounce-session` (task_752). After a
+/// redeploy, a long-lived session keeps serving the MCP tools/list it cached at connect — so a tool shipped
+/// since (e.g. `pose_question`) stays invisible until the session reconnects. This sweeps every RUNNING
+/// board-native agent and bounces the ones whose session was launched under an OLDER binary than the one
+/// running this sweep (the per-agent launch-rev stamp vs this binary's `FLEET_BUILD_REV`). Report-only by
+/// default (lists the stale sessions and why); `--apply` bounces each through the fenced per-agent
+/// `bounce-session` path as a SUBPROCESS, so a single refusal (busy pane / cooldown) or a kill never aborts
+/// the sweep — the same isolation `watchdog --revive-stranded` uses. `--force` passes through to each bounce.
+fn bounce_stale(fleet: &Fleet, apply: bool, force: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet bounce-stale: {e}");
+        std::process::exit(1);
+    });
+    let roster = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet bounce-stale: {e}");
+        std::process::exit(1);
+    });
+    let current_rev = env!("FLEET_BUILD_REV");
+    let windows = tmux_window_names(&board_session());
+    // Bounce each candidate by re-invoking THIS binary (so the relaunch stamps the current rev) as a
+    // subprocess, mirroring the --revive-stranded isolation: a per-agent failure never aborts the sweep.
+    let self_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "fleet".to_string());
+
+    println!(
+        "bounce-stale ({}): current fleet rev {current_rev} — scanning running board-native sessions for a stale tools/list",
+        if apply { "APPLY" } else { "dry-run" }
+    );
+
+    let mut candidates = 0usize;
+    let mut bounced = 0usize;
+    for rec in &roster {
+        let Some(id) = rec.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let is_native = rec
+            .get("metadata")
+            .and_then(|m| m.get("native"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !is_native {
+            continue; // only board-native agents launch (and relaunch) through the fleet
+        }
+        if !windows.iter().any(|w| w == id) {
+            continue; // not running on this host — nothing to bounce (spin-up starts it fresh anyway)
+        }
+        let launch_rev = read_launch_rev(fleet, id);
+        if !stale_launch_for_deploy(launch_rev.as_deref(), current_rev) {
+            continue; // launched under the current rev — its tools/list is already fresh
+        }
+        candidates += 1;
+        println!("  STALE '{id}' (launched rev {} != current {current_rev})", launch_rev.as_deref().unwrap_or("unknown"));
+        if !apply {
+            continue;
+        }
+        let mut args = vec!["bounce-session".to_string(), id.to_string(), "--apply".to_string()];
+        if force {
+            args.push("--force".to_string());
+        }
+        match std::process::Command::new(&self_bin).args(&args).status() {
+            Ok(st) if st.success() => bounced += 1,
+            Ok(_) => eprintln!("    (bounce-session '{id}' declined — likely a busy pane or cooldown; left running, next sweep retries)"),
+            Err(e) => eprintln!("    (could not run bounce-session '{id}': {e})"),
+        }
+    }
+
+    if candidates == 0 {
+        println!("  no stale sessions — every running board-native agent is on the current rev");
+    } else if apply {
+        println!("  bounced {bounced}/{candidates} stale session(s); any shortfall was fenced (busy pane or cooldown) and retries next sweep");
+    } else {
+        println!("  {candidates} stale session(s) would be bounced — re-run with --apply (each still passes the per-agent busy + cooldown fences)");
+    }
 }
 
 /// A recognizable marker in the fleet-installed fmt pre-commit hook, so a re-install tells OUR hook (safe to
@@ -9587,6 +9735,21 @@ mod tests {
         assert!(!bounce_on_cooldown(Some(10_000), 20_000, 1_800));
         // Clock skew (now < last) saturates to 0 elapsed → treated as on cooldown (fail-safe, no thrash).
         assert!(bounce_on_cooldown(Some(10_000), 9_000, 1_800));
+    }
+
+    #[test]
+    fn stale_launch_for_deploy_flags_a_mismatch_or_unknown_rev() {
+        // task_752: a session launched under the SAME rev as the running sweep is fresh — not a candidate.
+        assert!(!stale_launch_for_deploy(Some("abc123"), "abc123"));
+        // Launched under a different (older) rev → stale, a bounce candidate to refresh its tools/list.
+        assert!(stale_launch_for_deploy(Some("old999"), "abc123"));
+        // No recorded launch rev (a session predating stamping, or launched outside spin-up) → treated as
+        // stale: a one-time catch-up bounce establishes the stamp. The cooldown fence + report-only-first
+        // default keep that safe, and a bounced session re-stamps the current rev so it drops off the list.
+        assert!(stale_launch_for_deploy(None, "abc123"));
+        // An empty stamp reads as None upstream (read_launch_rev), so the Some("") shape never reaches here;
+        // but even if it did, it differs from a real rev and is correctly stale.
+        assert!(stale_launch_for_deploy(Some(""), "abc123"));
     }
 
     #[test]
