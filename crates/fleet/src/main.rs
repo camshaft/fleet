@@ -2405,6 +2405,20 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Spawn the per-angle ephemeral adversarial reviewers for one review on the existing spawn engine
+    /// (task_374 S2a). Dry-run by default; `--apply` launches. The board-side idempotent per-angle claim and
+    /// the automatic `review.opened_for_review` trigger are later slices — so this is the manual entry point,
+    /// and re-running `--apply` re-spawns until the claim lands.
+    ReviewSpawn {
+        /// The review id to spawn adversarial reviewers for.
+        review_id: i64,
+        /// Restrict to one angle key (default: all REVIEW_ANGLES). E.g. `risk-security`.
+        #[arg(long)]
+        angle: Option<String>,
+        /// Actually launch the reviewers; without it, only print the spawn plan (dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Pattern-kill processes WITHOUT the `pkill -f` self-match footgun (task_1068): kill every process whose
     /// full command line contains `pattern`, but NEVER the caller's own process, its ancestor chain (the
     /// invoking shell, the Bash-tool wrapper, the agent's claude session), or its process group. `pkill -f`
@@ -2920,6 +2934,11 @@ fn main() {
             tunnel_bin,
             apply,
         } => tunnel_guard(&name, &probe_url, &recreate, &tunnel_bin, apply),
+        Cmd::ReviewSpawn {
+            review_id,
+            angle,
+            apply,
+        } => review_spawn(&board_session(), review_id, angle.as_deref(), apply),
         Cmd::SafePkill {
             pattern,
             dry_run,
@@ -6225,6 +6244,24 @@ fn obs_window_name(target: &str) -> String {
     format!("obs-{}", target.replace(['/', ':', '.'], "-"))
 }
 
+/// The per-(review, angle) reviewer tmux window name (local only; the board identity stays `reviewer`), the
+/// reviewer analog of [`obs_window_name`]. Several angles on one review (and several reviews) run at once
+/// without a name clash. The angle keys are kebab-case so already window-safe; mangled defensively anyway.
+/// Pure — unit-tested.
+fn reviewer_window_name(review_id: i64, angle: &str) -> String {
+    format!("rev-{review_id}-{}", angle.replace(['/', ':', '.'], "-"))
+}
+
+/// The idempotent per-angle CLAIM id for an adversarial review (task_374 S2, v-task-board contract
+/// comment_1093): `adversarial-claim:<review_id>:<angle>`. The spawn pass APPENDS an `adversarial_review` log
+/// entry with this `external_id` FIRST and spawns the angle's reviewer only when the append returns
+/// `appended:true`; a re-sweep's duplicate append returns `appended:false` (deduped by external_id, atomic
+/// under the board's single-writer pool) → skip. Per-ANGLE so a partial-failure re-sweep re-spawns only the
+/// angle that had not yet claimed. Pure — unit-tested. (The board append that consumes this is S2b.)
+fn reviewer_claim_external_id(review_id: i64, angle: &str) -> String {
+    format!("adversarial-claim:{review_id}:{angle}")
+}
+
 /// Whether an `obs-<target>` window that is STILL ALIVE should be reaped (task_610). A healthy in-flight
 /// observer has a RECENT spawn stamp (< bound) → never reaped. A stamp older than the bound = the observer
 /// never confirmed (`observe-record` clears the stamp on success), so it crashed/hung → reap. An ABSENT stamp
@@ -6479,6 +6516,105 @@ fn spawn_observer(
         Ok(s) if s.success() => format!("spawned({window})"),
         Ok(_) => "spawn-FAILED(tmux new-window)".to_string(),
         Err(e) => format!("spawn-FAILED(tmux: {e})"),
+    }
+}
+
+/// Launch (or, with `dry_run`, preview) an ephemeral adversarial-reviewer session for one review on one angle
+/// (task_374 S2a) — the reviewer analog of [`spawn_observer`] on the same ephemeral spawn engine (#187/#188).
+/// Runs in a repo-less workspace under the fleet root; the board identity is `reviewer` (the session
+/// registers/authors as it per [`build_reviewer_kickoff`]), and the per-(review,angle) tmux window
+/// ([`reviewer_window_name`]) lets several angles run at once. Returns a short action label for the caller's
+/// report. Best-effort: a launch error is reported, never fatal (one angle failing must not abort the rest).
+fn spawn_reviewer(
+    board_session: &str,
+    review_id: i64,
+    angle_key: &str,
+    angle_focus: &str,
+    dry_run: bool,
+) -> String {
+    let fleet_root = config::get()
+        .root
+        .clone()
+        .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
+    let workdir = workspace::agent_root_dir(&fleet_root, "reviewer");
+    // Use THIS standalone binary (absolute path) for the reviewer's `fleet` commands; the role body ships
+    // beside it at <repo>/loops/reviewer.md (binary = <repo>/target/<profile>/fleet → up 3). Mirrors
+    // spawn_observer's resolution exactly.
+    let exe = std::env::current_exe().ok();
+    let fleet_bin = exe
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .unwrap_or("fleet")
+        .to_string();
+    let role_path = exe
+        .as_ref()
+        .and_then(|p| p.ancestors().nth(3))
+        .map(|repo| repo.join("loops/reviewer.md").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "loops/reviewer.md".to_string());
+    let kickoff = build_reviewer_kickoff(review_id, angle_key, angle_focus, &role_path, &fleet_bin);
+    let window = reviewer_window_name(review_id, angle_key);
+    if dry_run {
+        return format!("would-spawn({window}←review#{review_id}/{angle_key})");
+    }
+    if let Err(e) = std::fs::create_dir_all(&workdir) {
+        return format!("spawn-FAILED(mkdir {workdir}: {e})");
+    }
+    let _ = pre_trust_dirs(&[fleet_root.clone(), workdir.clone()]);
+    let cmd = match build_launch_cmd("claude", &resolve_model("opus"), "high", None) {
+        Ok(c) => c,
+        Err(e) => return format!("spawn-FAILED({e})"),
+    };
+    match std::process::Command::new("tmux")
+        .args([
+            "new-window",
+            "-d",
+            "-t",
+            board_session,
+            "-n",
+            &window,
+            "-c",
+            &workdir,
+            "-e",
+            &format!("CDZ_KICKOFF={kickoff}"),
+            &cmd,
+        ])
+        .status()
+    {
+        Ok(s) if s.success() => format!("spawned({window})"),
+        Ok(_) => "spawn-FAILED(tmux new-window)".to_string(),
+        Err(e) => format!("spawn-FAILED(tmux: {e})"),
+    }
+}
+
+/// `fleet review-spawn <review_id> [--angle <key>] [--apply]` (task_374 S2a): spawn the per-angle ephemeral
+/// adversarial reviewers for ONE review on the existing spawn engine. Dry-run by default (prints the plan);
+/// `--apply` launches. `--angle` restricts to one [`REVIEW_ANGLES`] key (default: all). This is the MANUAL
+/// entry point; the board-side idempotent per-angle CLAIM (append_review_log, [`reviewer_claim_external_id`])
+/// and the automatic `review.opened_for_review` trigger are the next slices (S2b/S2c) — so re-running `--apply`
+/// re-spawns (no claim yet), which is acceptable for an operator-invoked command and called out in its help.
+fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply: bool) {
+    let angles: Vec<&(&str, &str)> = match angle {
+        Some(k) => {
+            let found: Vec<_> = REVIEW_ANGLES.iter().filter(|(key, _)| *key == k).collect();
+            if found.is_empty() {
+                eprintln!(
+                    "review-spawn: unknown angle '{k}' (known: {})",
+                    REVIEW_ANGLES.iter().map(|(key, _)| *key).collect::<Vec<_>>().join(", ")
+                );
+                std::process::exit(2);
+            }
+            found
+        }
+        None => REVIEW_ANGLES.iter().collect(),
+    };
+    println!(
+        "review-spawn: review #{review_id}, {} angle(s){}",
+        angles.len(),
+        if apply { "" } else { " (dry-run — pass --apply to launch)" }
+    );
+    for (key, focus) in angles {
+        let label = spawn_reviewer(board_session, review_id, key, focus, !apply);
+        println!("  {key}: {label}  [claim {}]", reviewer_claim_external_id(review_id, key));
     }
 }
 
@@ -16636,6 +16772,38 @@ detached
         assert_eq!(obs_window_name("v-fleet-tooling"), "obs-v-fleet-tooling");
         assert_eq!(obs_window_name("camshaft/cadenza"), "obs-camshaft-cadenza");
         assert_eq!(obs_window_name("a.b:c/d"), "obs-a-b-c-d");
+    }
+
+    #[test]
+    fn reviewer_window_name_is_per_review_and_angle_and_window_safe() {
+        // task_374 S2a: one window per (review, angle) so angles + reviews don't clash. Angle keys are kebab
+        // already; defensively mangle any `/`:`.` to `-` so it stays a single valid tmux window token.
+        assert_eq!(reviewer_window_name(42, "risk-security"), "rev-42-risk-security");
+        assert_eq!(reviewer_window_name(7, "clarity-writing"), "rev-7-clarity-writing");
+        assert_eq!(reviewer_window_name(1, "a/b.c:d"), "rev-1-a-b-c-d");
+        // distinct review ids and distinct angles both yield distinct windows (no collision).
+        assert_ne!(reviewer_window_name(1, "alternatives"), reviewer_window_name(2, "alternatives"));
+        assert_ne!(reviewer_window_name(1, "alternatives"), reviewer_window_name(1, "risk-security"));
+    }
+
+    #[test]
+    fn reviewer_claim_external_id_matches_the_v_task_board_contract() {
+        // task_374 S2 claim contract (v-task-board comment_1093): adversarial-claim:<review_id>:<angle>, PER
+        // ANGLE so a partial re-sweep re-claims only the un-claimed angle. Append-first-then-spawn-on-appended.
+        assert_eq!(
+            reviewer_claim_external_id(42, "risk-security"),
+            "adversarial-claim:42:risk-security"
+        );
+        assert_eq!(
+            reviewer_claim_external_id(7, "correctness-completeness"),
+            "adversarial-claim:7:correctness-completeness"
+        );
+        // every shipped angle yields a DISTINCT claim id for a given review (independent per-angle spawn).
+        let ids: std::collections::BTreeSet<_> = REVIEW_ANGLES
+            .iter()
+            .map(|(k, _)| reviewer_claim_external_id(42, k))
+            .collect();
+        assert_eq!(ids.len(), REVIEW_ANGLES.len(), "per-angle claim ids are unique");
     }
 
     #[test]
