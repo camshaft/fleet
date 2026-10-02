@@ -2234,6 +2234,10 @@ enum Cmd {
         /// A file to scan as-is from disk; repeatable. Default when omitted: the staged index.
         #[arg(long = "file")]
         files: Vec<String>,
+        /// A git diff range (e.g. `origin/main...HEAD`): scan the current on-disk content of every file the
+        /// range adds/modifies. The CI-backstop mode; takes precedence over `--file` and the staged default.
+        #[arg(long)]
+        diff: Option<String>,
         /// Scan the staged index even when `--file`s are given.
         #[arg(long)]
         staged: bool,
@@ -2741,6 +2745,7 @@ fn main() {
         Cmd::ScanContent {
             taxonomy,
             files,
+            diff,
             staged,
             warn_only,
             redact,
@@ -2748,6 +2753,7 @@ fn main() {
         } => scan::scan_content(scan::ScanOpts {
             taxonomy,
             files,
+            diff,
             staged,
             warn_only,
             redact,
