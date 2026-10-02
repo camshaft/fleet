@@ -1962,15 +1962,34 @@ fn today_utc_date() -> String {
     time::OffsetDateTime::now_utc().date().to_string()
 }
 
+/// The default board channel for dream notify-on-new posts: a dedicated, watchable, pageable feed (the
+/// librarian's convention, channel_218), isolated from 1:1 coordination DMs.
+pub const DREAM_NOTIFY_CHANNEL: &str = "dream-reports";
+
+/// Format the dream notify-on-new post: one light line per scope with new proposals (scope + count + the
+/// `dreams/<scope>` review doc), scannable and low-noise. Only called when at least one scope has new>0;
+/// dispositions carry forward so a declined proposal never re-pings. Pure.
+fn format_dream_notify_post(new_by_scope: &[(String, usize)]) -> String {
+    let total: usize = new_by_scope.iter().map(|(_, n)| n).sum();
+    let mut body = format!(
+        "Automatic dreaming surfaced {total} new proposal(s) across {} scope(s) -- review the dreams/<scope> doc for each (declined/deferred proposals carry forward and will not re-ping):\n",
+        new_by_scope.len()
+    );
+    for (scope, n) in new_by_scope {
+        body.push_str(&format!("- {scope}: {n} new -> dreams/{scope}\n"));
+    }
+    body
+}
+
 /// `fleet dream-run` (task_1123): the automatic-dreaming RUNNER. Pulls every `repos/*` memory from the live
 /// board in one pass, groups by repo, and runs the analyze+publish pass per repo scope -- refreshing each
 /// versioned `dreams/<scope>` review doc and writing a per-scope report under `<state-dir>/dreams/`. Emits a
-/// consolidated `DREAM-NEW scope=... new=... ids=...` line to stdout per scope that surfaced new proposals
-/// (the librarian-blessed notify-on-new signal); the systemd timer/service wiring (v-fleet-tooling) carries
-/// that signal to the librarian. FIRST CUT is corpus-only: no `--repo-root`, so the staleness detector skips
-/// (the repo-root mapping is a v-fleet-tooling follow-on). Returns a nonzero exit if any scope failed, so a
+/// `DREAM-NEW scope=... new=... ids=...` line to stdout per scope that surfaced new proposals, and posts a
+/// light notify-on-new message to the librarian's `notify_channel` (dedicated `dream-reports` feed) when any
+/// scope is new. FIRST CUT is corpus-only: no `--repo-root`, so the staleness detector skips (the repo-root
+/// mapping is a v-fleet-tooling follow-on). Returns a nonzero exit if any scope (or the notify) failed, so a
 /// failed run is visible to the timer, while still processing the other scopes.
-pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str) -> i32 {
+pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str, notify_channel: &str) -> i32 {
     let date = today_utc_date();
     let recs = match load_corpus_from_board(board_api, "repos") {
         Ok(r) => r,
@@ -1998,7 +2017,7 @@ pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str) -> i32 {
         return 1;
     }
 
-    let mut scopes_with_new = 0usize;
+    let mut new_by_scope: Vec<(String, usize)> = Vec::new();
     let mut had_error = false;
     for (repo, group) in &by_repo {
         let scope = format!("repos/{repo}");
@@ -2010,14 +2029,14 @@ pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str) -> i32 {
                     group.len(),
                     o.new_count
                 );
-                // The librarian-blessed notify-on-new signal; the service wiring carries it to the librarian.
                 if o.new_count > 0 {
-                    scopes_with_new += 1;
+                    // Journaled signal (also lets the service debug/trace), plus the collected notify set.
                     println!(
                         "DREAM-NEW scope={scope} new={} ids={}",
                         o.new_count,
                         o.new_ids.join(",")
                     );
+                    new_by_scope.push((scope, o.new_count));
                 }
             }
             Err(e) => {
@@ -2026,10 +2045,35 @@ pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str) -> i32 {
             }
         }
     }
+
+    // Notify-on-new: a light post to the librarian's dedicated `dream-reports` channel, ONLY when a scope
+    // surfaced new proposals (dispositions carry forward, so a declined proposal never re-pings).
+    if !new_by_scope.is_empty() {
+        let board = crate::board::Board::with_base(board_api);
+        match board.create_or_get_channel(notify_channel, "v-agent-memory") {
+            Ok(ch) => {
+                let body = to_ascii(&format_dream_notify_post(&new_by_scope));
+                if let Err(e) = board.post_to_channel(ch, "v-agent-memory", &body) {
+                    eprintln!("dream-run: notify post to {notify_channel} failed: {e}");
+                    had_error = true;
+                } else {
+                    eprintln!(
+                        "dream-run: notified {notify_channel} of {} scope(s) with new proposals",
+                        new_by_scope.len()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("dream-run: cannot resolve notify channel {notify_channel}: {e}");
+                had_error = true;
+            }
+        }
+    }
+
     eprintln!(
         "dream-run: {} scope(s) processed, {} with new proposals",
         by_repo.len(),
-        scopes_with_new
+        new_by_scope.len()
     );
     if had_error { 1 } else { 0 }
 }
@@ -2528,5 +2572,17 @@ mod tests {
             scope_report_filename("repos/fleet", "2026-01-01"),
             "repos-fleet-2026-01-01.json"
         );
+    }
+
+    #[test]
+    fn format_dream_notify_post_lists_scopes_and_totals() {
+        let body = format_dream_notify_post(&[
+            ("repos/camshaft-cadenza".to_string(), 3),
+            ("repos/fleet".to_string(), 1),
+        ]);
+        assert!(body.contains("4 new proposal(s) across 2 scope(s)")); // 3 + 1 total
+        assert!(body.contains("- repos/camshaft-cadenza: 3 new -> dreams/repos/camshaft-cadenza"));
+        assert!(body.contains("- repos/fleet: 1 new -> dreams/repos/fleet"));
+        assert!(body.contains("will not re-ping")); // the no-noise disposition note
     }
 }

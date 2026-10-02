@@ -166,6 +166,15 @@ impl Board {
         })
     }
 
+    /// Build a client against an explicit base URL (used where the base was resolved by the caller, e.g.
+    /// `dream-run --board-api`, so reads and the notify post share one base).
+    pub fn with_base(base: &str) -> Board {
+        Board {
+            base: base.to_string(),
+            agent: ureq::agent(),
+        }
+    }
+
     fn get_json(&self, path: &str) -> Result<Value, String> {
         let url = format!("{}{}", self.base, path);
         let resp = with_transient_retry(|| {
