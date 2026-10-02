@@ -1,0 +1,4287 @@
+[
+  {
+    "file": "crates/fleet/build.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HEAD"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACTIONABLE"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AGENTS"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AND"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ANY"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "APPROVED"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BODY"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CF"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CLAIM"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DESIGN"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DISCOVERABLE"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DUP"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXACT"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FIRST"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GET"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HEAD"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INCLUDING"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KEY"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIST"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIVE"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEW"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONLY"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OPEN"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ORCHESTRATOR"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWN"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PARKED"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PATCH"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "POST"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PUBLIC"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "READ"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ROUTE"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SSE"
+  },
+  {
+    "file": "crates/fleet/src/board.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TRANSIENT"
+  },
+  {
+    "file": "crates/fleet/src/concierge_mint.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AGENT"
+  },
+  {
+    "file": "crates/fleet/src/concierge_mint.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BOARD"
+  },
+  {
+    "file": "crates/fleet/src/concierge_mint.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CHANNEL"
+  },
+  {
+    "file": "crates/fleet/src/concierge_mint.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DM"
+  },
+  {
+    "file": "crates/fleet/src/concierge_mint.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "crates/fleet/src/concierge_mint.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PURE"
+  },
+  {
+    "file": "crates/fleet/src/concierge_mint.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SLACK"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ESCALATES"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ETA"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HOME"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOCATE"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NO"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REASSIGN"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ROUND"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "USER"
+  },
+  {
+    "file": "crates/fleet/src/config.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WEDGED"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ABOUT"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ADVISORY"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AND"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BOTH"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CF"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONCURRENT"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DD"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIFFERENT"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DREAM"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EMITS"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FEW"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FILE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FIRST"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FNV"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FUZZY"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FYI"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GET"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HAS"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "JSONL"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KEPT"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LINE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIVE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LLM"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LSH"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MEMORY"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MM"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MORE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEVER"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEW"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NO"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOTHING"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OFF"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ON"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONLY"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OR"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWN"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PATH"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRIME"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PROPOSE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RUNNER"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SAME"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STRICT"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUBJECT"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUBSTANCE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VALUE"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VOLUME"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WITH"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WITHIN"
+  },
+  {
+    "file": "crates/fleet/src/dream.rs",
+    "rule": "caps-for-emphasis",
+    "token": "YYYY"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ARCHIVE"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EMITS"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EMITTED"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GATED"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GET"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INC"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIBRARIAN"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MEMORY"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MUST"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONLY"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OR"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PLANS"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PROTECTED"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STANDARD"
+  },
+  {
+    "file": "crates/fleet/src/dream_apply.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THIS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ABSENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ABSOLUTE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACKED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACROSS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACTION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACTIONABLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACTIONS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACTIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ADDRESSED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ADDS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ADVANCE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ADVANCING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AFTER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AGENTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AHEAD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALLOW"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALLOWLIST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALONE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALSO"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALWAYS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AMBIGUOUS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AND"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ANGLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ANOTHER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ANTI"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ANY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "APPENDS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "APPLY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ARBITRARY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ARGUMENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ASSIGNED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ASSIGNEE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ASSUMED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ATTEMPTED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AUDIT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AUTHORITATIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AUTO"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AWS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BACKS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BARE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BECOME"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BEFORE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BLIND"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BOARD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BOTH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BUILD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BUT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CADENCE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CANNOT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CANONICAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CAP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CHANGED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CHILD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CLAIM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CLAIMS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CLEAR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CLOSE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CLOSED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CLOSES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CODE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "COMMITS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "COMPILE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "COMPLETE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONFIRM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONFIRMED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONFIRMS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONNECTED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONNECTIVITY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONSERVING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONSIDER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CONTINUES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "COOLDOWN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CORE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CORRECTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "COVERAGE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CRATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CREATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CRITICAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CRUX"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CSV"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CURRENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CURRENTLY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CWD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DARK"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DATA"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DECISION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DECLARATIVELY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DECLARED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DECLINED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DEFERRED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DELIBERATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DELIBERATELY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DERIVED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DERIVES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DESIGN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DESIRED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DETAIL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DETECTION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIFFERENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIFFERENTLY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIFFERS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIRECTORY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIRTY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DISCOVERY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DISPOSITIONED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DISTINCT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DOWN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DRAINED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DREAM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DRY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DUPLICATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DURABLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EARLIER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EMITTED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EMPTY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ENABLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EPHEMERAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ESRCH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ETA"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EVERY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXACT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXCEPT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXCLUDE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXCLUDED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXCLUDES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXCLUSIONS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXISTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXIT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXITS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXPECTED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXPECTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXPIRED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXPIRES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXPLICIT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXPLICITLY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXTENDED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FAIL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FAILED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FAITHFUL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FALSE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FATAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FENCE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FILE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FILENAME"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FILTER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FINDS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FIRST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FIXED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FLAG"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FLEET"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FLOOR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FOOTGUN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FORBID"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FOREIGN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FORWARDING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FOUNDATION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FREE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FREEZES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FRESH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FROM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FROZEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GATED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GENERIC"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GET"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GIVEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GONE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GREEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GROUP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HAND"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HARD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HEAD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HEARTBEAT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HELD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HOLD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HOLDING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HOLDS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HOME"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HUB"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IDEMPOTENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IDENTIFICATION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IDLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IF"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INC"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INCLUDE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INCLUDING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INDEPENDENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INFORMATIONAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INLINE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INSIDE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INSTALL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INTERACTIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INTERNAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INTERPOLATED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INTERVAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INVOKING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ISOLATION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ITS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "JSONL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KEEP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KEPT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KEY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KNOWN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LAST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LAUNCHABLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LAUNCHED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LAUNCHER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LEAVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LENGTHEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIFELINE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIFT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIMITED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LITERAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LLM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOCAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOG"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOOKS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOOP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOSSLESS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOUD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOUDLY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOW"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MAINTAINED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MANAGED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MANDATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MARKER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MASKS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MATCH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MEANT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MESSAGES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MINUS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MIRROR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MISSING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MODERATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MONITOR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MORE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MOST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MOVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MUST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NAME"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NAMES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NATIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEITHER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEVER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEW"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEWER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEWEST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEXT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NIX"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NO"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NON"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NORMAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOTHING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOTICE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NUDGE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NUL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OBSERVATION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OBSERVED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OBSERVER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OFF"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OLD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OLDER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OLDEST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ON"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONCE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONLY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OPAQUE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OPEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OPT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ORDER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ORPHAN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OTHER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OUR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OUT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OUTAGE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OUTSIDE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OVER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWNER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWNERSHIP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWNING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWNS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PARAMETER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PARAMETERIZED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PARENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PARKED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PARKING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PASSED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PAST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PATCH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PATH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PATROL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PERSISTENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "POLL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "POSITIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "POST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PREFIX"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRESENCE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRESENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PREVIEW"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRIMARY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRINT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRINTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRIOR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRIORITY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRIVATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PROACTIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PROOF"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PROPOSE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PUBLIC"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PURE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PUSH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "QUERIES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "QUEUE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "QUIESCE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "QUIESCED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REACTIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "READ"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "READS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "READY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REASSIGN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REASSIGNED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RECENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RECLAIM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RECONNECTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RECORD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RECOVER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REFUSAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REFUSALS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REFUSED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REFUSING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REGARDLESS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REGISTERED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RELATIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RELAUNCH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RELAUNCHES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REMOVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REPORT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REPORTS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REQUIRED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RESOLVER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RESPONSIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RESTART"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RESUMABLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RETIRED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RETURNS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REUSE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REVIVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ROTATION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ROUTE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ROUTED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ROUTER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RUN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RUNNER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "RUNNING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SAFE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SAFEGUARD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SAME"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SATISFIES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SCAFFOLD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SDK"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SEAM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SECOND"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SEED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SELECTION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SELF"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SEPARATE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SESSION"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SET"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SHORT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SHOULD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SIGKILL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SIGTERM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SILENT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SINGLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SIZE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SKIP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SKIPPED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SKIPPING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SLA"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SOFT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SOLE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SOON"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SOONER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SPAWN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SPAWNER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SPECIFIC"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SPIN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STAGED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STALE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STANDING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STARTED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STATUS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STILL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STOOD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STOP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STOPPED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STRANDED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STRING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUBDIR"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUBPROCESS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUBPROCESSES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUCCESSFUL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUFFIX"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SWEEP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SWITCH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TAG"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TAIL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TARGET"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TARGETED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TERM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TERMINAL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TEST"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THAN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THAT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THIS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THROUGH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TICKED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TO"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TOCTOU"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TTL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TUI"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TUNNEL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TWO"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TYPED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNAMBIGUOUS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNANSWERED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNASSIGNED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNCHANGED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNDECLARED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNDRAINED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNIQUE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNIT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNKNOWN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNLANDED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNLESS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNPINNED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNRECOVERABLY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNSAFE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UNSET"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UP"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UPSTREAM"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "USER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VALUE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VERIFIED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VOCABULARY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WAKE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WALL"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WARN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WARNING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WARNINGS"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WAVE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WAVES"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WEDGE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WEDGED"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WHEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WHICH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WHY"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WIDE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WINDOW"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WITH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WITHOUT"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WORK"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WORKER"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WORKING"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WOULD"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WRITE"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WRITTEN"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WRONG"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ZERO"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "emphatic",
+    "token": "floored"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "emphatic",
+    "token": "load-bearing"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "emphatic",
+    "token": "robust"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BASED"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BYTES"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CHANGED"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DOTALL"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FILE"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LINE"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEW"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOTES"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWN"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PATH"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PORT"
+  },
+  {
+    "file": "crates/fleet/src/memory.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UTF"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ALREADY"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AMBIENT"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AND"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CAPABLE"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "CREATED"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DESIGN"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIRECT"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIRECTLY"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DM"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DOES"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EVERY"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXPLICITLY"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EXTRA"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FIREHOSE"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FIRST"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FLEET"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FYI"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "GET"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "INFORMATIONAL"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IS"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "METHOD"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MISS"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MUST"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEVER"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NO"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOTIFICATION"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONLY"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "POST"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REACTIVE"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "REQUEST"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SP"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUBMITTED"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUBSCRIPTION"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SUPPRESSED"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THIS"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TUI"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TYPE"
+  },
+  {
+    "file": "crates/fleet/src/notify.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VERSION"
+  },
+  {
+    "file": "crates/fleet/src/prose_lint.rs",
+    "rule": "emphatic",
+    "token": "robust"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "COMMITTED"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DATABASE"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ERROR"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FAILS"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HEAD"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "IS"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "MARKER"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NAME"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NAMES"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NO"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OPEN"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PLACEHOLDER"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PRIVATE"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PUBLIC"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PURE"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "THIS"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "UTF"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VOCABULARY"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ACCOUNTED"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AKIA"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "AWARE"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BOTH"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "COUNTED"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "FAITHFUL"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HOME"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "JSONL"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KEY"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "KNOWN"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LIMITATION"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LONGEST"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "LOSSLESS"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWNER"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWNS"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ROSTER"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SAME"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "STRING"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "VALUE"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WITHIN"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BASE"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BEST"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DESIGN"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "DIFFERENT"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "EFFORT"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "HEAD"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NEW"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NO"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OWN"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "TAGS"
+  },
+  {
+    "file": "crates/fleet/src/workspace.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WITH"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ACTIONABLE"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ACTIVELY"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ACTUAL"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ACTUALLY"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "AI"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ANY"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "BEFORE"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "BLOCKED"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "BUILD"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "BYPASSES"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "CF"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "CID"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "DEMAND"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "DESTRUCTIVE"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "EACH"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "EVERY"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "FOR"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "HELD"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "HONOR"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "HUB"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "INFORMATIONAL"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "INTERNAL"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "IPFS"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "KEEP"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "MUST"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "NEVER"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ON"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "ONLY"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "OTHER"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "OWN"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "OWNER"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "PATH"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "PROMPTLY"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "PROSE"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "REPO"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "RESOLVER"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "SAME"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "STOP"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "STOPPED"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "SYNTHESIZED"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "TARGET"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "TYPED"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "UNATTENDED"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "UNCONFIRMED"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "VERBATIM"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "WORKING"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "YOU"
+  },
+  {
+    "file": "loops/AGENTS-fleet.md",
+    "rule": "caps-for-emphasis",
+    "token": "YOUR"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ACTUAL"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ADVISORY"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ALL"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "AND"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "BEFORE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "BUILD"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CAP"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CHARTER"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CHILD"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CHILDREN"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CLOSE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CLOSES"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CONFIRMED"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "DECLINED"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "DOC"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "DOCUMENT"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "DONE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "DRIVE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "EVIDENCE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "EXIT"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "FALLBACK"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "FIRST"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "FLOOR"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "FULL"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "HARD"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "IN"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "IPFS"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "IS"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "KNOWN"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "LANDED"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "LAST"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "MANDATORY"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "MAY"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "MEMORY"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "MUST"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "NEW"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "NOTHING"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ONLY"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "OPEN"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "OUTSIDE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "OWN"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "PASS"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "PRIOR"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "PRIORITY"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "PROCESS"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "PROMPT"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "PROPOSAL"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "REPORT"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ROLE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "SKIP"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "TASK"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "TEMPLATE"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "TOOLING"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "UI"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "UNOBSERVED"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "VERY"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "WITHOUT"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "caps-for-emphasis",
+    "token": "YOU"
+  },
+  {
+    "file": "loops/observer.md",
+    "rule": "emphatic",
+    "token": "the floor"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ACTIONABLE"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "AI"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ALTERNATIVES"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "AT"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "BEFORE"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CHANGE"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CHILD"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CLEAN"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CLEAR"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "COMPLETE"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "CORRECT"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "EXIT"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "FULL"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "HARD"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "IN"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "NEVER"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "NOTHING"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "ONE"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "REVIEW"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "TIME"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "WRITTEN"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "WRONG"
+  },
+  {
+    "file": "loops/reviewer.md",
+    "rule": "caps-for-emphasis",
+    "token": "YOUR"
+  }
+]

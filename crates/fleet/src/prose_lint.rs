@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Which rule produced a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +339,63 @@ fn walk_sources(dir: &str) -> Vec<String> {
     out
 }
 
+/// One baseline entry: the file, the rule name, and the matched token. The baseline is keyed on these
+/// three, not the line, so it is robust to the line-number drift of ordinary edits, matching the
+/// content-guardrail secrets-baseline approach. It records the known findings of the existing tree so the
+/// gate can land and fire only on new findings, with the burn-down of the baseline a later cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BaselineEntry {
+    pub file: String,
+    pub rule: String,
+    pub token: String,
+}
+
+fn entry_of(f: &Finding) -> BaselineEntry {
+    BaselineEntry {
+        file: f.file.clone(),
+        rule: f.rule.as_str().to_string(),
+        token: f.token.clone(),
+    }
+}
+
+/// The sorted, deduped baseline entries for a set of findings. Pure.
+pub fn baseline_entries(findings: &[Finding]) -> Vec<BaselineEntry> {
+    let mut e: Vec<BaselineEntry> = findings.iter().map(entry_of).collect();
+    e.sort();
+    e.dedup();
+    e
+}
+
+/// Render findings as a deterministic, deduped, sorted baseline JSON document (pretty, reviewable in a
+/// diff). Pure.
+pub fn render_baseline(findings: &[Finding]) -> String {
+    serde_json::to_string_pretty(&baseline_entries(findings)).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Parse a baseline JSON document into a membership set. Pure.
+pub fn parse_baseline(json: &str) -> Result<BTreeSet<BaselineEntry>, String> {
+    let entries: Vec<BaselineEntry> =
+        serde_json::from_str(json).map_err(|e| format!("baseline parse error: {e}"))?;
+    Ok(entries.into_iter().collect())
+}
+
+/// Split findings into the new ones (not in the baseline) and a count of the suppressed ones. Pure.
+pub fn filter_baselined(
+    findings: Vec<Finding>,
+    baseline: &BTreeSet<BaselineEntry>,
+) -> (Vec<Finding>, usize) {
+    let mut fresh = Vec::new();
+    let mut suppressed = 0usize;
+    for f in findings {
+        if baseline.contains(&entry_of(&f)) {
+            suppressed += 1;
+        } else {
+            fresh.push(f);
+        }
+    }
+    (fresh, suppressed)
+}
+
 /// Options for [`lint_prose`].
 pub struct LintOpts {
     /// Explicit ruleset path; falls back to `$FLEET_PROSE_RULESET`.
@@ -349,6 +406,11 @@ pub struct LintOpts {
     pub dirs: Vec<String>,
     /// Report findings but exit 0 (advisory).
     pub warn_only: bool,
+    /// Path to a findings baseline (JSON). When set, a finding already in the baseline is suppressed and the
+    /// gate fires only on a new finding, so the gate lands without a flag-day cleanup of the existing tree.
+    pub baseline: Option<String>,
+    /// Write every current finding to the `--baseline` path as the audited baseline, then exit 0.
+    pub write_baseline: bool,
 }
 
 /// `fleet lint-prose` -- lint comments and loops markdown for filler emphatics and caps-for-emphasis.
@@ -379,20 +441,62 @@ pub fn lint_prose(opts: LintOpts) {
         findings.extend(lint_file(path, &content, &rs));
     }
 
+    // Write-baseline mode records every current finding as the audited baseline, then exits clean.
+    if opts.write_baseline {
+        let Some(path) = opts.baseline.as_deref() else {
+            eprintln!("lint-prose: --write-baseline needs --baseline <path>");
+            std::process::exit(2);
+        };
+        let count = baseline_entries(&findings).len();
+        if let Err(e) = std::fs::write(path, format!("{}\n", render_baseline(&findings))) {
+            eprintln!("lint-prose: cannot write baseline '{path}': {e}");
+            std::process::exit(2);
+        }
+        println!("lint-prose: wrote baseline {path} ({count} entries, {scanned} file(s) scanned)");
+        return;
+    }
+
+    // A baseline suppresses the known findings of the existing tree, so the gate fires only on a new one.
+    let (findings, suppressed) = if let Some(path) = opts.baseline.as_deref() {
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lint-prose: cannot read baseline '{path}': {e}");
+                std::process::exit(2);
+            }
+        };
+        let set = match parse_baseline(&src) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lint-prose: {e}");
+                std::process::exit(2);
+            }
+        };
+        filter_baselined(findings, &set)
+    } else {
+        (findings, 0)
+    };
+
     for f in &findings {
         eprintln!("{}:{}: {} '{}'", f.file, f.line, f.rule.as_str(), f.token);
     }
 
+    let tail = if suppressed > 0 {
+        format!(", {suppressed} baselined")
+    } else {
+        String::new()
+    };
+
     if findings.is_empty() {
-        println!("lint-prose: clean ({scanned} file(s) scanned)");
+        println!("lint-prose: clean ({scanned} file(s) scanned{tail})");
         return;
     }
     if opts.warn_only {
-        eprintln!("lint-prose: {} finding(s) (advisory)", findings.len());
+        eprintln!("lint-prose: {} finding(s) (advisory{tail})", findings.len());
         return;
     }
     eprintln!(
-        "lint-prose: {} finding(s) -- blocked (comments must read as clean prose)",
+        "lint-prose: {} new finding(s) -- blocked (comments must read as clean prose{tail})",
         findings.len()
     );
     std::process::exit(1);
@@ -797,5 +901,56 @@ mod tests {
             before, after,
             "an added board phrase changes the render (drift)"
         );
+    }
+
+    fn finding(file: &str, line: usize, rule: Rule, token: &str) -> Finding {
+        Finding {
+            file: file.to_string(),
+            line,
+            rule,
+            token: token.to_string(),
+        }
+    }
+
+    #[test]
+    fn baseline_round_trips_through_render_and_parse() {
+        let findings = vec![
+            finding("a.rs", 3, Rule::Emphatic, "leverage"),
+            finding("a.rs", 9, Rule::CapsEmphasis, "SAME"),
+        ];
+        let doc = render_baseline(&findings);
+        let set = parse_baseline(&doc).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&entry_of(&findings[0])));
+    }
+
+    #[test]
+    fn baseline_dedups_the_same_token_on_different_lines() {
+        // The baseline is keyed on file plus rule plus token, so the same token on two lines is one entry
+        // and is robust to line drift.
+        let findings = vec![
+            finding("a.rs", 3, Rule::CapsEmphasis, "SAME"),
+            finding("a.rs", 50, Rule::CapsEmphasis, "SAME"),
+        ];
+        assert_eq!(baseline_entries(&findings).len(), 1);
+    }
+
+    #[test]
+    fn filter_suppresses_baselined_and_keeps_new() {
+        let baselined = finding("a.rs", 3, Rule::Emphatic, "leverage");
+        let set = parse_baseline(&render_baseline(std::slice::from_ref(&baselined))).unwrap();
+        let current = vec![
+            finding("a.rs", 4, Rule::Emphatic, "leverage"),
+            finding("a.rs", 7, Rule::CapsEmphasis, "SAME"),
+            finding("b.rs", 1, Rule::Emphatic, "leverage"),
+        ];
+        let (fresh, suppressed) = filter_baselined(current, &set);
+        assert_eq!(
+            suppressed, 1,
+            "the a.rs leverage is baselined regardless of line"
+        );
+        assert_eq!(fresh.len(), 2);
+        assert!(fresh.iter().any(|f| f.file == "b.rs"));
+        assert!(fresh.iter().any(|f| f.rule == Rule::CapsEmphasis));
     }
 }
