@@ -8585,6 +8585,10 @@ fn watchdog_board(
     // window is GONE (crashed/vanished — a relaunch candidate) from one that is merely stale-but-running.
     let wd_windows = tmux_window_names(&session);
     let mut missing_window_ids: Vec<String> = Vec::new();
+    // task_1248 (report-only this slice): managed agents whose loop is frozen — a live window + launchable
+    // presence but a last_seen stale past N x their interval ([`revive_frozen_candidate`]). Surfaced in one
+    // WARNING; the opt-in auto-revive act is the next slice.
+    let mut frozen_loop_ids: Vec<String> = Vec::new();
     // task_794 (report-only this slice): RUNNING agents whose open backlog exceeds the depth threshold — the
     // PM hire/route signal. (id, open_count), surfaced in one WARNING; the auto board-signal is the opt-in next.
     let backlog_depth = std::env::var("CDZ_BACKLOG_DEPTH")
@@ -8705,6 +8709,23 @@ fn watchdog_board(
         let has_window = wd_windows.iter().any(|w| w == id);
         if relaunch_missing_candidate(has_window, stood_down, spin_up_hold_reason(md, &host)) {
             missing_window_ids.push(id.to_string());
+        }
+        // task_1248 (report-only this slice): the complement to missing-window — a live window + launchable but a
+        // last_seen stale past N x its interval, the window-alive-but-loop-stuck crash class. Exclude never_ticked
+        // (a loop that never STARTED is the launch-crash class, surfaced + relaunched separately, not a frozen
+        // live loop); the safeguard-wedge keeps last_seen advancing so it never trips the stale bound here. The
+        // auto-revive act is the next slice; this slice only warns.
+        if !never_ticked
+            && revive_frozen_candidate(
+                has_window,
+                stood_down,
+                spin_up_hold_reason(md, &host),
+                age_secs,
+                interval_secs as i64,
+                REVIVE_FROZEN_STALE_FACTOR,
+            )
+        {
+            frozen_loop_ids.push(id.to_string());
         }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
         // #535 work-driven tight cadence: a work-holder quiet beyond the short work cadence is a candidate even
@@ -9112,6 +9133,18 @@ fn watchdog_board(
                 "-- relaunch-missing (task_1152): relaunched {relaunched}, {cooled} on cooldown, {failed} failed (opt-in auto-spin-up of missing-window agents; cooldown {cooldown}s per agent)"
             );
         }
+    }
+    if !frozen_loop_ids.is_empty() {
+        // task_1248 report-only slice: these managed agents have a live tmux window and a launchable presence, yet
+        // last_seen has not advanced for N x their loop interval — the window-alive-but-loop-stuck crash class
+        // that the missing-window (gone window) and never-ticked (never started) signals both miss. Warn only; the
+        // opt-in --revive-frozen act (force spin-down + spin-up, cooldown-fenced, quiesce-suppressed) is the next
+        // slice. Recover by hand meanwhile with a bounce.
+        println!(
+            "-- WARNING: {} managed agent(s) FROZEN-LOOP (task_1248: live window + launchable but last_seen stale past {REVIVE_FROZEN_STALE_FACTOR}x their interval — the loop is stuck though the process is alive): {}. Recover: `fleet bounce-session <agent> --apply` (or spin-down + spin-up); the opt-in --revive-frozen act is coming.",
+            frozen_loop_ids.len(),
+            frozen_loop_ids.join(", ")
+        );
     }
     if !backlog_overflow_ids.is_empty() {
         // task_794: a RUNNING agent whose open backlog exceeds the depth threshold — the PM hire/route signal
