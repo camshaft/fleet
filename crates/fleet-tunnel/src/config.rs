@@ -1,6 +1,7 @@
 //! The daemon's TOML config (operator mandate #159 — no env-var config). See config.example.toml.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,12 +39,13 @@ pub struct Config {
     /// Local upstream base URL the daemon forwards board requests to (the notifier).
     #[serde(default = "default_upstream")]
     pub upstream: String,
-    /// Cloudflare Access service-token id (off-LAN / public-gateway dial).
+    /// Optional operator-configured HTTP headers added to the off-LAN / public-gateway
+    /// handshake (header name to value). The operator supplies the specific header names and
+    /// token values in a PRIVATE config out-of-band; public source carries no specific header
+    /// name or value. Empty/unset = no extra headers (on-LAN dial, or the gateway authenticates
+    /// the connection itself).
     #[serde(default)]
-    pub cf_client_id: Option<String>,
-    /// Cloudflare Access service-token secret.
-    #[serde(default)]
-    pub cf_client_secret: Option<String>,
+    pub auth_headers: BTreeMap<String, String>,
     /// Optional loopback address for the health/liveness HTTP probe (e.g. "127.0.0.1:8898").
     /// Unset = probe disabled and the daemon binds no inbound port (its default posture).
     #[serde(default)]
@@ -117,18 +119,22 @@ impl Config {
     /// `served_refresh_secs = 0` disables it. `None` = disabled (static list, or explicitly off). Pure.
     pub fn served_refresh_interval(&self) -> Option<Duration> {
         self.agents_cmd_argv()?; // no dynamic derivation → the set can't change under us → nothing to poll
-        let secs = self.served_refresh_secs.unwrap_or(DEFAULT_SERVED_REFRESH_SECS);
+        let secs = self
+            .served_refresh_secs
+            .unwrap_or(DEFAULT_SERVED_REFRESH_SECS);
         (secs > 0).then(|| Duration::from_secs(secs))
     }
 
-    /// The Cloudflare Access service-token pair, if both are present + non-empty.
-    pub fn cf_credentials(&self) -> Option<(String, String)> {
-        match (&self.cf_client_id, &self.cf_client_secret) {
-            (Some(id), Some(secret)) if !id.trim().is_empty() && !secret.trim().is_empty() => {
-                Some((id.clone(), secret.clone()))
-            }
-            _ => None,
-        }
+    /// Operator-configured HTTP headers to add to the off-LAN / public-gateway handshake,
+    /// filtered to entries whose name AND value are both non-empty (trimmed). Empty when none
+    /// are configured (on-LAN dial, or the gateway authenticates the connection itself).
+    /// Pure — unit-tested.
+    pub fn auth_header_pairs(&self) -> Vec<(&str, &str)> {
+        self.auth_headers
+            .iter()
+            .map(|(name, value)| (name.trim(), value.trim()))
+            .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+            .collect()
     }
 }
 
@@ -199,7 +205,7 @@ mod tests {
             "absent agents_cmd → use the static list"
         );
         assert!(cfg.token.is_none());
-        assert!(cfg.cf_credentials().is_none());
+        assert!(cfg.auth_header_pairs().is_empty());
         assert!(cfg.health_bind().is_none()); // probe disabled by default
     }
 
@@ -245,8 +251,10 @@ mod tests {
             agents = ["a", "b", "c"]
             token = "sekret"
             upstream = "http://127.0.0.1:9000/"
-            cf_client_id = "cid"
-            cf_client_secret = "csec"
+
+            [auth_headers]
+            "X-Example-Id" = "cid"
+            "X-Example-Secret" = "csec"
             "#,
         )
         .unwrap();
@@ -255,7 +263,11 @@ mod tests {
         assert_eq!(cfg.token.as_deref(), Some("sekret"));
         // trailing slash trimmed so `path` (which starts with /) appends cleanly.
         assert_eq!(cfg.upstream_trimmed(), "http://127.0.0.1:9000");
-        assert_eq!(cfg.cf_credentials(), Some(("cid".into(), "csec".into())));
+        // BTreeMap iterates by key, so the pairs come back name-sorted.
+        assert_eq!(
+            cfg.auth_header_pairs(),
+            vec![("X-Example-Id", "cid"), ("X-Example-Secret", "csec")]
+        );
     }
 
     #[test]
@@ -301,10 +313,16 @@ mod tests {
     fn served_set_differs_is_order_insensitive_and_detects_membership_change() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // Same members, different order → NOT different (no needless reconnect).
-        assert!(!served_set_differs(&s(&["a", "b", "c"]), &s(&["c", "a", "b"])));
+        assert!(!served_set_differs(
+            &s(&["a", "b", "c"]),
+            &s(&["c", "a", "b"])
+        ));
         assert!(!served_set_differs(&s(&["a"]), &s(&["a"])));
         // A NEW agent (the #449 case: george just appeared) → different → reconnect.
-        assert!(served_set_differs(&s(&["a", "b"]), &s(&["a", "b", "george"])));
+        assert!(served_set_differs(
+            &s(&["a", "b"]),
+            &s(&["a", "b", "george"])
+        ));
         // A removed agent → different.
         assert!(served_set_differs(&s(&["a", "b"]), &s(&["a"])));
         // Empty vs non-empty.
@@ -322,7 +340,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(static_list.served_refresh_interval(), None, "no agents_cmd → static set never changes");
+        assert_eq!(
+            static_list.served_refresh_interval(),
+            None,
+            "no agents_cmd → static set never changes"
+        );
         // agents_cmd set, no explicit secs → the built-in default.
         let dyn_default = Config::from_toml_str(
             r#"
@@ -344,7 +366,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(dyn_override.served_refresh_interval(), Some(Duration::from_secs(45)));
+        assert_eq!(
+            dyn_override.served_refresh_interval(),
+            Some(Duration::from_secs(45))
+        );
         // 0 disables the periodic refresh (back to refresh-only-on-reconnect).
         let disabled = Config::from_toml_str(
             r#"
@@ -358,14 +383,17 @@ mod tests {
     }
 
     #[test]
-    fn partial_cf_credentials_are_ignored() {
+    fn blank_auth_header_values_are_dropped() {
         let cfg = Config::from_toml_str(
             r#"
             board_ws = "ws://x/tunnel/ws"
-            cf_client_id = "only-id"
+            [auth_headers]
+            "X-Example-Id" = "only-id"
+            "X-Example-Secret" = ""
             "#,
         )
         .unwrap();
-        assert!(cfg.cf_credentials().is_none());
+        // a blank-valued header is dropped; the populated one is kept.
+        assert_eq!(cfg.auth_header_pairs(), vec![("X-Example-Id", "only-id")]);
     }
 }

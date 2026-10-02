@@ -301,7 +301,16 @@ async fn run_once(cfg: &Arc<Config>, health: &Arc<HealthState>) -> Result<(), Bo
         .timeout(UPSTREAM_TIMEOUT)
         .build()?;
     let upstream = cfg.upstream_trimmed().to_string();
-    let result = serve(&mut read, &tx, &upstream, &client, health, keepalive, reconnect_rx).await;
+    let result = serve(
+        &mut read,
+        &tx,
+        &upstream,
+        &client,
+        health,
+        keepalive,
+        reconnect_rx,
+    )
+    .await;
 
     heartbeat.abort();
     if let Some(w) = watcher {
@@ -571,21 +580,17 @@ async fn probe_upstream(upstream: &str) -> bool {
     client.get(upstream).send().await.is_ok()
 }
 
-/// Build the WS handshake request, adding the Cloudflare Access service-token headers for the
-/// off-LAN public-gateway dial when configured.
+/// Build the WS handshake request, adding any operator-configured auth headers for the
+/// off-LAN / public-gateway dial.
 fn build_request(
     cfg: &Config,
 ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, BoxError> {
     let mut request = cfg.board_ws.as_str().into_client_request()?;
-    if let Some((id, secret)) = cfg.cf_credentials() {
-        let headers = request.headers_mut();
+    let headers = request.headers_mut();
+    for (name, value) in cfg.auth_header_pairs() {
         headers.insert(
-            HeaderName::from_static("cf-access-client-id"),
-            HeaderValue::from_str(&id)?,
-        );
-        headers.insert(
-            HeaderName::from_static("cf-access-client-secret"),
-            HeaderValue::from_str(&secret)?,
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value)?,
         );
     }
     Ok(request)
