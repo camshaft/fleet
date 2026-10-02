@@ -1138,6 +1138,16 @@ fn detect_stale_refs(
 /// for a STRICT gate; 7 days is deliberately tight (tunable).
 const CONTRADICTION_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// A precise value contradiction is among a FEW memories about ONE specific subject. A (unit, subject-token)
+/// bucket shared by more than this many distinct memories is a common identifier, not a distinctive subject,
+/// so it is skipped: this sharpens precision AND bounds the pairwise work. Without it a hot bucket on a large
+/// corpus produces O(k^2) pairs -- the cadenza-scale ~958MB report that 502'd its publish (task_1123 co-verify).
+const MAX_VALUE_CONTRADICTION_BUCKET: usize = 6;
+
+/// Hard per-scope cap on emitted value-contradiction proposals -- a safety bound so no scope yields a
+/// pathological report even if many small buckets contradict. 50 is a generous single review batch.
+const MAX_VALUE_CONTRADICTIONS: usize = 50;
+
 /// Parse a provenance timestamp `Value` to unix seconds: an RFC3339 string, or a number read as epoch
 /// seconds. `None` when absent or unparseable -- the value-contradiction detector treats `None` as "cannot
 /// prove concurrency" and suppresses, so a missing timestamp never produces a flag.
@@ -1272,8 +1282,17 @@ fn detect_value_contradictions(
     let mut keys: Vec<&(String, String)> = by_key.keys().collect();
     keys.sort();
     for key in keys {
+        if out.len() >= MAX_VALUE_CONTRADICTIONS {
+            eprintln!(
+                "value_contradiction: hit the per-scope cap ({MAX_VALUE_CONTRADICTIONS}); remaining buckets unexamined"
+            );
+            break;
+        }
         let entries = &by_key[key];
-        if entries.len() < 2 {
+        // Skip a bucket with nothing to pair, OR one shared by too many memories: a (unit, token) in more than
+        // MAX_VALUE_CONTRADICTION_BUCKET distinct memories is a common identifier, not a distinctive subject,
+        // and pairing it is O(k^2) noise -- this guards the cadenza-scale combinatorial blowup.
+        if entries.len() < 2 || entries.len() > MAX_VALUE_CONTRADICTION_BUCKET {
             continue;
         }
         let (unit, token) = key;
@@ -2560,6 +2579,38 @@ mod tests {
         ];
         let bl2 = build_backlinks(&no_subject);
         assert!(detect_value_contradictions(&no_subject, &HashMap::new(), &bl2).is_empty());
+    }
+
+    #[test]
+    fn detect_value_contradictions_skips_oversized_buckets() {
+        // A (unit, subject-token) bucket shared by MORE than MAX_VALUE_CONTRADICTION_BUCKET distinct memories
+        // (all concurrent, all distinct KB values on the same shared token) is a common identifier, not a
+        // distinctive subject -- skipped, so no O(k^2) blowup. This is the cadenza-scale guard.
+        let n = MAX_VALUE_CONTRADICTION_BUCKET + 1;
+        let recs: Vec<Rec> = (0..n)
+            .map(|i| {
+                ts_rec(
+                    &format!("mem-{i}"),
+                    &format!("the common-shared-subject-token is {}KB", 100 + i),
+                    &format!("m{i}"),
+                    "2026-09-01T00:00:00Z",
+                )
+            })
+            .collect();
+        let bl = build_backlinks(&recs);
+        assert!(
+            detect_value_contradictions(&recs, &HashMap::new(), &bl).is_empty(),
+            "a bucket of {n} (> cap {MAX_VALUE_CONTRADICTION_BUCKET}) is skipped, not O(k^2)-paired"
+        );
+
+        // Exactly 2 in the bucket (<= cap) still produces the contradiction -- the cap bounds, not disables.
+        let pair = &recs[..2];
+        let bl2 = build_backlinks(pair);
+        assert_eq!(
+            detect_value_contradictions(pair, &HashMap::new(), &bl2).len(),
+            1,
+            "a small bucket still surfaces the real contradiction"
+        );
     }
 
     #[test]
