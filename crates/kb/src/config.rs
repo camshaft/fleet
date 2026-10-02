@@ -69,6 +69,14 @@ pub struct Config {
     /// read it; the always-on server ignores it.
     pub pipeline_poll_secs: u64,
 
+    /// Host the board-driven workers advertise in the `webhook_url` they register, so the board can POST task
+    /// events back to them. Empty (the default) means auto-detect the local IP the OS routes toward the board
+    /// (so a NON-co-resident board can reach the worker); set an explicit host/IP to override. If detection
+    /// fails on an empty value the worker falls back to loopback (`127.0.0.1`) — correct when the board is
+    /// co-resident, but unreachable from a remote board, so set this explicitly in that case. Only the workers
+    /// read it.
+    pub webhook_advertise_host: String,
+
     /// Drop-folder the `kb inbox` worker drains (was `KB_INBOX_DIR`). Each file is ingested + IPFS-pinned
     /// then deleted; the first path component is its collection.
     pub inbox_dir: String,
@@ -135,6 +143,7 @@ impl Default for Config {
             ipfs_url: "http://127.0.0.1:5001".to_string(),
             board_url: "http://127.0.0.1:8079/api".to_string(),
             pipeline_poll_secs: 60, // periodic catch-up backstop for missed webhook deliveries; 0 disables
+            webhook_advertise_host: String::new(), // empty = auto-detect routable IP toward the board
             inbox_dir: "/data/kb-inbox".to_string(),
             inbox_default_collection: "inbox".to_string(),
             // Generic loopback default (NOT the host-specific green-machine.lan), matching the other
@@ -235,6 +244,7 @@ mod tests {
         assert_eq!(c.authority_for("unknown"), 0.5);
         assert_eq!(c.pdf_ocr_min_chars, 0); // OCR off by default (task_40)
         assert_eq!(c.pipeline_poll_secs, 60); // periodic catch-up backstop on by default
+        assert_eq!(c.webhook_advertise_host, ""); // empty = auto-detect routable IP toward the board
         // Host-neutral default (task_727): the public-extraction repo must not hardcode green-machine.lan.
         // Deployments override via the role TOML; a config-less run gets loopback.
         assert_eq!(c.ipfs_gateway, "http://127.0.0.1:8080");
