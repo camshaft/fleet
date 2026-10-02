@@ -1,10 +1,5 @@
 [
   {
-    "file": "crates/fleet/build.rs",
-    "rule": "caps-for-emphasis",
-    "token": "HEAD"
-  },
-  {
     "file": "crates/fleet/src/board.rs",
     "rule": "caps-for-emphasis",
     "token": "ACTIONABLE"
@@ -73,11 +68,6 @@
     "file": "crates/fleet/src/board.rs",
     "rule": "caps-for-emphasis",
     "token": "GET"
-  },
-  {
-    "file": "crates/fleet/src/board.rs",
-    "rule": "caps-for-emphasis",
-    "token": "HEAD"
   },
   {
     "file": "crates/fleet/src/board.rs",
@@ -208,56 +198,6 @@
     "file": "crates/fleet/src/concierge_mint.rs",
     "rule": "caps-for-emphasis",
     "token": "SLACK"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "ESCALATES"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "ETA"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "HOME"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "LOCATE"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NO"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NOT"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "REASSIGN"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "ROUND"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "USER"
-  },
-  {
-    "file": "crates/fleet/src/config.rs",
-    "rule": "caps-for-emphasis",
-    "token": "WEDGED"
   },
   {
     "file": "crates/fleet/src/dream.rs",
@@ -1262,11 +1202,6 @@
   {
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
-    "token": "ETA"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
     "token": "EVERY"
   },
   {
@@ -1527,11 +1462,6 @@
   {
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
-    "token": "HEAD"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
     "token": "HEARTBEAT"
   },
   {
@@ -1553,11 +1483,6 @@
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
     "token": "HOLDS"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
-    "token": "HOME"
   },
   {
     "file": "crates/fleet/src/main.rs",
@@ -3380,11 +3305,6 @@
     "token": "VERSION"
   },
   {
-    "file": "crates/fleet/src/prose_lint.rs",
-    "rule": "emphatic",
-    "token": "robust"
-  },
-  {
     "file": "crates/fleet/src/scan.rs",
     "rule": "caps-for-emphasis",
     "token": "COMMITTED"
@@ -3403,11 +3323,6 @@
     "file": "crates/fleet/src/scan.rs",
     "rule": "caps-for-emphasis",
     "token": "FAILS"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "HEAD"
   },
   {
     "file": "crates/fleet/src/scan.rs",
@@ -3512,11 +3427,6 @@
   {
     "file": "crates/fleet/src/transcripts.rs",
     "rule": "caps-for-emphasis",
-    "token": "HOME"
-  },
-  {
-    "file": "crates/fleet/src/transcripts.rs",
-    "rule": "caps-for-emphasis",
     "token": "JSONL"
   },
   {
@@ -3613,11 +3523,6 @@
     "file": "crates/fleet/src/workspace.rs",
     "rule": "caps-for-emphasis",
     "token": "EFFORT"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "HEAD"
   },
   {
     "file": "crates/fleet/src/workspace.rs",
