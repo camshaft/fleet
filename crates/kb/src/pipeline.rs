@@ -646,17 +646,28 @@ pub async fn run_role(role: &str) -> Result<(), String> {
         )
         .await?;
 
-    // Catch-up: dispatch any todo task already assigned to me (e.g. filed while I was down). Claim each so a
-    // racing webhook redelivery does not double-dispatch it — the guard is released when processing ends.
-    match board.list_tasks(Some(role), Some("todo")).await {
-        Ok(tasks) => {
-            for t in tasks {
-                if let Some(guard) = busy.claim(t.id) {
-                    spawn_process(&board, &ipfs, role, t.id, guard);
-                }
+    // Startup catch-up: dispatch any todo task already assigned to me (e.g. filed while I was down).
+    catch_up(&board, &ipfs, role, &busy).await;
+
+    // Periodic catch-up backstop: re-poll on an interval so a MISSED webhook delivery still gets picked up —
+    // e.g. when the board and this worker are not co-resident, the loopback `webhook_url` registered above is
+    // unreachable from the board, so pure-reactive delivery silently drops. catch_up is claim-guarded, so a
+    // poll never races the webhook into a double-dispatch. `pipeline_poll_secs == 0` disables it (pure reactive).
+    let poll_secs = config::get().pipeline_poll_secs;
+    if poll_secs > 0 {
+        let board_poll = Arc::clone(&board);
+        let ipfs_poll = Arc::clone(&ipfs);
+        let busy_poll = Arc::clone(&busy);
+        let role_poll = role.to_string();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
+            tick.tick().await; // consume the immediate first tick — the startup catch-up above already ran
+            loop {
+                tick.tick().await;
+                catch_up(&board_poll, &ipfs_poll, &role_poll, &busy_poll).await;
             }
-        }
-        Err(e) => tracing::warn!("pipeline {role}: catch-up list_tasks failed: {e}"),
+        });
+        tracing::info!("pipeline {role}: catch-up poll every {poll_secs}s");
     }
 
     // Serve the webhook; the receiver parses + classifies + dedups and hands (task_id, guard) over the channel.
@@ -675,6 +686,22 @@ pub async fn run_role(role: &str) -> Result<(), String> {
     receiver
         .await
         .map_err(|e| format!("pipeline {role}: receiver task panicked: {e}"))?
+}
+
+/// Dispatch every `todo` task currently assigned to `role`, claiming each so a racing webhook redelivery (or
+/// an overlapping poll pass) does not double-dispatch it — the guard is released when processing ends. Shared
+/// by the startup catch-up and the periodic poll backstop in [`run_role`].
+async fn catch_up(board: &Arc<Board>, ipfs: &Arc<Ipfs>, role: &str, busy: &Arc<BusySet>) {
+    match board.list_tasks(Some(role), Some("todo")).await {
+        Ok(tasks) => {
+            for t in tasks {
+                if let Some(guard) = busy.claim(t.id) {
+                    spawn_process(board, ipfs, role, t.id, guard);
+                }
+            }
+        }
+        Err(e) => tracing::warn!("pipeline {role}: catch-up list_tasks failed: {e}"),
+    }
 }
 
 /// Spawn the processing of one claimed task, releasing its busy-claim (`guard`) when done — the Python

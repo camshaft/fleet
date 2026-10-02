@@ -59,6 +59,12 @@ ipfs_url = "http://127.0.0.1:5001"
 ipfs_gateway = "http://127.0.0.1:8080"
 # Coordination-board REST base URL for the board-driven pipeline worker (#238). Unused by `kb inbox`. (TB_MCP_URL)
 board_url = "http://127.0.0.1:8079/api"
+# Seconds between periodic catch-up polls for the board-driven workers (uploader/embedder) — a backstop that
+# re-claims any `todo` task assigned to the worker, so a MISSED board->worker webhook delivery still gets
+# processed (e.g. when the board and the worker are NOT co-resident, so the loopback webhook_url the worker
+# registers is unreachable from the board). The poll shares the startup catch-up's claim guard, so it never
+# double-dispatches a task the webhook already took. 0 disables it (pure reactive). Unused by `kb serve`.
+pipeline_poll_secs = 60
 
 # --- MCP server ---
 # Bind address for `kb serve`. (was KB_MCP_HOST / KB_MCP_PORT)
