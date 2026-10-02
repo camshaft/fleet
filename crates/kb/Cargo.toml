@@ -62,6 +62,9 @@ toml = "0.8"
 # Deterministic point ids: uuid(md5("source|path|page|chunk")) — must match the Python `_id` byte-for-byte
 # so a re-ingest updates in place instead of duplicating.
 md-5 = "0.10"
+# Decode base64 image bytes submitted to the CAS image tool (task_1185). Already in the workspace lock
+# (shared transitively), so no new tree. STANDARD engine only.
+base64 = "0.22"
 # v4: random ids for kb_remember/kb_supersede (Python `uuid.uuid4()`); default features cover from_bytes.
 uuid = { version = "1", features = ["v4"] }
 # RFC3339 UTC timestamps (created_at/updated_at/last_verified) + recency-decay math input.

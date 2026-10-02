@@ -27,6 +27,9 @@ use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, t
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use base64::Engine;
+
+use crate::ipfs::Ipfs;
 use crate::{config, curate, embed, search, store::Store};
 
 /// The MCP handler. Stateless — every tool opens a fresh `Store` (a Qdrant REST call is sessionless and a
@@ -94,6 +97,33 @@ fn cite(p: &Map<String, Value>) -> String {
         src.push_str(&format!("\nfile: {abs}"));
     }
     src
+}
+
+/// Normalize a submitted confidentiality class to the fail-closed set: anything that is not exactly "public"
+/// (case-insensitive) is treated as "internal". Internal content must never reach a public IPFS gateway or
+/// public web (operator boundary, task_1185); it is fine on the board (internal CAS resolve) and on
+/// enterprise Slack (byte upload).
+fn normalize_image_class(s: &str) -> &'static str {
+    if s.trim().eq_ignore_ascii_case("public") {
+        "public"
+    } else {
+        "internal"
+    }
+}
+
+/// The inline board-comment embed for a CAS image: a CID-only Markdown image. The board renderer and the
+/// Slack bridge each resolve the CID internally, so the comment never carries a hard-coded gateway URL
+/// (operator-preferred, task_1185 comment_5737). `alt` is sanitized of `]`/newline so it can't break the
+/// Markdown image syntax.
+fn image_embed(alt: &str, cid: &str) -> String {
+    let safe_alt: String = alt
+        .chars()
+        .map(|c| match c {
+            ']' | '\r' | '\n' => ' ',
+            other => other,
+        })
+        .collect();
+    format!("![{}](ipfs://{cid})", safe_alt.trim())
 }
 
 // --- argument structs (schemars-derived; defaults mirror the Python signatures) ---
@@ -226,6 +256,26 @@ fn put_opt_f64(m: &mut Map<String, Value>, key: &str, v: Option<f64>) {
     if let Some(v) = v {
         m.insert(key.to_string(), Value::from(v));
     }
+}
+
+fn default_image_class() -> String {
+    "internal".to_string()
+}
+
+/// Args for `cas_add_image` — submit a generated image to the fleet CAS for inline board/Slack embedding.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CasAddImageArgs {
+    /// Base64-encoded image bytes (the generated graph/table, e.g. a PNG or SVG).
+    pub data_base64: String,
+    /// A filename for the image (e.g. "throughput.png"); used only as the CAS object name.
+    pub filename: String,
+    /// Confidentiality class: "internal" (default, fail-closed) or "public". Internal content stays on the
+    /// board + enterprise Slack and never reaches a public IPFS gateway / public web.
+    #[serde(default = "default_image_class")]
+    pub class: String,
+    /// Optional alt text for the embed; defaults to the filename.
+    #[serde(default)]
+    pub alt: Option<String>,
 }
 
 #[tool_router]
@@ -634,6 +684,41 @@ impl Kb {
                 .join("\n"),
         )
     }
+
+    #[tool(
+        description = "Submit a generated image (graph/table) to the fleet CAS (IPFS) so it can be embedded inline in a board comment. Base64-encode the image bytes and pass them as `data_base64` with a `filename`. Returns the content id (CID) and a ready-to-paste Markdown embed `![alt](ipfs://<cid>)` -- paste that into a board comment and it renders inline (the board and the Slack bridge each resolve the CID internally; never hard-code a gateway URL). CONFIDENTIALITY: `class` defaults to \"internal\" (membrain / amazon-internal content), which stays on the board and enterprise Slack and never reaches a public IPFS gateway; pass class=\"public\" only for a genuinely public or generic image."
+    )]
+    async fn cas_add_image(
+        &self,
+        Parameters(a): Parameters<CasAddImageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(a.data_base64.trim().as_bytes())
+            .map_err(|e| {
+                map_err(format!(
+                    "cas_add_image: data_base64 was not valid base64: {e}"
+                ))
+            })?;
+        if bytes.is_empty() {
+            return Err(map_err(
+                "cas_add_image: decoded image was empty".to_string(),
+            ));
+        }
+        let class = normalize_image_class(&a.class);
+        let alt = a.alt.unwrap_or_else(|| a.filename.clone());
+        // Add + pin to the fleet-internal Kubo. The node's reprovide stays off for internal content
+        // (task_833), so the CID is not announced to the public DHT; the board resolves it via its internal
+        // /api/ipfs route and the Slack bridge byte-uploads it, so it never reaches a public gateway.
+        let added = Ipfs::connect()
+            .add_bytes(&a.filename, &bytes)
+            .await
+            .map_err(map_err)?;
+        let embed = image_embed(&alt, &added.cid);
+        text_result(format!(
+            "Stored to CAS and pinned.\ncid: {}\nclass: {}\nsize: {} bytes\n\nPaste this into a board comment to embed inline:\n{}",
+            added.cid, class, added.size, embed
+        ))
+    }
 }
 
 /// A payload numeric field as i64 (page/chunk/counters), defaulting to 0 — matches the Python `p.get(k) or 0`.
@@ -707,5 +792,40 @@ mod tests {
     fn search_schema_has_query() {
         let schema = serde_json::to_value(schema_for!(SearchArgs)).unwrap();
         assert!(schema.pointer("/properties/query").is_some(), "{schema}");
+    }
+
+    #[test]
+    fn image_class_is_fail_closed_internal() {
+        assert_eq!(normalize_image_class("public"), "public");
+        assert_eq!(normalize_image_class("PUBLIC"), "public");
+        assert_eq!(normalize_image_class("  public "), "public");
+        // Anything else -> internal (default, typo, empty, unknown).
+        assert_eq!(normalize_image_class("internal"), "internal");
+        assert_eq!(normalize_image_class(""), "internal");
+        assert_eq!(normalize_image_class("publik"), "internal");
+        assert_eq!(normalize_image_class("Public graphs ok"), "internal");
+    }
+
+    #[test]
+    fn image_embed_is_cid_only_and_alt_safe() {
+        assert_eq!(
+            image_embed("throughput", "bafyxyz"),
+            "![throughput](ipfs://bafyxyz)"
+        );
+        // alt cannot break out of the Markdown image syntax or inject a newline.
+        assert_eq!(image_embed("a]b\nc", "QmX"), "![a b c](ipfs://QmX)");
+        // No hard-coded gateway anywhere — only the ipfs:// CID scheme.
+        assert!(!image_embed("x", "QmX").contains("http"));
+    }
+
+    #[test]
+    fn cas_add_image_schema_requires_data_and_filename() {
+        let schema = serde_json::to_value(schema_for!(CasAddImageArgs)).unwrap();
+        assert!(
+            schema.pointer("/properties/data_base64").is_some(),
+            "{schema}"
+        );
+        assert!(schema.pointer("/properties/filename").is_some(), "{schema}");
+        assert!(schema.pointer("/properties/class").is_some(), "{schema}");
     }
 }
