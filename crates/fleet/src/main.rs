@@ -2942,19 +2942,27 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, operator: Option<&s
          exists, then get_agent '{agent}' to read your OWN charter + metadata from the board and follow that \
          charter as your role. IMPORTANT — the board does NOT bind your session: each call may reach a fresh, \
          unbound board, so register_agent does NOT make later id-less calls work. Pass your identity \
-         EXPLICITLY on EVERY board call, and note that each tool NAMES the identity field DIFFERENTLY — \
-         agent_id on check_notifications / set_status / get_messages / list_tasks, from_agent on send_message, \
+         EXPLICITLY on every board call THAT TAKES ONE, and note that each such tool NAMES the identity field \
+         DIFFERENTLY — agent_id on check_notifications / set_status / get_messages, from_agent on send_message, \
          author on comment_task / comment_document, actor on update_task, created_by on create_task (all = \
-         '{agent}'). Passing the WRONG field (e.g. agent_id to comment_task, which takes author) is silently \
-         accepted but records the actor as null, so the board cannot exclude you from your own notification and \
-         you wake on your OWN comment — use each tool's own field. The board defaults identity to null and a \
+         '{agent}'). But PURE READ / FILTER tools take NO caller identity: list_tasks, get_task, get_project, \
+         get_document, get_channel_posts, list_agents and the like REJECT an agent_id field with a hard \
+         'unknown field agent_id' deserialize error — filter list_tasks by assignee '{agent}', and read the \
+         rest by the OBJECT id (task_id / project_id / document id), never a caller id. Passing the WRONG field \
+         — agent_id to comment_task (which takes author), or agent_id onto a pure read like list_tasks / \
+         get_task (which take none) — is either silently accepted recording the actor as null (so you wake on \
+         your OWN comment) or hard-rejected, costing a failed call every tick; use each tool's own field, and \
+         pass NO identity on a pure read. The board defaults identity to null and a \
          call that omits it fails with 'no identity for this session'. Never PRECOMPUTE or guess a task id: \
          reference a task only by the id create_task RETURNS, because concurrent creation on the shared board \
          can hand a guessed next-id to a DIFFERENT agent's task. TYPED REFERENCES (task_584): whenever you \
          WRITE a task or PR/issue reference into any board body (a comment, a message, or a channel post), \
          spell it as a TYPED id — 'task_N' for a board task, or 'owner/repo#N' for a GitHub issue/PR — and \
          NEVER a bare '#N': the board hard-rejects a bare '#N' in posted content, so a bare ref costs you a \
-         reword-and-retry every time. \
+         reword-and-retry every time. That typed-ref rule is for CONTENT you WRITE (bodies); an id PARAMETER is \
+         the opposite — a tool's id argument (channel_id, task_id, project_id, document id) takes the BARE \
+         INTEGER (e.g. 6), NEVER a 'channel_N' / 'task_N' token and NEVER a quoted string, so do not \
+         typed-prefix or quote an id argument. \
          Coordinate through the board (send_message / check_notifications / \
          comment_task / set_status) — there is no file inbox. Any board Document you author (design / \
          proposal / plan) MUST follow the Fleet Doc-Writing Style Guide — wiki guides/doc-writing-style-guide \
@@ -9665,8 +9673,14 @@ mod tests {
         assert!(k.contains("register_agent"), "registers the record once (idempotent)");
         assert!(k.contains("get_agent"), "self-discovers its charter");
         assert!(k.contains("does NOT bind your session"), "states the board never binds the session (#336)");
-        assert!(k.contains("EVERY board call"), "explicit ids on every call, not a fallback");
+        assert!(k.contains("every board call THAT TAKES ONE"), "explicit ids on every call that takes one, not a fallback");
         assert!(k.contains("from_agent") && k.contains("created_by") && k.contains("actor"), "names the explicit-id params incl. send_message's from_agent");
+        // task_1024 (rule-level, not list_tasks-specific): pure READ/FILTER tools take NO caller identity, so an
+        // agent_id bolted onto list_tasks/get_task hard-rejects — 5 agents hit this on their post-flip boot ticks.
+        assert!(k.contains("PURE READ / FILTER tools take NO caller identity"), "states the no-identity-on-reads rule");
+        assert!(k.contains("get_task") && k.contains("unknown field agent_id"), "names get_task + the exact reject so an agent does not bolt agent_id onto a read");
+        // task_955: the typed-ref rule is for WRITTEN content; an id PARAMETER takes the bare integer, not a token.
+        assert!(k.contains("id PARAMETER is the opposite") && k.contains("takes the BARE INTEGER"), "carves out that an id argument takes a bare integer, not a typed/quoted token");
         // Per-tool identity map (#531): each tool names identity DIFFERENTLY, and the wrong field records
         // actor=null and self-notifies you on your own comment — the exact footgun task_531 exists to stop.
         assert!(k.contains("author on comment_task"), "names comment_task's author field explicitly (#531)");
