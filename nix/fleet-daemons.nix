@@ -483,6 +483,21 @@ let
       intervalSecs = 3600;
       onBootSec = 300;
       persistent = true;
+    })
+    # Prose-style ruleset drift check (task_1334): the clean-prose lint reads crates/fleet/prose-style.toml, a
+    # committed projection of the live board banned-phrases list. Public CI + the pre-commit hook cannot reach the
+    # board, so the committed projection can fall behind it. `fleet prose-sync --check` compares the committed
+    # ruleset against a fresh board fetch (exit 1 on drift); --alert-on-drift additionally opens or reuses a
+    # deduped board task naming the refresh command (ft-hygiene, camshaft/fleet#400), so drift SURFACES rather
+    # than passing silently. Runs only where the board is reachable (never public CI). The committed ruleset lives
+    # in the repo (not under $HOME), so FLEET_PROSE_RULESET is injected at install time, same pattern as FLEET_REPO.
+    // (mkTimer {
+      name = "fleet-prose-sync-check";
+      description = "Fleet prose-style ruleset drift check (task_1334)";
+      exec = "${fleetBin} prose-sync --check --alert-on-drift";
+      intervalSecs = 21600;
+      onBootSec = 600;
+      persistent = true;
     });
 
   unitsDir = pkgs.runCommand "fleet-user-units" { } (
@@ -520,6 +535,10 @@ let
     # scoped step (without the Group B guard flag-day). It is not itself a fleet-binary-ExecStart unit; it runs
     # the sweep app, which READS `fleet version` + git to detect a dark binary and nudge.
     "fleet-binary-sweep"
+    # The prose-style drift check (task_1334) runs `fleet prose-sync` (a fleet-binary ExecStart), so a binary
+    # deploy must refresh its store path too. It is a maintenance timer, not a Group B guard, so including it here
+    # is safe (no crontab flag-day). FLEET_PROSE_RULESET is injected at install, same as FLEET_REPO.
+    "fleet-prose-sync-check"
   ];
   isFleetBinaryUnit = fname: lib.any (b: lib.hasPrefix (b + ".") fname) fleetBinaryBaseNames;
   fleetBinaryUnits = lib.filterAttrs (fname: _: isFleetBinaryUnit fname) units;
@@ -605,6 +624,13 @@ let
         chmod u+w "$UNIT_DIR/fleet-binary-sweep.service" 2>/dev/null || true
         printf 'Environment=FLEET_REPO=%s\n' "$fleet_repo" >> "$UNIT_DIR/fleet-binary-sweep.service"
       fi
+      # task_1334: inject the committed prose-style ruleset path into the prose-sync-check unit (it lives in the
+      # repo, not under $HOME, so install-time injection like FLEET_REPO; `fleet prose-sync --check` reads it via
+      # $FLEET_PROSE_RULESET). The board base auto-resolves to the configured board, so no board env is needed.
+      if [ -e "$UNIT_DIR/fleet-prose-sync-check.service" ]; then
+        chmod u+w "$UNIT_DIR/fleet-prose-sync-check.service" 2>/dev/null || true
+        printf 'Environment=FLEET_PROSE_RULESET=%s\n' "$fleet_repo/crates/fleet/prose-style.toml" >> "$UNIT_DIR/fleet-prose-sync-check.service"
+      fi
       # task_1123: fleet-dream's oneshot shells out to `board-memory` (publishes each dreams/<scope> doc) and the
       # model tooling, so it needs the login PATH plus the fleet repo's bin/ (where board-memory lives). Inject
       # both at install time, same machine-path pattern as the watchdog PATH and the FLEET_REPO above — never
@@ -681,6 +707,12 @@ let
       if [ -e "$UNIT_DIR/fleet-binary-sweep.service" ]; then
         chmod u+w "$UNIT_DIR/fleet-binary-sweep.service" 2>/dev/null || true
         printf 'Environment=FLEET_REPO=%s\n' "$fleet_repo" >> "$UNIT_DIR/fleet-binary-sweep.service"
+      fi
+      # task_1334: same prose-style ruleset path injection as install-fleet-daemons (the prose-sync-check unit is
+      # in the fleet-binary set, so a binary deploy re-copies it and must re-inject FLEET_PROSE_RULESET).
+      if [ -e "$UNIT_DIR/fleet-prose-sync-check.service" ]; then
+        chmod u+w "$UNIT_DIR/fleet-prose-sync-check.service" 2>/dev/null || true
+        printf 'Environment=FLEET_PROSE_RULESET=%s\n' "$fleet_repo/crates/fleet/prose-style.toml" >> "$UNIT_DIR/fleet-prose-sync-check.service"
       fi
       systemctl --user daemon-reload
       # Re-arm the binary timers: their oneshot ExecStart now points at the new store binary, so the next fire
