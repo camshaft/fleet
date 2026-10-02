@@ -5045,8 +5045,13 @@ fn build_kickoff(
         )
     } else {
         format!(
-            "run one tick of your charter: drain your board notifications (check_notifications), do ONE unit \
-             of work per your charter, then update your presence (set_status). WORK-CONSERVING PACING: after \
+            "run one tick of your charter. First do a charter self-check, before the unit: confirm your \
+             current or next action is within your chartered scope and role, and that you are not idle while \
+             holding actionable, non-blocked assigned work. If you have drifted off-charter, or are idle with \
+             actionable assigned work pending, return to charter now — switch to the in-charter or actionable \
+             work this tick, or state in one line why your current focus is genuinely in-charter (task_736). \
+             Then: drain your board notifications (check_notifications), do ONE unit of work per your charter, \
+             then update your presence (set_status). WORK-CONSERVING PACING: after \
              the unit, check your OPEN assigned tasks (list_tasks with assignee '{agent}', counting ONLY \
              todo/in_progress tasks that are NOT blocked/parked — a blocked task, or one parked on a blocker or \
              a not-yet-existing prereq, is NOT actionable pending work) and your unread notifications. If you \
@@ -14273,6 +14278,22 @@ mod tests {
         // Neither given (both blank) is a misconfiguration -> Err, so the guard fails fast.
         assert!(tunnel_recovery_plan(None, "").is_err());
         assert!(tunnel_recovery_plan(Some(""), "   ").is_err());
+    }
+
+    #[test]
+    fn build_kickoff_carries_the_charter_self_check_clause() {
+        // task_1325 Stage-1 slice 2: the top-of-tick charter self-check (doc_3410) is baked into the
+        // non-reactive tick so it runs every tick via /loop. Two-sided: off-charter work AND idle while
+        // holding actionable, non-blocked work (the task_736 condition).
+        let k = build_kickoff("v-x", "/wt/x", "30m", None, false, false);
+        assert!(
+            k.contains("charter self-check") && k.contains("return to charter"),
+            "non-reactive kickoff carries the top-of-tick charter self-check clause"
+        );
+        assert!(
+            k.contains("idle while holding actionable") && k.contains("task_736"),
+            "the self-check includes the switch-do-not-idle condition"
+        );
     }
 
     #[test]
