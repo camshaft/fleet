@@ -21,6 +21,7 @@ mod dream;
 mod dream_apply;
 mod memory;
 mod notify;
+mod scan;
 mod transcripts;
 mod workspace;
 
@@ -2220,6 +2221,32 @@ enum Cmd {
         /// The board-native agent whose live claude session to inspect.
         agent: String,
     },
+    /// Scan staged (or given) content for Amazon-internal MARKER hits before a commit lands in a PUBLIC repo
+    /// (task_782 / doc_104 mechanism). The marker VOCABULARY is loaded from a PRIVATE taxonomy file (never
+    /// baked into this public source) via `--taxonomy` or `$FLEET_CONTENT_TAXONOMY`. Exit 1 on a blocking hit
+    /// (fail-closed), 2 on a config error (no/invalid taxonomy), 0 when clean or advisory-only. Composes with
+    /// an external secret scanner: detect-secrets owns secrets; this owns the internal identifier NAMES a
+    /// secret scanner cannot know (the class behind the camshaft/fleet#340 leak).
+    ScanContent {
+        /// Path to the marker taxonomy TOML (else `$FLEET_CONTENT_TAXONOMY`).
+        #[arg(long)]
+        taxonomy: Option<String>,
+        /// A file to scan as-is from disk; repeatable. Default when omitted: the staged index.
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Scan the staged index even when `--file`s are given.
+        #[arg(long)]
+        staged: bool,
+        /// Downgrade every blocking hit to advisory (report, exit 0).
+        #[arg(long)]
+        warn_only: bool,
+        /// Print only `file:line: category`, never the matched token (for public CI logs).
+        #[arg(long)]
+        redact: bool,
+        /// Treat a missing taxonomy as a skip (exit 0) instead of a fail-closed config error.
+        #[arg(long)]
+        allow_missing_taxonomy: bool,
+    },
     /// Pattern-kill processes WITHOUT the `pkill -f` self-match footgun (task_1068): kill every process whose
     /// full command line contains `pattern`, but NEVER the caller's own process, its ancestor chain (the
     /// invoking shell, the Bash-tool wrapper, the agent's claude session), or its process group. `pkill -f`
@@ -2711,6 +2738,21 @@ fn main() {
         } => safeguard_check(&agent, threshold, tail),
         Cmd::DedupCheck { agent, kill } => dedup_check(agent.as_deref(), kill),
         Cmd::McpCheck { agent } => mcp_check(&agent),
+        Cmd::ScanContent {
+            taxonomy,
+            files,
+            staged,
+            warn_only,
+            redact,
+            allow_missing_taxonomy,
+        } => scan::scan_content(scan::ScanOpts {
+            taxonomy,
+            files,
+            staged,
+            warn_only,
+            redact,
+            allow_missing_taxonomy,
+        }),
         Cmd::SafePkill {
             pattern,
             dry_run,
