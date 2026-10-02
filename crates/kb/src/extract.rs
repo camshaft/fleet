@@ -13,7 +13,7 @@
 // Ported ahead of its callers (the phase-2 ingest workers), so the helpers read as dead code until then.
 #![allow(dead_code)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -47,6 +47,8 @@ enum Kind {
     Text,
     /// A PDF, extracted per page.
     Pdf,
+    /// A .docx (OOXML WordprocessingML), extracted as one text unit.
+    Docx,
 }
 
 /// Ingestable text extensions — the Python `chunk.DOC_EXT`. Read verbatim as UTF-8. (Deliberately NOT the
@@ -65,6 +67,8 @@ fn classify(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if ext == "pdf" {
         Some(Kind::Pdf)
+    } else if ext == "docx" {
+        Some(Kind::Docx)
     } else if DOC_EXT.contains(&ext.as_str()) {
         Some(Kind::Text)
     } else {
@@ -115,6 +119,7 @@ pub fn extract_units(path: &Path) -> Result<Vec<(Option<i64>, String)>, String> 
             .enumerate()
             .map(|(i, text)| (Some(i as i64 + 1), text))
             .collect()),
+        Some(Kind::Docx) => Ok(vec![(None, extract_docx(path)?)]),
         None => Err(format!(
             "extract: unsupported file type: {}",
             path.display()
@@ -165,6 +170,114 @@ pub fn extract_pdf_bytes(data: &[u8]) -> Result<Vec<String>, String> {
         .iter()
         .map(|page| page_text(&page, min_chars))
         .collect())
+}
+
+/// Extract a .docx file's text — a thin wrapper over [`extract_docx_bytes`] that reads the file into memory
+/// first. The whole document is one text unit (page `None`), like a plain-text file.
+fn extract_docx(path: &Path) -> Result<String, String> {
+    let data = std::fs::read(path).map_err(|e| format!("extract: read {}: {e}", path.display()))?;
+    extract_docx_bytes(&data)
+}
+
+/// Extract a .docx's text from in-memory bytes — the bytes analogue of [`extract_docx`], for the pipeline
+/// embedder which cats a docx's bytes back from IPFS (no file path). A .docx is a ZIP whose `word/document.xml`
+/// holds the body; [`docx_xml_to_text`] pulls the readable text, CRLF-normalized like the PDF path. A non-zip
+/// input or a missing `word/document.xml` is an error (surfaced, never a panic).
+pub fn extract_docx_bytes(data: &[u8]) -> Result<String, String> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| {
+        format!(
+            "extract: docx is not a valid zip ({} bytes): {e}",
+            data.len()
+        )
+    })?;
+    let mut xml = String::new();
+    zip.by_name("word/document.xml")
+        .map_err(|e| format!("extract: docx has no word/document.xml: {e}"))?
+        .read_to_string(&mut xml)
+        .map_err(|e| format!("extract: docx read document.xml: {e}"))?;
+    Ok(normalize_newlines(&docx_xml_to_text(&xml)))
+}
+
+/// Pull readable text from a WordprocessingML `word/document.xml`: text lives in `<w:t>` runs; a paragraph
+/// close (`</w:p>`) and `<w:br>`/`<w:cr>` become newlines, `<w:tab/>` a tab, and every other tag is dropped.
+/// XML entities inside runs are unescaped ([`xml_unescape`]). A deliberately small hand parser (so the crate
+/// takes no XML dependency) matched to the one structure Word emits — it assumes the standard `w:` text
+/// namespace prefix. Pure; unit-tested.
+fn docx_xml_to_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut rest = xml;
+    while let Some(lt) = rest.find('<') {
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else { break };
+        let tag = after[..gt].trim();
+        let is_close = tag.starts_with('/');
+        let is_self = tag.ends_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split([' ', '\t', '\r', '\n'])
+            .next()
+            .unwrap_or("");
+        // Absolute byte offset of the first char AFTER this tag's '>'.
+        let past_tag = lt + 1 + gt + 1;
+        if name == "w:t" && !is_close && !is_self {
+            // Text run: take the char data up to the matching </w:t>.
+            if let Some(close) = rest[past_tag..].find("</w:t>") {
+                out.push_str(&xml_unescape(&rest[past_tag..past_tag + close]));
+                rest = &rest[past_tag + close + "</w:t>".len()..];
+                continue;
+            }
+            break; // unterminated run (malformed) — stop rather than spin
+        }
+        match name {
+            "w:tab" => out.push('\t'),
+            "w:br" | "w:cr" => out.push('\n'),
+            "w:p" if is_close => out.push('\n'),
+            _ => {}
+        }
+        rest = &rest[past_tag..];
+    }
+    out
+}
+
+/// Unescape the five XML predefined entities plus numeric (`&#NN;` / `&#xHH;`) character references in run
+/// text; an unknown entity is left verbatim. Pure; unit-tested.
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let Some(semi) = tail.find(';') else {
+            out.push_str(tail);
+            return out;
+        };
+        let ent = &tail[1..semi];
+        let decoded = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                u32::from_str_radix(&ent[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+            }
+            _ if ent.starts_with('#') => ent[1..].parse::<u32>().ok().and_then(char::from_u32),
+            _ => None,
+        };
+        match decoded {
+            Some(c) => out.push(c),
+            None => out.push_str(&tail[..=semi]), // unknown entity: keep "&...;" verbatim
+        }
+        rest = &tail[semi + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Count of non-whitespace characters — the "how much real text is on this page" measure the OCR threshold
@@ -439,5 +552,100 @@ mod tests {
         assert!(junk_ratio("plain english text") < 0.05);
         assert!(junk_ratio("digits 123 and punct .,;:!?()[]{}") < 0.05);
         assert!(junk_ratio(&"\u{FFFD}".repeat(20)) > 0.9); // all replacement chars -> ~all junk
+    }
+
+    /// Build a minimal .docx (a ZIP with one `word/document.xml`) around a WordML `<w:body>` fragment. Stored
+    /// (uncompressed) so the test needs no deflate feature; the reader handles stored + deflated alike.
+    fn docx_with(body: &str) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let xml = format!(
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>{body}</w:body></w:document>"
+        );
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("word/document.xml", opts).unwrap();
+            zw.write_all(xml.as_bytes()).unwrap();
+            let _ = zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn classify_recognizes_docx() {
+        assert_eq!(classify(Path::new("a.docx")), Some(Kind::Docx));
+        assert_eq!(classify(Path::new("A.DOCX")), Some(Kind::Docx)); // case-insensitive
+        assert_eq!(classify(Path::new("a.doc")), None); // legacy binary .doc is NOT supported
+    }
+
+    #[test]
+    fn extract_docx_bytes_pulls_runs_and_paragraph_breaks() {
+        let docx = docx_with(
+            "<w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t xml:space=\"preserve\"> world</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>Line &amp; two</w:t></w:r></w:p>",
+        );
+        // Two paragraphs: runs concatenate, each </w:p> is a line break; the &amp; entity is unescaped.
+        assert_eq!(
+            extract_docx_bytes(&docx).unwrap(),
+            "Hello world\nLine & two\n"
+        );
+    }
+
+    #[test]
+    fn extract_docx_bytes_handles_tab_and_break() {
+        let docx =
+            docx_with("<w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>");
+        assert_eq!(extract_docx_bytes(&docx).unwrap(), "a\tb\nc\n");
+    }
+
+    #[test]
+    fn extract_docx_bytes_errors_on_non_zip() {
+        // Surfaces an Err (never panics) for a leading-PK non-zip and for arbitrary bytes.
+        assert!(extract_docx_bytes(b"PK not really a zip").is_err());
+        assert!(extract_docx_bytes(b"totally not a docx").is_err());
+    }
+
+    #[test]
+    fn extract_docx_bytes_errors_when_no_document_xml() {
+        use std::io::{Cursor, Write};
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("other.xml", opts).unwrap();
+            zw.write_all(b"<x/>").unwrap();
+            let _ = zw.finish().unwrap();
+        }
+        // A valid zip but without word/document.xml -> error, not panic.
+        assert!(extract_docx_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn extract_units_docx_is_single_page_none() {
+        let d = TmpDir::new();
+        let p = d.0.join("doc.docx");
+        fs::write(&p, docx_with("<w:p><w:r><w:t>body text</w:t></w:r></w:p>")).unwrap();
+        // docx is one unit with page None (like a text file), str(None) -> "None" in the id key.
+        assert_eq!(
+            extract_units(&p).unwrap(),
+            vec![(None, "body text\n".to_string())]
+        );
+    }
+
+    #[test]
+    fn xml_unescape_decodes_named_and_numeric() {
+        assert_eq!(
+            xml_unescape("a&amp;b&lt;c&gt;d&quot;e&apos;f"),
+            "a&b<c>d\"e'f"
+        );
+        assert_eq!(xml_unescape("&#65;&#x42;"), "AB"); // decimal + hex char refs
+        assert_eq!(xml_unescape("no entities"), "no entities");
+        assert_eq!(
+            xml_unescape("keep &unknown; verbatim"),
+            "keep &unknown; verbatim"
+        );
     }
 }
