@@ -2114,7 +2114,10 @@ enum Cmd {
     /// seam-touching paths are printed so its tick opens with the diff in hand), exit 1 = error / no seam
     /// declared. Report-only — it computes the verdict, it does not itself wake or skip anything.
     SeamCheck {
-        /// The agent whose `metadata.seam` globs + worktree to check.
+        /// The agent whose `metadata.seam` globs + worktree to check. A seam entry prefixed with `!` is an
+        /// EXCLUDE: a path is on-seam when it matches an include glob AND no exclude, so a vertical can own a
+        /// directory broadly yet carve out a shared-but-not-owned subtree (e.g. `backend/cadenza/**` +
+        /// `!backend/cadenza/select/**`) to avoid waking on another lane's churn.
         agent: String,
         /// Skip `git fetch` and check against the already-fetched `origin/main` (for tests / rapid re-runs).
         #[arg(long)]
@@ -5843,14 +5846,35 @@ fn glob_rec(pat: &[u8], text: &[u8]) -> bool {
     }
 }
 
-/// The subset of `changed` paths that touch any of the agent's declared `seams` (task_579). EMPTY means
-/// GREEN — no incoming commit touched the monitor's seam, so the wake is a deterministic no-op and the
-/// caller may heartbeat WITHOUT waking the model. Non-empty means CHANGED — wake the model with exactly
-/// these paths in hand. Pure — unit-tested.
+/// Partition a declared seam list into (include globs, exclude globs). A glob prefixed with `!` is an
+/// EXCLUDE (the `!` is stripped); every other glob is an include (task_579). Pure — unit-tested.
+fn split_seam_globs(seams: &[String]) -> (Vec<&str>, Vec<&str>) {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for g in seams {
+        match g.strip_prefix('!') {
+            Some(ex) => excludes.push(ex),
+            None => includes.push(g.as_str()),
+        }
+    }
+    (includes, excludes)
+}
+
+/// The subset of `changed` paths that touch the agent's declared `seams` (task_579). A path is on-seam when
+/// it matches at least one INCLUDE glob AND no EXCLUDE glob (a `!`-prefixed entry). The exclude form is the
+/// curation a monitor seam needs: a vertical can own a directory broadly (`backend/cadenza/**`) yet carve out
+/// a shared-but-not-owned subtree (`!backend/cadenza/select/**`) so another lane's churn there does not wake
+/// it. EMPTY means GREEN — no incoming commit touched the monitor's seam, so the wake is a deterministic
+/// no-op and the caller may heartbeat WITHOUT waking the model. Non-empty means CHANGED — wake the model with
+/// exactly these paths in hand. Pure — unit-tested.
 fn seam_touched<'a>(changed: &'a [String], seams: &[String]) -> Vec<&'a str> {
+    let (includes, excludes) = split_seam_globs(seams);
     changed
         .iter()
-        .filter(|p| seams.iter().any(|g| seam_glob_matches(p, g)))
+        .filter(|p| {
+            includes.iter().any(|g| seam_glob_matches(p, g))
+                && !excludes.iter().any(|g| seam_glob_matches(p, g))
+        })
         .map(String::as_str)
         .collect()
 }
@@ -6944,6 +6968,12 @@ fn seam_decision(rec: &serde_json::Value, no_fetch: bool) -> SeamVerdict {
         .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
         .unwrap_or_default();
     if seams.is_empty() {
+        return SeamVerdict::NoSeam;
+    }
+    // A seam that is ALL excludes (no positive include) can never match a path, which would make every tick
+    // silently GREEN and never wake the model — the opposite of fail-safe. Treat it as undeclared so the
+    // model is woken rather than a monitor going permanently dark on a misconfiguration.
+    if split_seam_globs(&seams).0.is_empty() {
         return SeamVerdict::NoSeam;
     }
     let worktree = md.and_then(|m| m.get("worktree")).and_then(|v| v.as_str()).unwrap_or(".");
@@ -11471,6 +11501,44 @@ mod tests {
         assert!(seam_touched(&clean, &seams).is_empty(), "no on-seam change is GREEN");
         // No declared seam -> nothing can match -> GREEN (the command treats 'no seam' separately).
         assert!(seam_touched(&changed, &[]).is_empty());
+    }
+
+    #[test]
+    fn split_seam_globs_partitions_includes_and_excludes() {
+        let seams = vec![
+            "backend/cadenza/**".to_string(),
+            "!backend/cadenza/select/**".to_string(),
+            "**/lower.rs".to_string(),
+        ];
+        let (inc, exc) = split_seam_globs(&seams);
+        assert_eq!(inc, vec!["backend/cadenza/**", "**/lower.rs"]);
+        assert_eq!(exc, vec!["backend/cadenza/select/**"]);
+        // All-include list -> no excludes.
+        assert!(split_seam_globs(&["a/**".to_string()]).1.is_empty());
+    }
+
+    #[test]
+    fn seam_touched_excludes_shared_subtrees_with_bang_globs() {
+        // v-cadenza-backend's real curation (observer comment_4445): own the re-emit lowering broadly, but
+        // EXCLUDE the HOP2-shared select/** subtree so another lane's churn there does not wake this monitor.
+        let seams = vec![
+            "backend/cadenza/**".to_string(),
+            "!backend/cadenza/select/**".to_string(),
+        ];
+        let changed = vec![
+            "backend/cadenza/lower.rs".to_string(),          // owned seam -> on
+            "backend/cadenza/opt.rs".to_string(),            // owned seam -> on
+            "backend/cadenza/select/marshal.rs".to_string(), // shared, excluded -> off
+            "backend/cadenza/select/reclaim.rs".to_string(), // shared, excluded -> off
+        ];
+        assert_eq!(
+            seam_touched(&changed, &seams),
+            vec!["backend/cadenza/lower.rs", "backend/cadenza/opt.rs"],
+            "an excluded shared subtree must not count as an on-seam change"
+        );
+        // An exclude that shadows the ONLY changed path -> GREEN (do not wake).
+        let only_shared = vec!["backend/cadenza/select/marshal.rs".to_string()];
+        assert!(seam_touched(&only_shared, &seams).is_empty(), "only-excluded change is GREEN");
     }
 
     #[test]
