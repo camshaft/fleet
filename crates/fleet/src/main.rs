@@ -2648,10 +2648,17 @@ fn spin_up(agent: &str, apply: bool) {
     for r in &repos {
         let repo = r.get("repo").and_then(|v| v.as_str()).unwrap_or("?");
         let branch = r.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
+        // Optional per-repo UPSTREAM remote (e.g. `aws/s2n-quic`): a fork-maintainer vertical declares the
+        // repo it forks so spin-up pre-wires the `upstream` remote + tags into the shared mirror, making a
+        // fork-vs-upstream parity diff one command on a FRESH checkout (task_875). Absent for a non-fork repo.
+        let upstream = r.get("upstream").and_then(|v| v.as_str()).map(str::trim).filter(|u| !u.is_empty());
         let wd = if apply {
-            match workspace::ensure(&fleet_root, agent, repo, branch) {
+            match workspace::ensure(&fleet_root, agent, repo, branch, upstream) {
                 Ok(wd) => {
                     println!("  workspace ready: {wd}  (worktree of {repo}@{branch} off a shared mirror)");
+                    if let Some(up) = upstream {
+                        println!("  pre-wired upstream remote '{up}' (+tags) on the mirror — fork-parity diff is one command (task_875)");
+                    }
                     // Install the generic fail-open fmt pre-commit into the repo's shared MIRROR hooks dir
                     // (a linked worktree runs hooks from the common/mirror dir), so a board-native agent gets
                     // a commit-time rustfmt nudge — the safety net a ~/.fleet worktree otherwise lacks (#283).
@@ -2668,6 +2675,9 @@ fn spin_up(agent: &str, apply: bool) {
         } else {
             let wd = workspace::workspace_dir(&fleet_root, agent, repo);
             println!("  would materialize: {wd}  (worktree of {repo}@{branch} off {fleet_root}/mirrors)");
+            if let Some(up) = upstream {
+                println!("    + would pre-wire upstream remote '{up}' (+tags) on the mirror (fork-parity diff, task_875)");
+            }
             wd
         };
         if primary_workdir.is_none() {

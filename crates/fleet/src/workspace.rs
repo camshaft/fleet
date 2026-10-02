@@ -57,6 +57,27 @@ pub fn mirror_dir(fleet_root: &str, repo: &str) -> String {
     format!("{fleet_root}/mirrors/{}.git", repo_name(repo))
 }
 
+/// Pre-wire the fork's `upstream` remote on the shared mirror and fetch it WITH TAGS, so a fork-vs-upstream
+/// parity diff (`git diff <upstream-tag> -- …`) is one command from any worktree cut from the mirror — the
+/// version-parity-diff lever for a fork-maintainer vertical (task_875). BEST-EFFORT: a parity-diff
+/// convenience must never fail a spin-up, so every step only warns on failure and the caller continues.
+/// Idempotent: on a re-materialize it updates the URL (`set-url`) rather than erroring on an existing remote,
+/// and `--tags` re-fetch is a cheap no-op when nothing changed.
+fn pre_wire_upstream(mirror: &str, upstream: &str) {
+    let url = repo_url(upstream);
+    if git(&["-C", mirror, "remote", "get-url", "upstream"]).is_ok() {
+        // Remote already present (a re-materialize) — keep its URL current in case the declared upstream changed.
+        let _ = git(&["-C", mirror, "remote", "set-url", "upstream", &url]);
+    } else if let Err(e) = git(&["-C", mirror, "remote", "add", "upstream", &url]) {
+        eprintln!("  WARN: could not add upstream remote {url}: {e} (a fork-parity diff will need a manual `git remote add upstream`)");
+        return;
+    }
+    // Fetch WITH TAGS so a release-tag parity diff is one command; this does not touch origin's refs.
+    if let Err(e) = git(&["-C", mirror, "fetch", "upstream", "--tags", "--prune", "--quiet"]) {
+        eprintln!("  WARN: could not fetch upstream {url}: {e} (a fork-parity diff will need a manual `git fetch upstream --tags`)");
+    }
+}
+
 /// The remote-tracking ref a NEW agent branch is cut from (never a local head, so a peer's `fetch --prune`
 /// can't delete it): `origin/HEAD`, else `origin/main`/`origin/master`.
 fn mirror_default_base(mirror: &str) -> Result<String, String> {
@@ -78,7 +99,19 @@ fn mirror_default_base(mirror: &str) -> Result<String, String> {
 /// agents can share one repo mirror without colliding on a single checked-out branch. Idempotent:
 /// refreshes an existing mirror (prune touches only remote-tracking refs) and leaves an existing worktree
 /// as-is.
-pub fn ensure(fleet_root: &str, agent: &str, repo_spec: &str, branch: &str) -> Result<String, String> {
+///
+/// `upstream` (optional, e.g. `aws/s2n-quic`): a fork-maintainer vertical's upstream repo. When set, an
+/// `upstream` remote is pre-wired on the shared mirror and fetched WITH TAGS, so every worktree cut from the
+/// mirror can diff the fork against an upstream release tag (`git diff v1.88.0 -- …`) in one command, with no
+/// by-hand `git remote add` mid-investigation — the version-parity-diff lever (task_875). It is best-effort:
+/// a parity-diff convenience must never fail a spin-up, so a remote-add/fetch hiccup only warns.
+pub fn ensure(
+    fleet_root: &str,
+    agent: &str,
+    repo_spec: &str,
+    branch: &str,
+    upstream: Option<&str>,
+) -> Result<String, String> {
     let name = repo_name(repo_spec);
     let mirrors = format!("{fleet_root}/mirrors");
     let mirror = format!("{mirrors}/{name}.git");
@@ -93,6 +126,9 @@ pub fn ensure(fleet_root: &str, agent: &str, repo_spec: &str, branch: &str) -> R
         git(&["-C", &mirror, "fetch", "origin", "--prune", "--quiet"])?;
     }
     let _ = git(&["-C", &mirror, "remote", "set-head", "origin", "-a"]); // best-effort default-branch pointer
+    if let Some(up) = upstream.map(str::trim).filter(|u| !u.is_empty()) {
+        pre_wire_upstream(&mirror, up);
+    }
 
     if !Path::new(&workdir).exists() {
         let adir = format!("{fleet_root}/agents/{agent}");
@@ -143,6 +179,77 @@ mod tests {
             workspace_dir("/root/.fleet", "v-x", "camshaft/task-board"),
             "/root/.fleet/agents/v-x/task-board"
         );
+    }
+
+    #[test]
+    fn ensure_pre_wires_the_upstream_remote_with_tags() {
+        // task_875: a fork vertical declaring an upstream gets the `upstream` remote + its release tags
+        // pre-wired on the shared mirror, so a fork-vs-upstream parity diff is one command on a fresh checkout.
+        let base = std::env::temp_dir().join(format!("fleet-ws-upstream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let up = base.join("upstream");
+        let origin = base.join("origin");
+        let fleet_root = base.join("fleet");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git").current_dir(dir).args(args).output().unwrap().status.success(),
+                "git {args:?} in {dir:?}"
+            );
+        };
+        // upstream repo: one commit + a release tag (the parity-diff target).
+        run(&up, &["init", "-q", "-b", "main"]);
+        run(&up, &["config", "user.email", "u@u"]);
+        run(&up, &["config", "user.name", "u"]);
+        std::fs::write(up.join("lib.rs"), "// upstream v1").unwrap();
+        run(&up, &["add", "-A"]);
+        run(&up, &["commit", "-qm", "upstream init"]);
+        run(&up, &["tag", "v1.0"]);
+        // origin (the fork) repo: one commit.
+        run(&origin, &["init", "-q", "-b", "main"]);
+        run(&origin, &["config", "user.email", "o@o"]);
+        run(&origin, &["config", "user.name", "o"]);
+        std::fs::write(origin.join("lib.rs"), "// fork").unwrap();
+        run(&origin, &["add", "-A"]);
+        run(&origin, &["commit", "-qm", "fork init"]);
+
+        let fr = fleet_root.to_str().unwrap();
+        let origin_spec = origin.to_str().unwrap();
+        let up_spec = up.to_str().unwrap();
+
+        let wd = ensure(fr, "v-fork", origin_spec, "main", Some(up_spec)).expect("ensure with upstream");
+        assert!(Path::new(&wd).is_dir(), "worktree materialized");
+
+        let mirror = mirror_dir(fr, origin_spec);
+        // the `upstream` remote is wired on the shared mirror, pointing at the declared upstream,
+        assert_eq!(
+            git(&["-C", &mirror, "remote", "get-url", "upstream"]).expect("upstream remote wired"),
+            repo_url(up_spec)
+        );
+        // and the upstream's release tag was fetched, so a parity diff against it is one command.
+        git(&["-C", &mirror, "rev-parse", "--verify", "v1.0"]).expect("upstream tag v1.0 fetched into the mirror");
+
+        // idempotent: a second materialize with the same upstream is a clean no-op (set-url, re-fetch).
+        let wd2 = ensure(fr, "v-fork", origin_spec, "main", Some(up_spec)).expect("idempotent re-materialize");
+        assert_eq!(wd, wd2);
+
+        // a DIFFERENT repo with NO upstream declared wires no upstream remote.
+        let origin2 = base.join("origin2");
+        std::fs::create_dir_all(&origin2).unwrap();
+        run(&origin2, &["init", "-q", "-b", "main"]);
+        run(&origin2, &["config", "user.email", "o2@o"]);
+        run(&origin2, &["config", "user.name", "o2"]);
+        std::fs::write(origin2.join("f"), "x").unwrap();
+        run(&origin2, &["add", "-A"]);
+        run(&origin2, &["commit", "-qm", "init"]);
+        let _ = ensure(fr, "v-plain", origin2.to_str().unwrap(), "main", None).expect("ensure without upstream");
+        assert!(
+            git(&["-C", &mirror_dir(fr, origin2.to_str().unwrap()), "remote", "get-url", "upstream"]).is_err(),
+            "no upstream remote when none is declared"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
