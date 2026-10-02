@@ -2990,6 +2990,16 @@ enum Cmd {
         /// operator-posture enable), like `--observe --spawn` / `--review-sweep`.
         #[arg(long)]
         intake_watch: bool,
+        /// ACT on the task_1248 FROZEN-LOOP signal: for each managed board-native agent whose loop is frozen —
+        /// a live tmux window + launchable presence but a last_seen stale past N x its interval (the
+        /// window-alive-but-loop-stuck crash class the missing-window / never-ticked signals miss) — AUTO-REVIVE
+        /// it: `fleet spin-down <id> --apply --force` then `fleet spin-up <id> --apply`, so a fresh session
+        /// un-sticks the loop. Cooldown-fenced per agent (CDZ_REVIVE_FROZEN_COOLDOWN_SECS, default 3600) against a
+        /// separate .revive-frozen stamp, and suppressed during a fleet-quiesce. OPT-IN so merely shipping the
+        /// detection never force-restarts an agent; without it the freeze stays report-only (a WARNING line).
+        /// Mirrors --recover-wedged; the deployed-watchdog enable is a separate operator-posture flip.
+        #[arg(long)]
+        revive_frozen: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -3915,6 +3925,7 @@ fn main() {
             relaunch_missing,
             review_sweep,
             intake_watch,
+            revive_frozen,
         } => watchdog(
             stale_only,
             rearm,
@@ -3931,6 +3942,7 @@ fn main() {
             relaunch_missing,
             review_sweep,
             intake_watch,
+            revive_frozen,
         ),
         Cmd::ObserveRecord {
             agent,
@@ -7285,6 +7297,42 @@ fn write_recover_wedged_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+/// task_1248 default revive-frozen cooldown: at most one auto-revive (force spin-down + spin-up) per frozen
+/// agent per this window, so a revive that does not immediately un-stick the loop is not retried every sweep (a
+/// fresh session that re-freezes must not be thrashed). 1h matches the recover-wedged cadence;
+/// `CDZ_REVIVE_FROZEN_COOLDOWN_SECS` tunes it. The within-window check reuses the generic
+/// [`recover_wedged_on_cooldown`].
+const REVIVE_FROZEN_COOLDOWN_SECS: u64 = 3600;
+
+/// The per-agent last-revive stamp path: `<hub>/.claude/fleet/watchdog/<name>.revive-frozen` (unix secs). A
+/// SEPARATE stamp from recover-wedged: the two acts fence independently, so a recent wedge-recovery never
+/// suppresses a frozen-loop revive on the same agent (or vice versa).
+fn revive_frozen_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet
+        .root
+        .join("watchdog")
+        .join(format!("{name}.revive-frozen"))
+}
+
+/// Read an agent's last-revive unix time; `None` on an absent/unparseable stamp (never revived).
+fn read_revive_frozen_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(revive_frozen_stamp_path(fleet, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record that an agent was just auto-revived at `now` (best-effort — a write failure only means the cooldown is
+/// not enforced for that agent on the next sweep).
+fn write_revive_frozen_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = revive_frozen_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
 // ── observation triggers (#187, BUILD 2/5) ─────────────────────────────────────────────────────────
 // The watchdog is also the SPAWNER of ephemeral per-agent observer sessions: it tracks each agent's
 // transcript growth against a per-agent watermark and, when the unobserved increment crosses a threshold
@@ -8152,6 +8200,7 @@ fn watchdog(
     sweep_reviews: bool,
     // Named distinctly from the `intake_watch` function it gates (a same-name binding would shadow the fn).
     sweep_intake: bool,
+    revive_frozen: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -8205,6 +8254,7 @@ fn watchdog(
                 revive_stranded,
                 recover_wedged,
                 relaunch_missing,
+                revive_frozen,
             );
             // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
             // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
@@ -8566,6 +8616,7 @@ fn watchdog_board(
     revive_stranded: bool,
     recover_wedged: bool,
     relaunch_missing: bool,
+    revive_frozen: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
@@ -9201,16 +9252,79 @@ fn watchdog_board(
         }
     }
     if !frozen_loop_ids.is_empty() {
-        // task_1248 report-only slice: these managed agents have a live tmux window and a launchable presence, yet
-        // last_seen has not advanced for N x their loop interval — the window-alive-but-loop-stuck crash class
-        // that the missing-window (gone window) and never-ticked (never started) signals both miss. Warn only; the
-        // opt-in --revive-frozen act (force spin-down + spin-up, cooldown-fenced, quiesce-suppressed) is the next
-        // slice. Recover by hand meanwhile with a bounce.
+        // task_1248: these managed agents have a live tmux window and a launchable presence, yet last_seen has
+        // not advanced for N x their loop interval — the window-alive-but-loop-stuck crash class that the
+        // missing-window (gone window) and never-ticked (never started) signals both miss. The WARNING always
+        // prints (the report); with --revive-frozen it ALSO force-revives each below.
         println!(
-            "-- WARNING: {} managed agent(s) FROZEN-LOOP (task_1248: live window + launchable but last_seen stale past {REVIVE_FROZEN_STALE_FACTOR}x their interval — the loop is stuck though the process is alive): {}. Recover: `fleet bounce-session <agent> --apply` (or spin-down + spin-up); the opt-in --revive-frozen act is coming.",
+            "-- WARNING: {} managed agent(s) FROZEN-LOOP (task_1248: live window + launchable but last_seen stale past {REVIVE_FROZEN_STALE_FACTOR}x their interval — the loop is stuck though the process is alive): {}. Recover: `fleet bounce-session <agent> --apply` (or spin-down + spin-up), or run the watchdog with --revive-frozen to auto-revive.",
             frozen_loop_ids.len(),
             frozen_loop_ids.join(", ")
         );
+        // ACT (task_1248 auto-revive, opt-in --revive-frozen): a frozen loop keeps a live window + process but
+        // stops advancing last_seen, so no wake/re-arm reaches it — only a FRESH session does. Force spin-down
+        // (kill the stuck window; --force overrides the busy fence, since a stuck pane can read as working) then
+        // spin-up, both as SUBPROCESSES so a per-agent failure (process::exit) is contained in the child and
+        // never aborts the sweep. Cooldown-fenced per agent against a SEPARATE .revive-frozen stamp so a revive
+        // that does not clear the freeze is not retried every sweep. Suppressed during a fleet-quiesce: a mass
+        // spin-down parks agents deliberately, and force-restarting one then would fight the operator. Mirrors
+        // --recover-wedged (task_582).
+        if revive_frozen && fleet_quiesced {
+            println!(
+                "-- revive-frozen SUPPRESSED (task_1032): fleet-quiesce in effect (mass spin-down) — not force-restarting {} frozen agent(s) into the operator spin-down",
+                frozen_loop_ids.len()
+            );
+        } else if watchdog_action_enabled(revive_frozen, fleet_quiesced) {
+            let cooldown = std::env::var("CDZ_REVIVE_FROZEN_COOLDOWN_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(REVIVE_FROZEN_COOLDOWN_SECS);
+            let self_bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "fleet".to_string());
+            let (mut revived, mut cooled, mut failed) = (0usize, 0usize, 0usize);
+            for id in &frozen_loop_ids {
+                // Reuse the generic recover-wedged within-window check against the SEPARATE revive-frozen stamp.
+                if recover_wedged_on_cooldown(
+                    read_revive_frozen_stamp(&fleet, id),
+                    now_unix,
+                    cooldown,
+                ) {
+                    cooled += 1;
+                    continue;
+                }
+                // Force spin-down (break the frozen window past the busy fence), then spin-up a fresh session.
+                let down = std::process::Command::new(&self_bin)
+                    .args(["spin-down", id, "--apply", "--force"])
+                    .status();
+                if !matches!(down, Ok(s) if s.success()) {
+                    eprintln!(
+                        "  ! revive-frozen: spin-down '{id}' failed — not spinning up / not stamping, will retry next sweep"
+                    );
+                    failed += 1;
+                    continue;
+                }
+                match std::process::Command::new(&self_bin)
+                    .args(["spin-up", id, "--apply"])
+                    .status()
+                {
+                    Ok(s) if s.success() => {
+                        write_revive_frozen_stamp(&fleet, id, now_unix);
+                        revived += 1;
+                    }
+                    _ => {
+                        eprintln!(
+                            "  ! revive-frozen: spin-up '{id}' failed after spin-down — agent left DOWN (spin it up manually); not stamping"
+                        );
+                        failed += 1;
+                    }
+                }
+            }
+            println!(
+                "-- revive-frozen (task_1248): revived {revived}, {cooled} on cooldown, {failed} failed (opt-in force spin-down+spin-up of frozen-loop agents; cooldown {cooldown}s per agent)"
+            );
+        }
     }
     if !backlog_overflow_ids.is_empty() {
         // task_794: a RUNNING agent whose open backlog exceeds the depth threshold — the PM hire/route signal
