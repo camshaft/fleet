@@ -2925,6 +2925,7 @@ struct WorkspaceKindPlan {
     name: String,
     description: Option<String>,
     setup_script: Option<String>,
+    verify: Option<String>,
     cwd: String,
     pre_trust: Vec<String>,
     env: Vec<(String, String)>,
@@ -2957,6 +2958,13 @@ fn parse_workspace_kind(
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
+    // task_1174: an optional post-setup health-assertion command, run AFTER the setup_script to confirm the
+    // workspace is actually ready (not just that setup_script exited 0). Same shape as setup_script.
+    let verify = rec
+        .get("verify")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
     let config = rec
         .get("config")
         .cloned()
@@ -2985,6 +2993,7 @@ fn parse_workspace_kind(
         name,
         description,
         setup_script,
+        verify,
         cwd,
         pre_trust,
         env,
@@ -3095,9 +3104,16 @@ fn spin_up_workspace_kind(
             "  setup_script: NONE — no materialization; spin-up creates the launch cwd, then launches in it"
         ),
     }
+    match &plan.verify {
+        Some(v) => println!(
+            "  verify: {} line(s) — runs AFTER setup_script; a non-zero exit aborts spin-up (workspace not ready)",
+            v.lines().count()
+        ),
+        None => println!("  verify: NONE — no post-setup health assertion for this kind"),
+    }
 
     if !apply {
-        println!("  (dry-run — re-run with --apply to run the setup_script + launch)");
+        println!("  (dry-run — re-run with --apply to run the setup_script, verify, + launch)");
         return;
     }
     if !has_charter {
@@ -3136,6 +3152,34 @@ fn spin_up_workspace_kind(
             }
             Err(e) => {
                 eprintln!("  setup_script FAILED to run: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // task_1174: run the kind's post-setup health assertion, if any, AFTER the setup_script. A setup_script
+    // exiting 0 does not prove the workspace is usable — an interrupted or IO-stalled cold bootstrap can leave
+    // a half-populated workspace (e.g. a toolchain whose bin/ never populated) that then fails quietly at build
+    // time and pushes the agent to a workaround. The verify command (with the same environment as the
+    // setup_script) asserts readiness and, on a non-zero exit, aborts spin-up loudly rather than launching an
+    // agent into a broken workspace. A kind with no verify command is unchanged.
+    if let Some(check) = &plan.verify {
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c").arg(check).current_dir(fleet_root);
+        for (k, v) in setup_script_env(agent, fleet_root, &plan) {
+            cmd.env(k, v);
+        }
+        match cmd.status() {
+            Ok(st) if st.success() => println!("  verify OK — workspace is ready"),
+            Ok(st) => {
+                eprintln!(
+                    "  verify FAILED (exit {}): workspace not ready (a half-complete or interrupted bootstrap?) — refusing to launch '{agent}' into a broken workspace",
+                    st.code().unwrap_or(-1)
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("  verify FAILED to run: {e}");
                 std::process::exit(1);
             }
         }
@@ -13598,6 +13642,7 @@ mod tests {
             "name": "example-env",
             "description": "a board-defined environment",
             "setup_script": "echo materialize\n",
+            "verify": "test -d \"$FLEET_WORKSPACE_CWD/bin\"\n",
             "config": {
                 "cwd": "/work/example",
                 "pre_trust": ["/work/example/sub", "/opt/toolchain"],
@@ -13611,6 +13656,11 @@ mod tests {
             Some("a board-defined environment")
         );
         assert_eq!(p.setup_script.as_deref(), Some("echo materialize\n"));
+        assert_eq!(
+            p.verify.as_deref(),
+            Some("test -d \"$FLEET_WORKSPACE_CWD/bin\"\n"),
+            "task_1174: the post-setup verify command is read"
+        );
         assert_eq!(p.cwd, "/work/example", "absolute config.cwd is used as-is");
         // The launch cwd + the fleet root are always trusted, then the config pre_trust entries.
         assert_eq!(
@@ -13629,7 +13679,7 @@ mod tests {
     #[test]
     fn parse_workspace_kind_defaults_cwd_and_treats_blank_setup_as_none() {
         // No config at all: cwd falls back to the agent's own root dir under the fleet root, no extra trust.
-        let rec = serde_json::json!({ "name": "bare", "setup_script": "   \n" });
+        let rec = serde_json::json!({ "name": "bare", "setup_script": "   \n", "verify": "  \n" });
         let p = parse_workspace_kind("v-bare", "/home/u/.fleet", &rec, None);
         assert_eq!(p.cwd, workspace::agent_root_dir("/home/u/.fleet", "v-bare"));
         assert_eq!(
@@ -13639,6 +13689,10 @@ mod tests {
         assert!(
             p.setup_script.is_none(),
             "whitespace-only setup_script is treated as absent"
+        );
+        assert!(
+            p.verify.is_none(),
+            "whitespace-only verify is treated as absent (task_1174)"
         );
         // A relative config.cwd is taken under the fleet root.
         let rec2 = serde_json::json!({ "name": "rel", "config": { "cwd": "checkout/here" } });
@@ -13685,6 +13739,7 @@ mod tests {
             name: "membrain".to_string(),
             description: None,
             setup_script: Some("make build\n".to_string()),
+            verify: None,
             cwd: "/work/agent-a".to_string(),
             pre_trust: vec![],
             env: vec![("K".to_string(), "v".to_string())],
