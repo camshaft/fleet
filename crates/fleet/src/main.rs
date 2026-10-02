@@ -2203,6 +2203,97 @@ fn board_hygiene(
     }
 }
 
+/// The ordered list of mandate SET paths an agent inherits (task_906 / task_870): the universal `core`, then
+/// its `roles/<role>`, then `targets/<repo>` for each declared repo (sorted by repo name), then
+/// `capabilities/<capability>` for each declared capability (sorted). The compose step fetches each path's
+/// operator-approved document version and concatenates them; this is the pure SELECTION half. Pure.
+fn mandate_set_paths(role: Option<&str>, repos: &[String], capabilities: &[String]) -> Vec<String> {
+    let mut paths = vec!["core".to_string()];
+    if let Some(r) = role.map(str::trim).filter(|r| !r.is_empty()) {
+        paths.push(format!("roles/{r}"));
+    }
+    let mut repos: Vec<&String> = repos.iter().filter(|r| !r.trim().is_empty()).collect();
+    repos.sort();
+    repos.dedup();
+    for r in repos {
+        paths.push(format!("targets/{r}"));
+    }
+    let mut caps: Vec<&String> = capabilities
+        .iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
+    caps.sort();
+    caps.dedup();
+    for c in caps {
+        paths.push(format!("capabilities/{c}"));
+    }
+    paths
+}
+
+/// Extract the ordered mandate set paths from an agent's board metadata (task_906): `role`, `repos[].repo`,
+/// and `capabilities[]`. A missing field contributes nothing (the agent just inherits fewer sets). Pure.
+fn mandate_set_paths_from_metadata(md: &serde_json::Value) -> Vec<String> {
+    let role = md.get("role").and_then(serde_json::Value::as_str);
+    let repos: Vec<String> = md
+        .get("repos")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| {
+                    r.get("repo")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let capabilities: Vec<String> = md
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    mandate_set_paths(role, &repos, &capabilities)
+}
+
+/// The result of composing an agent's mandate sets into one boot-local artifact (task_906): the flattened
+/// text plus the paths that were skipped (no operator-approved version yet), which the caller logs.
+#[derive(Debug, PartialEq, Eq)]
+struct ComposedMandate {
+    artifact: String,
+    skipped: Vec<String>,
+}
+
+/// Concatenate the fetched mandate sets into one flattened artifact under stable per-set headers (task_906).
+/// `sets` is the ordered `(path, approved_content)` list; a `None` content means that set has no approved
+/// version. `core` is HARD-REQUIRED: no approved core is an `Err` (the caller holds + alarms rather than boot
+/// an agent with no universal contract). Any other set with no approved version is FAIL-SOFT skipped and
+/// recorded in `skipped`. Pure — unit-tested; the board fetch + atomic hash-gated write wrap it.
+fn compose_mandate_artifact(sets: &[(String, Option<String>)]) -> Result<ComposedMandate, String> {
+    if !sets.iter().any(|(p, c)| p == "core" && c.is_some()) {
+        return Err(
+            "compose-mandates: no operator-approved `core` set - refusing to compose (hold + alarm)"
+                .to_string(),
+        );
+    }
+    let mut artifact = String::new();
+    let mut skipped = Vec::new();
+    for (path, content) in sets {
+        match content {
+            Some(body) => {
+                artifact.push_str(&format!("## mandate-set: {path}\n\n"));
+                artifact.push_str(body.trim_end());
+                artifact.push_str("\n\n");
+            }
+            None => skipped.push(path.clone()),
+        }
+    }
+    Ok(ComposedMandate { artifact, skipped })
+}
+
 #[derive(Parser)]
 #[command(
     name = "fleet",
@@ -16546,6 +16637,79 @@ detached
             c.to_lowercase().contains("rout"),
             "asks to route it out of the inbox: {c}"
         );
+    }
+
+    #[test]
+    fn mandate_set_paths_orders_core_role_targets_capabilities() {
+        let paths = mandate_set_paths(
+            Some("vertical"),
+            &["camshaft/fleet".to_string(), "camshaft/cadenza".to_string()],
+            &["gate".to_string(), "deploy".to_string()],
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "core".to_string(),
+                "roles/vertical".to_string(),
+                "targets/camshaft/cadenza".to_string(), // repos sorted by name
+                "targets/camshaft/fleet".to_string(),
+                "capabilities/deploy".to_string(), // capabilities sorted
+                "capabilities/gate".to_string(),
+            ]
+        );
+        // No role / repos / caps -> just the universal core.
+        assert_eq!(mandate_set_paths(None, &[], &[]), vec!["core".to_string()]);
+    }
+
+    #[test]
+    fn mandate_set_paths_from_metadata_reads_role_repos_capabilities() {
+        let md = serde_json::json!({
+            "role": "vertical",
+            "repos": [{"repo":"camshaft/fleet","branch":"main"},{"repo":"camshaft/cadenza","branch":"main"}],
+            "capabilities": ["deploy","gate"]
+        });
+        assert_eq!(
+            mandate_set_paths_from_metadata(&md),
+            [
+                "core",
+                "roles/vertical",
+                "targets/camshaft/cadenza",
+                "targets/camshaft/fleet",
+                "capabilities/deploy",
+                "capabilities/gate"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compose_mandate_requires_core_and_fail_soft_skips_unapproved_sets() {
+        // No approved core -> Err (hold + alarm), never boot an agent with no universal contract.
+        let no_core = compose_mandate_artifact(&[
+            ("core".to_string(), None),
+            ("roles/vertical".to_string(), Some("R".to_string())),
+        ]);
+        assert!(no_core.is_err());
+        // Core present; an unapproved target is skipped, approved sets concatenated under headers in order.
+        let out = compose_mandate_artifact(&[
+            ("core".to_string(), Some("CORE BODY".to_string())),
+            ("roles/vertical".to_string(), Some("ROLE BODY".to_string())),
+            ("targets/camshaft/fleet".to_string(), None),
+        ])
+        .unwrap();
+        assert_eq!(out.skipped, vec!["targets/camshaft/fleet".to_string()]);
+        assert!(out.artifact.contains("## mandate-set: core"));
+        assert!(out.artifact.contains("CORE BODY"));
+        assert!(out.artifact.contains("## mandate-set: roles/vertical"));
+        assert!(out.artifact.contains("ROLE BODY"));
+        assert!(
+            !out.artifact.contains("targets/camshaft/fleet"),
+            "a skipped set is absent from the artifact"
+        );
+        // Order preserved: core header precedes the role header.
+        assert!(out.artifact.find("core").unwrap() < out.artifact.find("roles/vertical").unwrap());
     }
 
     #[test]
