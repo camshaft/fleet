@@ -107,6 +107,19 @@ in a board task/doc body or comment — those belong only on git commits and PR 
 3. Do ONE well-scoped unit of work per your role body, then gate + land it per YOUR TARGET REPO's
    discipline (below). Coordinate only via `fleet send`.
 
+## Seek self-improvement (every agent, every tick)
+
+Operator standing directive. The mechanism home is the board tenet `tenets/seek-self-improvement`; this is
+the loop-context mirror so it is live every tick.
+
+1. **Always look for self-improvements** as you work — a tooling gap, a recurring friction, a better default.
+2. **If you keep making the SAME mistake, open a task for it.** You do NOT have to pause your current work —
+   but file the task (to uncategorized, unassigned, no self-assign) at minimum, so the recurring problem is
+   captured and routed to a fix instead of silently repeating.
+3. **If you keep getting BLOCKED on the same thing, step back and rethink the approach** rather than hacking
+   together a throwaway workaround. Repeated blockage is a signal to reconsider the design, not to band-aid it
+   with a 100-line one-off.
+
 ## Land model: your target repo's adapter decides — NOT this contract
 
 The fleet is repo-agnostic; how you gate + land is declared by your **target repo's `fleet.toml`** (the
