@@ -56,9 +56,15 @@ pub fn notification_prompt(
     channel_id: Option<i64>,
     subscribed: bool,
     reactive_unaddressed: bool,
+    doc_ref: Option<&str>,
 ) -> Option<String> {
     match event_type {
         "task.assigned" => task_id.map(|id| format!("[notification] task #{id}")),
+        // A document approval wakes its subscribers: the board delivers `document.approved` only to the doc's
+        // subscribers, so delivery IS the subscription — wake-on-type, like a DM (task_1147). Render the
+        // board's canonical typed ref verbatim as `[approval] doc_123`. The ref the board sends is ALREADY
+        // `doc_<id>`, so NEVER prepend `doc ` — that doubles to `doc doc_123`.
+        "document.approved" => doc_ref.map(|r| format!("[notification] [approval] {r}")),
         "message.direct" => event_seq.map(|seq| format!("[notification] message #{seq}")),
         // A reactive relay/responder member of this channel is not addressed by this post (task_580): suppress
         // the wake so ambient channel chatter it would conclude "no action" on does not cost a harness tick. It
@@ -105,6 +111,12 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
     let reactive = v.get("reactive").and_then(Value::as_bool).unwrap_or(false);
     let addressed = v.get("addressed").and_then(Value::as_bool);
     let reactive_unaddressed = reactive && addressed == Some(false);
+    // The board's canonical typed id for a document event (task_1147): top-level `ref`, falling back to
+    // `data.ref` depending on how the event body is shaped. Rendered verbatim (already `doc_<id>`).
+    let doc_ref = v
+        .get("ref")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("data").and_then(|d| d.get("ref")).and_then(Value::as_str));
     let prompt = notification_prompt(
         event_type,
         task_id,
@@ -112,6 +124,7 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
         channel_id,
         subscribed,
         reactive_unaddressed,
+        doc_ref,
     )?;
     Some((recipient.to_string(), prompt))
 }
@@ -530,31 +543,31 @@ mod tests {
         // wake regardless of the `subscribed` hint (here `false`). A DM in particular has no subscribable
         // target, so it MUST stay type-gated.
         assert_eq!(
-            notification_prompt("task.assigned", Some(42), None, None, false, false).as_deref(),
+            notification_prompt("task.assigned", Some(42), None, None, false, false, None).as_deref(),
             Some("[notification] task #42")
         );
         assert_eq!(
-            notification_prompt("message.direct", None, Some(438), None, false, false).as_deref(),
+            notification_prompt("message.direct", None, Some(438), None, false, false, None).as_deref(),
             Some("[notification] message #438")
         );
         // A post to a channel the agent is a member of (delivery = membership; #171) wakes on type.
         assert_eq!(
-            notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(),
+            notification_prompt("channel.post", None, Some(9), Some(7), false, false, None).as_deref(),
             Some("[notification] channel #7")
         );
         assert_eq!(
-            notification_prompt("channel.post", None, Some(9), None, false, false),
+            notification_prompt("channel.post", None, Some(9), None, false, false, None),
             None,
             "no channel_id → can't form a prompt"
         );
         // A comment on a target the recipient DIRECTLY subscribes to wakes (#384, subscription = notification)
         // — the collaboration case the zero-polling mandate targets.
         assert_eq!(
-            notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(),
+            notification_prompt("task.commented", Some(42), Some(9), None, true, false, None).as_deref(),
             Some("[notification] comment on task #42")
         );
         assert_eq!(
-            notification_prompt("task.commented", None, Some(9), None, true, false),
+            notification_prompt("task.commented", None, Some(9), None, true, false, None),
             None,
             "no task_id → can't form a prompt even when subscribed"
         );
@@ -562,31 +575,31 @@ mod tests {
         // subscription) must not loop-wake a board-wide coordinator on every ticket; a status change never
         // wakes at all.
         assert_eq!(
-            notification_prompt("task.commented", Some(42), Some(9), None, false, false),
+            notification_prompt("task.commented", Some(42), Some(9), None, false, false, None),
             None,
             "a firehose-only comment accrues for poll, never wakes"
         );
         assert_eq!(
-            notification_prompt("task.status_changed", Some(42), Some(9), None, true, false),
+            notification_prompt("task.status_changed", Some(42), Some(9), None, true, false, None),
             None,
             "status change never wakes, even when subscribed"
         );
         // an assignment without a task_id, or a DM without a seq, can't form a prompt
         assert_eq!(
-            notification_prompt("task.assigned", None, Some(1), None, false, false),
+            notification_prompt("task.assigned", None, Some(1), None, false, false, None),
             None
         );
         assert_eq!(
-            notification_prompt("message.direct", Some(1), None, None, false, false),
+            notification_prompt("message.direct", Some(1), None, None, false, false, None),
             None
         );
         // presence churn and other event types are ignored
         assert_eq!(
-            notification_prompt("presence.updated", None, Some(3), None, true, false),
+            notification_prompt("presence.updated", None, Some(3), None, true, false, None),
             None
         );
         assert_eq!(
-            notification_prompt("task.updated", Some(5), None, None, true, false),
+            notification_prompt("task.updated", Some(5), None, None, true, false, None),
             None
         );
     }
@@ -598,35 +611,35 @@ mod tests {
         // subscription wakes — and ONLY those — when the recipient is reactive and the event does not address it.
         // channel.post: woken when not gated, SUPPRESSED when reactive_unaddressed.
         assert_eq!(
-            notification_prompt("channel.post", None, Some(9), Some(7), false, false).as_deref(),
+            notification_prompt("channel.post", None, Some(9), Some(7), false, false, None).as_deref(),
             Some("[notification] channel #7"),
             "ungated channel.post still wakes a member"
         );
         assert_eq!(
-            notification_prompt("channel.post", None, Some(9), Some(7), false, true),
+            notification_prompt("channel.post", None, Some(9), Some(7), false, true, None),
             None,
             "a reactive member not addressed by the post is NOT woken (task_580)"
         );
         // task.commented: a direct-subscribed comment wakes, but is SUPPRESSED when reactive_unaddressed.
         assert_eq!(
-            notification_prompt("task.commented", Some(42), Some(9), None, true, false).as_deref(),
+            notification_prompt("task.commented", Some(42), Some(9), None, true, false, None).as_deref(),
             Some("[notification] comment on task #42"),
             "ungated subscribed comment still wakes"
         );
         assert_eq!(
-            notification_prompt("task.commented", Some(42), Some(9), None, true, true),
+            notification_prompt("task.commented", Some(42), Some(9), None, true, true, None),
             None,
             "a reactive subscriber not addressed by the comment is NOT woken (task_580)"
         );
         // The gate NEVER touches the inherently-addressed direct-delivery types: an assignment or a DM to a
         // reactive agent still wakes even when reactive_unaddressed is set (those address it by definition).
         assert_eq!(
-            notification_prompt("task.assigned", Some(42), None, None, false, true).as_deref(),
+            notification_prompt("task.assigned", Some(42), None, None, false, true, None).as_deref(),
             Some("[notification] task #42"),
             "an assignment addresses the recipient — reactive gate must not suppress it"
         );
         assert_eq!(
-            notification_prompt("message.direct", None, Some(438), None, false, true).as_deref(),
+            notification_prompt("message.direct", None, Some(438), None, false, true, None).as_deref(),
             Some("[notification] message #438"),
             "a DM addresses the recipient — reactive gate must not suppress it"
         );
@@ -721,6 +734,49 @@ mod tests {
         assert_eq!(
             payload_to_wake(&post),
             Some(("waiter".into(), "[notification] channel #7".into()))
+        );
+    }
+
+    #[test]
+    fn document_approved_wakes_with_the_canonical_ref_verbatim_not_doubled() {
+        // task_1147: a document.approved wakes its subscribers with "[approval] <ref>", rendering the board's
+        // canonical typed ref verbatim. The board already sends ref="doc_<id>", so the prompt must NOT prepend
+        // "doc " — the regression this guards is the doubled "doc doc_123".
+        assert_eq!(
+            notification_prompt(
+                "document.approved",
+                None,
+                None,
+                None,
+                false,
+                false,
+                Some("doc_123")
+            )
+            .as_deref(),
+            Some("[notification] [approval] doc_123")
+        );
+        // end-to-end: top-level `ref`.
+        let top = serde_json::json!({"recipient":"charter-steward","type":"document.approved","ref":"doc_104"});
+        assert_eq!(
+            payload_to_wake(&top),
+            Some((
+                "charter-steward".into(),
+                "[notification] [approval] doc_104".into()
+            ))
+        );
+        // end-to-end: nested `data.ref` (the alternate body shape) resolves the same.
+        let nested = serde_json::json!({"recipient":"x","type":"document.approved","data":{"ref":"doc_55","title":"t"}});
+        assert_eq!(
+            payload_to_wake(&nested),
+            Some(("x".into(), "[notification] [approval] doc_55".into()))
+        );
+        // never doubled: the rendered prompt carries exactly one "doc_" and no "doc doc".
+        let (_, prompt) = payload_to_wake(&top).unwrap();
+        assert!(!prompt.contains("doc doc"), "ref is rendered verbatim, not re-prefixed");
+        // a document.approved with no ref at all cannot be rendered -> no wake (defensive, not a doubled id).
+        assert_eq!(
+            payload_to_wake(&serde_json::json!({"recipient":"x","type":"document.approved"})),
+            None
         );
     }
 }
