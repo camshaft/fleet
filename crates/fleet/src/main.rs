@@ -3303,6 +3303,14 @@ fn spin_down_all(except_csv: Option<&str>, apply: bool, force: bool) {
         println!("  keep-up: {}", keep.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
     }
 
+    // task_1032: raise the fleet-quiesce sentinel BEFORE parking any agent, so the nudge-stale daemon is silent
+    // for the whole wind-down (it must not nudge the owners this pass is about to park, nor route their stale
+    // work to the router mid-cutover). `spin-up-all`'s final wave clears it; the TTL backstop clears a sentinel
+    // a crashed cutover leaves behind. Apply-only — a dry run must not touch the daemon's live state.
+    if apply {
+        set_fleet_quiesce();
+    }
+
     let (mut ready, mut refused, mut applied) = (0usize, 0usize, 0usize);
     for id in &targets {
         let has_window = windows.iter().any(|w| w == id);
@@ -3444,10 +3452,17 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, apply: bool) {
     }
     if apply {
         println!("  summary: {launched} launched, {failed} failed this wave");
+        let down_non_except = down_native.len().saturating_sub(except.len());
         if let Some(n) = limit
-            && down_native.len().saturating_sub(except.len()) > n
+            && down_non_except > n
         {
             println!("  (more down than this wave's --limit — pause, confirm health, then re-run for the next wave)");
+        }
+        // task_1032: once the fan-out completes (this was the final/only wave), lower the fleet-quiesce sentinel
+        // so the nudge-stale daemon resumes chasing stale work. A partial wave leaves it set — the fleet is
+        // still mostly parked; the next (final) wave, or the TTL backstop, clears it.
+        if spin_up_all_completes_fanout(down_non_except, limit) {
+            clear_fleet_quiesce();
         }
     } else if !targets.is_empty() {
         println!("  (dry-run — re-run with --apply to launch this wave)");
@@ -4232,10 +4247,29 @@ fn status(stale_only: bool) {
 /// injected by the deploy; the repo carries only `host-services.toml.example` (placeholder shape). An absent
 /// file yields an empty registry + a hint pointing at the path, never an error.
 fn host_services_path() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| {
-        std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-    });
-    base.join("fleet").join("host-services.toml")
+    fleet_local_config_dir().join("host-services.toml")
+}
+
+/// The local fleet config dir — `$XDG_CONFIG_HOME/fleet` (fallback `$HOME/.config/fleet`). Where the host-local
+/// fleet resources live (the host-service registry, the fleet-quiesce sentinel): host-specific, deploy-injected,
+/// never committed. `HOME`/`XDG_CONFIG_HOME` are OS-standard locators, not fleet knobs.
+fn fleet_local_config_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        })
+        .join("fleet")
+}
+
+/// task_1032: the fleet-quiesce (maintenance-mode) sentinel — a LOCAL marker that a fleet-wide spin-down writes
+/// and a reconstitution clears, so the nudge-stale daemon stays SILENT during an operator-directed mass
+/// spin-down/cutover. Without it, a mass spin-down parks 60+ resumable agents and the daemon then nudges every
+/// parked owner and routes their stale/unassigned tasks to the router mid-cutover — coordinator noise, and a
+/// board-write-during-snapshot-freeze risk at the most delicate moment (observer task_1032). Its first line is
+/// the RFC3339 instant the quiesce began, so a stale sentinel self-expires via the TTL backstop.
+fn quiesce_sentinel_path() -> std::path::PathBuf {
+    fleet_local_config_dir().join("quiesce")
 }
 
 /// One managed host service's ownership record: who owns it, where its authoritative definition lives, and
@@ -8121,6 +8155,12 @@ const ACKED_NUDGE_COOLDOWN_HOURS: f64 = 4.0;
 /// deliberately-sequenced owner goes quiet (pinged ~daily, not hourly) without ever going fully silent.
 const MAX_ACKED_BACKOFF_STEPS: u32 = 3;
 
+/// task_1032: how long the fleet-quiesce sentinel suppresses the nudge-stale daemon before it SELF-EXPIRES.
+/// A fleet-wide spin-down/cutover runs minutes-to-a-few-hours (the observed migration freeze was ~3h); this
+/// backstop auto-clears a sentinel a crashed `spin-up-all` left behind, so a failed cutover can never wedge the
+/// daemon muted forever — the daemon resumes chasing stale work once the sentinel ages past this.
+const FLEET_QUIESCE_TTL_HOURS: f64 = 6.0;
+
 /// task_859 facet 2: how much longer a LOW-priority task's nudge threshold is than the base. A priority
 /// downgrade must LENGTHEN the cadence, not zero it (a low-pri task that is still live work must not vanish
 /// from oversight when it goes silent — just surface on a longer interval). Default 3x.
@@ -8377,16 +8417,25 @@ fn escalation_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswe
     )
 }
 
-/// #540 inc2: is a task's assigned OWNER GONE — no longer a registered agent in the roster (retired/removed),
-/// so its stale task is genuinely orphaned and should be ROUTED to the router for re-placement? This is the
-/// FALSE-POSITIVE-FREE reroute signal: an `offline`/`away` owner, or one with a stale heartbeat, is NOT gone —
-/// it is a DELIBERATELY spun-down (operator-directed, RESUMABLE) or slow-cadence owner whose tasks are its own
-/// correct work parked until it resumes, and rerouting those just bounces (board-pm #540 inc2 review: all 4
-/// offline/stale-owner reroutes were spun-down-resumable false positives). Only an owner absent from the live
-/// roster cannot come back to its work. `roster_ids` is the set of currently-registered agent ids. Pure —
-/// unit-tested.
-fn owner_is_gone(owner: &str, roster_ids: &std::collections::BTreeSet<String>) -> bool {
-    !roster_ids.contains(owner)
+/// #540 inc2: is a task's assigned OWNER GONE — truly retired/removed, so its stale task is genuinely orphaned
+/// and should be ROUTED to the router for re-placement? This is the FALSE-POSITIVE-FREE reroute signal: an
+/// `offline`/`away` owner, or one with a stale heartbeat, is NOT gone — it is a DELIBERATELY spun-down
+/// (operator-directed, RESUMABLE) or slow-cadence owner whose tasks are its own correct work parked until it
+/// resumes, and rerouting those just bounces (board-pm #540 inc2 review: all 4 offline/stale-owner reroutes
+/// were spun-down-resumable false positives).
+///
+/// task_1032 (KB 8f001c48 retire-marker follow-on): gone requires absence from BOTH the live board roster AND
+/// the DECLARED fleet manifest. A mass spin-down can drop an agent's board record while its registry.json entry
+/// survives (parked-resumable) — board-roster absence ALONE would then falsely orphan 60+ parked owners' tasks.
+/// Declared-manifest membership is the explicit resume-vs-retire marker: a `fleet remove` (true retire) drops
+/// the registry entry, a spin-down does not. `board_roster` is the set of currently-registered board agent ids;
+/// `declared_fleet` is the set of agent names the fleet manifest still manages. Pure — unit-tested.
+fn owner_is_gone(
+    owner: &str,
+    board_roster: &std::collections::BTreeSet<String>,
+    declared_fleet: &std::collections::BTreeSet<String>,
+) -> bool {
+    !board_roster.contains(owner) && !declared_fleet.contains(owner)
 }
 
 /// #540 inc2: the comment posted when a stale task is ROUTED to the router (board-pm) — an audit trail naming
@@ -8529,7 +8578,97 @@ fn parent_rollup_body(threshold_hours: f64, assignee: &str, idle_secs: i64, open
     )
 }
 
+/// task_1032: is the fleet currently QUIESCED — a mass spin-down/cutover in effect — so the nudge-stale daemon
+/// must suppress every nudge and reroute this sweep? True only when the sentinel is PRESENT (`Some(age)`) AND
+/// still within the TTL; an absent sentinel (`None`) is the normal running fleet, and a sentinel older than the
+/// TTL has self-expired (a crashed cutover must not mute the daemon forever). Pure — unit-tested.
+fn fleet_is_quiesced(sentinel_age_secs: Option<i64>, ttl_secs: i64) -> bool {
+    matches!(sentinel_age_secs, Some(age) if age < ttl_secs)
+}
+
+/// task_1032: the age in seconds of the fleet-quiesce sentinel's recorded start instant, or `None` when the
+/// sentinel is absent (the normal case). Reads the RFC3339 instant written on the first line (what
+/// [`set_fleet_quiesce`] writes); falls back to the file mtime so a hand-touched sentinel still works.
+/// Best-effort — any read error degrades to `None` (not quiesced), so the daemon never wedges on an unreadable
+/// marker (it fails OPEN: it would rather nudge than go permanently silent on a corrupt sentinel).
+fn quiesce_sentinel_age_secs(now: time::OffsetDateTime) -> Option<i64> {
+    let path = quiesce_sentinel_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    if let Some(age) = text.lines().next().and_then(|l| last_seen_age_secs(l.trim(), now)) {
+        return Some(age);
+    }
+    // No parseable timestamp on line 1 (a hand-created sentinel) → use the file mtime as the quiesce start.
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    Some(modified.elapsed().ok()?.as_secs() as i64)
+}
+
+/// task_1032: WRITE the fleet-quiesce sentinel (maintenance mode ON) — called by `spin-down-all --apply` before
+/// it parks any agent, so the nudge-stale daemon goes silent for the whole wind-down. Line 1 is the RFC3339
+/// start instant (the TTL clock); the rest is a human note. Best-effort: a write failure is logged, never fatal
+/// (a missed sentinel degrades to the pre-task_1032 behavior — the daemon still nudges — not a crash).
+fn set_fleet_quiesce() {
+    let path = quiesce_sentinel_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stamp = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let body = format!(
+        "{stamp}\n# fleet-quiesce sentinel (task_1032): a fleet-wide spin-down is in effect; the nudge-stale \
+         daemon is suppressed. `fleet spin-up-all --apply` (final wave) clears it; it self-expires after \
+         {FLEET_QUIESCE_TTL_HOURS}h.\n"
+    );
+    match std::fs::write(&path, body) {
+        Ok(()) => println!("  fleet-quiesce ON — nudge-stale suppressed (sentinel {})", path.display()),
+        Err(e) => eprintln!(
+            "  WARN: could not write quiesce sentinel {}: {e} (nudge daemon NOT suppressed this wind-down)",
+            path.display()
+        ),
+    }
+}
+
+/// task_1032: CLEAR the fleet-quiesce sentinel (maintenance mode OFF) — called by `spin-up-all --apply` once a
+/// reconstitution wave completes the fan-out, so the nudge-stale daemon resumes. An already-absent sentinel is
+/// a no-op (idempotent); any other remove error is logged (the TTL backstop clears it regardless).
+fn clear_fleet_quiesce() {
+    let path = quiesce_sentinel_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => println!("  fleet-quiesce OFF — nudge-stale resumes (removed {})", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("  WARN: could not remove quiesce sentinel {}: {e}", path.display()),
+    }
+}
+
+/// task_1032: does THIS `spin-up-all` wave COMPLETE the fan-out (no down candidates remain after it), so the
+/// fleet-quiesce sentinel should be cleared and the nudge daemon resume? True when every down-non-excepted
+/// agent is launched this pass — `limit` None (bring everyone up) or the remaining count fits the limit. A
+/// partial wave leaves the sentinel set (the fleet is still mostly parked); the TTL backstop clears it if the
+/// final wave never comes. Mirrors the inverse of the "more down than this wave's limit" message. Pure —
+/// unit-tested.
+fn spin_up_all_completes_fanout(down_non_except: usize, limit: Option<usize>) -> bool {
+    match limit {
+        None => true,
+        Some(n) => down_non_except <= n,
+    }
+}
+
 fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
+    // task_1032: fleet-quiesce gate. During an operator-directed mass spin-down/cutover a sentinel is set
+    // (`fleet spin-down-all --apply`) and the whole fleet is parked-resumable; nudging every parked owner or
+    // routing their stale/unassigned tasks to the router then is pure coordinator noise at the most delicate
+    // moment (and risks a board write during a snapshot freeze — observer task_1032). While the sentinel is
+    // present and within its TTL, emit ONE quiesce-ack line and do nothing else. It self-expires (TTL) so a
+    // crashed cutover cannot mute the daemon forever, and `spin-up-all` clears it when the fan-out completes.
+    // The check is a local file read, so a quiesced daemon never even opens a board connection.
+    let now = time::OffsetDateTime::now_utc();
+    let quiesce_ttl_secs = (FLEET_QUIESCE_TTL_HOURS * 3600.0).round() as i64;
+    if fleet_is_quiesced(quiesce_sentinel_age_secs(now), quiesce_ttl_secs) {
+        println!(
+            "fleet nudge-stale: fleet-quiesce in effect (mass spin-down) — suppressing all nudges + routes this sweep"
+        );
+        return;
+    }
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet nudge-stale: {e}");
         std::process::exit(1);
@@ -8548,6 +8687,15 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         .into_iter()
         .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
         .collect();
+    // task_1032 (KB 8f001c48 retire-marker follow-on): the DECLARED fleet roster — the agents registry.json
+    // still manages. A spun-down-RESUMABLE agent stays declared (its registry entry survives a park); only a
+    // true retire (`fleet remove`) drops it. So an owner absent from the BOARD roster but STILL declared is
+    // parked-resumable, not an orphan — its stale task stays with it, which is what keeps a mass spin-down from
+    // rerouting 60+ parked owners' work the moment their board records go (the predicted migration wave). This
+    // registry-membership check is the explicit resume-vs-retire marker KB 8f001c48 parked. Best-effort: a load
+    // failure yields an empty set, degrading [`owner_is_gone`] to the board-roster-only signal (prior behavior).
+    let declared_fleet: std::collections::BTreeSet<String> =
+        Fleet::resolve().load().agents.into_iter().map(|a| a.name).collect();
     // #540: nudge stale ASSIGNED work in in_progress AND todo. A task where work started (a plan comment) but
     // was never flipped to in_progress still stalls, and the operator wants it caught (task_512). A bare
     // untouched todo is NOT nudged — the per-task check below requires worker activity for a todo — so widening
@@ -8567,7 +8715,6 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         if apply { "" } else { " (DRY RUN — no comments will be posted)" }
     );
 
-    let now = time::OffsetDateTime::now_utc();
     // The operator's own tasks are their work queue, not a stall, so a task assigned to the operator is never
     // nudged/routed (#478 exclusion). The operator id is a deployment-specific value read from config; absent →
     // NO exemption (the generic case: a fleet with no designated operator). The fleet code holds no operator id.
@@ -8709,7 +8856,7 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         let route_reason: Option<String> = match assignee {
             None => Some("unassigned".to_string()),
             Some(owner) if owner != NUDGE_ROUTER => (!roster_ids.is_empty()
-                && owner_is_gone(owner, &roster_ids))
+                && owner_is_gone(owner, &roster_ids, &declared_fleet))
             .then(|| format!("owner {owner} is gone from the roster")),
             Some(_) => None, // already the router → nudge it, don't self-reassign
         };
@@ -12884,14 +13031,56 @@ detached
 
     #[test]
     fn owner_is_gone_flags_only_an_owner_absent_from_the_roster() {
-        let roster: std::collections::BTreeSet<String> =
+        let board: std::collections::BTreeSet<String> =
             ["v-alpha", "v-beta"].iter().map(|s| s.to_string()).collect();
+        // The declared manifest mirrors the board here (the steady-state fleet).
+        let declared = board.clone();
         // A registered owner is present regardless of its status (offline is deliberate/resumable, board-pm
         // seq-7848) → NOT gone, so its stale task stays with it.
-        assert!(!owner_is_gone("v-alpha", &roster));
-        assert!(!owner_is_gone("v-beta", &roster));
-        // An owner no longer in the roster (retired/removed) → gone → its stale task is orphaned and routes.
-        assert!(owner_is_gone("v-retired", &roster));
+        assert!(!owner_is_gone("v-alpha", &board, &declared));
+        assert!(!owner_is_gone("v-beta", &board, &declared));
+        // An owner in NEITHER the board roster NOR the declared manifest (truly retired/removed) → gone → its
+        // stale task is orphaned and routes.
+        assert!(owner_is_gone("v-retired", &board, &declared));
+    }
+
+    #[test]
+    fn owner_is_gone_keeps_a_deregistered_but_declared_owner_parked() {
+        // task_1032: a mass spin-down can drop an agent's BOARD record while its registry.json entry survives
+        // (parked-resumable). Board-roster absence alone would falsely orphan it; declared-manifest membership
+        // is the resume-vs-retire marker, so a deregistered-but-declared owner is NOT gone — its task stays.
+        let board: std::collections::BTreeSet<String> = ["v-still-up"].iter().map(|s| s.to_string()).collect();
+        let declared: std::collections::BTreeSet<String> =
+            ["v-still-up", "v-parked"].iter().map(|s| s.to_string()).collect();
+        // v-parked fell off the board (deregistered) but is still a declared fleet member → spun-down-resumable.
+        assert!(!board.contains("v-parked") && declared.contains("v-parked"));
+        assert!(!owner_is_gone("v-parked", &board, &declared), "a declared-but-deregistered owner must not reroute");
+        // Only an owner absent from BOTH is a true orphan.
+        assert!(owner_is_gone("v-retired", &board, &declared));
+    }
+
+    #[test]
+    fn fleet_is_quiesced_only_within_the_ttl() {
+        let ttl = (FLEET_QUIESCE_TTL_HOURS * 3600.0) as i64;
+        // No sentinel → the normal running fleet → not quiesced.
+        assert!(!fleet_is_quiesced(None, ttl));
+        // Sentinel present and fresh → quiesced (suppress nudges + routes).
+        assert!(fleet_is_quiesced(Some(0), ttl));
+        assert!(fleet_is_quiesced(Some(ttl - 1), ttl));
+        // Sentinel aged past the TTL → self-expired → NOT quiesced (a crashed cutover must not mute forever).
+        assert!(!fleet_is_quiesced(Some(ttl), ttl));
+        assert!(!fleet_is_quiesced(Some(ttl + 10_000), ttl));
+    }
+
+    #[test]
+    fn spin_up_all_completes_fanout_only_on_the_final_wave() {
+        // No limit → one pass brings everyone up → completes the fan-out → clear the sentinel.
+        assert!(spin_up_all_completes_fanout(42, None));
+        // Limited wave with MORE down than the limit → partial → leave the sentinel set.
+        assert!(!spin_up_all_completes_fanout(10, Some(5)));
+        // Limited wave that covers the remaining down candidates → final wave → clear the sentinel.
+        assert!(spin_up_all_completes_fanout(5, Some(5)));
+        assert!(spin_up_all_completes_fanout(3, Some(5)));
     }
 
     #[test]
