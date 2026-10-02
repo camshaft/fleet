@@ -595,6 +595,36 @@
     "token": "THIS"
   },
   {
+    "file": "crates/fleet/src/drift.rs",
+    "rule": "caps-for-emphasis",
+    "token": "BEHAVIORAL"
+  },
+  {
+    "file": "crates/fleet/src/drift.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NO"
+  },
+  {
+    "file": "crates/fleet/src/drift.rs",
+    "rule": "caps-for-emphasis",
+    "token": "NOT"
+  },
+  {
+    "file": "crates/fleet/src/drift.rs",
+    "rule": "caps-for-emphasis",
+    "token": "OTHER"
+  },
+  {
+    "file": "crates/fleet/src/drift.rs",
+    "rule": "caps-for-emphasis",
+    "token": "PURE"
+  },
+  {
+    "file": "crates/fleet/src/drift.rs",
+    "rule": "caps-for-emphasis",
+    "token": "SIGNAL"
+  },
+  {
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
     "token": "ABSENT"
@@ -2998,6 +3028,11 @@
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
     "token": "WHICH"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "caps-for-emphasis",
+    "token": "WHOLE"
   },
   {
     "file": "crates/fleet/src/main.rs",
