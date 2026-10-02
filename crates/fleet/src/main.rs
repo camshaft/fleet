@@ -4257,6 +4257,31 @@ fn fmt_hook_run() {
     }
 }
 
+/// The `tmux new-window` argv for a board-native agent: opens window `agent` in `workdir` running `cmd`,
+/// with the kickoff AND the agent identity placed in the window environment. `FLEET_AGENT` is exported into
+/// the session env so the agent's task-board MCP config can carry it as the per-session `X-Fleet-Agent`
+/// header the board forces its principal from (task_1039) — parallel to window.sh, which sets it for the
+/// `up` launch path. The board-native launch here does NOT exec window.sh, so without this the header would
+/// expand empty for every board-native agent (the common launch path) and the identity-force would never
+/// fire. Pure so the env wiring is unit-tested without spawning tmux.
+fn board_window_argv(session: &str, agent: &str, workdir: &str, kickoff: &str, cmd: &str) -> Vec<String> {
+    vec![
+        "new-window".into(),
+        "-d".into(),
+        "-t".into(),
+        session.into(),
+        "-n".into(),
+        agent.into(),
+        "-c".into(),
+        workdir.into(),
+        "-e".into(),
+        format!("CDZ_KICKOFF={kickoff}"),
+        "-e".into(),
+        format!("FLEET_AGENT={agent}"),
+        cmd.into(),
+    ]
+}
+
 /// Open a tmux window running the agent's harness in `workdir` with a SELF-DISCOVERY kickoff (the agent
 /// fetches its own charter from the board via its in-session MCP — nothing is injected). The launch command
 /// is harness-specific (see [`build_launch_cmd`]); refuses to double-launch an existing same-named window.
@@ -4273,15 +4298,10 @@ fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, ef
     }
     let kickoff = build_kickoff(agent, workdir, interval, config::get().operator_id.as_deref(), reactive);
     let cmd = build_launch_cmd(harness, model, effort, devshell.then_some(workdir))?;
+    let argv = board_window_argv(&session, agent, workdir, &kickoff, &cmd);
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
     let status = std::process::Command::new("tmux")
-        .args([
-            "new-window", "-d",
-            "-t", &session,
-            "-n", agent,
-            "-c", workdir,
-            "-e", &format!("CDZ_KICKOFF={kickoff}"),
-            &cmd,
-        ])
+        .args(&argv_ref)
         .status()
         .map_err(|e| format!("tmux new-window: {e}"))?;
     if !status.success() {
@@ -13017,6 +13037,20 @@ detached
                 "v-x",
             ]
         );
+    }
+
+    #[test]
+    fn board_window_argv_exports_fleet_agent_and_kickoff_into_the_window_env() {
+        let argv = board_window_argv("main", "ticket-ingest", "/wt/ti", "do a tick", "claude --model x");
+        // The agent identity is in the window env so the per-session X-Fleet-Agent header (task_1039) is
+        // non-empty for a board-native launch (which never execs window.sh). Window name == FLEET_AGENT value.
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "FLEET_AGENT=ticket-ingest"),
+            "board-native launch must export FLEET_AGENT: {argv:?}"
+        );
+        assert!(argv.windows(2).any(|w| w[0] == "-e" && w[1] == "CDZ_KICKOFF=do a tick"));
+        assert_eq!(argv.first().map(String::as_str), Some("new-window"));
+        assert_eq!(argv.last().map(String::as_str), Some("claude --model x"));
     }
 
     #[test]
