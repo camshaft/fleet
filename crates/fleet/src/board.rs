@@ -419,6 +419,27 @@ impl Board {
         }
     }
 
+    /// POST a JSON body to a board path and parse the JSON response — the write sibling of [`get_json`], used
+    /// by the project-scoped retention sweeps (`archive-done` / `age-out-todos`, task_1249). Retries a
+    /// transient 5xx/transport blip like the reads. `Err` on a non-2xx (the board's message is surfaced).
+    pub fn post_json(&self, path: &str, body: &Value) -> Result<Value, String> {
+        let url = format!("{}{}", self.base, path);
+        let payload = body.to_string();
+        let resp = with_transient_retry(|| {
+            self.agent
+                .post(&url)
+                .set("content-type", "application/json")
+                .set("user-agent", BOARD_UA)
+                .send_string(&payload)
+        })
+        .map_err(|e| format!("board POST {path} failed: {}", status_err(e)))?;
+        let raw = resp
+            .into_string()
+            .map_err(|e| format!("board POST {path} read failed: {e}"))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST {path}: response was not JSON: {e}"))
+    }
+
     /// One task's full record, INCLUDING its `comments` array (each with `author`/`body`/`created_at`) —
     /// the list projection (`list_tasks_by_status`) omits comments. `Err` on a non-2xx response (e.g. an
     /// unknown id).
