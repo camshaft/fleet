@@ -342,10 +342,18 @@ let
       script = "compact-nudge.sh";
       intervalSecs = 300;
     })
+    # slack-bridge-guard supervises the single live bridge daemon that carries operator comms, and its
+    # single-supervisor invariant is enforced by v-slack-bridge's coordinated flag-day (retire the cron guard +
+    # arm this unit in ONE move). Until that flag-day the cron guard stays the sole supervisor, so this timer
+    # ships DISABLED: the unit file installs but carries no [Install] and is never armed (the same inert pattern
+    # as the disabled watchdog and rearm-stale's toggle above), so install-fleet-daemons brings up the other
+    # Group B guards WITHOUT lighting a second bridge supervisor early (task_495, coordinated with v-nix +
+    # v-slack-bridge). At the flag-day: flip `enabled = true` + reinstall + retire the cron line, together.
     // (mkGuard {
       name = "fleet-slack-bridge-guard";
       script = "slack-bridge-guard.sh";
       intervalSecs = 300;
+      enabled = false;
     })
     // (mkGuard {
       name = "fleet-prune-tmp-inodes";
