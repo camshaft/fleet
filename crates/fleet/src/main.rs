@@ -2168,6 +2168,22 @@ enum Cmd {
         #[arg(long)]
         kill: bool,
     },
+    /// Pattern-kill processes WITHOUT the `pkill -f` self-match footgun (task_1068): kill every process whose
+    /// full command line contains `pattern`, but NEVER the caller's own process, its ancestor chain (the
+    /// invoking shell, the Bash-tool wrapper, the agent's claude session), or its process group. `pkill -f`
+    /// matches the pattern against the caller's OWN argv when the pattern string appears in an inline/heredoc
+    /// command, silently killing the agent's shell (exit 143/144, no output); this excludes self so that cannot
+    /// happen. Prints what it matched + what it will kill; `--dry-run` reports without killing.
+    SafePkill {
+        /// Substring to match against each process's full command line (like `pkill -f`, but self-safe).
+        pattern: String,
+        /// Report the matches + the kill set, but do not actually kill anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Signal to send (name or number, passed to `kill -s`); default TERM.
+        #[arg(long, default_value = "TERM")]
+        signal: String,
+    },
     /// Nudge stale in_progress tasks (board task #478, operator: automate what board-follow-up was missing).
     /// A task in `in_progress` whose latest activity (its `updated_at`, or a later comment) is at least
     /// `--threshold-hours` old gets a comment pinging its assignee for a progress update or ETA. Per-task
@@ -2551,6 +2567,7 @@ fn main() {
         Cmd::MonitorTick { agent, apply, no_fetch } => monitor_tick(&agent, apply, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::DedupCheck { agent, kill } => dedup_check(agent.as_deref(), kill),
+        Cmd::SafePkill { pattern, dry_run, signal } => safe_pkill(&pattern, dry_run, &signal),
         Cmd::NudgeStale {
             apply,
             threshold_hours,
@@ -10372,14 +10389,110 @@ fn dedup_decision(instances: &[(u32, String, u64)]) -> Vec<(String, u32, Vec<u32
     out
 }
 
-/// The process start time (field 22 of `/proc/<pid>/stat`, in clock ticks since boot) — a smaller value is an
-/// older process. Parses past the `(comm)` field (which may itself contain spaces/parens) by splitting after the
-/// last `)`. None if `/proc/<pid>/stat` is unreadable or malformed.
-fn proc_starttime(pid: u32) -> Option<u64> {
+/// Read a numeric field from `/proc/<pid>/stat` by its 1-indexed overall field number, parsing PAST the
+/// `(comm)` field (which may itself contain spaces/parens) by splitting after the last `)`. Field 4 = ppid,
+/// field 5 = pgrp (process group), field 22 = starttime (clock ticks since boot). None if the stat file is
+/// unreadable/malformed or the field is below 3 (pid/comm, before the split point).
+fn proc_stat_field(pid: u32, field: usize) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = &stat[stat.rfind(')')? + 1..];
-    // Fields after comm begin at `state` (overall field 3); starttime is overall field 22 → index 19 here.
-    after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()
+    // Fields after comm begin at `state` (overall field 3), so overall field N is index N-3 here.
+    after_comm.split_whitespace().nth(field.checked_sub(3)?)?.parse::<u64>().ok()
+}
+
+/// The process start time (field 22 of `/proc/<pid>/stat`, clock ticks since boot) — a smaller value is an older
+/// process.
+fn proc_starttime(pid: u32) -> Option<u64> {
+    proc_stat_field(pid, 22)
+}
+
+/// Walk the parent chain upward from `start`, collecting each ancestor pid (NOT `start` itself). `parent_of`
+/// yields the ppid of a pid; the walk stops at the root (ppid <= 1) or on a cycle. Pure (the `/proc` ppid lookup
+/// is injected) — unit-tested. Used by [`safe_pkill`] to protect the caller's whole ancestor chain (the invoking
+/// shell, the Bash-tool wrapper, the agent's claude session) from a self-match.
+fn ancestor_pids(start: u32, parent_of: &dyn Fn(u32) -> Option<u32>) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(start); // never re-collect the start node, even on a cycle
+    let mut cur = start;
+    while let Some(p) = parent_of(cur) {
+        if p <= 1 || !seen.insert(p) {
+            break;
+        }
+        out.push(p);
+        cur = p;
+    }
+    out
+}
+
+/// The pids to actually kill: those matching the pattern, MINUS the protected set (the caller's own pid, its
+/// ancestor chain, and its process group), sorted + deduped. This is what makes `fleet safe-pkill` self-safe
+/// where `pkill -f` is not — the pattern can appear in the caller's own argv (an inline/heredoc command), but a
+/// protected pid is never returned. Pure — unit-tested.
+fn safe_kill_targets(matches: &[u32], protected: &std::collections::HashSet<u32>) -> Vec<u32> {
+    let mut out: Vec<u32> = matches.iter().copied().filter(|p| !protected.contains(p)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `fleet safe-pkill <pattern>` (task_1068): kill processes whose full command line contains `pattern`, but
+/// NEVER the caller's own process, ancestor chain, or process group — so it cannot self-match the way
+/// `pkill -f` does when the pattern string appears in the invoking shell's own argv (killing the agent's shell,
+/// exit 143/144, no output). Reports matches + the kill set; `--dry_run` skips the kill.
+fn safe_pkill(pattern: &str, dry_run: bool, signal: &str) {
+    if pattern.is_empty() {
+        eprintln!("fleet safe-pkill: refusing an empty pattern (would match every process)");
+        std::process::exit(1);
+    }
+    let own = std::process::id();
+    let own_pgrp = proc_stat_field(own, 5);
+    let mut protected: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    protected.insert(own);
+    for a in ancestor_pids(own, &|p| proc_stat_field(p, 4).map(|v| v as u32)) {
+        protected.insert(a);
+    }
+    // One /proc pass: collect pattern matches, and protect every pid sharing the caller's process group.
+    let mut matches: Vec<u32> = Vec::new();
+    let mut cmdlines: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            if own_pgrp.is_some() && proc_stat_field(pid, 5) == own_pgrp {
+                protected.insert(pid);
+            }
+            let raw = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+            let cmd = String::from_utf8_lossy(&raw).replace('\0', " ");
+            let cmd = cmd.trim();
+            if cmd.contains(pattern) {
+                matches.push(pid);
+                cmdlines.insert(pid, cmd.to_string());
+            }
+        }
+    }
+    let targets = safe_kill_targets(&matches, &protected);
+    let excluded = matches.len().saturating_sub(targets.len());
+    println!(
+        "safe-pkill '{pattern}': {} match(es); {} target(s) after excluding self/ancestors/process-group ({excluded} self-protected)",
+        matches.len(),
+        targets.len()
+    );
+    for pid in &targets {
+        let snip: String = cmdlines.get(pid).map(|c| c.chars().take(100).collect()).unwrap_or_default();
+        println!("  {pid}: {snip}");
+    }
+    if dry_run {
+        println!("  (dry-run — nothing killed; re-run without --dry-run to send SIG{signal})");
+        return;
+    }
+    for pid in &targets {
+        let ok = std::process::Command::new("kill")
+            .args(["-s", signal, &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        println!("  {} pid {pid}", if ok { format!("SIG{signal} ->") } else { "FAILED to signal".to_string() });
+    }
 }
 
 /// `fleet dedup-check` (task_1063): the OS-process-authoritative single-instance check. Scans `/proc` for live
@@ -13231,6 +13344,35 @@ detached
         assert_eq!(agent_from_cwd("/home/u/.claude/worktrees/some-topic"), None);
         // `agents` with nothing after it -> None.
         assert_eq!(agent_from_cwd("/home/u/.fleet/agents"), None);
+    }
+
+    #[test]
+    fn ancestor_pids_walks_the_parent_chain_and_stops_at_root() {
+        // chain: 500 -> 400 -> 300 -> 1 (root). Ancestors of 500 are [400, 300].
+        let parent = |p: u32| match p {
+            500 => Some(400),
+            400 => Some(300),
+            300 => Some(1),
+            _ => None,
+        };
+        assert_eq!(ancestor_pids(500, &parent), vec![400, 300]);
+        // A cycle (A->B->A) is broken, not looped forever.
+        let cyc = |p: u32| match p {
+            10 => Some(20),
+            20 => Some(10),
+            _ => None,
+        };
+        assert_eq!(ancestor_pids(10, &cyc), vec![20]);
+    }
+
+    #[test]
+    fn safe_kill_targets_excludes_the_protected_self_set() {
+        // 300/400 are protected (caller's shell + wrapper); 900/901 are real matches to kill.
+        let protected: std::collections::HashSet<u32> = [111u32, 300, 400].into_iter().collect();
+        let matches = vec![400u32, 900, 300, 901, 111];
+        assert_eq!(safe_kill_targets(&matches, &protected), vec![900, 901]);
+        // If every match is protected (the pkill -f self-match case) -> nothing to kill.
+        assert!(safe_kill_targets(&[300, 400], &protected).is_empty());
     }
 
     #[test]
