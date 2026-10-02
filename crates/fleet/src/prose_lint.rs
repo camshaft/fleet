@@ -340,7 +340,7 @@ fn walk_sources(dir: &str) -> Vec<String> {
 }
 
 /// One baseline entry: the file, the rule name, and the matched token. The baseline is keyed on these
-/// three, not the line, so it is robust to the line-number drift of ordinary edits, matching the
+/// three, not the line, so it is stable across the line-number drift of ordinary edits, matching the
 /// content-guardrail secrets-baseline approach. It records the known findings of the existing tree so the
 /// gate can land and fire only on new findings, with the burn-down of the baseline a later cleanup.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn baseline_dedups_the_same_token_on_different_lines() {
         // The baseline is keyed on file plus rule plus token, so the same token on two lines is one entry
-        // and is robust to line drift.
+        // and is stable across line drift.
         let findings = vec![
             finding("a.rs", 3, Rule::CapsEmphasis, "SAME"),
             finding("a.rs", 50, Rule::CapsEmphasis, "SAME"),

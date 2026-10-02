@@ -1,9 +1,9 @@
 //! `config` — TOML-file configuration for the fleet binary.
 //!
-//! Operator mandate seq-1377: the fleet binary is configured by a TOML file, NOT `FLEET_*` environment
+//! Operator mandate seq-1377: the fleet binary is configured by a TOML file, not `FLEET_*` environment
 //! variables. Every fleet-specific knob (tmux session, hub root, workspace root, board API base, launcher
 //! path, this process's agent id) is read from the config here. The only environment still consulted is the
-//! OS-standard `HOME`/`XDG_CONFIG_HOME` used to LOCATE the config file (and as the workspace-root default) —
+//! OS-standard `HOME`/`XDG_CONFIG_HOME` used to locate the config file (and as the workspace-root default) —
 //! never a fleet knob. An absent config file or an absent key falls back to the same built-in default as the
 //! pre-config binary, so a host with no config behaves exactly as before.
 
@@ -32,26 +32,26 @@ pub struct Config {
     /// matches this (unpinned agents are unaffected). Default = the system hostname.
     pub host: Option<String>,
     /// The fleet-tunnel health-probe URL (e.g. `http://127.0.0.1:8898/`). When set, `watchdog` GETs it each
-    /// sweep and reports the wake-delivery path's health — a non-200 / unreachable probe means a WEDGED
+    /// sweep and reports the wake-delivery path's health — a non-200 / unreachable probe means a wedged
     /// tunnel (event-wakes are silently not being delivered). Absent → the tunnel-health check is skipped
     /// (a host with no tunnel, e.g. the board host itself).
     pub tunnel_health_url: Option<String>,
-    /// The systemd USER units `fleet redeploy` restarts after rebuilding a stale binary (the long-running
+    /// The systemd user units `fleet redeploy` restarts after rebuilding a stale binary (the long-running
     /// fleet daemons on this host). Absent → the built-in default set (see `redeploy`). A host with a
     /// different daemon set overrides it here.
     pub redeploy_services: Option<Vec<String>>,
     /// This deployment's operator board-agent id. A stale-task nudge/route never fires on a task assigned to
-    /// this id — the operator's own tasks are their work queue, not a stalled deliverable. Absent → NO
+    /// this id — the operator's own tasks are their work queue, not a stalled deliverable. Absent → no
     /// operator exemption (the generic case: a fleet with no designated operator). The operator id is a
     /// deployment-specific value, so it is named here, never hard-coded in the fleet code.
     pub operator_id: Option<String>,
-    /// task_627: the 1-based nudge ROUND at which a stale task's nudge starts also tagging the router (the
+    /// task_627: the 1-based nudge round at which a stale task's nudge starts also tagging the router (the
     /// operator-accountable backstop) to make a call — chase an ETA, reassign, mark it blocked, or close it —
     /// rather than only pinging the owner. Round 1 is the owner's alone; this defaults to round 2 (the first
     /// unanswered round) at the use site. Config-tunable so the threshold is never hard-coded.
     pub nudge_pm_tag_round: Option<usize>,
-    /// task_627: the 1-based nudge ROUND at which a stale task ESCALATES — the nudge tags the router to
-    /// REASSIGN it to a fresh agent (mint a helper if needed) rather than wait on the silent owner. Defaults to
+    /// task_627: the 1-based nudge round at which a stale task escalates — the nudge tags the router to
+    /// reassign it to a fresh agent (mint a helper if needed) rather than wait on the silent owner. Defaults to
     /// round 3 at the use site (= N). Takes precedence over the pm-tag round when both apply. Config-tunable.
     pub nudge_reassign_round: Option<usize>,
     /// task_1123: base directory under which local repo checkouts live, enabling the `dream-run` staleness
