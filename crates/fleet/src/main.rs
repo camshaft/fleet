@@ -3356,6 +3356,10 @@ enum Cmd {
         /// Explicit board base URL (else the configured board).
         #[arg(long)]
         board_api: Option<String>,
+        /// On a drift under --check, open or reuse a board task flagging it (for a periodic timer), in
+        /// addition to the non-zero exit.
+        #[arg(long)]
+        alert_on_drift: bool,
     },
     /// Keep a browser-facing tunnel's CLI client CONNECTED, not merely alive (task_1182): probe connectivity
     /// end-to-end THROUGH the tunnel and, when it is down (alive-but-not-forwarding — the failure a plain
@@ -4056,10 +4060,12 @@ fn main() {
             ruleset,
             check,
             board_api,
+            alert_on_drift,
         } => prose_lint::prose_sync(prose_lint::SyncOpts {
             ruleset,
             check,
             board_api,
+            alert_on_drift,
         }),
         Cmd::TunnelGuard {
             name,

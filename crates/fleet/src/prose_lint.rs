@@ -568,6 +568,54 @@ pub struct SyncOpts {
     pub check: bool,
     /// Explicit board base URL; falls back to the configured board.
     pub board_api: Option<String>,
+    /// On a drift under `--check`, open or reuse a board task flagging it, so a periodic timer surfaces the
+    /// drift rather than only exiting non-zero into a log. The non-zero exit contract is unchanged.
+    pub alert_on_drift: bool,
+}
+
+/// The self-improve project where a drift alert task is opened. A drift means the committed projection no
+/// longer matches the board, which is self-improve work alongside the other prose-lint tasks.
+const DRIFT_ALERT_PROJECT: i64 = 28;
+/// The idempotency tag for the drift alert task, so a periodic timer reuses one open task instead of opening
+/// a fresh one every tick.
+const DRIFT_ALERT_OBSERVES: &str = "prose-style-drift";
+
+/// The body of the drift alert task. Pure, so the wording is unit-tested.
+fn drift_alert_body(path: &str) -> String {
+    format!(
+        "The committed clean-prose projection {path} has fallen behind the board banned-phrases list, which \
+         is the one authoritative source. Refresh it and land the regenerated file:\n\n  fleet prose-sync \
+         --ruleset {path}\n\nThis alert is from the periodic fleet prose-sync --check --alert-on-drift tick \
+         (task_1334). It reuses one open task per the observes tag, so it does not accumulate; close it once \
+         the refresh lands and the committed projection matches the board again."
+    )
+}
+
+/// Open or reuse a board task flagging the drift, deduped by the observes tag. Best-effort: a board error is
+/// reported and does not change the exit contract (the caller still exits non-zero on drift).
+fn post_drift_alert(board: &crate::board::Board, path: &str) {
+    match board.open_observation_task(DRIFT_ALERT_PROJECT, DRIFT_ALERT_OBSERVES) {
+        Ok(Some(existing)) => {
+            eprintln!(
+                "prose-sync: a drift alert task is already open (task_{existing}); not duplicating"
+            );
+        }
+        Ok(None) => {
+            let meta = serde_json::json!({ "observes": DRIFT_ALERT_OBSERVES });
+            match board.create_task(
+                DRIFT_ALERT_PROJECT,
+                "[prose-lint] prose-style.toml projection has drifted from the board banned-phrases list",
+                &drift_alert_body(path),
+                "ft-hygiene",
+                meta,
+                None,
+            ) {
+                Ok(id) => eprintln!("prose-sync: opened drift alert task_{id}"),
+                Err(e) => eprintln!("prose-sync: could not open a drift alert task: {e}"),
+            }
+        }
+        Err(e) => eprintln!("prose-sync: could not check for an existing drift alert task: {e}"),
+    }
 }
 
 /// `fleet prose-sync` -- refresh (or, with `--check`, verify) the committed emphatics projection from the
@@ -628,6 +676,9 @@ pub fn prose_sync(opts: SyncOpts) {
             "prose-sync: drift -- the committed {path} is behind the board banned-phrases list; run \
              `fleet prose-sync --ruleset {path}` to refresh it"
         );
+        if opts.alert_on_drift {
+            post_drift_alert(&board, &path);
+        }
         std::process::exit(1);
     }
     if let Err(e) = std::fs::write(&path, &rendered) {
@@ -952,5 +1003,15 @@ mod tests {
         assert_eq!(fresh.len(), 2);
         assert!(fresh.iter().any(|f| f.file == "b.rs"));
         assert!(fresh.iter().any(|f| f.rule == Rule::CapsEmphasis));
+    }
+
+    #[test]
+    fn drift_alert_body_names_the_path_and_the_refresh_command() {
+        let body = drift_alert_body("crates/fleet/prose-style.toml");
+        assert!(body.contains("crates/fleet/prose-style.toml"));
+        assert!(
+            body.contains("fleet prose-sync --ruleset crates/fleet/prose-style.toml"),
+            "the alert tells the reader exactly how to refresh: {body}"
+        );
     }
 }
