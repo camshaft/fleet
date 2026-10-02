@@ -109,6 +109,18 @@ fn agent_is_launch_gated(md: Option<&serde_json::Value>) -> bool {
     .unwrap_or(false)
 }
 
+/// task_1144: a successful spin-up launch SATISFIES an agent's one-time bringup gate. `metadata.launch_gated` /
+/// `launch_gated_on` describe what an agent waited on before its FIRST launch (e.g. frank's "daemon mention-wake
+/// wiring"); the marker is set at mint but was never cleared once the agent went live, so a now-running
+/// production agent still read as launch-gated ([`agent_is_launch_gated`]) and was wrongly HELD out of a mass
+/// reconstitution — `spin-up-all` / `up-board` dropped `frank` on a reboot. Clearing the gate on launch makes
+/// the next reconstitution bring the agent back while a genuinely-never-launched gated agent (its marker still
+/// set) stays held. Returns the metadata-merge patch clearing both markers when either is set, else `None`
+/// (idempotent — once cleared it never re-writes). Pure — unit-tested.
+fn launch_gate_clear_patch(md: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    agent_is_launch_gated(md).then(|| serde_json::json!({ "launch_gated": false, "launch_gated_on": null }))
+}
+
 /// task_1037: whether an agent's charter is DEFERRED (`metadata.charter_projection == "deferred"`) — a
 /// deliberately-not-yet-active vertical (v-cas-http / v-bach during the migration) a mass reconstitution must
 /// not bring up. Absent → not deferred. Pure — unit-tested.
@@ -2956,6 +2968,7 @@ fn spin_up_workspace_kind(
     reactive: bool,
     apply: bool,
     cwd_override: Option<&str>,
+    gate_clear: Option<serde_json::Value>,
 ) {
     let rec = match board.get_workspace_kind(kind) {
         Ok(Some(r)) => r,
@@ -3076,6 +3089,14 @@ fn spin_up_workspace_kind(
                 Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
                 Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
             }
+            // task_1144: launching satisfies a one-time bringup gate — clear it so a reconstitution includes
+            // this now-live agent instead of holding it out on a stale launch_gated_on. Idempotent + non-fatal.
+            if let Some(patch) = gate_clear {
+                match board.patch_metadata(agent, patch) {
+                    Ok(()) => println!("  cleared launch gate (bringup gate satisfied — reconstitution will now include it)"),
+                    Err(e) => eprintln!("  WARN: launched but could not clear launch gate: {e}"),
+                }
+            }
             // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
             // from one that connected under an older binary (task_752).
             stamp_launch_rev(agent);
@@ -3178,6 +3199,10 @@ fn spin_up(agent: &str, apply: bool) {
         .clone()
         .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
 
+    // task_1144: if this agent carries a one-time bringup gate, launching it satisfies the gate — compute the
+    // clear patch now (while the agent's own metadata is in hand) to apply after a successful launch below.
+    let gate_clear = launch_gate_clear_patch(Some(&md));
+
     // A board-defined custom workspace kind (metadata.workspace_kind) takes precedence over `repos`: the
     // board resource named by the kind carries a setup_script that materializes the workspace and a
     // free-form config with the launch hints (cwd/pre_trust/env). This lets an environment the fleet does
@@ -3200,6 +3225,7 @@ fn spin_up(agent: &str, apply: bool) {
             reactive,
             apply,
             cwd_override.as_deref(),
+            gate_clear,
         );
     }
 
@@ -3389,6 +3415,15 @@ fn spin_up(agent: &str, apply: bool) {
             match board.patch_metadata(agent, serde_json::json!({ "native": true })) {
                 Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
                 Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
+            }
+            // task_1144: the launch satisfied any one-time bringup gate — clear it so a later reconstitution
+            // (spin-up-all / up-board) includes this now-live agent instead of holding it out on a stale
+            // launch_gated_on (the frank drop). Idempotent + non-fatal.
+            if let Some(patch) = gate_clear {
+                match board.patch_metadata(agent, patch) {
+                    Ok(()) => println!("  cleared launch gate (bringup gate satisfied — reconstitution will now include it)"),
+                    Err(e) => eprintln!("  WARN: launched but could not clear launch gate: {e}"),
+                }
             }
             // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
             // from one that connected under an older binary (task_752).
@@ -17164,6 +17199,32 @@ detached
         assert!(agent_charter_deferred(Some(
             &serde_json::json!({"charter_projection": "deferred"})
         )));
+    }
+
+    #[test]
+    fn launch_gate_clear_patch_clears_a_set_gate_and_is_a_no_op_otherwise() {
+        // task_1144: a launch clears whichever gate marker is set, so a now-live agent (frank) is no longer
+        // held out of a reconstitution. The patch sets launch_gated=false AND launch_gated_on=null, which
+        // drives agent_is_launch_gated to false regardless of which marker (or both) was set.
+        for set in [
+            serde_json::json!({"launch_gated_on": "daemon mention-wake wiring"}),
+            serde_json::json!({"launch_gated": true}),
+            serde_json::json!({"launch_gated": true, "launch_gated_on": "x"}),
+        ] {
+            let patch = launch_gate_clear_patch(Some(&set)).expect("a set gate yields a clear patch");
+            assert_eq!(patch, serde_json::json!({"launch_gated": false, "launch_gated_on": null}));
+            // Applying the patch (metadata merge) makes the agent read as not-gated.
+            let mut merged = set.clone();
+            for (k, v) in patch.as_object().unwrap() {
+                merged[k] = v.clone();
+            }
+            assert!(!agent_is_launch_gated(Some(&merged)), "cleared gate must read as not-gated");
+        }
+        // Idempotent: no gate set (or already cleared) yields no patch, so no spurious write.
+        assert!(launch_gate_clear_patch(None).is_none());
+        assert!(launch_gate_clear_patch(Some(&serde_json::json!({}))).is_none());
+        assert!(launch_gate_clear_patch(Some(&serde_json::json!({"launch_gated": false}))).is_none());
+        assert!(launch_gate_clear_patch(Some(&serde_json::json!({"launch_gated": false, "launch_gated_on": null}))).is_none());
     }
 
     #[test]
