@@ -122,16 +122,16 @@ jobs:
         run: cargo check -p ${{ matrix.crate }} --features ${{ matrix.features }} --all-targets
 
   # task_782 ITEM 1 (commit-content guardrail): the PUBLIC-SAFE always-on layer of doc_104's hybrid design --
-  # a detect-secrets scan on every PR including forks. detect-secrets' default plugins carry no internal
+  # a detect-secrets gate on every PR including forks. detect-secrets' default plugins carry no internal
   # vocabulary, so this is the correct always-on layer on the untrusted (fork) path, where repo secrets are
   # unavailable; the PRIVATE internal-marker layer (`fleet scan-content` against an Actions-secret taxonomy)
-  # runs only on trusted same-repo runs and is added once the operator provisions the secret (item-3).
-  # REPORTING-ONLY for now: the scan step is `|| true` so it never fails the build, and this job is NOT in the
-  # branch-protection required-check set -- the seed-before-flip rollout (prove it is low-noise against the
-  # current tree, THEN the operator marks it required with a .secrets.baseline allowlist in place). The plugin
-  # set + the allowlist are the content-owner's (librarian) call to tune.
+  # runs only on trusted same-repo runs and is added once the operator provisions the secret (item-3). The job
+  # FAILS on any secret-shaped finding not already in the committed .secrets.baseline (the audited allowlist,
+  # which also carries the exclude-lines filter for nix SRI hashes). librarian owns the baseline + plugin
+  # config; it becomes the gate of record once the operator adds this check to the branch-protection required
+  # set (item-3).
   content-guardrail:
-    name: content guardrail (reporting)
+    name: content guardrail
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,24 +143,31 @@ jobs:
       - name: Install detect-secrets
         run: pip install detect-secrets
 
-      - name: detect-secrets scan (public-safe always-on layer, reporting-only)
+      - name: detect-secrets gate (fail on a finding not in .secrets.baseline)
         run: |
-          # Scan the tracked tree and SUMMARISE findings. `|| true` keeps this reporting-only: it surfaces the
-          # secret-shaped-finding count so we can judge noise before the operator flips the job to required.
-          detect-secrets scan > detect-secrets.report.json || true
           python - <<'PY'
-          import json
-          try:
-              data = json.load(open("detect-secrets.report.json"))
-          except Exception as e:
-              print(f"detect-secrets: could not read report ({e}); reporting-only, not failing the build")
-              raise SystemExit(0)
-          results = data.get("results", {})
-          total = sum(len(v) for v in results.values())
-          print(f"detect-secrets: {total} potential secret-shaped finding(s) across {len(results)} file(s)")
-          for path, items in sorted(results.items()):
-              for it in items:
-                  print(f"  {path}:{it.get('line_number','?')} [{it.get('type','?')}]")
-          print("REPORTING-ONLY (task_782 seed phase): this never fails the build yet. The operator flips it "
-                "to a required check once low-noise is confirmed and a .secrets.baseline allowlist is in place.")
+          import json, subprocess, sys
+          BASELINE = ".secrets.baseline"
+          known = {(f, it["hashed_secret"])
+                   for f, items in json.load(open(BASELINE))["results"].items() for it in items}
+          # Re-scan against the committed baseline: detect-secrets applies its plugins + the baseline's
+          # exclude-lines filter (nix SRI hashes) and auto-excludes the baseline path; --exclude-files is a
+          # belt-and-suspenders so the allowlist file is never self-scanned. We compare by hashed_secret, so a
+          # baselined finding that merely MOVED lines is NOT a failure -- only a genuinely new secret-shaped
+          # string fails the gate.
+          subprocess.run(
+              ["detect-secrets", "scan", "--baseline", BASELINE, "--exclude-files", r"\.secrets\.baseline$"],
+              check=False, stdout=subprocess.DEVNULL,
+          )
+          new = [(f, it) for f, items in json.load(open(BASELINE))["results"].items()
+                 for it in items if (f, it["hashed_secret"]) not in known]
+          if new:
+              print("content guardrail: NEW secret-shaped finding(s) not in .secrets.baseline:")
+              for f, it in new:
+                  print(f"  {f}:{it.get('line_number')} [{it.get('type')}]")
+              print("If benign, audit + allowlist locally with:")
+              print("  detect-secrets scan --baseline .secrets.baseline && detect-secrets audit .secrets.baseline")
+              print("then commit the updated .secrets.baseline.")
+              sys.exit(1)
+          print("content guardrail: clean -- no secret-shaped findings beyond the audited baseline")
           PY
