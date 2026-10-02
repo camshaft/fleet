@@ -24,7 +24,6 @@ mod notify;
 mod transcripts;
 mod workspace;
 
-
 /// The tmux session board-native agents run in (their windows are opened here by `launch_board_agent`, and
 /// the notifier injects wakes here). From `config.session`, else `main`.
 fn board_session() -> String {
@@ -65,7 +64,7 @@ fn agent_host_matches(metadata: Option<&serde_json::Value>, this_host: &str) -> 
                     .any(|h| h == this_host)
         }
         serde_json::Value::Null => true, // host: null → unpinned
-        _ => true,                       // an odd shape shouldn't strand the agent — treat as unpinned
+        _ => true, // an odd shape shouldn't strand the agent — treat as unpinned
     }
 }
 
@@ -102,7 +101,9 @@ fn agent_is_staged(md: Option<&serde_json::Value>) -> bool {
 /// unit-tested.
 fn agent_is_launch_gated(md: Option<&serde_json::Value>) -> bool {
     md.map(|m| {
-        m.get("launch_gated").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        m.get("launch_gated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
             || m.get("launch_gated_on").is_some_and(|v| !v.is_null())
     })
     .unwrap_or(false)
@@ -112,7 +113,9 @@ fn agent_is_launch_gated(md: Option<&serde_json::Value>) -> bool {
 /// deliberately-not-yet-active vertical (v-cas-http / v-bach during the migration) a mass reconstitution must
 /// not bring up. Absent → not deferred. Pure — unit-tested.
 fn agent_charter_deferred(md: Option<&serde_json::Value>) -> bool {
-    md.and_then(|m| m.get("charter_projection")).and_then(serde_json::Value::as_str) == Some("deferred")
+    md.and_then(|m| m.get("charter_projection"))
+        .and_then(serde_json::Value::as_str)
+        == Some("deferred")
 }
 
 /// task_1037: the reason `spin-up-all` must HOLD a down board-native agent OUT of a mass reconstitution (so it
@@ -806,12 +809,7 @@ fn send(
     }
     let from = from
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            config::get()
-                .agent
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-        })
+        .or_else(|| config::get().agent.clone().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| "unknown".to_string());
     if from != "unknown"
         && let Err(why) = validate_agent_name(&from)
@@ -971,10 +969,14 @@ fn launch_window(session: &str, name: &str, worktree: &str, window_sh: &Path) ->
     // Idempotency guard (duplicate-instance prevention): never open a SECOND window for an agent that already
     // has a live one. Mirrors launch_board_agent's guard so BOTH fleet launch paths are idempotent regardless
     // of caller — a concurrent reconstitution/relaunch cannot double-spawn one identity.
-    if let Ok(out) = std::process::Command::new("tmux").args(["list-windows", "-t", session, "-F", "#W"]).output()
+    if let Ok(out) = std::process::Command::new("tmux")
+        .args(["list-windows", "-t", session, "-F", "#W"])
+        .output()
         && window_exists(&String::from_utf8_lossy(&out.stdout), name)
     {
-        eprintln!("  = '{name}': a tmux window already exists in '{session}' — skipping launch (already running)");
+        eprintln!(
+            "  = '{name}': a tmux window already exists in '{session}' — skipping launch (already running)"
+        );
         return false;
     }
     let ws = window_sh.to_string_lossy().to_string();
@@ -1063,7 +1065,11 @@ fn board_reconcile_plan(declared: &[(String, bool)], windows: &[String]) -> Boar
             plan.to_launch.push(id.clone());
         }
     }
-    for v in [&mut plan.to_launch, &mut plan.already_running, &mut plan.stood_down] {
+    for v in [
+        &mut plan.to_launch,
+        &mut plan.already_running,
+        &mut plan.stood_down,
+    ] {
         v.sort();
         v.dedup();
     }
@@ -2466,6 +2472,12 @@ enum Cmd {
         /// Path to the board-memory CLI (used by --publish-board).
         #[arg(long, default_value = "board-memory")]
         board_memory: String,
+        /// Repo worktree root to resolve file-path refs against for the verified-dangling staleness detector
+        /// (task_1141). When omitted the staleness detector is skipped entirely -- with no worktree there is
+        /// nothing to resolve against, so a corpus-only run never flags. The scheduled per-repo timer passes
+        /// the scope's repo worktree (e.g. `--repo-root .`).
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
     },
     /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
     /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
@@ -2526,14 +2538,32 @@ fn main() {
             provision,
             launch,
         } => up(&fleet, &config, provision || launch, launch),
-        Cmd::UpBoard { launch, pinned_only } => up_board(launch, pinned_only),
+        Cmd::UpBoard {
+            launch,
+            pinned_only,
+        } => up_board(launch, pinned_only),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
-        Cmd::SpinDown { agent, apply, force } => spin_down(&agent, apply, force),
-        Cmd::SpinDownAll { except, apply, force } => spin_down_all(except.as_deref(), apply, force),
-        Cmd::SpinUpAll { except, limit, include_held, apply } => {
-            spin_up_all(except.as_deref(), limit, include_held, apply)
-        }
-        Cmd::BounceSession { agent, apply, force } => bounce_session(&fleet, &agent, apply, force),
+        Cmd::SpinDown {
+            agent,
+            apply,
+            force,
+        } => spin_down(&agent, apply, force),
+        Cmd::SpinDownAll {
+            except,
+            apply,
+            force,
+        } => spin_down_all(except.as_deref(), apply, force),
+        Cmd::SpinUpAll {
+            except,
+            limit,
+            include_held,
+            apply,
+        } => spin_up_all(except.as_deref(), limit, include_held, apply),
+        Cmd::BounceSession {
+            agent,
+            apply,
+            force,
+        } => bounce_session(&fleet, &agent, apply, force),
         Cmd::BounceStale { apply, force } => bounce_stale(&fleet, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
         Cmd::Services { service } => services(service.as_deref()),
@@ -2551,7 +2581,20 @@ fn main() {
             revive_stranded,
             bounce_stale,
             recover_wedged,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal, revive_stranded, bounce_stale, recover_wedged),
+        } => watchdog(
+            stale_only,
+            rearm,
+            observe,
+            spawn,
+            dry_run,
+            pinned_only,
+            self_redeploy,
+            reap_stale_observers,
+            hire_signal,
+            revive_stranded,
+            bounce_stale,
+            recover_wedged,
+        ),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -2571,7 +2614,15 @@ fn main() {
             native,
             devshell,
             apply,
-        } => set_meta(&agent, &repos, interval.as_deref(), host.as_deref(), native, devshell, apply),
+        } => set_meta(
+            &agent,
+            &repos,
+            interval.as_deref(),
+            host.as_deref(),
+            native,
+            devshell,
+            apply,
+        ),
         Cmd::SetInterval { agent, interval } => set_interval(&fleet, &agent, &interval),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
@@ -2585,7 +2636,13 @@ fn main() {
             since,
             overlap,
             harness,
-        } => transcripts_cmd(&agent, session.as_deref(), since.as_deref(), overlap, &harness),
+        } => transcripts_cmd(
+            &agent,
+            session.as_deref(),
+            since.as_deref(),
+            overlap,
+            &harness,
+        ),
         Cmd::ServedSet { toml } => served_set(toml),
         Cmd::WakeAudit { verbose } => wake_audit(verbose),
         Cmd::ObserveCoverage {
@@ -2593,16 +2650,35 @@ fn main() {
             cadence_pinned,
             verbose,
         } => observe_coverage(cadence, cadence_pinned, verbose),
-        Cmd::ReclaimSurvey { root, mainline, verbose } => reclaim_survey(root, mainline, verbose),
-        Cmd::Gate { clippy_only, isolated } => gate(clippy_only, isolated),
+        Cmd::ReclaimSurvey {
+            root,
+            mainline,
+            verbose,
+        } => reclaim_survey(root, mainline, verbose),
+        Cmd::Gate {
+            clippy_only,
+            isolated,
+        } => gate(clippy_only, isolated),
         Cmd::WorktreeCheck { agent, verbose } => worktree_check(agent, verbose),
         Cmd::WorktreeSync { apply } => worktree_sync(apply),
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
-        Cmd::MonitorTick { agent, apply, no_fetch } => monitor_tick(&agent, apply, no_fetch),
-        Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
+        Cmd::MonitorTick {
+            agent,
+            apply,
+            no_fetch,
+        } => monitor_tick(&agent, apply, no_fetch),
+        Cmd::SafeguardCheck {
+            agent,
+            threshold,
+            tail,
+        } => safeguard_check(&agent, threshold, tail),
         Cmd::DedupCheck { agent, kill } => dedup_check(agent.as_deref(), kill),
         Cmd::McpCheck { agent } => mcp_check(&agent),
-        Cmd::SafePkill { pattern, dry_run, signal } => safe_pkill(&pattern, dry_run, &signal),
+        Cmd::SafePkill {
+            pattern,
+            dry_run,
+            signal,
+        } => safe_pkill(&pattern, dry_run, &signal),
         Cmd::NudgeStale {
             apply,
             threshold_hours,
@@ -2635,14 +2711,52 @@ fn main() {
             host,
             out_dir,
         ),
-        Cmd::UpUnit { pinned_only, interval_secs, bin, install, uninstall, host, out_dir } =>
-            up_unit(pinned_only, interval_secs, bin, install, uninstall, host, out_dir),
-        Cmd::DaemonUnit { name, exec, restart_sec, bin, install, enable, uninstall, host, out_dir } => {
-            daemon_unit(&name, exec, restart_sec, bin, install, enable, uninstall, host, out_dir)
-        }
+        Cmd::UpUnit {
+            pinned_only,
+            interval_secs,
+            bin,
+            install,
+            uninstall,
+            host,
+            out_dir,
+        } => up_unit(
+            pinned_only,
+            interval_secs,
+            bin,
+            install,
+            uninstall,
+            host,
+            out_dir,
+        ),
+        Cmd::DaemonUnit {
+            name,
+            exec,
+            restart_sec,
+            bin,
+            install,
+            enable,
+            uninstall,
+            host,
+            out_dir,
+        } => daemon_unit(
+            &name,
+            exec,
+            restart_sec,
+            bin,
+            install,
+            enable,
+            uninstall,
+            host,
+            out_dir,
+        ),
         Cmd::Version => println!("{}", version_line()),
         Cmd::Redeploy { apply } => redeploy(apply),
-        Cmd::ConfirmKill { pid, term, timeout, sigkill } => confirm_kill(pid, term, timeout, sigkill),
+        Cmd::ConfirmKill {
+            pid,
+            term,
+            timeout,
+            sigkill,
+        } => confirm_kill(pid, term, timeout, sigkill),
         Cmd::DaemonPids { daemon } => daemon_pids(&daemon),
         Cmd::FmtHookRun => fmt_hook_run(),
         Cmd::MemorySync {
@@ -2654,15 +2768,41 @@ fn main() {
             state,
             dry_run,
         } => {
-            let code = memory::sync_cmd(direction, agent, repo, &memory_dir, &board_memory, state, dry_run);
+            let code = memory::sync_cmd(
+                direction,
+                agent,
+                repo,
+                &memory_dir,
+                &board_memory,
+                state,
+                dry_run,
+            );
             if code != 0 {
                 std::process::exit(code);
             }
         }
-        Cmd::DreamAnalyze { corpus, from_board, scope, board_api, out, sample, publish_board, board_memory } => {
+        Cmd::DreamAnalyze {
+            corpus,
+            from_board,
+            scope,
+            board_api,
+            out,
+            sample,
+            publish_board,
+            board_memory,
+            repo_root,
+        } => {
             let api = board_api.unwrap_or_else(board::Board::base_url);
             let code = dream::analyze_cmd(
-                corpus.as_deref(), from_board, scope.as_deref(), &api, &out, sample, publish_board, &board_memory,
+                corpus.as_deref(),
+                from_board,
+                scope.as_deref(),
+                &api,
+                &out,
+                sample,
+                publish_board,
+                &board_memory,
+                repo_root.as_deref(),
             );
             if code != 0 {
                 std::process::exit(code);
@@ -2718,14 +2858,24 @@ fn parse_workspace_kind(
     rec: &serde_json::Value,
     cwd_override: Option<&str>,
 ) -> WorkspaceKindPlan {
-    let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-    let description = rec.get("description").and_then(|v| v.as_str()).map(str::to_string);
+    let name = rec
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let description = rec
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let setup_script = rec
         .get("setup_script")
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
-    let config = rec.get("config").cloned().unwrap_or(serde_json::Value::Null);
+    let config = rec
+        .get("config")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let cwd_src = cwd_override
         .filter(|s| !s.trim().is_empty())
         .or_else(|| config.get("cwd").and_then(|v| v.as_str()));
@@ -2746,7 +2896,14 @@ fn parse_workspace_kind(
             }
         }
     }
-    WorkspaceKindPlan { name, description, setup_script, cwd, pre_trust, env }
+    WorkspaceKindPlan {
+        name,
+        description,
+        setup_script,
+        cwd,
+        pre_trust,
+        env,
+    }
 }
 
 /// The environment a workspace-kind `setup_script` receives: the agent identity and fleet root, the resolved
@@ -2755,7 +2912,11 @@ fn parse_workspace_kind(
 /// workspace directory at an arbitrary host path with no shared convention, so the shared script has no other
 /// way to find the agent's own workspace. Config env is appended last so a kind may override a built-in if it
 /// deliberately must. Pure — unit-tested.
-fn setup_script_env(agent: &str, fleet_root: &str, plan: &WorkspaceKindPlan) -> Vec<(String, String)> {
+fn setup_script_env(
+    agent: &str,
+    fleet_root: &str,
+    plan: &WorkspaceKindPlan,
+) -> Vec<(String, String)> {
     let mut env = vec![
         ("FLEET_AGENT".to_string(), agent.to_string()),
         ("FLEET_ROOT".to_string(), fleet_root.to_string()),
@@ -2811,25 +2972,41 @@ fn spin_up_workspace_kind(
     };
     let plan = parse_workspace_kind(agent, fleet_root, &rec, cwd_override);
 
-    println!("spin-up '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    println!(
+        "spin-up '{agent}' ({}):",
+        if apply { "APPLY" } else { "dry-run" }
+    );
     println!(
         "  charter on board: {}",
-        if has_charter { "yes — the agent fetches it in-session at boot" } else { "NO — declare a charter first" }
+        if has_charter {
+            "yes — the agent fetches it in-session at boot"
+        } else {
+            "NO — declare a charter first"
+        }
     );
     println!("  harness={harness}  model={model}  effort={effort}  interval={interval}");
     println!(
         "  workspace kind: {}{}",
         plan.name,
-        plan.description.as_deref().map(|d| format!(" — {d}")).unwrap_or_default()
+        plan.description
+            .as_deref()
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default()
     );
     println!("  launch cwd: {}", plan.cwd);
     match &plan.setup_script {
         Some(s) => println!(
             "  setup_script: {} line(s) — runs with FLEET_AGENT/FLEET_ROOT/FLEET_WORKSPACE_CWD{} in the environment",
             s.lines().count(),
-            if plan.env.is_empty() { String::new() } else { format!(" + {} config env var(s)", plan.env.len()) }
+            if plan.env.is_empty() {
+                String::new()
+            } else {
+                format!(" + {} config env var(s)", plan.env.len())
+            }
         ),
-        None => println!("  setup_script: NONE — no materialization; spin-up creates the launch cwd, then launches in it"),
+        None => println!(
+            "  setup_script: NONE — no materialization; spin-up creates the launch cwd, then launches in it"
+        ),
     }
 
     if !apply {
@@ -2837,7 +3014,9 @@ fn spin_up_workspace_kind(
         return;
     }
     if !has_charter {
-        eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
+        eprintln!(
+            "  refusing to launch '{agent}': no charter on the board for it to self-discover"
+        );
         std::process::exit(1);
     }
 
@@ -2876,11 +3055,18 @@ fn spin_up_workspace_kind(
     }
 
     match pre_trust_for_harness(harness, &plan.pre_trust) {
-        Ok(true) => println!("  pre-trusted {} path(s) (launch cwd + fleet root + config pre_trust) in the {harness} config", plan.pre_trust.len()),
+        Ok(true) => println!(
+            "  pre-trusted {} path(s) (launch cwd + fleet root + config pre_trust) in the {harness} config",
+            plan.pre_trust.len()
+        ),
         Ok(false) => {}
-        Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
+        Err(e) => {
+            eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)")
+        }
     }
-    match launch_board_agent(agent, &plan.cwd, harness, model, effort, interval, devshell, reactive) {
+    match launch_board_agent(
+        agent, &plan.cwd, harness, model, effort, interval, devshell, reactive,
+    ) {
         Ok(win) => {
             println!(
                 "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {}) — it will get_agent itself for its charter, then run a work-conserving dynamic /loop (idle cadence ~{interval})",
@@ -2951,7 +3137,10 @@ fn spin_up(agent: &str, apply: bool) {
         eprintln!("fleet spin-up: {e}");
         std::process::exit(1);
     });
-    let md = rec.get("metadata").cloned().unwrap_or(serde_json::Value::Null);
+    let md = rec
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let field = |k: &str| md.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let has_charter = rec
         .get("charter")
@@ -2965,15 +3154,23 @@ fn spin_up(agent: &str, apply: bool) {
     let harness = field("harness").unwrap_or_else(|| "claude".into());
     // Opt-in: launch inside the workdir's flake devShell so the pinned toolchain is on PATH (#214). Off by
     // default — set only for an agent whose workdir is a flake with a devShell.
-    let devshell = md.get("devshell").and_then(|v| v.as_bool()).unwrap_or(false);
+    let devshell = md
+        .get("devshell")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Opt-in REACTIVE responder pacing (#438): a mention-only bot (e.g. a Slack-channel participant) gets a
     // kickoff whose only actionable trigger is being explicitly addressed, so it does not self-poll on ambient
     // chatter. Off by default — a normal work-conserving worker is unchanged.
-    let reactive = md.get("reactive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let reactive = md
+        .get("reactive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Accept the canonical structured list AND the looser hand-authored shapes (bare-string array, CSV
     // string) so a repos written by hand is never silently dropped (#472 / operator seq-6269).
     if md.get("repos").is_some_and(serde_json::Value::is_string) {
-        eprintln!("  note: metadata.repos is a comma-separated STRING — normalized to a structured list; prefer writing repos as [{{\"repo\":\"…\"}}] (the form `fleet set-meta --repo` produces)");
+        eprintln!(
+            "  note: metadata.repos is a comma-separated STRING — normalized to a structured list; prefer writing repos as [{{\"repo\":\"…\"}}] (the form `fleet set-meta --repo` produces)"
+        );
     }
     let repos = normalize_repos(md.get("repos"));
     let fleet_root = config::get()
@@ -2990,19 +3187,39 @@ fn spin_up(agent: &str, apply: bool) {
         // one kind (same setup_script/env) while each launches in its own workspace directory.
         let cwd_override = field("workspace_cwd");
         return spin_up_workspace_kind(
-            &board, agent, &kind, &fleet_root, has_charter, &harness, &model, &effort, &interval,
-            devshell, reactive, apply, cwd_override.as_deref(),
+            &board,
+            agent,
+            &kind,
+            &fleet_root,
+            has_charter,
+            &harness,
+            &model,
+            &effort,
+            &interval,
+            devshell,
+            reactive,
+            apply,
+            cwd_override.as_deref(),
         );
     }
 
-    println!("spin-up '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    println!(
+        "spin-up '{agent}' ({}):",
+        if apply { "APPLY" } else { "dry-run" }
+    );
     println!(
         "  charter on board: {}",
-        if has_charter { "yes — the agent fetches it in-session at boot" } else { "NO — declare a charter first" }
+        if has_charter {
+            "yes — the agent fetches it in-session at boot"
+        } else {
+            "NO — declare a charter first"
+        }
     );
     println!("  harness={harness}  model={model}  effort={effort}  interval={interval}");
     if repos.is_empty() {
-        println!("  repos: NONE declared — no workspace to materialize (declare `repos` on the board record)");
+        println!(
+            "  repos: NONE declared — no workspace to materialize (declare `repos` on the board record)"
+        );
     }
     let mut primary_workdir: Option<String> = None;
     for r in &repos {
@@ -3011,19 +3228,27 @@ fn spin_up(agent: &str, apply: bool) {
         // Optional per-repo UPSTREAM remote (e.g. `aws/s2n-quic`): a fork-maintainer vertical declares the
         // repo it forks so spin-up pre-wires the `upstream` remote + tags into the shared mirror, making a
         // fork-vs-upstream parity diff one command on a FRESH checkout (task_875). Absent for a non-fork repo.
-        let upstream = r.get("upstream").and_then(|v| v.as_str()).map(str::trim).filter(|u| !u.is_empty());
+        let upstream = r
+            .get("upstream")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|u| !u.is_empty());
         let wd = if apply {
             match workspace::ensure(&fleet_root, agent, repo, branch, upstream) {
                 Ok(wd) => {
-                    println!("  workspace ready: {wd}  (worktree of {repo}@{branch} off a shared mirror)");
+                    println!(
+                        "  workspace ready: {wd}  (worktree of {repo}@{branch} off a shared mirror)"
+                    );
                     if let Some(up) = upstream {
-                        println!("  pre-wired upstream remote '{up}' (+tags) on the mirror — fork-parity diff is one command (task_875)");
+                        println!(
+                            "  pre-wired upstream remote '{up}' (+tags) on the mirror — fork-parity diff is one command (task_875)"
+                        );
                     }
                     // Install the generic fail-open fmt pre-commit into the repo's shared MIRROR hooks dir
                     // (a linked worktree runs hooks from the common/mirror dir), so a board-native agent gets
                     // a commit-time rustfmt nudge — the safety net a ~/.fleet worktree otherwise lacks (#283).
-                    let hooks =
-                        std::path::Path::new(&workspace::mirror_dir(&fleet_root, repo)).join("hooks");
+                    let hooks = std::path::Path::new(&workspace::mirror_dir(&fleet_root, repo))
+                        .join("hooks");
                     install_fmt_hook(&hooks);
                     wd
                 }
@@ -3034,9 +3259,13 @@ fn spin_up(agent: &str, apply: bool) {
             }
         } else {
             let wd = workspace::workspace_dir(&fleet_root, agent, repo);
-            println!("  would materialize: {wd}  (worktree of {repo}@{branch} off {fleet_root}/mirrors)");
+            println!(
+                "  would materialize: {wd}  (worktree of {repo}@{branch} off {fleet_root}/mirrors)"
+            );
             if let Some(up) = upstream {
-                println!("    + would pre-wire upstream remote '{up}' (+tags) on the mirror (fork-parity diff, task_875)");
+                println!(
+                    "    + would pre-wire upstream remote '{up}' (+tags) on the mirror (fork-parity diff, task_875)"
+                );
             }
             wd
         };
@@ -3057,18 +3286,31 @@ fn spin_up(agent: &str, apply: bool) {
                     eprintln!("  workspace FAILED: mkdir {dir}: {e}");
                     std::process::exit(1);
                 }
-                println!("  repo-less workspace ready: {dir}  (no repo declared — runs via the board)");
+                println!(
+                    "  repo-less workspace ready: {dir}  (no repo declared — runs via the board)"
+                );
             } else {
-                println!("  would create repo-less workspace: {dir}  (no repo declared — runs via the board)");
+                println!(
+                    "  would create repo-less workspace: {dir}  (no repo declared — runs via the board)"
+                );
             }
             dir
         }
     };
     if !apply {
-        match build_launch_cmd(&harness, &model, &effort, devshell.then_some(workdir.as_str())) {
+        match build_launch_cmd(
+            &harness,
+            &model,
+            &effort,
+            devshell.then_some(workdir.as_str()),
+        ) {
             Ok(_) => println!(
                 "  would launch: {harness} in {workdir}{} (board MCP in-session) with a self-discovery kickoff, then a work-conserving dynamic /loop (idle cadence ~{interval})",
-                if devshell { " [inside nix develop]" } else { "" }
+                if devshell {
+                    " [inside nix develop]"
+                } else {
+                    ""
+                }
             ),
             Err(e) => println!("  would NOT launch: {e}"),
         }
@@ -3079,14 +3321,22 @@ fn spin_up(agent: &str, apply: bool) {
     // must never leave the charter pointing at a dead/old path. Done after materialize (the worktree exists)
     // and before the launch/charter guard, so the pointer is corrected even if the launch is later refused.
     // Idempotent (no-op when already correct) and NON-FATAL — a metadata blip must not fail a spin-up.
-    if let Some(patch) = worktree_metadata_patch(md.get("worktree").and_then(|v| v.as_str()), &workdir) {
+    if let Some(patch) =
+        worktree_metadata_patch(md.get("worktree").and_then(|v| v.as_str()), &workdir)
+    {
         match board.patch_metadata(agent, patch) {
-            Ok(()) => println!("  metadata.worktree -> {workdir} (synced so the charter never points at a stale tree)"),
-            Err(e) => eprintln!("  WARN: could not sync metadata.worktree ({e}); run `fleet worktree-check` to catch a stale pointer"),
+            Ok(()) => println!(
+                "  metadata.worktree -> {workdir} (synced so the charter never points at a stale tree)"
+            ),
+            Err(e) => eprintln!(
+                "  WARN: could not sync metadata.worktree ({e}); run `fleet worktree-check` to catch a stale pointer"
+            ),
         }
     }
     if !has_charter {
-        eprintln!("  refusing to launch '{agent}': no charter on the board for it to self-discover");
+        eprintln!(
+            "  refusing to launch '{agent}': no charter on the board for it to self-discover"
+        );
         std::process::exit(1);
     }
     // Pre-trust so the harness does not stall on the one-time folder-trust prompt (an interactive agent can't
@@ -3110,13 +3360,24 @@ fn spin_up(agent: &str, apply: bool) {
         t
     };
     match pre_trust_for_harness(&harness, &trust) {
-        Ok(true) => println!("  pre-trusted {} path(s) in the {harness} config", trust.len()),
+        Ok(true) => println!(
+            "  pre-trusted {} path(s) in the {harness} config",
+            trust.len()
+        ),
         Ok(false) => {}
-        Err(e) => eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)"),
+        Err(e) => {
+            eprintln!("  WARN: could not pre-trust: {e} (agent may hit a one-time trust prompt)")
+        }
     }
-    match launch_board_agent(agent, &workdir, &harness, &model, &effort, &interval, devshell, reactive) {
+    match launch_board_agent(
+        agent, &workdir, &harness, &model, &effort, &interval, devshell, reactive,
+    ) {
         Ok(win) => {
-            let loop_kind = if reactive { "reactive (mention-only) /loop" } else { "work-conserving dynamic /loop" };
+            let loop_kind = if reactive {
+                "reactive (mention-only) /loop"
+            } else {
+                "work-conserving dynamic /loop"
+            };
             println!(
                 "  LAUNCHED '{agent}' in tmux window '{win}' (cwd {workdir}) — it will get_agent itself for its charter, then run a {loop_kind} (idle cadence ~{interval})"
             );
@@ -3182,7 +3443,13 @@ fn long_cadence_cron_clause(interval: &str) -> String {
 /// that idle cadence exceeds one hour, the dynamic self-wake cannot schedule it (it clamps to a 1h maximum),
 /// so the kickoff adds `long_cadence_cron_clause` guidance to hold the rest cadence off a CronCreate cron
 /// instead of a self-re-arm (task_765 Tier A).
-fn build_kickoff(agent: &str, workdir: &str, interval: &str, operator: Option<&str>, reactive: bool) -> String {
+fn build_kickoff(
+    agent: &str,
+    workdir: &str,
+    interval: &str,
+    operator: Option<&str>,
+    reactive: bool,
+) -> String {
     // The operator-blocked dashboard convention (operator seq-2292, re-pointed task_936) applies only when this
     // deployment names an operator (config.operator_id); a generic fleet with no designated operator omits it.
     // The id is interpolated, never hard-coded, so the public fleet code carries no operator name (task_611).
@@ -3443,7 +3710,9 @@ fn spin_down_action(
     // was spun down ~16h still holding a CR review). Refuse BEFORE the busy/window checks so the operator sees
     // the reassign requirement first; --force overrides (stand down anyway, operator accepts the open tasks).
     if open_assignments > 0 && !force {
-        return SpinDownAction::RefuseHoldsAssignments { open: open_assignments };
+        return SpinDownAction::RefuseHoldsAssignments {
+            open: open_assignments,
+        };
     }
     if has_window && is_working && !force {
         return SpinDownAction::RefuseBusy;
@@ -3485,13 +3754,18 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
     let open_assignments = match board.open_task_count(agent) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("  ! could not verify open assignments ({e}) — proceeding without the stranding guard");
+            eprintln!(
+                "  ! could not verify open assignments ({e}) — proceeding without the stranding guard"
+            );
             0
         }
     };
     let action = spin_down_action(is_native, has_window, is_working, open_assignments, force);
 
-    println!("spin-down '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    println!(
+        "spin-down '{agent}' ({}):",
+        if apply { "APPLY" } else { "dry-run" }
+    );
     match action {
         SpinDownAction::NotBoardNative => {
             eprintln!(
@@ -3562,8 +3836,15 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
 /// to CONSIDER standing down — every native agent NOT on the stay-up `except` set, sorted for a stable roster.
 /// The per-agent task_786/busy guard still applies downstream; this is only the except-filter. Pure so the
 /// selection is unit-testable without a live board.
-fn batch_targets(all_native: &[String], except: &std::collections::BTreeSet<String>) -> Vec<String> {
-    let mut out: Vec<String> = all_native.iter().filter(|id| !except.contains(*id)).cloned().collect();
+fn batch_targets(
+    all_native: &[String],
+    except: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = all_native
+        .iter()
+        .filter(|id| !except.contains(*id))
+        .cloned()
+        .collect();
     out.sort();
     out.dedup();
     out
@@ -3601,12 +3882,22 @@ fn spin_down_all(except_csv: Option<&str>, apply: bool, force: bool) {
         native.len(),
         except.len(),
         targets.len(),
-        if force { " [--force: HARD STOP, overrides the holds-work/busy guard]" } else { "" }
+        if force {
+            " [--force: HARD STOP, overrides the holds-work/busy guard]"
+        } else {
+            ""
+        }
     );
     if !except.is_empty() {
         let mut keep: Vec<&String> = except.iter().collect();
         keep.sort();
-        println!("  keep-up: {}", keep.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        println!(
+            "  keep-up: {}",
+            keep.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     // task_1032: raise the fleet-quiesce sentinel BEFORE parking any agent, so the nudge-stale daemon is silent
@@ -3625,7 +3916,9 @@ fn spin_down_all(except_csv: Option<&str>, apply: bool, force: bool) {
         match spin_down_action(true, has_window, is_working, open, force) {
             SpinDownAction::RefuseHoldsAssignments { open } => {
                 refused += 1;
-                println!("  REFUSED  {id} — holds {open} open assignment(s) (still mid-work; park them first)");
+                println!(
+                    "  REFUSED  {id} — holds {open} open assignment(s) (still mid-work; park them first)"
+                );
             }
             SpinDownAction::RefuseBusy => {
                 refused += 1;
@@ -3634,20 +3927,28 @@ fn spin_down_all(except_csv: Option<&str>, apply: bool, force: bool) {
             SpinDownAction::NotBoardNative => {} // filtered to native already; unreachable in practice
             action @ (SpinDownAction::OfflineAndKill | SpinDownAction::OfflineOnly) => {
                 ready += 1;
-                let kind = if matches!(action, SpinDownAction::OfflineAndKill) { "offline+kill window" } else { "offline only (windowless)" };
+                let kind = if matches!(action, SpinDownAction::OfflineAndKill) {
+                    "offline+kill window"
+                } else {
+                    "offline only (windowless)"
+                };
                 if !apply {
                     println!("  READY    {id} — would {kind}");
                     continue;
                 }
                 // Offline FIRST (closes the up-board relaunch race), then kill the window if live.
-                let msg = format!("Spun down via `fleet spin-down --all` (migration wind-down, resumable). `fleet spin-up {id} --apply` revives it.");
+                let msg = format!(
+                    "Spun down via `fleet spin-down --all` (migration wind-down, resumable). `fleet spin-up {id} --apply` revives it."
+                );
                 if let Err(e) = board.set_status(id, "offline", &msg) {
                     println!("  ERROR    {id} — set offline failed: {e} (left running)");
                     continue;
                 }
                 if matches!(action, SpinDownAction::OfflineAndKill) {
                     let target = format!("{session}:{id}");
-                    let _ = std::process::Command::new("tmux").args(["kill-window", "-t", &target]).status();
+                    let _ = std::process::Command::new("tmux")
+                        .args(["kill-window", "-t", &target])
+                        .status();
                 }
                 applied += 1;
                 println!("  PARKED   {id} — {kind} (resumable)");
@@ -3656,7 +3957,11 @@ fn spin_down_all(except_csv: Option<&str>, apply: bool, force: bool) {
     }
     println!(
         "  summary: {ready} ready, {refused} refused (still mid-work -- re-run after they park){}",
-        if apply { format!(", {applied} parked this pass") } else { String::new() }
+        if apply {
+            format!(", {applied} parked this pass")
+        } else {
+            String::new()
+        }
     );
     if !apply && ready > 0 {
         println!("  (dry-run — re-run with --apply to stand down the READY agents)");
@@ -3673,7 +3978,11 @@ fn reconstitute_targets(
     except: &std::collections::BTreeSet<String>,
     limit: Option<usize>,
 ) -> Vec<String> {
-    let mut out: Vec<String> = down_native.iter().filter(|id| !except.contains(*id)).cloned().collect();
+    let mut out: Vec<String> = down_native
+        .iter()
+        .filter(|id| !except.contains(*id))
+        .cloned()
+        .collect();
     out.sort();
     out.dedup();
     if let Some(n) = limit {
@@ -3709,8 +4018,11 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, include_held: boo
     let windows = tmux_window_names(&session);
     // DOWN = board-native with NO live tmux window (parked / not currently running). Filtering by live window
     // (not by board status) is robust against status drift and means a running agent is never relaunched.
-    let down_native: Vec<String> =
-        native.iter().filter(|id| !windows.iter().any(|w| w == *id)).cloned().collect();
+    let down_native: Vec<String> = native
+        .iter()
+        .filter(|id| !windows.iter().any(|w| w == *id))
+        .cloned()
+        .collect();
     let up = native.len().saturating_sub(down_native.len());
     // task_1037: launchability filter. native_agent_ids keys only on metadata.native, so a down candidate can be
     // a staged / off-host / launch-gated / charter-deferred agent an auto-launch must NOT bring up. Partition the
@@ -3730,13 +4042,15 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, include_held: boo
     } else {
         down_native
             .iter()
-            .filter(|id| match spin_up_hold_reason(meta_of(id).as_ref(), &this_host) {
-                Some(reason) => {
-                    held.push(((*id).clone(), reason));
-                    false
-                }
-                None => true,
-            })
+            .filter(
+                |id| match spin_up_hold_reason(meta_of(id).as_ref(), &this_host) {
+                    Some(reason) => {
+                        held.push(((*id).clone(), reason));
+                        false
+                    }
+                    None => true,
+                },
+            )
             .cloned()
             .collect()
     };
@@ -3754,15 +4068,27 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, include_held: boo
         except.len(),
         targets.len(),
         limit.map(|n| format!(" [--limit {n}]")).unwrap_or_default(),
-        if include_held { " [--include-held: holds launched too]" } else { "" }
+        if include_held {
+            " [--include-held: holds launched too]"
+        } else {
+            ""
+        }
     );
     if !except.is_empty() {
         let mut keep: Vec<&String> = except.iter().collect();
         keep.sort();
-        println!("  leave-as-is: {}", keep.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        println!(
+            "  leave-as-is: {}",
+            keep.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     if !held.is_empty() {
-        println!("  held (not launchable by default — use `fleet spin-up <id> --apply` or --include-held):");
+        println!(
+            "  held (not launchable by default — use `fleet spin-up <id> --apply` or --include-held):"
+        );
         for (id, reason) in &held {
             println!("    ⊘ HELD {id} — {reason}");
         }
@@ -3779,7 +4105,10 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, include_held: boo
             continue;
         }
         // Subprocess so a per-agent spin_up failure (process::exit) is contained in the child, not this wave.
-        match std::process::Command::new(&self_bin).args(["spin-up", id, "--apply"]).status() {
+        match std::process::Command::new(&self_bin)
+            .args(["spin-up", id, "--apply"])
+            .status()
+        {
             Ok(s) if s.success() => {
                 launched += 1;
                 println!("  LAUNCHED {id}");
@@ -3802,7 +4131,9 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, include_held: boo
         if let Some(n) = limit
             && down_non_except > n
         {
-            println!("  (more down than this wave's --limit — pause, confirm health, then re-run for the next wave)");
+            println!(
+                "  (more down than this wave's --limit — pause, confirm health, then re-run for the next wave)"
+            );
         }
         // task_1032: once the fan-out completes (this was the final/only wave), lower the fleet-quiesce sentinel
         // so the nudge-stale daemon resumes chasing stale work. A partial wave leaves it set — the fleet is
@@ -3839,7 +4170,13 @@ enum BounceAction {
 /// through a live turn), then the cooldown fence (never thrash a healthy session). `--force` overrides the
 /// busy + cooldown refusals; it does NOT make a non-native or windowless agent bounceable (nothing to
 /// relaunch). Pure — unit-tested.
-fn bounce_action(is_native: bool, has_window: bool, is_working: bool, on_cooldown: bool, force: bool) -> BounceAction {
+fn bounce_action(
+    is_native: bool,
+    has_window: bool,
+    is_working: bool,
+    on_cooldown: bool,
+    force: bool,
+) -> BounceAction {
     if !is_native {
         return BounceAction::NotBoardNative;
     }
@@ -3874,7 +4211,11 @@ fn bounce_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
 
 /// Read an agent's last-bounce unix time; `None` on an absent/unparseable stamp (never bounced).
 fn read_bounce_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
-    std::fs::read_to_string(bounce_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+    std::fs::read_to_string(bounce_stamp_path(fleet, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Record that an agent was just bounced at `now` (best-effort — a write failure only means the cooldown is not
@@ -3892,7 +4233,10 @@ fn write_bounce_stamp(fleet: &Fleet, name: &str, now: u64) {
 /// stale-session selection reads this to tell whether a running session connected under an OLDER binary (so
 /// its cached MCP tools/list predates the current deploy) and is a bounce candidate.
 fn launch_rev_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
-    fleet.root.join("watchdog").join(format!("{name}.launchrev"))
+    fleet
+        .root
+        .join("watchdog")
+        .join(format!("{name}.launchrev"))
 }
 
 /// Read the build rev an agent's session was launched under; `None` on an absent/empty stamp (a session that
@@ -3972,7 +4316,10 @@ fn bounce_session(fleet: &Fleet, agent: &str, apply: bool, force: bool) {
     let on_cooldown = bounce_on_cooldown(read_bounce_stamp(fleet, agent), now, cooldown_secs);
     let action = bounce_action(is_native, has_window, is_working, on_cooldown, force);
 
-    println!("bounce-session '{agent}' ({}):", if apply { "APPLY" } else { "dry-run" });
+    println!(
+        "bounce-session '{agent}' ({}):",
+        if apply { "APPLY" } else { "dry-run" }
+    );
     match action {
         BounceAction::NotBoardNative => {
             eprintln!(
@@ -4005,7 +4352,11 @@ fn bounce_session(fleet: &Fleet, agent: &str, apply: bool, force: bool) {
         BounceAction::Bounce => println!(
             "  plan: kill tmux window {session}:{agent}, then relaunch via spin-up (the fresh session reconnects \
              to the board MCP server + refetches tools/list){}",
-            if force && is_working { " [--force: a live turn WILL be interrupted]" } else { "" }
+            if force && is_working {
+                " [--force: a live turn WILL be interrupted]"
+            } else {
+                ""
+            }
         ),
     }
     println!(
@@ -4095,17 +4446,26 @@ fn bounce_stale(fleet: &Fleet, apply: bool, force: bool) {
             continue; // launched under the current rev — its tools/list is already fresh
         }
         candidates += 1;
-        println!("  STALE '{id}' (launched rev {} != current {current_rev})", launch_rev.as_deref().unwrap_or("unknown"));
+        println!(
+            "  STALE '{id}' (launched rev {} != current {current_rev})",
+            launch_rev.as_deref().unwrap_or("unknown")
+        );
         if !apply {
             continue;
         }
-        let mut args = vec!["bounce-session".to_string(), id.to_string(), "--apply".to_string()];
+        let mut args = vec![
+            "bounce-session".to_string(),
+            id.to_string(),
+            "--apply".to_string(),
+        ];
         if force {
             args.push("--force".to_string());
         }
         match std::process::Command::new(&self_bin).args(&args).status() {
             Ok(st) if st.success() => bounced += 1,
-            Ok(_) => eprintln!("    (bounce-session '{id}' declined — likely a busy pane or cooldown; left running, next sweep retries)"),
+            Ok(_) => eprintln!(
+                "    (bounce-session '{id}' declined — likely a busy pane or cooldown; left running, next sweep retries)"
+            ),
             Err(e) => eprintln!("    (could not run bounce-session '{id}': {e})"),
         }
     }
@@ -4113,9 +4473,13 @@ fn bounce_stale(fleet: &Fleet, apply: bool, force: bool) {
     if candidates == 0 {
         println!("  no stale sessions — every running board-native agent is on the current rev");
     } else if apply {
-        println!("  bounced {bounced}/{candidates} stale session(s); any shortfall was fenced (busy pane or cooldown) and retries next sweep");
+        println!(
+            "  bounced {bounced}/{candidates} stale session(s); any shortfall was fenced (busy pane or cooldown) and retries next sweep"
+        );
     } else {
-        println!("  {candidates} stale session(s) would be bounced — re-run with --apply (each still passes the per-agent busy + cooldown fences)");
+        println!(
+            "  {candidates} stale session(s) would be bounced — re-run with --apply (each still passes the per-agent busy + cooldown fences)"
+        );
     }
 }
 
@@ -4171,7 +4535,10 @@ fn install_fmt_hook(hooks_dir: &std::path::Path) {
     let body = fmt_precommit_hook_body();
     match fmt_hook_install_action(existing.as_deref()) {
         FmtHookAction::SkipForeign => {
-            println!("  fmt hook: foreign pre-commit at {} left untouched", hook.display());
+            println!(
+                "  fmt hook: foreign pre-commit at {} left untouched",
+                hook.display()
+            );
             return;
         }
         // Already exactly our current hook — nothing to do, stay quiet (the common case after first install).
@@ -4179,11 +4546,17 @@ fn install_fmt_hook(hooks_dir: &std::path::Path) {
         FmtHookAction::Install | FmtHookAction::Refresh => {}
     }
     if let Err(e) = std::fs::create_dir_all(hooks_dir) {
-        eprintln!("  WARN: fmt hook not installed (mkdir {}: {e})", hooks_dir.display());
+        eprintln!(
+            "  WARN: fmt hook not installed (mkdir {}: {e})",
+            hooks_dir.display()
+        );
         return;
     }
     if let Err(e) = std::fs::write(&hook, &body) {
-        eprintln!("  WARN: fmt hook not installed (write {}: {e})", hook.display());
+        eprintln!(
+            "  WARN: fmt hook not installed (write {}: {e})",
+            hook.display()
+        );
         return;
     }
     #[cfg(unix)]
@@ -4193,7 +4566,11 @@ fn install_fmt_hook(hooks_dir: &std::path::Path) {
     }
     println!(
         "  fmt hook: {} the fail-open rustfmt pre-commit at {}",
-        if existing.is_some() { "refreshed" } else { "installed" },
+        if existing.is_some() {
+            "refreshed"
+        } else {
+            "installed"
+        },
         hook.display()
     );
 }
@@ -4295,17 +4672,23 @@ fn fmt_hook_run() {
         return;
     }
 
-    let mut by_manifest: std::collections::BTreeMap<PathBuf, Vec<String>> = std::collections::BTreeMap::new();
+    let mut by_manifest: std::collections::BTreeMap<PathBuf, Vec<String>> =
+        std::collections::BTreeMap::new();
     for file in staged {
-        let file_dir = repo_root.join(&file).parent().unwrap_or(&repo_root).to_path_buf();
+        let file_dir = repo_root
+            .join(&file)
+            .parent()
+            .unwrap_or(&repo_root)
+            .to_path_buf();
         let manifest = owning_manifest(&repo_root, &file_dir, is_cargo_package_manifest);
         by_manifest.entry(manifest).or_default().push(file);
     }
 
     let mut warned = false;
     for (manifest, files) in by_manifest {
-        let (safe, unsafe_files): (Vec<String>, Vec<String>) =
-            files.into_iter().partition(|f| is_fully_staged(&repo_root, f));
+        let (safe, unsafe_files): (Vec<String>, Vec<String>) = files
+            .into_iter()
+            .partition(|f| is_fully_staged(&repo_root, f));
 
         if !safe.is_empty() {
             let _ = std::process::Command::new("cargo")
@@ -4315,7 +4698,12 @@ fn fmt_hook_run() {
                 .arg("--")
                 .args(&safe)
                 .status();
-            let _ = std::process::Command::new("git").arg("-C").arg(&repo_root).arg("add").args(&safe).status();
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_root)
+                .arg("add")
+                .args(&safe)
+                .status();
         }
 
         if !unsafe_files.is_empty() {
@@ -4339,7 +4727,11 @@ fn fmt_hook_run() {
                      --manifest-path {}",
                     unsafe_files.join(", "),
                     if unsafe_files.len() == 1 { "s" } else { "ve" },
-                    if unsafe_files.len() == 1 { "it" } else { "them" },
+                    if unsafe_files.len() == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    },
                     manifest.display(),
                 );
                 warned = true;
@@ -4358,7 +4750,13 @@ fn fmt_hook_run() {
 /// `up` launch path. The board-native launch here does NOT exec window.sh, so without this the header would
 /// expand empty for every board-native agent (the common launch path) and the identity-force would never
 /// fire. Pure so the env wiring is unit-tested without spawning tmux.
-fn board_window_argv(session: &str, agent: &str, workdir: &str, kickoff: &str, cmd: &str) -> Vec<String> {
+fn board_window_argv(
+    session: &str,
+    agent: &str,
+    workdir: &str,
+    kickoff: &str,
+    cmd: &str,
+) -> Vec<String> {
     vec![
         "new-window".into(),
         "-d".into(),
@@ -4381,16 +4779,33 @@ fn board_window_argv(session: &str, agent: &str, workdir: &str, kickoff: &str, c
 /// is harness-specific (see [`build_launch_cmd`]); refuses to double-launch an existing same-named window.
 /// The kickoff is passed via a tmux env var so no shell quoting can mangle it.
 #[allow(clippy::too_many_arguments)]
-fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, effort: &str, interval: &str, devshell: bool, reactive: bool) -> Result<String, String> {
+fn launch_board_agent(
+    agent: &str,
+    workdir: &str,
+    harness: &str,
+    model: &str,
+    effort: &str,
+    interval: &str,
+    devshell: bool,
+    reactive: bool,
+) -> Result<String, String> {
     let session = board_session();
     if let Ok(out) = std::process::Command::new("tmux")
         .args(["list-windows", "-t", &session, "-F", "#W"])
         .output()
         && window_exists(&String::from_utf8_lossy(&out.stdout), agent)
     {
-        return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
+        return Err(format!(
+            "a tmux window '{agent}' already exists in session '{session}' (already spun up?)"
+        ));
     }
-    let kickoff = build_kickoff(agent, workdir, interval, config::get().operator_id.as_deref(), reactive);
+    let kickoff = build_kickoff(
+        agent,
+        workdir,
+        interval,
+        config::get().operator_id.as_deref(),
+        reactive,
+    );
     let cmd = build_launch_cmd(harness, model, effort, devshell.then_some(workdir))?;
     let argv = board_window_argv(&session, agent, workdir, &kickoff, &cmd);
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -4417,11 +4832,15 @@ fn ensure_trusted(config: &mut serde_json::Value, dir: &str) -> bool {
     if already {
         return false;
     }
-    let Some(obj) = config.as_object_mut() else { return false };
+    let Some(obj) = config.as_object_mut() else {
+        return false;
+    };
     let projects = obj
         .entry("projects")
         .or_insert_with(|| serde_json::json!({}));
-    let Some(projects) = projects.as_object_mut() else { return false };
+    let Some(projects) = projects.as_object_mut() else {
+        return false;
+    };
     let entry = projects
         .entry(dir.to_string())
         .or_insert_with(|| serde_json::json!({ "allowedTools": [] }));
@@ -4443,7 +4862,8 @@ fn pre_trust_dirs(dirs: &[String]) -> Result<bool, String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     let cfg = format!("{home}/.claude.json");
     let raw = std::fs::read_to_string(&cfg).map_err(|e| format!("read {cfg}: {e}"))?;
-    let mut v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("parse {cfg}: {e}"))?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {cfg}: {e}"))?;
     let mut changed = false;
     for dir in dirs {
         changed |= ensure_trusted(&mut v, dir);
@@ -4578,7 +4998,10 @@ fn status(stale_only: bool) {
         std::process::exit(1);
     });
     let now = time::OffsetDateTime::now_utc();
-    println!("{:<28} {:<10} {:<14} last_seen", "agent", "status", "liveness");
+    println!(
+        "{:<28} {:<10} {:<14} last_seen",
+        "agent", "status", "liveness"
+    );
     let mut shown = 0usize;
     for a in &agents {
         let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -4666,9 +5089,13 @@ fn host_service_registry() -> HostServiceRegistry {
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_host_service_registry(&text).unwrap_or_else(|e| {
             eprintln!("fleet services: {} failed to parse: {e}", path.display());
-            HostServiceRegistry { service: Vec::new() }
+            HostServiceRegistry {
+                service: Vec::new(),
+            }
         }),
-        Err(_) => HostServiceRegistry { service: Vec::new() },
+        Err(_) => HostServiceRegistry {
+            service: Vec::new(),
+        },
     }
 }
 
@@ -4703,12 +5130,21 @@ fn services(query: Option<&str>) {
     }
     match query {
         None => {
-            println!("Host-service ownership registry ({} services) — `fleet services <name>` for detail:", reg.service.len());
+            println!(
+                "Host-service ownership registry ({} services) — `fleet services <name>` for detail:",
+                reg.service.len()
+            );
             for s in &reg.service {
-                let flag = if s.lifeline { "  [LIFELINE — attended-only]" } else { "" };
+                let flag = if s.lifeline {
+                    "  [LIFELINE — attended-only]"
+                } else {
+                    ""
+                };
                 println!("  {:<24} owner: {}{flag}", s.name, s.owner);
             }
-            println!("Before modifying a shared service you do NOT own: resolve its owner + authored definition here first, prefer reusing that definition, and treat a lifeline change as owner-coordinated + operator-attended (never an unattended bounce).");
+            println!(
+                "Before modifying a shared service you do NOT own: resolve its owner + authored definition here first, prefer reusing that definition, and treat a lifeline change as owner-coordinated + operator-attended (never an unattended bounce)."
+            );
         }
         Some(q) => match find_host_service(&reg.service, q) {
             Some(s) => {
@@ -4722,7 +5158,9 @@ fn services(query: Option<&str>) {
                     println!("note:       {}", s.note);
                 }
                 if s.lifeline {
-                    println!("LIFELINE:   YES — a fleet-wide board/MCP/event-wake dependency. Changes are OWNER-COORDINATED + OPERATOR-ATTENDED with a tested rollback; NEVER an unattended activation/bounce. Reuse the authored definition above; do not re-author from the live process.");
+                    println!(
+                        "LIFELINE:   YES — a fleet-wide board/MCP/event-wake dependency. Changes are OWNER-COORDINATED + OPERATOR-ATTENDED with a tested rollback; NEVER an unattended activation/bounce. Reuse the authored definition above; do not re-author from the live process."
+                    );
                 } else {
                     println!("lifeline:   no");
                 }
@@ -4780,9 +5218,7 @@ fn is_retighten_candidate(verdict: &str, open_tasks: usize, interval_secs: u64) 
 /// limited and pane-fenced by [`rearm_candidate`], so this only changes WHICH agents are caught, never waking
 /// a working pane or spamming a stalled one. `None` age (unknown last_seen) is not a candidate. Pure.
 fn work_driven_rearm(open_tasks: usize, age_secs: Option<i64>, stood_down: bool) -> bool {
-    !stood_down
-        && open_tasks > 0
-        && matches!(age_secs, Some(a) if a >= WATCHDOG_WORK_CADENCE_SECS)
+    !stood_down && open_tasks > 0 && matches!(age_secs, Some(a) if a >= WATCHDOG_WORK_CADENCE_SECS)
 }
 
 /// task_506 Phase A.5 (status-driven violation): is an agent's board PRESENCE a "not actively working" one —
@@ -4843,7 +5279,12 @@ const WATCHDOG_NEVER_TICKED_GRACE_SECS: i64 = 600; // 10m
 /// cannot recover it (there is no live loop to re-arm — the #412/#420 lesson), so the watchdog surfaces it for
 /// investigation + relaunch, not a no-op wake. Timestamps are compared within a 2s epsilon so a precision
 /// difference between the two board columns does not mask the equality. Pure — unit-tested.
-fn agent_never_ticked(created_at: &str, last_seen: &str, now: time::OffsetDateTime, grace_secs: i64) -> bool {
+fn agent_never_ticked(
+    created_at: &str,
+    last_seen: &str,
+    now: time::OffsetDateTime,
+    grace_secs: i64,
+) -> bool {
     use time::format_description::well_known::Rfc3339;
     let (Ok(created), Ok(seen)) = (
         time::OffsetDateTime::parse(created_at, &Rfc3339),
@@ -4872,7 +5313,10 @@ fn parse_interval_secs(spec: &str) -> Option<u64> {
         c if c.is_ascii_digit() => (s, 1),
         _ => return None,
     };
-    num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(mult))
 }
 
 /// Watchdog verdict for a board-native agent: compare heartbeat `age_secs` to its OWN loop `interval_secs`.
@@ -5050,12 +5494,19 @@ fn hire_signal_on_cooldown(last_signal: Option<u64>, now: u64, cooldown_secs: u6
 
 /// The per-agent last-hire-signal stamp path: `<hub>/.claude/fleet/watchdog/<name>.hire-signal` (unix secs).
 fn hire_signal_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
-    fleet.root.join("watchdog").join(format!("{name}.hire-signal"))
+    fleet
+        .root
+        .join("watchdog")
+        .join(format!("{name}.hire-signal"))
 }
 
 /// Read an agent's last-hire-signal unix time; `None` on an absent/unparseable stamp (never signalled).
 fn read_hire_signal_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
-    std::fs::read_to_string(hire_signal_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+    std::fs::read_to_string(hire_signal_stamp_path(fleet, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Record that an agent's hire-signal was just posted at `now` (best-effort — a write failure only means the
@@ -5087,7 +5538,11 @@ fn revive_stranded_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
 
 /// Read an agent's last-revive unix time; `None` on an absent/unparseable stamp (never revived).
 fn read_revive_stranded_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
-    std::fs::read_to_string(revive_stranded_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+    std::fs::read_to_string(revive_stranded_stamp_path(fleet, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Record that an agent was just auto-revived at `now` (best-effort — a write failure only means the cooldown
@@ -5115,12 +5570,19 @@ fn recover_wedged_on_cooldown(last_recover: Option<u64>, now: u64, cooldown_secs
 
 /// The per-agent last-recovery stamp path: `<hub>/.claude/fleet/watchdog/<name>.recover-wedged` (unix secs).
 fn recover_wedged_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
-    fleet.root.join("watchdog").join(format!("{name}.recover-wedged"))
+    fleet
+        .root
+        .join("watchdog")
+        .join(format!("{name}.recover-wedged"))
 }
 
 /// Read an agent's last-recovery unix time; `None` on an absent/unparseable stamp (never recovered).
 fn read_recover_wedged_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
-    std::fs::read_to_string(recover_wedged_stamp_path(fleet, name)).ok()?.trim().parse().ok()
+    std::fs::read_to_string(recover_wedged_stamp_path(fleet, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Record that an agent was just auto-recovered at `now` (best-effort — a write failure only means the cooldown
@@ -5193,7 +5655,10 @@ fn observe_trigger(
 /// The per-agent observation watermark path: `<hub>/.claude/fleet/observer/<name>.watermark` (contents =
 /// `<session-id>:<line-offset>`, the `transcripts --since` form). Sibling of the re-arm cooldown store.
 fn observe_watermark_path(fleet: &Fleet, name: &str) -> PathBuf {
-    fleet.root.join("observer").join(format!("{name}.watermark"))
+    fleet
+        .root
+        .join("observer")
+        .join(format!("{name}.watermark"))
 }
 
 /// Read an agent's last-observed watermark `(session, line_offset)`; `("", 0)` when absent/unparseable — so
@@ -5230,7 +5695,13 @@ fn write_observe_watermark(fleet: &Fleet, name: &str, session: &str, offset: usi
 /// watermark and return the observation DECISION when one should fire (size threshold crossed, or a
 /// stood-down agent has a closing tail). `None` when the agent has no session or is below threshold. The
 /// caller formats the report line and (with `--spawn`) launches an observer scoped to `d.session:since_offset`.
-fn observe_candidate(fleet: &Fleet, agent: &str, roster: &[String], stood_down: bool, threshold: usize) -> Option<ObserveDecision> {
+fn observe_candidate(
+    fleet: &Fleet,
+    agent: &str,
+    roster: &[String],
+    stood_down: bool,
+    threshold: usize,
+) -> Option<ObserveDecision> {
     // task_846: roster-aware session location — resolve ONE owner per transcript dir (longest-match) so a
     // dash-prefix sibling (v-task-board vs v-task-board-helper) does not pick up the other's transcript and
     // re-fire the same span under a second watermark key forever.
@@ -5302,7 +5773,11 @@ fn observe_on_spawn_cooldown(last_spawn: Option<u64>, now: u64, cooldown: u64) -
 /// ~4-hourly instead of burning an Opus observer every cooldown. `prior_attempts` 0 or 1 → the base (no
 /// backoff yet). A confirmed observation advances the watermark, which resets the attempt count (see the spawn
 /// loop), so this reverts to the base cadence. Mirrors [`acked_cooldown_with_backoff`]. Pure — unit-tested.
-fn observe_respawn_cooldown(base_cooldown_secs: u64, prior_attempts: u32, max_doublings: u32) -> u64 {
+fn observe_respawn_cooldown(
+    base_cooldown_secs: u64,
+    prior_attempts: u32,
+    max_doublings: u32,
+) -> u64 {
     let steps = prior_attempts.saturating_sub(1).min(max_doublings);
     base_cooldown_secs.saturating_mul(1u64 << steps)
 }
@@ -5312,7 +5787,10 @@ fn observe_respawn_cooldown(base_cooldown_secs: u64, prior_attempts: u32, max_do
 /// spawn stamp. task_610: lets the re-spawn cooldown back off per unconfirmed attempt against the SAME
 /// watermark, and reset when the watermark advances.
 fn observe_spawn_attempts_path(fleet: &Fleet, name: &str) -> PathBuf {
-    fleet.root.join("observer").join(format!("{name}.spawn-attempts"))
+    fleet
+        .root
+        .join("observer")
+        .join(format!("{name}.spawn-attempts"))
 }
 
 /// Read `(watermark_the_attempts_are_against, count)`; `("", 0)` when absent/unparseable — so a never-recorded
@@ -5553,13 +6031,23 @@ fn spawn_observer(
     let role_path = exe
         .as_ref()
         .and_then(|p| p.ancestors().nth(3))
-        .map(|repo| repo.join("loops/observer.md").to_string_lossy().into_owned())
+        .map(|repo| {
+            repo.join("loops/observer.md")
+                .to_string_lossy()
+                .into_owned()
+        })
         .unwrap_or_else(|| "loops/observer.md".to_string());
     // The observation task this observer drives from (#290): the caller resolved it (reuse an open one, else
     // create) and threads its id here so the observer files proposals as its children + closes it. `None`
     // (dry-run, or a board hiccup) → the observer falls back to standalone proposals.
-    let kickoff =
-        build_observer_kickoff(target, obs_session, since_offset, &role_path, &fleet_bin, observation_task);
+    let kickoff = build_observer_kickoff(
+        target,
+        obs_session,
+        since_offset,
+        &role_path,
+        &fleet_bin,
+        observation_task,
+    );
     // A per-target tmux window (local only — the BOARD identity stays `observer`), so several observations
     // can run at once without a name clash.
     let window = obs_window_name(target);
@@ -5576,8 +6064,17 @@ fn spawn_observer(
     };
     match std::process::Command::new("tmux")
         .args([
-            "new-window", "-d", "-t", board_session, "-n", &window, "-c", &workdir,
-            "-e", &format!("CDZ_KICKOFF={kickoff}"), &cmd,
+            "new-window",
+            "-d",
+            "-t",
+            board_session,
+            "-n",
+            &window,
+            "-c",
+            &workdir,
+            "-e",
+            &format!("CDZ_KICKOFF={kickoff}"),
+            &cmd,
         ])
         .status()
     {
@@ -5621,7 +6118,9 @@ fn observe_record(fleet: &Fleet, agent: &str, session: &str, offset: usize) {
         if let Some((name, id)) = line.trim().split_once('\t')
             && observer_should_self_close(true, name)
         {
-            let _ = std::process::Command::new("tmux").args(["kill-window", "-t", id]).status();
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-window", "-t", id])
+                .status();
         }
     }
 }
@@ -5638,7 +6137,10 @@ const DEPLOY_SENDER: &str = "deployer";
 /// `deploy <repo>@<sha> → <host>: <STATUS>` (STATUS upper-cased, e.g. LIVE | FAILED — a waiter must STOP +
 /// escalate on FAILED, not wait forever, per board-pm). Pure — unit-tested.
 fn deploy_event_body(repo: &str, sha: &str, host: &str, status: &str) -> String {
-    format!("deploy {repo}@{sha} → {host}: {}", status.trim().to_uppercase())
+    format!(
+        "deploy {repo}@{sha} → {host}: {}",
+        status.trim().to_uppercase()
+    )
 }
 
 /// `fleet post-deploy --repo --sha --host --status`: the deploy pipeline (#73/#74 deployer role) calls this
@@ -5661,7 +6163,9 @@ fn post_deploy(repo: &str, sha: &str, host: &str, status: &str) {
     match board.post_to_channel(channel_id, DEPLOY_SENDER, &body) {
         Ok(()) => println!("post-deploy: posted to #{DEPLOYS_CHANNEL} (id {channel_id}): {body}"),
         Err(e) => {
-            eprintln!("fleet post-deploy: post to #{DEPLOYS_CHANNEL} (id {channel_id}) failed: {e}");
+            eprintln!(
+                "fleet post-deploy: post to #{DEPLOYS_CHANNEL} (id {channel_id}) failed: {e}"
+            );
             std::process::exit(1);
         }
     }
@@ -5729,7 +6233,11 @@ fn watchdog(
     // fix not effective until rebuilt). With `--self-redeploy` (#388) ACT on it — rebuild + restart the daemons
     // so the fix goes live without a manual step; otherwise WARN (rebuilding stays out of band). No-op for a
     // deployed binary (no .git) or when already fresh.
-    match watchdog_stale_self_action(env!("FLEET_BUILD_REV"), checkout_head_short().as_deref(), self_redeploy) {
+    match watchdog_stale_self_action(
+        env!("FLEET_BUILD_REV"),
+        checkout_head_short().as_deref(),
+        self_redeploy,
+    ) {
         StaleSelfAction::Fresh => {}
         StaleSelfAction::Warn(w) => eprintln!("{w}"),
         StaleSelfAction::Redeploy(w) => {
@@ -5753,26 +6261,42 @@ fn watchdog(
     // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
     // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
     // is unreachable — the file-hub scan then covers everything as a best-effort outage fallback.
-    let native_ids = match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
-        Ok((board, agents)) => {
-            let native_ids = native_agent_ids(&agents);
-            watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers, hire_signal, revive_stranded, recover_wedged);
-            // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
-            // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
-            // sweep, and in APPLY mode (passing the flag IS the opt-in, like --revive-stranded). The sweep's own
-            // per-agent fences (busy / cooldown) protect each session; --force is not plumbed here (an automated
-            // sweep must never override the busy fence and reconnect through a live turn).
-            if sweep_stale {
-                println!("-- bounce-stale (--bounce-stale: refreshing stale sessions' tools/list) --");
-                bounce_stale(&Fleet::resolve(), true, false);
+    let native_ids =
+        match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
+            Ok((board, agents)) => {
+                let native_ids = native_agent_ids(&agents);
+                watchdog_board(
+                    &board,
+                    &agents,
+                    stale_only,
+                    rearm,
+                    observe,
+                    spawn,
+                    spawn_dry_run,
+                    pinned_only,
+                    reap_stale_observers,
+                    hire_signal,
+                    revive_stranded,
+                    recover_wedged,
+                );
+                // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
+                // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
+                // sweep, and in APPLY mode (passing the flag IS the opt-in, like --revive-stranded). The sweep's own
+                // per-agent fences (busy / cooldown) protect each session; --force is not plumbed here (an automated
+                // sweep must never override the busy fence and reconnect through a live turn).
+                if sweep_stale {
+                    println!(
+                        "-- bounce-stale (--bounce-stale: refreshing stale sessions' tools/list) --"
+                    );
+                    bounce_stale(&Fleet::resolve(), true, false);
+                }
+                native_ids
             }
-            native_ids
-        }
-        Err(e) => {
-            eprintln!("fleet watchdog: board unavailable ({e}); scanning the file-hub only");
-            std::collections::BTreeSet::new()
-        }
-    };
+            Err(e) => {
+                eprintln!("fleet watchdog: board unavailable ({e}); scanning the file-hub only");
+                std::collections::BTreeSet::new()
+            }
+        };
     // FILE-HUB agents are not on the board (no board event delivery), so the event-wake path never reaches
     // them — the poll watchdog is their only liveness. Scan the file-hub registry too (no-op when no hub is
     // configured / no active file-hub agents, i.e. a board-only host). Runs regardless of board health above.
@@ -5788,7 +6312,11 @@ fn watchdog(
 /// unset (a host with no tunnel). Report-only — like the rest of the watchdog it never reaps/restarts; it
 /// makes a WEDGED wake-delivery path visible. The bounded GET can't hang the sweep.
 fn watchdog_tunnel_health() {
-    let Some(url) = config::get().tunnel_health_url.clone().filter(|s| !s.trim().is_empty()) else {
+    let Some(url) = config::get()
+        .tunnel_health_url
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+    else {
         return;
     };
     let agent = ureq::AgentBuilder::new()
@@ -5803,7 +6331,9 @@ fn watchdog_tunnel_health() {
     println!("-- tunnel --");
     println!("{}", msg);
     if !ok {
-        eprintln!("  ⚠ tunnel wedged: event-wakes are NOT being delivered to this host — agents fall back to slow poll. Probe {url}");
+        eprintln!(
+            "  ⚠ tunnel wedged: event-wakes are NOT being delivered to this host — agents fall back to slow poll. Probe {url}"
+        );
     }
 }
 
@@ -5812,9 +6342,19 @@ fn watchdog_tunnel_health() {
 /// verdict is unit-testable without a live daemon; the caller does the bounded GET. See fleet-tunnel #59.
 fn tunnel_health_line(probe: &Result<u16, String>) -> (bool, String) {
     match probe {
-        Ok(200) => (true, "tunnel health: OK (HTTP 200 — board WS connected, frame fresh, upstream reachable)".to_string()),
-        Ok(code) => (false, format!("tunnel health: WEDGED (HTTP {code} — probe reachable but not ok)")),
-        Err(e) => (false, format!("tunnel health: UNREACHABLE (probe failed: {e})")),
+        Ok(200) => (
+            true,
+            "tunnel health: OK (HTTP 200 — board WS connected, frame fresh, upstream reachable)"
+                .to_string(),
+        ),
+        Ok(code) => (
+            false,
+            format!("tunnel health: WEDGED (HTTP {code} — probe reachable but not ok)"),
+        ),
+        Err(e) => (
+            false,
+            format!("tunnel health: UNREACHABLE (probe failed: {e})"),
+        ),
     }
 }
 
@@ -5829,7 +6369,11 @@ fn native_agent_ids(agents: &[serde_json::Value]) -> std::collections::BTreeSet<
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         })
-        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(String::from))
+        .filter_map(|a| {
+            a.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        })
         .collect()
 }
 
@@ -5911,7 +6455,10 @@ fn glob_rec(pat: &[u8], text: &[u8]) -> bool {
             return true;
         }
         // `**/` also matches ZERO directories (gitignore semantics: `**/foo` matches `foo` at the root too).
-        if rest.strip_prefix(b"/").is_some_and(|after| glob_rec(after, text)) {
+        if rest
+            .strip_prefix(b"/")
+            .is_some_and(|after| glob_rec(after, text))
+        {
             return true;
         }
         return (0..text.len()).any(|i| glob_rec(rest, &text[i + 1..]));
@@ -6084,12 +6631,16 @@ fn watchdog_board(
     // (revive-stranded, hire-signal) stand down this sweep — reviving a parked agent would fight the operator's
     // spin-down and a hire-signal post is a board write during the freeze. The report WARNINGS still print; only
     // the ACT is gated. Same local sentinel the nudge-stale daemon reads (self-expires via the TTL).
-    let fleet_quiesced =
-        fleet_is_quiesced(quiesce_sentinel_age_secs(now), (FLEET_QUIESCE_TTL_HOURS * 3600.0).round() as i64);
+    let fleet_quiesced = fleet_is_quiesced(
+        quiesce_sentinel_age_secs(now),
+        (FLEET_QUIESCE_TTL_HOURS * 3600.0).round() as i64,
+    );
     let session = board_session();
     let host = this_host(); // host-affinity: this box only manages agents pinned here (or unpinned)
     if pinned_only {
-        println!("(--pinned-only: managing only agents EXPLICITLY pinned to {host}; unpinned run-anywhere agents skipped)");
+        println!(
+            "(--pinned-only: managing only agents EXPLICITLY pinned to {host}; unpinned run-anywhere agents skipped)"
+        );
     }
     // Resilience: a roster where NO agent carries metadata means the board /agents LIST endpoint dropped
     // per-agent metadata (the by-id endpoint still has it). Every agent then reads native == false and the
@@ -6120,9 +6671,16 @@ fn watchdog_board(
     // holding-work signal) and `monitor_exempt_owners` (deliberate continuous monitors, excluded from the #544
     // drained-self-poller lengthen). A query error degrades both to empty (no false violations / no false
     // lengthens) rather than failing the whole watchdog.
-    let (inprogress_owners, monitor_exempt_owners) = match board.list_tasks_by_status("in_progress") {
-        Ok(tasks) => (inprogress_task_assignees(&tasks), monitor_exempt_task_owners(&tasks)),
-        Err(_) => (std::collections::BTreeSet::new(), std::collections::BTreeSet::new()),
+    let (inprogress_owners, monitor_exempt_owners) = match board.list_tasks_by_status("in_progress")
+    {
+        Ok(tasks) => (
+            inprogress_task_assignees(&tasks),
+            monitor_exempt_task_owners(&tasks),
+        ),
+        Err(_) => (
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeSet::new(),
+        ),
     };
     // task_736 switch-to-actionable: the owners of a task PARKED on an external blocker. An agent here that
     // ALSO owns an actionable task must switch to it rather than idle on the block. One extra status query per
@@ -6191,7 +6749,10 @@ fn watchdog_board(
         let interval_secs = parse_interval_secs(interval_str).unwrap_or(0);
         let age_secs = last_seen_age_secs(ls, now);
         let (verdict, age_str) = match age_secs {
-            Some(age) => (watchdog_verdict(age, interval_secs), format!("{}m", age / 60)),
+            Some(age) => (
+                watchdog_verdict(age, interval_secs),
+                format!("{}m", age / 60),
+            ),
             None => ("?", "?".to_string()),
         };
         // Best-effort open assigned-task count (the second signal); a query error degrades to 0/"?" and
@@ -6210,7 +6771,10 @@ fn watchdog_board(
         // regardless of the open-task / stale gates the older signals apply — a crash-looping agent with an
         // empty queue slips past both, which is exactly how the board-triage/board-follow-up outage went
         // unflagged. Staged (registered-but-unlaunched) and offline agents have legitimately not ticked.
-        let created_at = a.get("created_at").and_then(serde_json::Value::as_str).unwrap_or("");
+        let created_at = a
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         let never_ticked = !agent_is_staged(md)
             && !stood_down
             && agent_never_ticked(created_at, ls, now, WATCHDOG_NEVER_TICKED_GRACE_SECS);
@@ -6237,7 +6801,10 @@ fn watchdog_board(
         // Observation (#187): check transcript growth BEFORE the stale-only skip below — a spin-down (offline)
         // agent is not a re-arm candidate, so it would be skipped, yet its closing read is exactly what the
         // mandatory spin-down trigger must catch. Report-only this slice (no spawn / no watermark advance).
-        if observe && let Some(d) = observe_candidate(&fleet, id, &roster_ids, stood_down, observe_threshold) {
+        if observe
+            && let Some(d) =
+                observe_candidate(&fleet, id, &roster_ids, stood_down, observe_threshold)
+        {
             obs.push((id.to_string(), stood_down, d));
         }
         // task_786 corrective + task_794: both read the per-agent open_task_count already computed above, and
@@ -6333,7 +6900,14 @@ fn watchdog_board(
             flagged += 1;
             holding_work_count += 1;
             if rearm {
-                let (_act, did) = rearm_candidate(&fleet, &session, id, interval_secs, now_unix, WATCHDOG_REARM_WAKE);
+                let (_act, did) = rearm_candidate(
+                    &fleet,
+                    &session,
+                    id,
+                    interval_secs,
+                    now_unix,
+                    WATCHDOG_REARM_WAKE,
+                );
                 if did {
                     rearmed += 1;
                 }
@@ -6352,7 +6926,14 @@ fn watchdog_board(
                 } else {
                     interval_secs
                 };
-                let (act, did) = rearm_candidate(&fleet, &session, id, cooldown_base, now_unix, WATCHDOG_REARM_WAKE);
+                let (act, did) = rearm_candidate(
+                    &fleet,
+                    &session,
+                    id,
+                    cooldown_base,
+                    now_unix,
+                    WATCHDOG_REARM_WAKE,
+                );
                 if did {
                     rearmed += 1;
                 }
@@ -6388,7 +6969,11 @@ fn watchdog_board(
         } else {
             "ok"
         };
-        let iv = if interval_str.is_empty() { "?" } else { interval_str };
+        let iv = if interval_str.is_empty() {
+            "?"
+        } else {
+            interval_str
+        };
         println!("{id:<28} {iv:<8} {age_str:<7} {open_str:<5} {verdict:<8} {action:<12} {ls}");
     }
     if stale_only && flagged == 0 {
@@ -6460,7 +7045,11 @@ fn watchdog_board(
                 .unwrap_or_else(|| "fleet".to_string());
             let (mut recovered, mut cooled, mut failed) = (0usize, 0usize, 0usize);
             for id in &wedged_ids {
-                if recover_wedged_on_cooldown(read_recover_wedged_stamp(&fleet, id), now_unix, cooldown) {
+                if recover_wedged_on_cooldown(
+                    read_recover_wedged_stamp(&fleet, id),
+                    now_unix,
+                    cooldown,
+                ) {
                     cooled += 1;
                     continue;
                 }
@@ -6469,17 +7058,24 @@ fn watchdog_board(
                     .args(["spin-down", id, "--apply", "--force"])
                     .status();
                 if !matches!(down, Ok(s) if s.success()) {
-                    eprintln!("  ! recover-wedged: spin-down '{id}' failed — not spinning up / not stamping, will retry next sweep");
+                    eprintln!(
+                        "  ! recover-wedged: spin-down '{id}' failed — not spinning up / not stamping, will retry next sweep"
+                    );
                     failed += 1;
                     continue;
                 }
-                match std::process::Command::new(&self_bin).args(["spin-up", id, "--apply"]).status() {
+                match std::process::Command::new(&self_bin)
+                    .args(["spin-up", id, "--apply"])
+                    .status()
+                {
                     Ok(s) if s.success() => {
                         write_recover_wedged_stamp(&fleet, id, now_unix);
                         recovered += 1;
                     }
                     _ => {
-                        eprintln!("  ! recover-wedged: spin-up '{id}' failed after spin-down — agent left DOWN (spin it up manually); not stamping");
+                        eprintln!(
+                            "  ! recover-wedged: spin-up '{id}' failed after spin-down — agent left DOWN (spin it up manually); not stamping"
+                        );
                         failed += 1;
                     }
                 }
@@ -6497,7 +7093,10 @@ fn watchdog_board(
         // or its tasks reassigned. The WARNING always prints (the report); with --revive-stranded (task_818) it
         // ALSO auto-spins-up each stranded agent below, cooldown-fenced. The prevention companion is the
         // task_786 spin-down refuse-to-strand guard (PR 266).
-        let list: Vec<String> = stranded_ids.iter().map(|(id, n)| format!("{id}({n})")).collect();
+        let list: Vec<String> = stranded_ids
+            .iter()
+            .map(|(id, n)| format!("{id}({n})"))
+            .collect();
         println!(
             "-- WARNING: {} agent(s) STRANDED (task_786): stood down while still holding open assignment(s) [agent(open)]: {}. A stood-down agent has no live loop to work them and a wake cannot revive a windowless agent — spin each up (`fleet spin-up <agent> --apply`) or reassign its tasks.",
             stranded_ids.len(),
@@ -6529,17 +7128,26 @@ fn watchdog_board(
                 .unwrap_or_else(|| "fleet".to_string());
             let (mut revived, mut cooled, mut failed) = (0usize, 0usize, 0usize);
             for (id, _open) in &stranded_ids {
-                if revive_stranded_on_cooldown(read_revive_stranded_stamp(&fleet, id), now_unix, cooldown) {
+                if revive_stranded_on_cooldown(
+                    read_revive_stranded_stamp(&fleet, id),
+                    now_unix,
+                    cooldown,
+                ) {
                     cooled += 1;
                     continue;
                 }
-                match std::process::Command::new(&self_bin).args(["spin-up", id, "--apply"]).status() {
+                match std::process::Command::new(&self_bin)
+                    .args(["spin-up", id, "--apply"])
+                    .status()
+                {
                     Ok(s) if s.success() => {
                         write_revive_stranded_stamp(&fleet, id, now_unix);
                         revived += 1;
                     }
                     Ok(_) => {
-                        eprintln!("  ! revive-stranded: spin-up '{id}' failed (nonzero exit) — not stamping, will retry next sweep");
+                        eprintln!(
+                            "  ! revive-stranded: spin-up '{id}' failed (nonzero exit) — not stamping, will retry next sweep"
+                        );
                         failed += 1;
                     }
                     Err(e) => {
@@ -6557,7 +7165,10 @@ fn watchdog_board(
         // task_794: a RUNNING agent whose open backlog exceeds the depth threshold — the PM hire/route signal
         // (the automated complement to the task_786 don't-strand guard). The WARNING is always printed (the
         // human-/PM-readable report); with --hire-signal it ALSO posts each breach to the PM's channel below.
-        let list: Vec<String> = backlog_overflow_ids.iter().map(|(id, n)| format!("{id}({n})")).collect();
+        let list: Vec<String> = backlog_overflow_ids
+            .iter()
+            .map(|(id, n)| format!("{id}({n})"))
+            .collect();
         println!(
             "-- WARNING: {} agent(s) OVER BACKLOG DEPTH (task_794: >{} open) [agent(open)]: {}. A deep backlog is the PM hire/route signal — route a helper or reassign. (Set CDZ_BACKLOG_DEPTH to tune the threshold.)",
             backlog_overflow_ids.len(),
@@ -6585,7 +7196,11 @@ fn watchdog_board(
                 Ok(channel_id) => {
                     let (mut posted, mut cooled, mut failed) = (0usize, 0usize, 0usize);
                     for (id, open) in &backlog_overflow_ids {
-                        if hire_signal_on_cooldown(read_hire_signal_stamp(&fleet, id), now_unix, cooldown) {
+                        if hire_signal_on_cooldown(
+                            read_hire_signal_stamp(&fleet, id),
+                            now_unix,
+                            cooldown,
+                        ) {
                             cooled += 1;
                             continue;
                         }
@@ -6629,19 +7244,29 @@ fn watchdog_board(
     }
     if observe {
         if obs.is_empty() {
-            println!(
-                "-- observation: no agent over the {observe_threshold}-line growth threshold"
-            );
+            println!("-- observation: no agent over the {observe_threshold}-line growth threshold");
         } else {
             let display: Vec<String> = obs
                 .iter()
                 .map(|(id, sd, d)| {
                     let why = if *sd { "spin-down" } else { "size" };
-                    format!("{id}[{}:{}+{} {why}]", d.session, d.since_offset, d.increment)
+                    format!(
+                        "{id}[{}:{}+{} {why}]",
+                        d.session, d.since_offset, d.increment
+                    )
                 })
                 .collect();
-            let tail = if spawn { "" } else { " (report-only; pass --spawn to launch observers)" };
-            println!("-- observation candidates ({}){}: {}", obs.len(), tail, display.join(", "));
+            let tail = if spawn {
+                ""
+            } else {
+                " (report-only; pass --spawn to launch observers)"
+            };
+            println!(
+                "-- observation candidates ({}){}: {}",
+                obs.len(),
+                tail,
+                display.join(", ")
+            );
         }
         if spawn {
             observe_spawn_pass(board, &fleet, &session, &mut obs, now_unix, spawn_dry_run);
@@ -6674,28 +7299,43 @@ fn watchdog_board(
             }
             // The window's target's spawn stamp (None for an ORPHAN window whose agent is gone from the roster —
             // treated as stale, since no live owner means no in-flight observation to protect).
-            let stamp = name_to_target.get(&win_name).and_then(|t| read_observe_spawn_stamp(&fleet, t));
+            let stamp = name_to_target
+                .get(&win_name)
+                .and_then(|t| read_observe_spawn_stamp(&fleet, t));
             // A recent spawn stamp = a healthy in-flight observer → never reaped.
             if !observer_window_is_stale(stamp, now_unix, reap_bound) {
                 continue;
             }
             stale_seen += 1;
             if spawn_dry_run {
-                println!("-- reap: obs window {win_name} ({win_id}) is STALE — would kill-window (dry-run)");
+                println!(
+                    "-- reap: obs window {win_name} ({win_id}) is STALE — would kill-window (dry-run)"
+                );
             } else {
-                match std::process::Command::new("tmux").args(["kill-window", "-t", &win_id]).status() {
+                match std::process::Command::new("tmux")
+                    .args(["kill-window", "-t", &win_id])
+                    .status()
+                {
                     Ok(s) if s.success() => {
                         reaped += 1;
-                        println!("-- reap: killed STALE obs window {win_name} ({win_id}) (leaked observer — never reached observe-record)");
+                        println!(
+                            "-- reap: killed STALE obs window {win_name} ({win_id}) (leaked observer — never reached observe-record)"
+                        );
                     }
-                    _ => eprintln!("-- reap: kill-window {win_name} ({win_id}) FAILED (remove it manually if it lingers)"),
+                    _ => eprintln!(
+                        "-- reap: kill-window {win_name} ({win_id}) FAILED (remove it manually if it lingers)"
+                    ),
                 }
             }
         }
         if stale_seen == 0 {
-            println!("-- reap: no stale observer windows (every obs-* window is a healthy in-flight observer, or none exist)");
+            println!(
+                "-- reap: no stale observer windows (every obs-* window is a healthy in-flight observer, or none exist)"
+            );
         } else if spawn_dry_run {
-            println!("-- reap: {stale_seen} stale observer window(s) WOULD be reaped (re-run without --dry-run to kill)");
+            println!(
+                "-- reap: {stale_seen} stale observer window(s) WOULD be reaped (re-run without --dry-run to kill)"
+            );
         } else {
             println!("-- reap: {reaped}/{stale_seen} stale observer window(s) killed");
         }
@@ -6731,20 +7371,31 @@ fn resolve_observation_task(
                 None
             } else {
                 let meta = serde_json::json!({ "observes": target });
-                match board.create_task(spec.project_id, &spec.title, &spec.body, "observer", meta, None) {
+                match board.create_task(
+                    spec.project_id,
+                    &spec.title,
+                    &spec.body,
+                    "observer",
+                    meta,
+                    None,
+                ) {
                     Ok(id) => {
                         println!("   observation task: created #{id} (observes {target})");
                         Some(id)
                     }
                     Err(e) => {
-                        eprintln!("   observation task: create FAILED ({e}); observer runs without a parent task");
+                        eprintln!(
+                            "   observation task: create FAILED ({e}); observer runs without a parent task"
+                        );
                         None
                     }
                 }
             }
         }
         Err(e) => {
-            eprintln!("   observation task: open-check FAILED ({e}); observer runs without a parent task");
+            eprintln!(
+                "   observation task: open-check FAILED ({e}); observer runs without a parent task"
+            );
             None
         }
     }
@@ -6775,7 +7426,12 @@ fn observe_spawn_pass(
     // SPIN-DOWN candidates first (their closing read is mandatory + unrepeatable — a retiring agent's
     // context is about to be gone), then most-grown first. So a small spin-down window is never crowded out
     // of the per-sweep cap by large size candidates.
-    obs.sort_by_key(|(_, stood_down, d)| (std::cmp::Reverse(*stood_down), std::cmp::Reverse(d.increment)));
+    obs.sort_by_key(|(_, stood_down, d)| {
+        (
+            std::cmp::Reverse(*stood_down),
+            std::cmp::Reverse(d.increment),
+        )
+    });
     let mut launched = 0usize;
     let mut actions: Vec<String> = Vec::new();
     for (id, _sd, d) in obs.iter() {
@@ -6790,9 +7446,14 @@ fn observe_spawn_pass(
         let cur_wm = format!("{wm_session}:{wm_offset}");
         let (rec_wm, prior_attempts) = read_observe_spawn_attempts(fleet, id);
         let attempts = if rec_wm == cur_wm { prior_attempts } else { 0 };
-        let eff_cooldown = observe_respawn_cooldown(cooldown, attempts, OBSERVE_RESPAWN_MAX_BACKOFF_STEPS);
+        let eff_cooldown =
+            observe_respawn_cooldown(cooldown, attempts, OBSERVE_RESPAWN_MAX_BACKOFF_STEPS);
         if observe_on_spawn_cooldown(read_observe_spawn_stamp(fleet, id), now_unix, eff_cooldown) {
-            actions.push(if attempts > 1 { format!("{id}=cooldown(backoff,attempt={attempts})") } else { format!("{id}=cooldown") });
+            actions.push(if attempts > 1 {
+                format!("{id}=cooldown(backoff,attempt={attempts})")
+            } else {
+                format!("{id}=cooldown")
+            });
             continue;
         }
         let obs_task = resolve_observation_task(board, id, &d.session, d.since_offset, dry_run);
@@ -6809,7 +7470,10 @@ fn observe_spawn_pass(
         actions.push(format!("{id}={act}"));
     }
     let mode = if dry_run { "DRY-RUN " } else { "" };
-    println!("-- observer {mode}spawn (cap {cap}): {}", actions.join(", "));
+    println!(
+        "-- observer {mode}spawn (cap {cap}): {}",
+        actions.join(", ")
+    );
 }
 
 /// Watchdog scan of the FILE-HUB registry (the agents not yet migrated board-native). Same signals adapted
@@ -6821,7 +7485,11 @@ fn observe_spawn_pass(
 /// file, so its file mtime is stale by design — the board scan already covers it, and scanning it here would
 /// false-flag it STALE (the v-slack-bridge report). The real cleanup is `fleet deregister`, but skipping is
 /// the robust guard.
-fn watchdog_file_hub(stale_only: bool, rearm: bool, native_ids: &std::collections::BTreeSet<String>) {
+fn watchdog_file_hub(
+    stale_only: bool,
+    rearm: bool,
+    native_ids: &std::collections::BTreeSet<String>,
+) {
     let fleet = Fleet::resolve();
     let reg = fleet.load();
     let active: Vec<&Agent> = reg
@@ -6850,7 +7518,10 @@ fn watchdog_file_hub(stale_only: bool, rearm: bool, native_ids: &std::collection
         let (verdict, age_str) = match hb {
             Some(m) => {
                 let age = now.saturating_sub(m) as i64;
-                (watchdog_verdict(age, interval_secs), format!("{}m", age / 60))
+                (
+                    watchdog_verdict(age, interval_secs),
+                    format!("{}m", age / 60),
+                )
             }
             None => ("?", "?".to_string()),
         };
@@ -6865,7 +7536,14 @@ fn watchdog_file_hub(stale_only: bool, rearm: bool, native_ids: &std::collection
         let action = if retighten {
             flagged += 1;
             if rearm {
-                let (act, did) = rearm_candidate(&fleet, &session, &a.name, interval_secs, now, WATCHDOG_REARM_WAKE);
+                let (act, did) = rearm_candidate(
+                    &fleet,
+                    &session,
+                    &a.name,
+                    interval_secs,
+                    now,
+                    WATCHDOG_REARM_WAKE,
+                );
                 if did {
                     rearmed += 1;
                 }
@@ -6876,7 +7554,11 @@ fn watchdog_file_hub(stale_only: bool, rearm: bool, native_ids: &std::collection
         } else {
             "ok"
         };
-        let iv = if a.interval.is_empty() { "?" } else { &a.interval };
+        let iv = if a.interval.is_empty() {
+            "?"
+        } else {
+            &a.interval
+        };
         println!(
             "{:<28} {iv:<8} {age_str:<7} {pending:<5} {verdict:<8} {action:<12}",
             a.name
@@ -6920,7 +7602,10 @@ fn build_meta_patch(
         patch.insert("repos".to_string(), serde_json::Value::Array(entries));
     }
     if let Some(iv) = interval {
-        patch.insert("interval".to_string(), serde_json::Value::String(iv.to_string()));
+        patch.insert(
+            "interval".to_string(),
+            serde_json::Value::String(iv.to_string()),
+        );
     }
     if let Some(h) = host {
         // Pin the agent to a host (host-affinity). `""` clears the pin (unpinned) via JSON null.
@@ -6973,19 +7658,31 @@ fn set_meta(
         serde_json::to_string(&patch).unwrap_or_default()
     );
     if !apply {
-        println!("  (dry-run — re-run with --apply to write; merge preserves every other metadata key)");
+        println!(
+            "  (dry-run — re-run with --apply to write; merge preserves every other metadata key)"
+        );
         return;
     }
     if let Err(e) = board.patch_metadata(agent, patch) {
         eprintln!("  write FAILED: {e}");
         std::process::exit(1);
     }
-    match board.get_agent(agent).ok().and_then(|r| r.get("metadata").cloned()) {
+    match board
+        .get_agent(agent)
+        .ok()
+        .and_then(|r| r.get("metadata").cloned())
+    {
         Some(md) => println!(
             "  written. metadata now: repos={} interval={} host={}",
-            md.get("repos").map(|v| v.to_string()).unwrap_or_else(|| "<none>".into()),
-            md.get("interval").and_then(|v| v.as_str()).unwrap_or("<none>"),
-            md.get("host").map(|v| v.to_string()).unwrap_or_else(|| "<none>".into())
+            md.get("repos")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<none>".into()),
+            md.get("interval")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<none>"),
+            md.get("host")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<none>".into())
         ),
         None => println!("  written (could not read back the record to confirm)"),
     }
@@ -7030,7 +7727,11 @@ fn set_interval(fleet: &Fleet, agent: &str, interval: &str) {
 /// (gates the model wake + heartbeats on green) so both agree on the verdict.
 enum SeamVerdict {
     /// No incoming commit touched the declared seam — the model turn can be skipped (synced to `head`).
-    Green { incoming: usize, seams: usize, head: String },
+    Green {
+        incoming: usize,
+        seams: usize,
+        head: String,
+    },
     /// Incoming commits touched the seam — wake the model with these paths.
     Changed(Vec<String>),
     /// No `metadata.seam` declared — cannot gate; fail-safe wake.
@@ -7056,7 +7757,11 @@ fn seam_decision(rec: &serde_json::Value, no_fetch: bool) -> SeamVerdict {
     let seams: Vec<String> = md
         .and_then(|m| m.get("seam"))
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     if seams.is_empty() {
         return SeamVerdict::NoSeam;
@@ -7067,7 +7772,10 @@ fn seam_decision(rec: &serde_json::Value, no_fetch: bool) -> SeamVerdict {
     if split_seam_globs(&seams).0.is_empty() {
         return SeamVerdict::NoSeam;
     }
-    let worktree = md.and_then(|m| m.get("worktree")).and_then(|v| v.as_str()).unwrap_or(".");
+    let worktree = md
+        .and_then(|m| m.get("worktree"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
     let wt_path = {
         let p = std::path::Path::new(worktree);
         if p.is_absolute() {
@@ -7085,13 +7793,14 @@ fn seam_decision(rec: &serde_json::Value, no_fetch: bool) -> SeamVerdict {
             .output()
             .map_err(|e| format!("git {args:?}: {e}"))?;
         if !out.status.success() {
-            return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            return Err(format!(
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     };
-    if !no_fetch
-        && let Err(e) = git(&["fetch", "origin", "main"])
-    {
+    if !no_fetch && let Err(e) = git(&["fetch", "origin", "main"]) {
         return SeamVerdict::Error(e);
     }
     // Files in commits reachable from origin/main but not HEAD = what a ff-sync would bring in.
@@ -7099,12 +7808,23 @@ fn seam_decision(rec: &serde_json::Value, no_fetch: bool) -> SeamVerdict {
         Ok(d) => d,
         Err(e) => return SeamVerdict::Error(e),
     };
-    let changed: Vec<String> =
-        diff.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    let changed: Vec<String> = diff
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
     let matched = seam_touched(&changed, &seams);
     if matched.is_empty() {
-        let head = git(&["rev-parse", "--short", "origin/main"]).unwrap_or_default().trim().to_string();
-        SeamVerdict::Green { incoming: changed.len(), seams: seams.len(), head }
+        let head = git(&["rev-parse", "--short", "origin/main"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        SeamVerdict::Green {
+            incoming: changed.len(),
+            seams: seams.len(),
+            head,
+        }
     } else {
         SeamVerdict::Changed(matched.iter().map(|s| s.to_string()).collect())
     }
@@ -7137,14 +7857,19 @@ fn seam_check(agent: &str, no_fetch: bool) {
             eprintln!("fleet seam-check '{agent}': {e}");
             std::process::exit(1);
         }
-        SeamVerdict::Green { incoming, seams, .. } => {
+        SeamVerdict::Green {
+            incoming, seams, ..
+        } => {
             println!(
                 "seam-check '{agent}': GREEN — {incoming} incoming file(s), none on seam ({seams} glob(s)); heartbeat, do NOT wake the model"
             );
             std::process::exit(0);
         }
         SeamVerdict::Changed(matched) => {
-            println!("seam-check '{agent}': CHANGED — {} seam-touching path(s), wake the model:", matched.len());
+            println!(
+                "seam-check '{agent}': CHANGED — {} seam-touching path(s), wake the model:",
+                matched.len()
+            );
             for p in &matched {
                 println!("  {p}");
             }
@@ -7169,31 +7894,48 @@ fn monitor_tick(agent: &str, apply: bool, no_fetch: bool) {
         eprintln!("fleet monitor-tick: get_agent '{agent}' failed: {e}");
         std::process::exit(1);
     });
-    let status = rec.get("status").and_then(|v| v.as_str()).unwrap_or("online").to_string();
+    let status = rec
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("online")
+        .to_string();
     let verdict = seam_decision(&rec, no_fetch);
     match &verdict {
-        SeamVerdict::Green { incoming, seams, head } => {
+        SeamVerdict::Green {
+            incoming,
+            seams,
+            head,
+        } => {
             let msg = format!(
                 "MONITOR: seam green — synced to {head}, {incoming} incoming file(s), none on {seams} seam glob(s); model turn gated (skipped)"
             );
             if apply {
                 if let Err(e) = board.set_status(agent, &status, &msg) {
-                    eprintln!("monitor-tick '{agent}': GREEN but heartbeat set_status failed ({e}); waking the model fail-safe");
+                    eprintln!(
+                        "monitor-tick '{agent}': GREEN but heartbeat set_status failed ({e}); waking the model fail-safe"
+                    );
                     std::process::exit(3);
                 }
                 println!("monitor-tick '{agent}': GREEN — heartbeat set, model NOT woken");
             } else {
-                println!("monitor-tick '{agent}': GREEN (report-only) — would heartbeat + NOT wake the model (re-run --apply to heartbeat): {msg}");
+                println!(
+                    "monitor-tick '{agent}': GREEN (report-only) — would heartbeat + NOT wake the model (re-run --apply to heartbeat): {msg}"
+                );
             }
         }
         SeamVerdict::Changed(matched) => {
-            println!("monitor-tick '{agent}': CHANGED — {} seam-touching path(s), WAKE the model:", matched.len());
+            println!(
+                "monitor-tick '{agent}': CHANGED — {} seam-touching path(s), WAKE the model:",
+                matched.len()
+            );
             for p in matched {
                 println!("  {p}");
             }
         }
         SeamVerdict::NoSeam => {
-            eprintln!("monitor-tick '{agent}': no metadata.seam declared — cannot gate; WAKE the model (fail-safe). Declare metadata.seam to enable gating.");
+            eprintln!(
+                "monitor-tick '{agent}': no metadata.seam declared — cannot gate; WAKE the model (fail-safe). Declare metadata.seam to enable gating."
+            );
         }
         SeamVerdict::Error(e) => {
             eprintln!("monitor-tick '{agent}': {e} — cannot gate; WAKE the model (fail-safe)");
@@ -7238,7 +7980,11 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     let text = String::from_utf8_lossy(&buf).into_owned();
     // Only when we started mid-file is the first line a (likely partial) fragment to drop.
     if start > 0 {
-        Some(text.split_once('\n').map(|(_partial, rest)| rest.to_string()).unwrap_or(text))
+        Some(
+            text.split_once('\n')
+                .map(|(_partial, rest)| rest.to_string())
+                .unwrap_or(text),
+        )
     } else {
         Some(text)
     }
@@ -7272,7 +8018,10 @@ fn safeguard_check(agent: &str, threshold: usize, tail: usize) {
         std::process::exit(1);
     };
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("fleet safeguard-check '{agent}': reading {}: {e}", path.display());
+        eprintln!(
+            "fleet safeguard-check '{agent}': reading {}: {e}",
+            path.display()
+        );
         std::process::exit(1);
     });
     // Last `tail` lines, in chronological order, parsed to assistant stop_reasons only (shared with the
@@ -7314,7 +8063,10 @@ fn resolve_session_arg(session: &Path, agent: &str) -> Option<PathBuf> {
     if session.exists() {
         return Some(session.to_path_buf());
     }
-    match_session_id_in(&session.to_string_lossy(), &transcripts::locate_sessions(agent))
+    match_session_id_in(
+        &session.to_string_lossy(),
+        &transcripts::locate_sessions(agent),
+    )
 }
 
 /// Render an agent's session transcript faithfully (see [`transcripts`]). Resolves the session file
@@ -7323,19 +8075,29 @@ fn resolve_session_arg(session: &Path, agent: &str) -> Option<PathBuf> {
 /// `--since` record offset backed up by `--overlap`, renders + scrubs, and prints the advancing watermark.
 /// The watermark offset is a RECORD index (parsed JSONL records already observed), printed as
 /// `<session-id>:<record-count>` in the footer.
-fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, overlap: usize, harness: &str) {
+fn transcripts_cmd(
+    agent: &str,
+    session: Option<&Path>,
+    since: Option<&str>,
+    overlap: usize,
+    harness: &str,
+) {
     // Select the harness renderer up front so an unknown value fails before we touch the filesystem.
     let harness: Box<dyn transcripts::Harness> = match harness {
         "codex" => Box::new(transcripts::Codex),
         "claude" | "claude-code" => Box::new(transcripts::ClaudeCode),
         other => {
-            eprintln!("fleet transcripts: unknown --harness '{other}' (expected 'claude' or 'codex')");
+            eprintln!(
+                "fleet transcripts: unknown --harness '{other}' (expected 'claude' or 'codex')"
+            );
             std::process::exit(1);
         }
     };
     let (path, want_offset) = match session {
         Some(p) => {
-            let off = since.map(|s| transcripts::parse_watermark(s).1).unwrap_or(0);
+            let off = since
+                .map(|s| transcripts::parse_watermark(s).1)
+                .unwrap_or(0);
             match resolve_session_arg(p, agent) {
                 Some(found) => (found, off),
                 None => {
@@ -7350,13 +8112,18 @@ fn transcripts_cmd(agent: &str, session: Option<&Path>, since: Option<&str>, ove
         None => {
             let sessions = transcripts::locate_sessions(agent);
             if sessions.is_empty() {
-                eprintln!("fleet transcripts: no session files found for '{agent}' (try --session <file>)");
+                eprintln!(
+                    "fleet transcripts: no session files found for '{agent}' (try --session <file>)"
+                );
                 std::process::exit(1);
             }
             match since.map(transcripts::parse_watermark) {
                 // Watermark names a session: render THAT one from its offset if we can find it, else the
                 // newest from the start (the named session rotated away).
-                Some((sid, off)) => match sessions.iter().find(|p| transcripts::session_id_of(p) == sid) {
+                Some((sid, off)) => match sessions
+                    .iter()
+                    .find(|p| transcripts::session_id_of(p) == sid)
+                {
                     Some(p) => (p.clone(), off),
                     None => (sessions.into_iter().next().unwrap(), 0),
                 },
@@ -7499,8 +8266,14 @@ fn classify_wake_path(webhook_url: Option<&str>, has_live_tunnel: bool) -> WakeP
 /// `kind` — an `assistant` is an interactive human-driven session and an `observer` is spawned per watchdog
 /// sweep and exits, so neither waits on events. Pure — unit-tested.
 fn agent_expected_running(agent: &serde_json::Value) -> bool {
-    let status = agent.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
-    if matches!(status.to_ascii_lowercase().as_str(), "offline" | "done" | "cancelled") {
+    let status = agent
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if matches!(
+        status.to_ascii_lowercase().as_str(),
+        "offline" | "done" | "cancelled"
+    ) {
         return false;
     }
     let standing_down = agent
@@ -7513,7 +8286,10 @@ fn agent_expected_running(agent: &serde_json::Value) -> bool {
     if agent_is_staged(agent.get("metadata")) {
         return false;
     }
-    let kind = agent.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+    let kind = agent
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     !matches!(kind, "assistant" | "observer")
 }
 
@@ -7531,7 +8307,9 @@ fn wake_audit(verbose: bool) {
         std::process::exit(1);
     });
     let tunnels = board.tunnel_agent_ids().unwrap_or_else(|e| {
-        eprintln!("fleet wake-audit: board /tunnels query failed ({e}); cannot tell tunnel coverage");
+        eprintln!(
+            "fleet wake-audit: board /tunnels query failed ({e}); cannot tell tunnel coverage"
+        );
         std::process::exit(1);
     });
 
@@ -7540,19 +8318,24 @@ fn wake_audit(verbose: bool) {
     // Stable order so the report reads the same run-to-run.
     let mut ids: Vec<String> = roster
         .iter()
-        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .filter_map(|a| {
+            a.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     ids.sort();
 
-    println!("fleet wake-audit: {} agent(s), {} live tunnel(s)", ids.len(), tunnels.len());
+    println!(
+        "fleet wake-audit: {} agent(s), {} live tunnel(s)",
+        ids.len(),
+        tunnels.len()
+    );
     for id in &ids {
         // The list record omits webhook_url; the DETAIL record carries it. Fall back to the (already-fetched)
         // list record only if the detail fetch fails, so a transient error never silently flags an agent.
         let detail = board.get_agent(id).ok();
-        let expected = detail
-            .as_ref()
-            .map(agent_expected_running)
-            .unwrap_or(true);
+        let expected = detail.as_ref().map(agent_expected_running).unwrap_or(true);
         if !expected {
             n_skipped += 1;
             if verbose {
@@ -7580,7 +8363,10 @@ fn wake_audit(verbose: bool) {
             }
             WakePath::PollOnly => {
                 poll_only.push(id.clone());
-                println!("  - {id}: {} — no webhook_url and no live tunnel", WakePath::PollOnly.label());
+                println!(
+                    "  - {id}: {} — no webhook_url and no live tunnel",
+                    WakePath::PollOnly.label()
+                );
             }
         }
     }
@@ -7615,17 +8401,28 @@ fn observe_coverage(cadence: Vec<String>, cadence_pinned: Vec<String>, verbose: 
     // below so the audit never reasons from a hidden assumption.
     let mut cadences: Vec<ObserveCadence> = Vec::new();
     for host in cadence {
-        cadences.push(ObserveCadence { host, pinned_only: false });
+        cadences.push(ObserveCadence {
+            host,
+            pinned_only: false,
+        });
     }
     for host in cadence_pinned {
-        cadences.push(ObserveCadence { host, pinned_only: true });
+        cadences.push(ObserveCadence {
+            host,
+            pinned_only: true,
+        });
     }
     if cadences.is_empty() {
-        cadences.push(ObserveCadence { host: this.clone(), pinned_only: false });
+        cadences.push(ObserveCadence {
+            host: this.clone(),
+            pinned_only: false,
+        });
     }
 
     let board = board::Board::connect().unwrap_or_else(|e| {
-        eprintln!("fleet observe-coverage: board unavailable ({e}); cannot audit observer coverage");
+        eprintln!(
+            "fleet observe-coverage: board unavailable ({e}); cannot audit observer coverage"
+        );
         std::process::exit(1);
     });
     let roster = board.list_agents().unwrap_or_else(|e| {
@@ -7635,16 +8432,29 @@ fn observe_coverage(cadence: Vec<String>, cadence_pinned: Vec<String>, verbose: 
 
     let cadence_desc = cadences
         .iter()
-        .map(|c| format!("{}{}", c.host, if c.pinned_only { " (pinned-only)" } else { "" }))
+        .map(|c| {
+            format!(
+                "{}{}",
+                c.host,
+                if c.pinned_only { " (pinned-only)" } else { "" }
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    println!("fleet observe-coverage: {} declared cadence(s): {cadence_desc}", cadences.len());
+    println!(
+        "fleet observe-coverage: {} declared cadence(s): {cadence_desc}",
+        cadences.len()
+    );
     println!("local host: {this} (transcript presence verifiable only here)");
 
     // Stable order so the report reads the same run-to-run.
     let mut ids: Vec<String> = roster
         .iter()
-        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .filter_map(|a| {
+            a.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     ids.sort();
 
@@ -7676,7 +8486,9 @@ fn observe_coverage(cadence: Vec<String>, cadence_pinned: Vec<String>, verbose: 
                 continue;
             }
             NativeVerdict::Unknown => {
-                eprintln!("  - {id}: WARN native/metadata unknown (roster shape) — auditing fail-safe");
+                eprintln!(
+                    "  - {id}: WARN native/metadata unknown (roster shape) — auditing fail-safe"
+                );
             }
             NativeVerdict::Native => {}
         }
@@ -7695,7 +8507,9 @@ fn observe_coverage(cadence: Vec<String>, cadence_pinned: Vec<String>, verbose: 
             ObserveCoverage::CoveredAssumed => {
                 n_assumed += 1;
                 if verbose {
-                    println!("  - {id}: covered (assumed — managed by a declared cadence on another host)");
+                    println!(
+                        "  - {id}: covered (assumed — managed by a declared cadence on another host)"
+                    );
                 }
             }
             ObserveCoverage::ManagedNoLocalTranscript => {
@@ -7784,7 +8598,12 @@ impl ReclaimState {
 /// clean tree that is either fully pushed to its upstream (`has_upstream && ahead == 0`) OR already an ancestor
 /// of the mainline (`merged_into_mainline`). A dirty tree is unsafe outright. A no-upstream, not-merged tree is
 /// the footgun bucket — unprovable, so unsafe. Pure — unit-tested.
-fn classify_reclaim(dirty: bool, has_upstream: bool, ahead: usize, merged_into_mainline: bool) -> ReclaimState {
+fn classify_reclaim(
+    dirty: bool,
+    has_upstream: bool,
+    ahead: usize,
+    merged_into_mainline: bool,
+) -> ReclaimState {
     if dirty {
         return ReclaimState::Dirty;
     }
@@ -7877,7 +8696,17 @@ fn mainline_candidates(primary: &str) -> Vec<String> {
 fn resolve_mainline(dir: &Path, candidates: &[String]) -> Option<String> {
     candidates
         .iter()
-        .find(|c| git_ok(dir, &["rev-parse", "--verify", "--quiet", &format!("{c}^{{commit}}")]))
+        .find(|c| {
+            git_ok(
+                dir,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{c}^{{commit}}"),
+                ],
+            )
+        })
         .cloned()
 }
 
@@ -7916,7 +8745,9 @@ fn live_process_cwds() -> Vec<PathBuf> {
     };
     for e in entries.flatten() {
         // Only numeric PID directories carry a `cwd` symlink.
-        if e.file_name().to_str().is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        if e.file_name()
+            .to_str()
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
             && let Ok(target) = std::fs::read_link(e.path().join("cwd"))
         {
             cwds.push(target.canonicalize().unwrap_or(target));
@@ -7928,7 +8759,9 @@ fn live_process_cwds() -> Vec<PathBuf> {
 /// task_774: is `checkout` the home of a live process — some live cwd IS the checkout or is nested under it?
 /// Both sides are expected pre-canonicalized by the caller. Pure — unit-tested.
 fn path_is_live(checkout: &Path, live_cwds: &[PathBuf]) -> bool {
-    live_cwds.iter().any(|cwd| cwd == checkout || cwd.starts_with(checkout))
+    live_cwds
+        .iter()
+        .any(|cwd| cwd == checkout || cwd.starts_with(checkout))
 }
 
 /// task_774: a PRIMARY (main) working tree — its `.git` is a real DIRECTORY. A linked `git worktree` has `.git`
@@ -7944,7 +8777,9 @@ fn is_primary_worktree(dir: &Path) -> bool {
 /// name does NOT match the agent's tmux window name, so a window-name liveness match misses it — the `.v-`
 /// infix is the reliable catch. Pure — unit-tested.
 fn is_agent_suffix_worktree(path: &Path) -> bool {
-    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".v-"))
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".v-"))
 }
 
 /// task_774: the disk-reclaim SAFETY overlay on top of the git-state classification. A checkout can be
@@ -7952,7 +8787,11 @@ fn is_agent_suffix_worktree(path: &Path) -> bool {
 /// home, a primary clone rather than a disposable linked worktree, or an off-tree-agent worktree. Returns the
 /// KEEP reason when any such condition holds, else `None` (truly disposable). Pure — unit-tested. This is the
 /// gap task_774 bakes out: `reclaimable()` proves the COMMITS are preserved, not that the checkout is idle.
-fn reclaim_safety_override(is_live: bool, is_primary: bool, is_agent_suffix: bool) -> Option<&'static str> {
+fn reclaim_safety_override(
+    is_live: bool,
+    is_primary: bool,
+    is_agent_suffix: bool,
+) -> Option<&'static str> {
     if is_live {
         Some("LIVE (a running process is cwd'd at/under it)")
     } else if is_primary {
@@ -8063,7 +8902,14 @@ fn reclaim_survey(roots: Vec<PathBuf>, mainline: String, verbose: bool) {
 fn gate_steps(clippy_only: bool) -> Vec<(&'static str, Vec<&'static str>)> {
     let mut steps: Vec<(&'static str, Vec<&'static str>)> = vec![(
         "clippy (workspace, all targets, deny warnings)",
-        vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+        vec![
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
     )];
     if !clippy_only {
         steps.push(("test (workspace)", vec!["test", "--workspace"]));
@@ -8083,10 +8929,17 @@ fn gate(clippy_only: bool, isolated: bool) {
     };
     for (label, args) in gate_steps(clippy_only) {
         println!("fleet gate: cargo {}", args.join(" "));
-        match std::process::Command::new("cargo").current_dir(&root).args(&args).status() {
+        match std::process::Command::new("cargo")
+            .current_dir(&root)
+            .args(&args)
+            .status()
+        {
             Ok(s) if s.success() => println!("  ok: {label}"),
             Ok(s) => {
-                eprintln!("fleet gate: FAILED at `{label}` (cargo exit {:?}) — fix before requesting a merge", s.code());
+                eprintln!(
+                    "fleet gate: FAILED at `{label}` (cargo exit {:?}) — fix before requesting a merge",
+                    s.code()
+                );
                 std::process::exit(1);
             }
             Err(e) => {
@@ -8110,10 +8963,15 @@ fn gate(clippy_only: bool, isolated: bool) {
             .map(|s| workspace_members(&s))
             .unwrap_or_default();
         if members.is_empty() {
-            eprintln!("fleet gate --isolated: could not enumerate workspace members (cargo metadata failed)");
+            eprintln!(
+                "fleet gate --isolated: could not enumerate workspace members (cargo metadata failed)"
+            );
             std::process::exit(1);
         }
-        println!("fleet gate --isolated: checking {} crate(s) in isolation", members.len());
+        println!(
+            "fleet gate --isolated: checking {} crate(s) in isolation",
+            members.len()
+        );
         for m in &members {
             println!("fleet gate: cargo check -p {m}");
             match std::process::Command::new("cargo")
@@ -8138,7 +8996,11 @@ fn gate(clippy_only: bool, isolated: bool) {
     }
     println!(
         "fleet gate: PASS — matches CI's `clippy + test (workspace)` merge gate{}",
-        if isolated { " + per-crate isolation" } else { "" }
+        if isolated {
+            " + per-crate isolation"
+        } else {
+            ""
+        }
     );
 }
 
@@ -8151,7 +9013,11 @@ fn workspace_members(metadata_json: &str) -> Vec<String> {
         .and_then(|v| {
             v.get("packages").and_then(|p| p.as_array()).map(|arr| {
                 arr.iter()
-                    .filter_map(|p| p.get("name").and_then(serde_json::Value::as_str).map(str::to_string))
+                    .filter_map(|p| {
+                        p.get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
                     .collect::<Vec<_>>()
             })
         })
@@ -8225,13 +9091,18 @@ fn worktree_check(agent: Option<String>, verbose: bool) {
     });
     let mut ids: Vec<String> = roster
         .iter()
-        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .filter_map(|a| {
+            a.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     ids.sort();
     let mainline_cands = mainline_candidates("origin/main");
 
     let mut stale: Vec<String> = Vec::new();
-    let (mut n_clean, mut n_unlanded, mut n_unset, mut n_skipped) = (0usize, 0usize, 0usize, 0usize);
+    let (mut n_clean, mut n_unlanded, mut n_unset, mut n_skipped) =
+        (0usize, 0usize, 0usize, 0usize);
     for id in &ids {
         if let Some(f) = &agent
             && f != id
@@ -8272,7 +9143,9 @@ fn worktree_check(agent: Option<String>, verbose: bool) {
         };
         let path_exists = resolved.as_deref().map(|p| p.is_dir()).unwrap_or(false);
         let ahead = if path_exists {
-            let p = resolved.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+            let p = resolved
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("."));
             resolve_mainline(p, &mainline_cands)
                 .and_then(|base| git_capture(p, &["rev-list", "--count", &format!("{base}..HEAD")]))
                 .and_then(|s| s.parse::<usize>().ok())
@@ -8494,12 +9367,23 @@ fn worktree_sync(apply: bool) {
         .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
     let mut ids: Vec<String> = roster
         .iter()
-        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .filter_map(|a| {
+            a.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     ids.sort();
 
-    let (mut n_fixed, mut n_already, mut n_ambiguous, mut n_notree, mut n_nowt, mut n_skipped, mut n_err) =
-        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (
+        mut n_fixed,
+        mut n_already,
+        mut n_ambiguous,
+        mut n_notree,
+        mut n_nowt,
+        mut n_skipped,
+        mut n_err,
+    ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut n_stranded = 0usize;
     for id in &ids {
         // The DETAIL record reliably carries metadata (the list projection has dropped it before — task_418).
@@ -8533,10 +9417,23 @@ fn worktree_sync(apply: bool) {
         // path `workspace_dir` builds, and rewrite a correct entry to the symlink form. `canonicalize` resolves
         // both to the real path; it needs the path to exist, so fall back to the raw string when it does not (a
         // stale pointer at a vanished tree stays != the real tree, i.e. still Fixable, which is correct).
-        let canon = |p: &str| std::fs::canonicalize(p).ok().and_then(|c| c.to_str().map(str::to_string));
-        let expected_target = expected.as_deref().map(|p| canon(p).unwrap_or_else(|| p.to_string()));
-        let current_cmp = current.as_deref().map(|c| canon(c).unwrap_or_else(|| c.to_string()));
-        match classify_worktree_sync(repos.len(), expected_target.as_deref(), expected_exists, current_cmp.as_deref()) {
+        let canon = |p: &str| {
+            std::fs::canonicalize(p)
+                .ok()
+                .and_then(|c| c.to_str().map(str::to_string))
+        };
+        let expected_target = expected
+            .as_deref()
+            .map(|p| canon(p).unwrap_or_else(|| p.to_string()));
+        let current_cmp = current
+            .as_deref()
+            .map(|c| canon(c).unwrap_or_else(|| c.to_string()));
+        match classify_worktree_sync(
+            repos.len(),
+            expected_target.as_deref(),
+            expected_exists,
+            current_cmp.as_deref(),
+        ) {
             WorktreeSyncVerdict::NoWorktree => n_nowt += 1,
             WorktreeSyncVerdict::AmbiguousRepos => {
                 n_ambiguous += 1;
@@ -8576,15 +9473,19 @@ fn worktree_sync(apply: bool) {
                             serde_json::json!({"source": "worktree-sync", "old_path": old_path}),
                             None,
                         ) {
-                            Ok(task_id) => match board.reassign_task(task_id, id, "fleet-worktree-sync") {
-                                Ok(()) => println!(
-                                    "  - {id}: STRANDED-WORK notice filed as task_{task_id} ({old_path}: {ahead} ahead, dirty={dirty})"
-                                ),
-                                Err(e) => eprintln!(
-                                    "  - {id}: stranded-work task_{task_id} created but reassign FAILED ({e})"
-                                ),
-                            },
-                            Err(e) => eprintln!("  - {id}: stranded-work notice FAILED to file ({e})"),
+                            Ok(task_id) => {
+                                match board.reassign_task(task_id, id, "fleet-worktree-sync") {
+                                    Ok(()) => println!(
+                                        "  - {id}: STRANDED-WORK notice filed as task_{task_id} ({old_path}: {ahead} ahead, dirty={dirty})"
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "  - {id}: stranded-work task_{task_id} created but reassign FAILED ({e})"
+                                    ),
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  - {id}: stranded-work notice FAILED to file ({e})")
+                            }
                         }
                     } else {
                         println!(
@@ -8624,7 +9525,11 @@ fn worktree_sync(apply: bool) {
     let stranded_verb = if apply { "flagged" } else { "would-flag" };
     println!(
         "\nsummary: {n_fixed} {verb}, {n_already} already-correct, {n_ambiguous} multi-repo-skipped, {n_notree} no-real-tree, {n_nowt} no-worktree, {n_skipped} non-native, {n_stranded} stranded-work-{stranded_verb}{}",
-        if n_err > 0 { format!(", {n_err} ERRORED") } else { String::new() }
+        if n_err > 0 {
+            format!(", {n_err} ERRORED")
+        } else {
+            String::new()
+        }
     );
     if !apply && n_fixed > 0 {
         println!("(dry-run — re-run with --apply to write these corrections)");
@@ -8693,7 +9598,11 @@ fn stale_task_should_nudge(
     match last_nudge_secs {
         None => true,
         Some(since_last_nudge) => {
-            let cooldown = if assignee_ack_fresher { acked_cooldown_secs } else { cooldown_secs };
+            let cooldown = if assignee_ack_fresher {
+                acked_cooldown_secs
+            } else {
+                cooldown_secs
+            };
             since_last_nudge >= cooldown
         }
     }
@@ -8728,19 +9637,21 @@ fn acked_cooldown_with_backoff(base_acked_cooldown_secs: i64, prior_nudges: usiz
 /// owner comment resets [`nudge_round_count`] to 0 -> round 1 -> Owner), but the explicit cap guarantees the
 /// invariant regardless of how the round count is derived. Pure — unit-tested.
 fn responsive_capped_tier(base: NudgeTier, ack_fresher: bool) -> NudgeTier {
-    if ack_fresher {
-        NudgeTier::Owner
-    } else {
-        base
-    }
+    if ack_fresher { NudgeTier::Owner } else { base }
 }
 
 /// A task's latest activity age in seconds: the freshest of its `updated_at` and every comment's
 /// `created_at` (a comment does NOT bump `updated_at` on this board, so both must be checked — #478).
 /// `None` only if `updated_at` itself fails to parse (a malformed record); an unparseable comment
 /// timestamp is skipped rather than failing the whole task.
-fn task_latest_activity_age_secs(task: &serde_json::Value, now: time::OffsetDateTime) -> Option<i64> {
-    let updated_at = task.get("updated_at").and_then(serde_json::Value::as_str).unwrap_or("");
+fn task_latest_activity_age_secs(
+    task: &serde_json::Value,
+    now: time::OffsetDateTime,
+) -> Option<i64> {
+    let updated_at = task
+        .get("updated_at")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let mut best = last_seen_age_secs(updated_at, now)?;
     if let Some(comments) = task.get("comments").and_then(serde_json::Value::as_array) {
         for c in comments {
@@ -8892,7 +9803,13 @@ fn nudge_body(threshold_hours: f64, assignee: &str, idle_secs: i64) -> String {
 /// the `router` (the operator-accountable backstop) in to make the call — chase an ETA, reassign, mark it
 /// blocked, or close it — while still giving the owner the chance to respond. Names the owner so the trail
 /// shows who went silent. Pure — unit-tested.
-fn pm_tag_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswered_rounds: usize, router: &str) -> String {
+fn pm_tag_body(
+    threshold_hours: f64,
+    assignee: &str,
+    idle_secs: i64,
+    unanswered_rounds: usize,
+    router: &str,
+) -> String {
     format!(
         "fleet escalation: this task is still idle (over {threshold_hours}h, idle {}) after {unanswered_rounds} \
          unanswered nudge(s) to {assignee}. {router}, please make the call: chase an ETA, reassign it to an \
@@ -8907,7 +9824,13 @@ fn pm_tag_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswered_
 /// daemon escalates to a REASSIGN — it tags the `router` to hand the task to a fresh agent (mint a helper if
 /// needed) rather than keep waiting on an owner who is not picking it up. The router still makes the call (no
 /// blind auto-reassign). Pure — unit-tested.
-fn escalation_body(threshold_hours: f64, assignee: &str, idle_secs: i64, unanswered_rounds: usize, router: &str) -> String {
+fn escalation_body(
+    threshold_hours: f64,
+    assignee: &str,
+    idle_secs: i64,
+    unanswered_rounds: usize,
+    router: &str,
+) -> String {
     format!(
         "fleet escalation (REASSIGN): this task is still idle (over {threshold_hours}h, idle {}) after \
          {unanswered_rounds} unanswered nudge(s) to {assignee}, who is not picking it up. {router}, please \
@@ -9026,7 +9949,11 @@ fn nudge_run_is_outage(apply: bool, posted: usize, failed: usize) -> bool {
 /// task_859 facet 2: the nudge threshold scaled by task PRIORITY. A LOW-priority task keeps nudging — on a
 /// longer interval (`low_scale`x the base) — rather than dropping out of oversight entirely; normal / high /
 /// absent priority keep the base threshold. Pure — unit-tested.
-fn priority_scaled_threshold(base_threshold_secs: i64, priority: Option<&str>, low_scale: i64) -> i64 {
+fn priority_scaled_threshold(
+    base_threshold_secs: i64,
+    priority: Option<&str>,
+    low_scale: i64,
+) -> i64 {
     match priority {
         Some("low") => base_threshold_secs.saturating_mul(low_scale.max(1)),
         _ => base_threshold_secs,
@@ -9044,19 +9971,31 @@ fn open_children_rollup(task: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|c| {
-            let status = c.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+            let status = c
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             if status == "done" || status == "cancelled" {
                 return None;
             }
             let id = c.get("id").and_then(serde_json::Value::as_i64)?;
-            let title = c.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+            let title = c
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             let blocked = c
                 .get("blocked_on_kind")
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(|k| match c.get("blocked_on_ref").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()) {
-                    Some(r) => format!(", blocked_on {k} {r}"),
-                    None => format!(", blocked_on {k}"),
+                .map(|k| {
+                    match c
+                        .get("blocked_on_ref")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(r) => format!(", blocked_on {k} {r}"),
+                        None => format!(", blocked_on {k}"),
+                    }
                 })
                 .unwrap_or_default();
             Some(format!("task_{id} [{status}{blocked}] {title}"))
@@ -9069,8 +10008,17 @@ fn open_children_rollup(task: &serde_json::Value) -> Vec<String> {
 /// silently un-nudged (task_486: a parent read quiet ~16h with its one child blocked_on=operator and nobody
 /// surfaced it). The idle is the parent's OWN activity, never rolled up from children (that would re-suppress
 /// the nudge). Pure — unit-tested.
-fn parent_rollup_body(threshold_hours: f64, assignee: &str, idle_secs: i64, open_children: &[String]) -> String {
-    let kids = open_children.iter().map(|c| format!("  - {c}")).collect::<Vec<_>>().join("\n");
+fn parent_rollup_body(
+    threshold_hours: f64,
+    assignee: &str,
+    idle_secs: i64,
+    open_children: &[String],
+) -> String {
+    let kids = open_children
+        .iter()
+        .map(|c| format!("  - {c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "fleet nudge: this parent task has had no activity of its OWN for over {threshold_hours}h (idle {}), \
          but it has open children whose progress it tracks. {assignee}, please post a rollup of where the \
@@ -9095,7 +10043,11 @@ fn fleet_is_quiesced(sentinel_age_secs: Option<i64>, ttl_secs: i64) -> bool {
 fn quiesce_sentinel_age_secs(now: time::OffsetDateTime) -> Option<i64> {
     let path = quiesce_sentinel_path();
     let text = std::fs::read_to_string(&path).ok()?;
-    if let Some(age) = text.lines().next().and_then(|l| last_seen_age_secs(l.trim(), now)) {
+    if let Some(age) = text
+        .lines()
+        .next()
+        .and_then(|l| last_seen_age_secs(l.trim(), now))
+    {
         return Some(age);
     }
     // No parseable timestamp on line 1 (a hand-created sentinel) → use the file mtime as the quiesce start.
@@ -9121,7 +10073,10 @@ fn set_fleet_quiesce() {
          {FLEET_QUIESCE_TTL_HOURS}h.\n"
     );
     match std::fs::write(&path, body) {
-        Ok(()) => println!("  fleet-quiesce ON — nudge-stale suppressed (sentinel {})", path.display()),
+        Ok(()) => println!(
+            "  fleet-quiesce ON — nudge-stale suppressed (sentinel {})",
+            path.display()
+        ),
         Err(e) => eprintln!(
             "  WARN: could not write quiesce sentinel {}: {e} (nudge daemon NOT suppressed this wind-down)",
             path.display()
@@ -9135,9 +10090,15 @@ fn set_fleet_quiesce() {
 fn clear_fleet_quiesce() {
     let path = quiesce_sentinel_path();
     match std::fs::remove_file(&path) {
-        Ok(()) => println!("  fleet-quiesce OFF — nudge-stale resumes (removed {})", path.display()),
+        Ok(()) => println!(
+            "  fleet-quiesce OFF — nudge-stale resumes (removed {})",
+            path.display()
+        ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("  WARN: could not remove quiesce sentinel {}: {e}", path.display()),
+        Err(e) => eprintln!(
+            "  WARN: could not remove quiesce sentinel {}: {e}",
+            path.display()
+        ),
     }
 }
 
@@ -9147,7 +10108,10 @@ fn clear_fleet_quiesce() {
 /// it is worth flagging for cleanup). Pure — unit-tested.
 fn quiesce_status_line(sentinel_age_secs: Option<i64>, ttl_secs: i64) -> String {
     match sentinel_age_secs {
-        None => "fleet-quiesce: OFF (no sentinel) — nudge-stale + watchdog auto-actions run normally".to_string(),
+        None => {
+            "fleet-quiesce: OFF (no sentinel) — nudge-stale + watchdog auto-actions run normally"
+                .to_string()
+        }
         Some(age) if age < ttl_secs => format!(
             "fleet-quiesce: ON — set {} ago, {} until TTL self-expiry; nudge-stale + watchdog auto-actions (revive-stranded / hire-signal / recover-wedged) suppressed",
             format_hm(age),
@@ -9175,7 +10139,10 @@ fn quiesce_cmd(on: bool, off: bool) {
         clear_fleet_quiesce();
     }
     let now = time::OffsetDateTime::now_utc();
-    println!("{}", quiesce_status_line(quiesce_sentinel_age_secs(now), ttl_secs));
+    println!(
+        "{}",
+        quiesce_status_line(quiesce_sentinel_age_secs(now), ttl_secs)
+    );
 }
 
 /// task_1032: does THIS `spin-up-all` wave COMPLETE the fan-out (no down candidates remain after it), so the
@@ -9232,7 +10199,11 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         .list_agents()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|a| a.get("id").and_then(serde_json::Value::as_str).map(str::to_string))
+        .filter_map(|a| {
+            a.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     // task_1032 (KB 8f001c48 retire-marker follow-on): the DECLARED fleet roster — the agents registry.json
     // still manages. A spun-down-RESUMABLE agent stays declared (its registry entry survives a park); only a
@@ -9241,25 +10212,37 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
     // rerouting 60+ parked owners' work the moment their board records go (the predicted migration wave). This
     // registry-membership check is the explicit resume-vs-retire marker KB 8f001c48 parked. Best-effort: a load
     // failure yields an empty set, degrading [`owner_is_gone`] to the board-roster-only signal (prior behavior).
-    let declared_fleet: std::collections::BTreeSet<String> =
-        Fleet::resolve().load().agents.into_iter().map(|a| a.name).collect();
+    let declared_fleet: std::collections::BTreeSet<String> = Fleet::resolve()
+        .load()
+        .agents
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
     // #540: nudge stale ASSIGNED work in in_progress AND todo. A task where work started (a plan comment) but
     // was never flipped to in_progress still stalls, and the operator wants it caught (task_512). A bare
     // untouched todo is NOT nudged — the per-task check below requires worker activity for a todo — so widening
     // to todo stays high-signal (real stalls only, not unstarted backlog).
-    let mut candidates = board.list_tasks_by_status("in_progress").unwrap_or_else(|e| {
-        eprintln!("fleet nudge-stale: {e}");
-        std::process::exit(1);
-    });
+    let mut candidates = board
+        .list_tasks_by_status("in_progress")
+        .unwrap_or_else(|e| {
+            eprintln!("fleet nudge-stale: {e}");
+            std::process::exit(1);
+        });
     match board.list_tasks_by_status("todo") {
         Ok(mut todo) => candidates.append(&mut todo),
-        Err(e) => eprintln!("fleet nudge-stale: listing todo tasks failed ({e}); nudging in_progress only"),
+        Err(e) => eprintln!(
+            "fleet nudge-stale: listing todo tasks failed ({e}); nudging in_progress only"
+        ),
     }
 
     println!(
         "fleet nudge-stale: {} assigned in_progress/todo task(s), threshold {threshold_hours}h, cooldown {cooldown_hours}h{}",
         candidates.len(),
-        if apply { "" } else { " (DRY RUN — no comments will be posted)" }
+        if apply {
+            ""
+        } else {
+            " (DRY RUN — no comments will be posted)"
+        }
     );
 
     // The operator's own tasks are their work queue, not a stall, so a task assigned to the operator is never
@@ -9337,7 +10320,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         };
         // Re-check status: it may have changed between the list query and this fetch. #540: in_progress OR
         // todo now qualify.
-        let status = full.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+        let status = full
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if status != "in_progress" && status != "todo" {
             continue;
         }
@@ -9345,7 +10331,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         // record, not the older list snapshot — a task reassigned or unassigned between the list query and now
         // must route/nudge on its LIVE owner, closing the read-vs-act race. Re-apply the operator exclusion on
         // the fresh value too (a task just handed to the operator must not be nudged).
-        let assignee = full.get("assignee").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
+        let assignee = full
+            .get("assignee")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty());
         if operator_id.is_some() && assignee == operator_id {
             continue;
         }
@@ -9377,11 +10366,13 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         // so a consistently-responsive owner is pinged progressively less often instead of hourly — without
         // going fully silent (the task stays visible, not monitor_exempt). A silent owner (ack not fresher) is
         // unaffected: stale_task_should_nudge then uses the normal cooldown and the escalation ladder proceeds.
-        let effective_acked_cooldown = acked_cooldown_with_backoff(acked_cooldown_secs, nudge_comment_count(&full));
+        let effective_acked_cooldown =
+            acked_cooldown_with_backoff(acked_cooldown_secs, nudge_comment_count(&full));
         // task_859 facet 2: scale the first-nudge threshold by priority so a LOW-priority task still surfaces
         // when it goes silent, just on a longer interval, instead of dropping out of oversight entirely.
         let priority = full.get("priority").and_then(serde_json::Value::as_str);
-        let eff_threshold_secs = priority_scaled_threshold(threshold_secs, priority, LOW_PRIORITY_NUDGE_SCALE);
+        let eff_threshold_secs =
+            priority_scaled_threshold(threshold_secs, priority, LOW_PRIORITY_NUDGE_SCALE);
         if !stale_task_should_nudge(
             idle_secs,
             last_nudge_secs,
@@ -9393,7 +10384,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
             continue;
         }
 
-        let title = t.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+        let title = t
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         // #540 inc2: decide ROUTE (reassign to the router) vs NUDGE (ping a live owner). Route an UNASSIGNED
         // task, or one whose owner is GONE from the roster — retired/removed, not merely offline (an offline
         // owner is usually a DELIBERATELY spun-down, resumable agent whose task must stay with it, board-pm
@@ -9411,13 +10405,22 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         match route_reason {
             Some(reason) => {
                 if apply {
-                    let res = board.reassign_task(id, NUDGE_ROUTER, NUDGE_AUTHOR).and_then(|()| {
-                        board.comment_task(id, NUDGE_AUTHOR, &route_body(&reason, threshold_hours, idle_secs))
-                    });
+                    let res = board
+                        .reassign_task(id, NUDGE_ROUTER, NUDGE_AUTHOR)
+                        .and_then(|()| {
+                            board.comment_task(
+                                id,
+                                NUDGE_AUTHOR,
+                                &route_body(&reason, threshold_hours, idle_secs),
+                            )
+                        });
                     match res {
                         Ok(()) => {
                             routed += 1;
-                            println!("  routed #{id} \"{title}\" → {NUDGE_ROUTER} ({reason}, idle={})", format_hm(idle_secs));
+                            println!(
+                                "  routed #{id} \"{title}\" → {NUDGE_ROUTER} ({reason}, idle={})",
+                                format_hm(idle_secs)
+                            );
                         }
                         Err(e) => {
                             failed += 1;
@@ -9426,7 +10429,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                     }
                 } else {
                     routed += 1;
-                    println!("  would route #{id} \"{title}\" → {NUDGE_ROUTER} ({reason}, idle={})", format_hm(idle_secs));
+                    println!(
+                        "  would route #{id} \"{title}\" → {NUDGE_ROUTER} ({reason}, idle={})",
+                        format_hm(idle_secs)
+                    );
                 }
             }
             None => {
@@ -9439,7 +10445,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                 // task_627 (task_499): never escalate a RESPONSIVE owner — one who has commented since our last
                 // nudge (ack_fresher) is engaged, so the ladder is capped at the Owner tier (no router PM-tag or
                 // reassign). board-pm's hard requirement.
-                let tier = responsive_capped_tier(nudge_tier(round, pm_tag_round, reassign_round), ack_fresher);
+                let tier = responsive_capped_tier(
+                    nudge_tier(round, pm_tag_round, reassign_round),
+                    ack_fresher,
+                );
                 // task_859 facet 1: at the Owner tier, a parent with open children gets a child-rollup body
                 // instead of the generic nudge. Higher tiers (the owner has gone silent) keep the escalation
                 // ladder bodies that pull in the router.
@@ -9453,15 +10462,28 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                 };
                 if apply {
                     let body = match tier {
-                        NudgeTier::Owner if parent_rollup => parent_rollup_body(threshold_hours, owner, idle_secs, &open_children),
+                        NudgeTier::Owner if parent_rollup => {
+                            parent_rollup_body(threshold_hours, owner, idle_secs, &open_children)
+                        }
                         NudgeTier::Owner => nudge_body(threshold_hours, owner, idle_secs),
-                        NudgeTier::PmTag => pm_tag_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER),
-                        NudgeTier::Reassign => escalation_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER),
+                        NudgeTier::PmTag => {
+                            pm_tag_body(threshold_hours, owner, idle_secs, unanswered, NUDGE_ROUTER)
+                        }
+                        NudgeTier::Reassign => escalation_body(
+                            threshold_hours,
+                            owner,
+                            idle_secs,
+                            unanswered,
+                            NUDGE_ROUTER,
+                        ),
                     };
                     match board.comment_task(id, NUDGE_AUTHOR, &body) {
                         Ok(()) => {
                             nudged += 1;
-                            println!("  nudged #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})", format_hm(idle_secs));
+                            println!(
+                                "  nudged #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})",
+                                format_hm(idle_secs)
+                            );
                             // task_627 inc2b: a PM-tag or reassign is a ROUTER escalation — capture it for the
                             // once-per-sweep accountability digest so the router is woken with it. A plain
                             // owner nudge (round 1) is owner-facing only and does not go to the channel.
@@ -9483,7 +10505,10 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
                     }
                 } else {
                     nudged += 1;
-                    println!("  would nudge #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})", format_hm(idle_secs));
+                    println!(
+                        "  would nudge #{id} \"{title}\" ({kind}, round {round}, assignee={owner}, idle={})",
+                        format_hm(idle_secs)
+                    );
                     if matches!(tier, NudgeTier::PmTag | NudgeTier::Reassign) {
                         would_escalate += 1;
                     }
@@ -9497,8 +10522,16 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
         if apply { "posted" } else { "would post" },
         nudged,
         routed,
-        if failed > 0 { format!(" ({failed} FAILED)") } else { String::new() },
-        if apply { "" } else { " — re-run with --apply to act" }
+        if failed > 0 {
+            format!(" ({failed} FAILED)")
+        } else {
+            String::new()
+        },
+        if apply {
+            ""
+        } else {
+            " — re-run with --apply to act"
+        }
     );
 
     // task_627 inc2b: push this sweep's router escalations (PM-tags + reassigns) to the fleet-accountability
@@ -9528,7 +10561,9 @@ fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
             }
         }
     } else if would_escalate > 0 {
-        println!("  would post accountability digest ({would_escalate} escalation(s)) to #{ACCOUNTABILITY_CHANNEL}");
+        println!(
+            "  would post accountability digest ({would_escalate} escalation(s)) to #{ACCOUNTABILITY_CHANNEL}"
+        );
     }
 
     // task_609: a total-outage guard. If this apply run ATTEMPTED posts but landed ZERO (every nudge/route
@@ -9639,8 +10674,10 @@ fn write_units_to_dir(dir: &str, units: &[(&str, &str)]) {
 /// rendered as systemd `Environment=` lines. Run at install time from the working interactive session so the
 /// captured values are the ones under which a Claude session actually launches. Reads the environment (not pure).
 fn captured_observer_env() -> String {
-    let vars: Vec<(&str, Option<String>)> =
-        OBSERVER_ENV_ALLOWLIST.iter().map(|n| (*n, std::env::var(n).ok())).collect();
+    let vars: Vec<(&str, Option<String>)> = OBSERVER_ENV_ALLOWLIST
+        .iter()
+        .map(|n| (*n, std::env::var(n).ok()))
+        .collect();
     render_service_env_lines(&vars)
 }
 
@@ -9681,7 +10718,12 @@ fn watchdog_unit_files(
 /// The two units concatenated with display headers, for `fleet watchdog-unit` stdout — a host installs these
 /// DECLARATIVELY (home-manager `systemd.user.services`/`timers`); the emitted text is the canonical shape to
 /// translate, not a file to write. Pure — unit-tested.
-fn render_watchdog_units(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) -> String {
+fn render_watchdog_units(
+    fleet_bin: &str,
+    exec_args: &str,
+    interval_secs: u64,
+    env_block: &str,
+) -> String {
     let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs, env_block);
     format!(
         "# ---- fleet-watchdog.service (systemd USER oneshot) ----\n{service}\n\
@@ -9729,8 +10771,14 @@ fn watchdog_unit(
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| "fleet".to_string())
     });
-    let exec_args =
-        watchdog_exec_args(rearm, observe, pinned_only, self_redeploy, hire_signal, reap_stale_observers);
+    let exec_args = watchdog_exec_args(
+        rearm,
+        observe,
+        pinned_only,
+        self_redeploy,
+        hire_signal,
+        reap_stale_observers,
+    );
     // The target-host line (task_948) comes first regardless of --observe, so a bare rearm-only unit still
     // names which host it manages. Only an observer-spawning watchdog ALSO needs a launch environment (a
     // rearm-only sweep just sends keys to an existing window) -- captured from this (working) session so the
@@ -9742,8 +10790,15 @@ fn watchdog_unit(
     // --out-dir (task_464 flake wiring): emit the correctly-named unit files into a GIVEN dir purely (no HOME,
     // no systemctl guidance) so a nix derivation can point it at $out. Takes precedence over install/print.
     if let Some(dir) = out_dir {
-        let (service, timer) = watchdog_unit_files(&fleet_bin, &exec_args, interval_secs, &env_block);
-        write_units_to_dir(&dir, &[("fleet-watchdog.service", &service), ("fleet-watchdog.timer", &timer)]);
+        let (service, timer) =
+            watchdog_unit_files(&fleet_bin, &exec_args, interval_secs, &env_block);
+        write_units_to_dir(
+            &dir,
+            &[
+                ("fleet-watchdog.service", &service),
+                ("fleet-watchdog.timer", &timer),
+            ],
+        );
         return;
     }
     if uninstall {
@@ -9754,32 +10809,50 @@ fn watchdog_unit(
         watchdog_unit_install(&fleet_bin, &exec_args, interval_secs, &env_block);
         return;
     }
-    print!("{}", render_watchdog_units(&fleet_bin, &exec_args, interval_secs, &env_block));
+    print!(
+        "{}",
+        render_watchdog_units(&fleet_bin, &exec_args, interval_secs, &env_block)
+    );
 }
 
 /// Write the watchdog service + timer into `~/.config/systemd/user/` and print the enable command. User-level
 /// (no sudo). Idempotent (overwrites). Non-fatal guidance to stop any ad-hoc watchdog loop and to reverse.
 fn watchdog_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) {
     let Some(dir) = user_unit_dir() else {
-        eprintln!("fleet watchdog-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
+        eprintln!(
+            "fleet watchdog-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)"
+        );
         std::process::exit(1);
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("fleet watchdog-unit --install: mkdir {}: {e}", dir.display());
+        eprintln!(
+            "fleet watchdog-unit --install: mkdir {}: {e}",
+            dir.display()
+        );
         std::process::exit(1);
     }
     let (service, timer) = watchdog_unit_files(fleet_bin, exec_args, interval_secs, env_block);
-    for (name, body) in [("fleet-watchdog.service", &service), ("fleet-watchdog.timer", &timer)] {
+    for (name, body) in [
+        ("fleet-watchdog.service", &service),
+        ("fleet-watchdog.timer", &timer),
+    ] {
         let path = dir.join(name);
         if let Err(e) = std::fs::write(&path, body) {
-            eprintln!("fleet watchdog-unit --install: write {}: {e}", path.display());
+            eprintln!(
+                "fleet watchdog-unit --install: write {}: {e}",
+                path.display()
+            );
             std::process::exit(1);
         }
         println!("installed {}", path.display());
     }
     println!("  ExecStart: {fleet_bin} {exec_args}");
-    println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now fleet-watchdog.timer");
-    println!("  reverse: fleet watchdog-unit --uninstall  (or: systemctl --user disable --now fleet-watchdog.timer)");
+    println!(
+        "  enable:  systemctl --user daemon-reload && systemctl --user enable --now fleet-watchdog.timer"
+    );
+    println!(
+        "  reverse: fleet watchdog-unit --uninstall  (or: systemctl --user disable --now fleet-watchdog.timer)"
+    );
 }
 
 /// Remove the user watchdog units this installed and print the disable command. Best-effort (a missing file is
@@ -9794,7 +10867,9 @@ fn watchdog_unit_uninstall() {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => println!("removed {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("absent (ok): {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("absent (ok): {}", path.display())
+            }
             Err(e) => eprintln!("  WARN: remove {}: {e}", path.display()),
         }
     }
@@ -9819,7 +10894,12 @@ fn up_exec_args(pinned_only: bool) -> String {
 /// The timer fires it shortly after boot (`OnBootSec`) and periodically re-reconciles on `OnUnitActiveSec`, so a
 /// rebooted host brings its fleet back up and a window that died between watchdog re-arms is relaunched.
 /// `env_block` is the pre-rendered `Environment=` lines (the FLEET_HOST host-parameterization). Pure -- unit-tested.
-fn up_unit_files(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) -> (String, String) {
+fn up_unit_files(
+    fleet_bin: &str,
+    exec_args: &str,
+    interval_secs: u64,
+    env_block: &str,
+) -> (String, String) {
     let service = format!(
         "[Unit]\n\
          Description=Fleet launcher — reconstitute board-native agents (up-board) from the board, no file-hub\n\
@@ -9845,7 +10925,12 @@ fn up_unit_files(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block
 
 /// The two launcher units concatenated with display headers, for `fleet up-unit` stdout -- a host installs these
 /// DECLARATIVELY (home-manager); the emitted text is the canonical shape to translate. Pure -- unit-tested.
-fn render_up_units(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) -> String {
+fn render_up_units(
+    fleet_bin: &str,
+    exec_args: &str,
+    interval_secs: u64,
+    env_block: &str,
+) -> String {
     let (service, timer) = up_unit_files(fleet_bin, exec_args, interval_secs, env_block);
     format!(
         "# ---- fleet-up.service (systemd USER oneshot — fleet up-board --launch) ----\n{service}\n\
@@ -9881,7 +10966,10 @@ fn up_unit(
     // can point it at $out. Takes precedence over install/print.
     if let Some(dir) = out_dir {
         let (service, timer) = up_unit_files(&fleet_bin, &exec_args, interval_secs, &env_block);
-        write_units_to_dir(&dir, &[("fleet-up.service", &service), ("fleet-up.timer", &timer)]);
+        write_units_to_dir(
+            &dir,
+            &[("fleet-up.service", &service), ("fleet-up.timer", &timer)],
+        );
         return;
     }
     if uninstall {
@@ -9892,14 +10980,19 @@ fn up_unit(
         up_unit_install(&fleet_bin, &exec_args, interval_secs, &env_block);
         return;
     }
-    print!("{}", render_up_units(&fleet_bin, &exec_args, interval_secs, &env_block));
+    print!(
+        "{}",
+        render_up_units(&fleet_bin, &exec_args, interval_secs, &env_block)
+    );
 }
 
 /// Write the launcher service + timer into `~/.config/systemd/user/` and print the enable command. User-level
 /// (no sudo). Idempotent (overwrites).
 fn up_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_block: &str) {
     let Some(dir) = user_unit_dir() else {
-        eprintln!("fleet up-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
+        eprintln!(
+            "fleet up-unit --install: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)"
+        );
         std::process::exit(1);
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -9916,8 +11009,12 @@ fn up_unit_install(fleet_bin: &str, exec_args: &str, interval_secs: u64, env_blo
         println!("installed {}", path.display());
     }
     println!("  ExecStart: {fleet_bin} {exec_args}");
-    println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now fleet-up.timer");
-    println!("  reverse: fleet up-unit --uninstall  (or: systemctl --user disable --now fleet-up.timer)");
+    println!(
+        "  enable:  systemctl --user daemon-reload && systemctl --user enable --now fleet-up.timer"
+    );
+    println!(
+        "  reverse: fleet up-unit --uninstall  (or: systemctl --user disable --now fleet-up.timer)"
+    );
 }
 
 /// Remove the user launcher units this installed and print the disable command. Best-effort (a missing file is
@@ -9932,7 +11029,9 @@ fn up_unit_uninstall() {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => println!("removed {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("absent (ok): {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("absent (ok): {}", path.display())
+            }
             Err(e) => eprintln!("  WARN: remove {}: {e}", path.display()),
         }
     }
@@ -9974,7 +11073,12 @@ fn captured_daemon_env() -> String {
 fn enable_argv(unit: &str) -> Vec<Vec<String>> {
     vec![
         vec!["--user".into(), "daemon-reload".into()],
-        vec!["--user".into(), "enable".into(), "--now".into(), unit.into()],
+        vec![
+            "--user".into(),
+            "enable".into(),
+            "--now".into(),
+            unit.into(),
+        ],
     ]
 }
 
@@ -10006,7 +11110,9 @@ fn daemon_unit(
         let path = dir.join(&unit);
         match std::fs::remove_file(&path) {
             Ok(()) => println!("removed {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("absent (ok): {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("absent (ok): {}", path.display())
+            }
             Err(e) => eprintln!("  WARN: remove {}: {e}", path.display()),
         }
         println!("  then: systemctl --user daemon-reload");
@@ -10022,7 +11128,9 @@ fn daemon_unit(
         Some(e) => e,
         None if name == "notifier" => format!("{fleet_bin} notify"),
         None => {
-            eprintln!("fleet daemon-unit {name}: --exec is required (no built-in command for '{name}'; the notifier defaults to `<bin> notify`)");
+            eprintln!(
+                "fleet daemon-unit {name}: --exec is required (no built-in command for '{name}'; the notifier defaults to `<bin> notify`)"
+            );
             std::process::exit(1);
         }
     };
@@ -10041,7 +11149,9 @@ fn daemon_unit(
     // `--enable` implies the write (it is the one-shot bring-up), so either flag lands the unit file.
     if install || enable {
         let Some(dir) = user_unit_dir() else {
-            eprintln!("fleet daemon-unit: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)");
+            eprintln!(
+                "fleet daemon-unit: cannot resolve ~/.config/systemd/user (no HOME/XDG_CONFIG_HOME)"
+            );
             std::process::exit(1);
         };
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -10062,14 +11172,26 @@ fn daemon_unit(
             for args in enable_argv(&unit) {
                 match std::process::Command::new("systemctl").args(&args).status() {
                     Ok(s) if s.success() => println!("  ran: systemctl {}", args.join(" ")),
-                    Ok(_) => eprintln!("  WARN: systemctl {} returned non-zero (enable it later once the user manager is up)", args.join(" ")),
-                    Err(e) => eprintln!("  WARN: systemctl {} failed: {e} (enable it later)", args.join(" ")),
+                    Ok(_) => eprintln!(
+                        "  WARN: systemctl {} returned non-zero (enable it later once the user manager is up)",
+                        args.join(" ")
+                    ),
+                    Err(e) => eprintln!(
+                        "  WARN: systemctl {} failed: {e} (enable it later)",
+                        args.join(" ")
+                    ),
                 }
             }
-            println!("  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})");
+            println!(
+                "  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})"
+            );
         } else {
-            println!("  enable:  systemctl --user daemon-reload && systemctl --user enable --now {unit}");
-            println!("  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})");
+            println!(
+                "  enable:  systemctl --user daemon-reload && systemctl --user enable --now {unit}"
+            );
+            println!(
+                "  reverse: fleet daemon-unit {name} --uninstall  (or: systemctl --user disable --now {unit})"
+            );
         }
         return;
     }
@@ -10080,7 +11202,11 @@ fn daemon_unit(
 /// into `FLEET_BUILD_REV`). Lets an operator or agent tell whether a deployed binary is current by comparing
 /// the rev to `origin/main` — the signal that was missing when a stale watchdog binary silently ran old logic.
 fn version_line() -> String {
-    format!("fleet {} (rev {})", env!("CARGO_PKG_VERSION"), env!("FLEET_BUILD_REV"))
+    format!(
+        "fleet {} (rev {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("FLEET_BUILD_REV")
+    )
 }
 
 /// Whether the running binary is STALE relative to its source checkout — the baked build rev differs from the
@@ -10117,7 +11243,11 @@ enum StaleSelfAction {
 /// Decide the watchdog's binary-freshness action (#388). Reuses [`build_freshness_warning`] as the cheap
 /// baked-vs-HEAD staleness signal (no per-sweep network fetch): when it reports staleness, `--self-redeploy`
 /// turns the passive warning into a redeploy trigger. Pure — unit-tested.
-fn watchdog_stale_self_action(baked_rev: &str, checkout_head: Option<&str>, self_redeploy: bool) -> StaleSelfAction {
+fn watchdog_stale_self_action(
+    baked_rev: &str,
+    checkout_head: Option<&str>,
+    self_redeploy: bool,
+) -> StaleSelfAction {
     match build_freshness_warning(baked_rev, checkout_head) {
         None => StaleSelfAction::Fresh,
         Some(w) if self_redeploy => StaleSelfAction::Redeploy(w),
@@ -10129,12 +11259,19 @@ fn watchdog_stale_self_action(baked_rev: &str, checkout_head: Option<&str>, self
 /// containing `.git`. `None` when there is no source tree (a deployed/hermetic binary). Best-effort.
 fn checkout_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    exe.ancestors().find(|p| p.join(".git").exists()).map(Path::to_path_buf)
+    exe.ancestors()
+        .find(|p| p.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 /// Run `git -C <root> <args...>` and return trimmed stdout on success, else `None`. Best-effort git helper.
 fn git_capture(root: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -10164,8 +11301,11 @@ fn checkout_head_short() -> Option<String> {
 
 /// The default systemd USER units `fleet redeploy` restarts (the long-running fleet daemons) when the config
 /// does not override `redeploy_services`. A unit not present on this host is skipped, not an error.
-const DEFAULT_REDEPLOY_SERVICES: &[&str] =
-    &["fleet-watchdog.timer", "fleet-notify.service", "fleet-tunnel.service"];
+const DEFAULT_REDEPLOY_SERVICES: &[&str] = &[
+    "fleet-watchdog.timer",
+    "fleet-notify.service",
+    "fleet-tunnel.service",
+];
 
 /// The release builds `fleet redeploy` runs before restarting the daemons — one per binary that BACKS a
 /// service in [`DEFAULT_REDEPLOY_SERVICES`]. `fleet-watchdog`/`fleet-notify` are the `fleet` binary
@@ -10173,8 +11313,10 @@ const DEFAULT_REDEPLOY_SERVICES: &[&str] =
 /// `--features transport`. Each entry is the cargo args AFTER `build --release`. Keep in sync with the
 /// restarted services: a daemon binary missing here would be restarted STALE — the #451 gap, where a
 /// fleet-tunnel change did not go live via redeploy because only `--bin fleet` was rebuilt.
-const REDEPLOY_BUILDS: &[&[&str]] =
-    &[&["--bin", "fleet"], &["-p", "fleet-tunnel", "--features", "transport"]];
+const REDEPLOY_BUILDS: &[&[&str]] = &[
+    &["--bin", "fleet"],
+    &["-p", "fleet-tunnel", "--features", "transport"],
+];
 
 /// What `fleet redeploy` should do, decided purely from the build/repo state. Pure — unit-tested.
 #[derive(Debug, PartialEq, Eq)]
@@ -10192,7 +11334,12 @@ enum RedeployAction {
 /// dirty build of the same commit is current). Otherwise a rebuild is needed, but only SAFE when the tree is
 /// clean AND on `main` (a fast-forward can't clobber); a dirty or off-`main` checkout returns `NeedsManual`
 /// so an automated redeploy never discards a sibling's in-progress work. Pure — unit-tested.
-fn redeploy_action(baked_rev: &str, remote_sha: &str, dirty: bool, on_main: bool) -> RedeployAction {
+fn redeploy_action(
+    baked_rev: &str,
+    remote_sha: &str,
+    dirty: bool,
+    on_main: bool,
+) -> RedeployAction {
     let base = baked_rev.strip_suffix("-dirty").unwrap_or(baked_rev);
     if base == remote_sha {
         return RedeployAction::UpToDate;
@@ -10239,10 +11386,13 @@ fn run_redeploy(apply: bool) -> Result<String, String> {
     // `cargo build --release` + restart would restart them onto the SAME store binary and silently no-op — an
     // ineffective redeploy that still LOOKS successful (the silent-success footgun). Refuse up front and direct
     // to the canonical nix path, rather than fetch/rebuild and misreport a deploy that changed nothing.
-    let planned_services: Vec<String> = config::get()
-        .redeploy_services
-        .clone()
-        .unwrap_or_else(|| DEFAULT_REDEPLOY_SERVICES.iter().map(|s| s.to_string()).collect());
+    let planned_services: Vec<String> =
+        config::get().redeploy_services.clone().unwrap_or_else(|| {
+            DEFAULT_REDEPLOY_SERVICES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
     let nix_units: Vec<String> = planned_services
         .iter()
         .filter(|s| unit_is_nix_managed(s) == Some(true))
@@ -10260,35 +11410,49 @@ fn run_redeploy(apply: bool) -> Result<String, String> {
         // fetch prints nothing on success, so None here can be a clean fetch OR a failure; probe the ref next.
     }
     let Some(remote_sha) = git_capture(&root, &["rev-parse", "--short", "origin/main"]) else {
-        return Err(format!("cannot resolve origin/main (fetch failed or no such remote) in {}", root.display()));
+        return Err(format!(
+            "cannot resolve origin/main (fetch failed or no such remote) in {}",
+            root.display()
+        ));
     };
     let dirty = git_capture(&root, &["status", "--porcelain"]).is_some();
-    let on_main = git_capture(&root, &["symbolic-ref", "--short", "HEAD"]).as_deref() == Some("main");
+    let on_main =
+        git_capture(&root, &["symbolic-ref", "--short", "HEAD"]).as_deref() == Some("main");
     let baked = env!("FLEET_BUILD_REV");
     let action = redeploy_action(baked, &remote_sha, dirty, on_main);
 
-    println!("fleet redeploy ({}): built rev {baked}, origin/main {remote_sha} — {}",
+    println!(
+        "fleet redeploy ({}): built rev {baked}, origin/main {remote_sha} — {}",
         if apply { "APPLY" } else { "report" },
         match &action {
             RedeployAction::UpToDate => "UP TO DATE".to_string(),
             RedeployAction::Rebuild => "REBUILD NEEDED (clean, on main)".to_string(),
-            RedeployAction::NeedsManual(why) => format!("BEHIND but MANUAL redeploy needed ({why})"),
+            RedeployAction::NeedsManual(why) =>
+                format!("BEHIND but MANUAL redeploy needed ({why})"),
         }
     );
     match action {
-        RedeployAction::UpToDate => return Ok(format!("up to date at {remote_sha}; nothing to redeploy")),
+        RedeployAction::UpToDate => {
+            return Ok(format!("up to date at {remote_sha}; nothing to redeploy"));
+        }
         RedeployAction::NeedsManual(why) => {
-            return Err(format!("not acting — {why}. Resolve it, then re-run (or rebuild by hand)."));
+            return Err(format!(
+                "not acting — {why}. Resolve it, then re-run (or rebuild by hand)."
+            ));
         }
         RedeployAction::Rebuild => {}
     }
     if !apply {
-        return Ok("report only — re-run with --apply to fast-forward, rebuild, and restart the daemons".to_string());
+        return Ok(
+            "report only — re-run with --apply to fast-forward, rebuild, and restart the daemons"
+                .to_string(),
+        );
     }
     // Fast-forward to origin/main (guaranteed possible: clean + on main + behind).
     println!("  fast-forwarding to origin/main…");
     if git_capture(&root, &["merge", "--ff-only", "origin/main"]).is_none()
-        && git_capture(&root, &["rev-parse", "--short", "HEAD"]).as_deref() != Some(remote_sha.as_str())
+        && git_capture(&root, &["rev-parse", "--short", "HEAD"]).as_deref()
+            != Some(remote_sha.as_str())
     {
         return Err("fast-forward to origin/main failed; aborting before rebuild".to_string());
     }
@@ -10296,10 +11460,16 @@ fn run_redeploy(apply: bool) -> Result<String, String> {
     // fleet-tunnel binary. If any build fails, abort before restarting so the daemons keep their old, working
     // binaries rather than being restarted onto a half-rebuilt tree.
     for &extra in REDEPLOY_BUILDS {
-        println!("  building release (cargo build --release {})…", extra.join(" "));
+        println!(
+            "  building release (cargo build --release {})…",
+            extra.join(" ")
+        );
         let mut args = vec!["build", "--release"];
         args.extend_from_slice(extra);
-        let build = std::process::Command::new("cargo").current_dir(&root).args(&args).status();
+        let build = std::process::Command::new("cargo")
+            .current_dir(&root)
+            .args(&args)
+            .status();
         match build {
             Ok(s) if s.success() => {}
             Ok(s) => {
@@ -10324,11 +11494,15 @@ fn run_redeploy(apply: bool) -> Result<String, String> {
         match st {
             Ok(s) if s.success() => println!("    restarted {svc}"),
             // A unit not installed on this host is not an error — the default set is a superset across hosts.
-            Ok(_) => println!("    skipped {svc} (not present on this host, or restart returned non-zero)"),
+            Ok(_) => println!(
+                "    skipped {svc} (not present on this host, or restart returned non-zero)"
+            ),
             Err(e) => println!("    could not restart {svc} ({e})"),
         }
     }
-    Ok(format!("now at {remote_sha}, binary rebuilt, daemons restarted."))
+    Ok(format!(
+        "now at {remote_sha}, binary rebuilt, daemons restarted."
+    ))
 }
 
 /// Whether a systemd unit's `ExecStart` runs a binary out of the nix store — the signal that the unit is
@@ -10374,7 +11548,12 @@ enum KillStep {
     GaveUp,
 }
 
-fn kill_confirm_step(alive: bool, deadline_passed: bool, sigkill_enabled: bool, sigkill_sent: bool) -> KillStep {
+fn kill_confirm_step(
+    alive: bool,
+    deadline_passed: bool,
+    sigkill_enabled: bool,
+    sigkill_sent: bool,
+) -> KillStep {
     if !alive {
         return KillStep::ConfirmedGone;
     }
@@ -10401,7 +11580,9 @@ fn process_is_alive(pid: i64) -> bool {
 }
 
 fn send_signal(sig: &str, pid: i64) {
-    let _ = std::process::Command::new("kill").args([sig, &pid.to_string()]).status();
+    let _ = std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status();
 }
 
 /// Does a `/proc/<pid>/exe` readlink target name the daemon `daemon`? The shell-agnostic core of the
@@ -10413,7 +11594,10 @@ fn send_signal(sig: &str, pid: i64) {
 /// strip is suffix-only, so a mid-path `(deleted)` directory never corrupts the match. Pure — unit-tested.
 fn exe_matches_daemon(exe_target: &str, daemon: &str) -> bool {
     let stripped = exe_target.strip_suffix(" (deleted)").unwrap_or(exe_target);
-    std::path::Path::new(stripped).file_name().and_then(|n| n.to_str()) == Some(daemon)
+    std::path::Path::new(stripped)
+        .file_name()
+        .and_then(|n| n.to_str())
+        == Some(daemon)
 }
 
 /// `fleet daemon-pids <daemon>` (task_924): print the pid of every LIVE process whose running binary is named
@@ -10443,7 +11627,8 @@ fn agent_from_cwd(cwd: &str) -> Option<&str> {
 /// do. Deterministic (agents sorted, kills ordered). Pure — unit-tested; the /proc scan and the actual kill
 /// wrap this.
 fn dedup_decision(instances: &[(u32, String, u64)]) -> Vec<(String, u32, Vec<u32>)> {
-    let mut by_agent: std::collections::BTreeMap<&str, Vec<(u32, u64)>> = std::collections::BTreeMap::new();
+    let mut by_agent: std::collections::BTreeMap<&str, Vec<(u32, u64)>> =
+        std::collections::BTreeMap::new();
     for (pid, agent, start) in instances {
         by_agent.entry(agent).or_default().push((*pid, *start));
     }
@@ -10469,7 +11654,11 @@ fn proc_stat_field(pid: u32, field: usize) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = &stat[stat.rfind(')')? + 1..];
     // Fields after comm begin at `state` (overall field 3), so overall field N is index N-3 here.
-    after_comm.split_whitespace().nth(field.checked_sub(3)?)?.parse::<u64>().ok()
+    after_comm
+        .split_whitespace()
+        .nth(field.checked_sub(3)?)?
+        .parse::<u64>()
+        .ok()
 }
 
 /// The process start time (field 22 of `/proc/<pid>/stat`, clock ticks since boot) — a smaller value is an older
@@ -10502,7 +11691,11 @@ fn ancestor_pids(start: u32, parent_of: &dyn Fn(u32) -> Option<u32>) -> Vec<u32>
 /// where `pkill -f` is not — the pattern can appear in the caller's own argv (an inline/heredoc command), but a
 /// protected pid is never returned. Pure — unit-tested.
 fn safe_kill_targets(matches: &[u32], protected: &std::collections::HashSet<u32>) -> Vec<u32> {
-    let mut out: Vec<u32> = matches.iter().copied().filter(|p| !protected.contains(p)).collect();
+    let mut out: Vec<u32> = matches
+        .iter()
+        .copied()
+        .filter(|p| !protected.contains(p))
+        .collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -10529,7 +11722,9 @@ fn safe_pkill(pattern: &str, dry_run: bool, signal: &str) {
     let mut cmdlines: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
-            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
             if own_pgrp.is_some() && proc_stat_field(pid, 5) == own_pgrp {
                 protected.insert(pid);
             }
@@ -10550,7 +11745,10 @@ fn safe_pkill(pattern: &str, dry_run: bool, signal: &str) {
         targets.len()
     );
     for pid in &targets {
-        let snip: String = cmdlines.get(pid).map(|c| c.chars().take(100).collect()).unwrap_or_default();
+        let snip: String = cmdlines
+            .get(pid)
+            .map(|c| c.chars().take(100).collect())
+            .unwrap_or_default();
         println!("  {pid}: {snip}");
     }
     if dry_run {
@@ -10563,7 +11761,14 @@ fn safe_pkill(pattern: &str, dry_run: bool, signal: &str) {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        println!("  {} pid {pid}", if ok { format!("SIG{signal} ->") } else { "FAILED to signal".to_string() });
+        println!(
+            "  {} pid {pid}",
+            if ok {
+                format!("SIG{signal} ->")
+            } else {
+                "FAILED to signal".to_string()
+            }
+        );
     }
 }
 
@@ -10576,13 +11781,23 @@ fn dedup_check(filter: Option<&str>, kill: bool) {
     let mut instances: Vec<(u32, String, u64)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
-            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
             // A Claude Code agent session's process comm is exactly `claude`.
-            if std::fs::read_to_string(e.path().join("comm")).unwrap_or_default().trim() != "claude" {
+            if std::fs::read_to_string(e.path().join("comm"))
+                .unwrap_or_default()
+                .trim()
+                != "claude"
+            {
                 continue;
             }
-            let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else { continue };
-            let Some(agent) = agent_from_cwd(&cwd.to_string_lossy()).map(str::to_string) else { continue };
+            let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else {
+                continue;
+            };
+            let Some(agent) = agent_from_cwd(&cwd.to_string_lossy()).map(str::to_string) else {
+                continue;
+            };
             if filter.is_some_and(|f| f != agent) {
                 continue;
             }
@@ -10593,7 +11808,9 @@ fn dedup_check(filter: Option<&str>, kill: bool) {
     println!(
         "dedup-check: {} live agent process(es){}",
         instances.len(),
-        filter.map(|f| format!(" (filter: {f})")).unwrap_or_default()
+        filter
+            .map(|f| format!(" (filter: {f})"))
+            .unwrap_or_default()
     );
     if dups.is_empty() {
         println!("  OK — every agent has at most one live instance (1:1 process:identity).");
@@ -10611,12 +11828,17 @@ fn dedup_check(filter: Option<&str>, kill: bool) {
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
-                println!("    {} pid {pid}", if ok { "SIGTERM ->" } else { "FAILED to kill" });
+                println!(
+                    "    {} pid {pid}",
+                    if ok { "SIGTERM ->" } else { "FAILED to kill" }
+                );
             }
         }
     }
     if !kill {
-        println!("  (report-only — re-run with --kill to SIGTERM the extra instance(s), keeping the oldest canonical)");
+        println!(
+            "  (report-only — re-run with --kill to SIGTERM the extra instance(s), keeping the oldest canonical)"
+        );
     }
 }
 
@@ -10636,7 +11858,11 @@ struct TaskboardIdentityConfig {
 /// `headers["X-Fleet-Agent"]` and `headersHelper`. Pure — unit-tested.
 fn taskboard_identity_config(config: &serde_json::Value) -> TaskboardIdentityConfig {
     let Some(entry) = config.get("mcpServers").and_then(|m| m.get("task-board")) else {
-        return TaskboardIdentityConfig { present: false, static_header: None, has_helper: false };
+        return TaskboardIdentityConfig {
+            present: false,
+            static_header: None,
+            has_helper: false,
+        };
     };
     let static_header = entry
         .get("headers")
@@ -10647,7 +11873,11 @@ fn taskboard_identity_config(config: &serde_json::Value) -> TaskboardIdentityCon
         .get("headersHelper")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|s| !s.is_empty());
-    TaskboardIdentityConfig { present: true, static_header, has_helper }
+    TaskboardIdentityConfig {
+        present: true,
+        static_header,
+        has_helper,
+    }
 }
 
 /// The verdict of an [`mcp_check_decision`].
@@ -10708,7 +11938,8 @@ fn mcp_check_decision(
             None => notes.push("task-board has no static headers[\"X-Fleet-Agent\"].".to_string()),
         }
         notes.push(if tb.has_helper {
-            "task-board headersHelper is configured (emits the header fresh at each connection).".to_string()
+            "task-board headersHelper is configured (emits the header fresh at each connection)."
+                .to_string()
         } else {
             "task-board has no headersHelper.".to_string()
         });
@@ -10732,9 +11963,19 @@ fn mcp_check_decision(
                 .static_header
                 .as_deref()
                 .is_some_and(|h| h == "${FLEET_AGENT}" || h == agent);
-        if static_ok { McpCheckVerdict::Pass } else { McpCheckVerdict::Warn }
+        if static_ok {
+            McpCheckVerdict::Pass
+        } else {
+            McpCheckVerdict::Warn
+        }
     };
-    McpCheckReport { fleet_agent_matches, uses_config_override, identity_wired, verdict, notes }
+    McpCheckReport {
+        fleet_agent_matches,
+        uses_config_override,
+        identity_wired,
+        verdict,
+        notes,
+    }
 }
 
 /// Read a single environment variable `key` from `/proc/<pid>/environ` (NUL-separated `KEY=VALUE`). None if the
@@ -10768,20 +12009,32 @@ fn mcp_check(agent: &str) {
     let mut pids: Vec<u32> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
-            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
             // A Claude Code agent session's process comm is exactly `claude`.
-            if std::fs::read_to_string(e.path().join("comm")).unwrap_or_default().trim() != "claude" {
+            if std::fs::read_to_string(e.path().join("comm"))
+                .unwrap_or_default()
+                .trim()
+                != "claude"
+            {
                 continue;
             }
-            let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else { continue };
+            let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else {
+                continue;
+            };
             if agent_from_cwd(&cwd.to_string_lossy()) == Some(agent) {
                 pids.push(pid);
             }
         }
     }
     if pids.is_empty() {
-        println!("mcp-check '{agent}': no live claude session found (no /proc entry with comm=claude cwd'd under agents/{agent}).");
-        println!("  (the agent may be down, or launched outside a worktree under .../agents/{agent})");
+        println!(
+            "mcp-check '{agent}': no live claude session found (no /proc entry with comm=claude cwd'd under agents/{agent})."
+        );
+        println!(
+            "  (the agent may be down, or launched outside a worktree under .../agents/{agent})"
+        );
         return;
     }
     // Keep the oldest (canonical) if duplicated — mirrors dedup-check's canonical choice.
@@ -10798,13 +12051,21 @@ fn mcp_check(agent: &str) {
     let argv = proc_cmdline(pid);
     let tb = match std::env::var("HOME")
         .map_err(|_| "no HOME".to_string())
-        .and_then(|home| std::fs::read_to_string(format!("{home}/.claude.json")).map_err(|e| e.to_string()))
+        .and_then(|home| {
+            std::fs::read_to_string(format!("{home}/.claude.json")).map_err(|e| e.to_string())
+        })
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string()))
     {
         Ok(v) => taskboard_identity_config(&v),
         Err(e) => {
-            println!("mcp-check '{agent}': could not read ~/.claude.json ({e}) — reporting without the task-board entry.");
-            TaskboardIdentityConfig { present: false, static_header: None, has_helper: false }
+            println!(
+                "mcp-check '{agent}': could not read ~/.claude.json ({e}) — reporting without the task-board entry."
+            );
+            TaskboardIdentityConfig {
+                present: false,
+                static_header: None,
+                has_helper: false,
+            }
         }
     };
 
@@ -10822,7 +12083,9 @@ fn mcp_check(agent: &str) {
         McpCheckVerdict::Pass => println!(
             "  => client is wired to auto-force identity for '{agent}'. A null attribution is then NOT a client-config problem — look server/transport-side."
         ),
-        McpCheckVerdict::Warn => println!("  => wired, but review the note(s) above before trusting auto-force for '{agent}'."),
+        McpCheckVerdict::Warn => println!(
+            "  => wired, but review the note(s) above before trusting auto-force for '{agent}'."
+        ),
         McpCheckVerdict::Fail => println!(
             "  => client will NOT auto-force identity for '{agent}' as configured; fix the note(s) above, then re-bounce (headersHelper is cached per connection, so a config change needs a reconnect)."
         ),
@@ -10834,9 +12097,15 @@ fn daemon_pids(daemon: &str) {
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             // Only numeric /proc/<pid> entries are processes.
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i64>() else { continue };
-            let Ok(target) = std::fs::read_link(entry.path().join("exe")) else { continue };
-            let Some(target) = target.to_str() else { continue };
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i64>() else {
+                continue;
+            };
+            let Ok(target) = std::fs::read_link(entry.path().join("exe")) else {
+                continue;
+            };
+            let Some(target) = target.to_str() else {
+                continue;
+            };
             if exe_matches_daemon(target, daemon) && process_is_alive(pid) {
                 found.push(pid);
             }
@@ -10876,7 +12145,9 @@ fn confirm_kill(pid: i64, term: bool, timeout: u64, sigkill: bool) {
                 deadline = std::time::Instant::now() + GRACE;
             }
             KillStep::GaveUp => {
-                eprintln!("pid {pid} STILL ALIVE after kill-confirm — do NOT start a replacement (would double-run)");
+                eprintln!(
+                    "pid {pid} STILL ALIVE after kill-confirm — do NOT start a replacement (would double-run)"
+                );
                 std::process::exit(1);
             }
         }
@@ -10906,96 +12177,225 @@ mod tests {
         // Identity (#336): the board does NOT bind the session (a fresh unbound board per call), so
         // register_agent can't make later id-less calls work — the kickoff must say pass ids EXPLICITLY on
         // EVERY call, and still register once + self-discover the charter via get_agent.
-        assert!(k.contains("register_agent"), "registers the record once (idempotent)");
+        assert!(
+            k.contains("register_agent"),
+            "registers the record once (idempotent)"
+        );
         assert!(k.contains("get_agent"), "self-discovers its charter");
-        assert!(k.contains("does NOT bind your session"), "states the board never binds the session (#336)");
-        assert!(k.contains("every board call THAT TAKES ONE"), "explicit ids on every call that takes one, not a fallback");
-        assert!(k.contains("from_agent") && k.contains("created_by") && k.contains("actor"), "names the explicit-id params incl. send_message's from_agent");
+        assert!(
+            k.contains("does NOT bind your session"),
+            "states the board never binds the session (#336)"
+        );
+        assert!(
+            k.contains("every board call THAT TAKES ONE"),
+            "explicit ids on every call that takes one, not a fallback"
+        );
+        assert!(
+            k.contains("from_agent") && k.contains("created_by") && k.contains("actor"),
+            "names the explicit-id params incl. send_message's from_agent"
+        );
         // task_1024 (rule-level, not list_tasks-specific): pure READ/FILTER tools take NO caller identity, so an
         // agent_id bolted onto list_tasks/get_task hard-rejects — 5 agents hit this on their post-flip boot ticks.
-        assert!(k.contains("PURE READ / FILTER tools take NO caller identity"), "states the no-identity-on-reads rule");
-        assert!(k.contains("get_task") && k.contains("unknown field agent_id"), "names get_task + the exact reject so an agent does not bolt agent_id onto a read");
+        assert!(
+            k.contains("PURE READ / FILTER tools take NO caller identity"),
+            "states the no-identity-on-reads rule"
+        );
+        assert!(
+            k.contains("get_task") && k.contains("unknown field agent_id"),
+            "names get_task + the exact reject so an agent does not bolt agent_id onto a read"
+        );
         // task_955: the typed-ref rule is for WRITTEN content; an id PARAMETER takes the bare integer, not a token.
-        assert!(k.contains("id PARAMETER is the opposite") && k.contains("takes the BARE INTEGER"), "carves out that an id argument takes a bare integer, not a typed/quoted token");
+        assert!(
+            k.contains("id PARAMETER is the opposite") && k.contains("takes the BARE INTEGER"),
+            "carves out that an id argument takes a bare integer, not a typed/quoted token"
+        );
         // Per-tool identity map (#531): each tool names identity DIFFERENTLY, and the wrong field records
         // actor=null and self-notifies you on your own comment — the exact footgun task_531 exists to stop.
-        assert!(k.contains("author on comment_task"), "names comment_task's author field explicitly (#531)");
-        assert!(k.contains("actor on update_task") && k.contains("created_by on create_task"), "per-tool write-identity map");
-        assert!(k.contains("wake on your OWN comment"), "warns that the wrong identity field self-notifies");
+        assert!(
+            k.contains("author on comment_task"),
+            "names comment_task's author field explicitly (#531)"
+        );
+        assert!(
+            k.contains("actor on update_task") && k.contains("created_by on create_task"),
+            "per-tool write-identity map"
+        );
+        assert!(
+            k.contains("wake on your OWN comment"),
+            "warns that the wrong identity field self-notifies"
+        );
         // Never precompute a task id (#526): reference only the id create_task returns.
-        assert!(k.contains("Never PRECOMPUTE") && k.contains("id create_task RETURNS"), "bans guessing a task id (#526)");
+        assert!(
+            k.contains("Never PRECOMPUTE") && k.contains("id create_task RETURNS"),
+            "bans guessing a task id (#526)"
+        );
         // Typed references (task_584): a bare `#N` is hard-rejected on board bodies, so the kickoff mandates
         // a TYPED id (`task_N` or `owner/repo#N`) in any comment/message/post — else a reword-retry every time.
-        assert!(k.contains("TYPED REFERENCES") && k.contains("owner/repo#N"), "mandates typed task/PR refs, not a bare #N (task_584)");
-        assert!(k.contains("hard-rejects a bare"), "states the board hard-rejects a bare #N in posted content");
+        assert!(
+            k.contains("TYPED REFERENCES") && k.contains("owner/repo#N"),
+            "mandates typed task/PR refs, not a bare #N (task_584)"
+        );
+        assert!(
+            k.contains("hard-rejects a bare"),
+            "states the board hard-rejects a bare #N in posted content"
+        );
         assert!(k.contains("'v-x'") && k.contains("/wt/v-x"));
         // OWNER-CONFIRM gate (#352): a trace-derived destructive/operator action against a service you don't
         // own must be owner-confirmed before executing or routing (a near-miss almost restarted a stale unit).
-        assert!(k.contains("OWNER-CONFIRM gate") && k.contains("OWNER-UNCONFIRMED"), "binds the owner-confirm gate for trace-derived destructive actions");
+        assert!(
+            k.contains("OWNER-CONFIRM gate") && k.contains("OWNER-UNCONFIRMED"),
+            "binds the owner-confirm gate for trace-derived destructive actions"
+        );
         // Shared-task coordination (task_565): R1 give-the-owner-a-beat (owner files a flagged spin-off; a
         // coordinator only if the owner is absent/stalled) + R2 dedup-is-single-writer (one owner picks the
         // survivor and FREEZES; never symmetric-cancel your own dup, which deadlocks).
-        assert!(k.contains("SHARED-TASK COORDINATION") && k.contains("the OWNER files the spin-off"), "R1: give the live owner a beat before a coordinator race-creates a flagged spin-off");
-        assert!(k.contains("DEDUP IS SINGLE-WRITER") && k.contains("symmetric-cancel"), "R2: dedup is single-writer; never symmetric-cancel your own dup (deadlock)");
+        assert!(
+            k.contains("SHARED-TASK COORDINATION") && k.contains("the OWNER files the spin-off"),
+            "R1: give the live owner a beat before a coordinator race-creates a flagged spin-off"
+        );
+        assert!(
+            k.contains("DEDUP IS SINGLE-WRITER") && k.contains("symmetric-cancel"),
+            "R2: dedup is single-writer; never symmetric-cancel your own dup (deadlock)"
+        );
         // Dynamic loop (no fixed interval arg after /loop) — the agent self-paces.
-        assert!(k.contains("/loop run one tick"), "dynamic /loop, not `/loop 30m`");
-        assert!(!k.contains("/loop 30m"), "must NOT pin a fixed interval on the loop");
+        assert!(
+            k.contains("/loop run one tick"),
+            "dynamic /loop, not `/loop 30m`"
+        );
+        assert!(
+            !k.contains("/loop 30m"),
+            "must NOT pin a fixed interval on the loop"
+        );
         // Work-conserving: gate the next wake on open assigned work + unread, long idle only when drained.
         assert!(k.contains("WORK-CONSERVING PACING"));
         assert!(k.contains("list_tasks with assignee 'v-x'"));
         assert!(k.contains("NEVER idle-sleep"));
-        assert!(k.contains("about 30m"), "the interval is the idle-fallback ceiling");
+        assert!(
+            k.contains("about 30m"),
+            "the interval is the idle-fallback ceiling"
+        );
         // blocked/parked ≠ actionable (board-pm refinement): the self-check counts only todo/in_progress and
         // excludes a blocked/parked task, so a task parked on a blocker doesn't keep the loop hot.
-        assert!(k.contains("todo/in_progress") && k.contains("NOT blocked/parked"), "blocked/parked is not actionable work");
+        assert!(
+            k.contains("todo/in_progress") && k.contains("NOT blocked/parked"),
+            "blocked/parked is not actionable work"
+        );
         // Doc-writing style guide clause (board-pm, operator-approved): every future author carries it.
-        assert!(k.contains("Fleet Doc-Writing Style Guide"), "kickoff points authors at the doc-writing style guide");
+        assert!(
+            k.contains("Fleet Doc-Writing Style Guide"),
+            "kickoff points authors at the doc-writing style guide"
+        );
         // Banned-phrases self-check (operator writing policy): reference the maintained list (data-driven),
         // applied to any doc OR comment, until the #308 pre-submit scanner lands.
-        assert!(k.contains("banned-phrases") && k.contains("doc OR comment"), "kickoff points authors at the banned-phrases list for docs and comments");
+        assert!(
+            k.contains("banned-phrases") && k.contains("doc OR comment"),
+            "kickoff points authors at the banned-phrases list for docs and comments"
+        );
         // task_589: never pass a shell $(cat file) substitution as an MCP content arg (stored verbatim,
         // silent clobber) + read back after a write; and no commit/PR attribution lines in board bodies.
-        assert!(k.contains("$(cat file)") && k.contains("READ BACK"), "warns against a $(cat) MCP arg + mandates read-back-after-write (task_589)");
-        assert!(k.contains("Co-Authored-By:") && k.contains("not board content"), "bans commit/PR attribution lines in board bodies");
+        assert!(
+            k.contains("$(cat file)") && k.contains("READ BACK"),
+            "warns against a $(cat) MCP arg + mandates read-back-after-write (task_589)"
+        );
+        assert!(
+            k.contains("Co-Authored-By:") && k.contains("not board content"),
+            "bans commit/PR attribution lines in board bodies"
+        );
         // External-dependency blocked → long/event-woken cadence (#349): the block carve-out is generalized
         // beyond the operator to ANY external dep (another agent, a pending deploy/CI), so an agent holding a
         // sole externally-blocked task sets it blocked + drops to the long cadence instead of SOON-polling.
-        assert!(k.contains("BLOCKED ON AN EXTERNAL DEPENDENCY"), "generalizes the block carve-out beyond the operator (#349)");
-        assert!(k.contains("another agent") && k.contains("deploy/CI"), "names the non-operator external deps");
-        assert!(k.contains("long/event-woken cadence"), "a sole blocked task drops to the long/event-woken cadence, not SOON polling");
+        assert!(
+            k.contains("BLOCKED ON AN EXTERNAL DEPENDENCY"),
+            "generalizes the block carve-out beyond the operator (#349)"
+        );
+        assert!(
+            k.contains("another agent") && k.contains("deploy/CI"),
+            "names the non-operator external deps"
+        );
+        assert!(
+            k.contains("long/event-woken cadence"),
+            "a sole blocked task drops to the long/event-woken cadence, not SOON polling"
+        );
         // Operator-blocked dashboard convention (operator seq-2292, re-pointed task_936) is preserved as a
         // sub-case, with the operator id INTERPOLATED from config (task_611), not hard-coded: OWNER-HELD +
         // typed blocked_on=operator, never a reassignment to the operator (operator-tenet 10).
-        assert!(k.contains("ON THE OPERATOR specifically") && k.contains("OWNER-HELD"), "interpolates the configured operator id into the owner-held operator-blocked convention (task_936)");
-        assert!(k.contains("NEVER assign the task to 'op-x'"), "bans assigning the task to the operator (task_936, operator-tenet 10)");
-        assert!(k.contains("blocked_on=operator FILTER"), "the operator dashboard signal is the blocked_on=operator filter, not an assignment");
-        assert!(!k.contains("metadata.blocked_owner"), "drops the stale blocked_owner reassign-back stash now that ownership never changes (task_936)");
+        assert!(
+            k.contains("ON THE OPERATOR specifically") && k.contains("OWNER-HELD"),
+            "interpolates the configured operator id into the owner-held operator-blocked convention (task_936)"
+        );
+        assert!(
+            k.contains("NEVER assign the task to 'op-x'"),
+            "bans assigning the task to the operator (task_936, operator-tenet 10)"
+        );
+        assert!(
+            k.contains("blocked_on=operator FILTER"),
+            "the operator dashboard signal is the blocked_on=operator filter, not an assignment"
+        );
+        assert!(
+            !k.contains("metadata.blocked_owner"),
+            "drops the stale blocked_owner reassign-back stash now that ownership never changes (task_936)"
+        );
         // No designated operator → the operator-blocked clause is omitted, but the surrounding external-dep
         // guidance stays intact (generic fleet with no operator; task_611).
         let k_no_op = build_kickoff("v-x", "/wt/v-x", "30m", None, false);
-        assert!(!k_no_op.contains("ON THE OPERATOR specifically"), "omits the operator-blocked clause when no operator is configured");
-        assert!(k_no_op.contains("buys nothing. (If your MCP cannot set a typed blocked_on"), "the surrounding external-dep clause reads cleanly with the operator clause omitted");
+        assert!(
+            !k_no_op.contains("ON THE OPERATOR specifically"),
+            "omits the operator-blocked clause when no operator is configured"
+        );
+        assert!(
+            k_no_op.contains("buys nothing. (If your MCP cannot set a typed blocked_on"),
+            "the surrounding external-dep clause reads cleanly with the operator clause omitted"
+        );
         // Status honesty (task_506 Layer 1): never stand down (offline/away) holding a live in_progress task —
         // progress it or re-state it blocked/done first; the companion watchdog warning flags the violation.
-        assert!(k.contains("STATUS HONESTY") && k.contains("in_progress"), "bans standing down on a live in_progress task (task_506 Layer 1)");
-        assert!(k.contains("status-honesty violation the watchdog flags"), "ties the kickoff clause to the watchdog #506 warning");
+        assert!(
+            k.contains("STATUS HONESTY") && k.contains("in_progress"),
+            "bans standing down on a live in_progress task (task_506 Layer 1)"
+        );
+        assert!(
+            k.contains("status-honesty violation the watchdog flags"),
+            "ties the kickoff clause to the watchdog #506 warning"
+        );
         // Self-close (task_604): the implementer flips its own completed task to done, never leaving a
         // "recommend closing" comment for the proposer/triage to flip hours later; a delegated-builder on a
         // task it does not own instead flags ready-to-close and the owner closes it promptly.
-        assert!(k.contains("SELF-CLOSE") && k.contains("set its status to done YOURSELF"), "implementer self-closes a completed task (task_604)");
-        assert!(k.contains("DELEGATED to BUILD a task you do not OWN"), "carves out the delegated-builder case, which still closes promptly (task_604)");
+        assert!(
+            k.contains("SELF-CLOSE") && k.contains("set its status to done YOURSELF"),
+            "implementer self-closes a completed task (task_604)"
+        );
+        assert!(
+            k.contains("DELEGATED to BUILD a task you do not OWN"),
+            "carves out the delegated-builder case, which still closes promptly (task_604)"
+        );
         // Drained / at-rest → persist a long cadence on the BOARD metadata (#383 + task_566): the lever is the
         // board metadata.interval (update_agent, the cadence the watchdog reads) which works even for a
         // board-only agent — NOT the frozen `cargo xtask fleet set-interval` which only writes the file-hub
         // registry (fails board-only, leaves the mirror stale). A raw reschedule also does not persist.
-        assert!(k.contains("DONE / at-rest"), "routes a drained/done cluster to the rest-cadence path (#383)");
-        assert!(k.contains("metadata.interval") && k.contains("update_agent"), "board metadata.interval via update_agent is the board-native cadence lever (task_566)");
-        assert!(k.contains("board-only agent with no file-hub registry row"), "the board lever works for a board-only agent, unlike the frozen cargo xtask set-interval");
-        assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the watchdog");
+        assert!(
+            k.contains("DONE / at-rest"),
+            "routes a drained/done cluster to the rest-cadence path (#383)"
+        );
+        assert!(
+            k.contains("metadata.interval") && k.contains("update_agent"),
+            "board metadata.interval via update_agent is the board-native cadence lever (task_566)"
+        );
+        assert!(
+            k.contains("board-only agent with no file-hub registry row"),
+            "the board lever works for a board-only agent, unlike the frozen cargo xtask set-interval"
+        );
+        assert!(
+            k.contains("does NOT persist"),
+            "explains a raw next-tick reschedule does not stick against the watchdog"
+        );
         // task_765 Tier A: a <=1h cadence (30m here) is schedulable by the dynamic self-wake, so the kickoff
         // carries NO cron-escalation clause — only a >1h cadence does.
-        assert!(!k.contains("CronCreate"), "a <=1h cadence gets no cron-cadence escalation (task_765)");
-        assert!(!k.contains("hard-clamped to a ONE-HOUR maximum"), "no clamp note for a cadence the self-wake can honor");
+        assert!(
+            !k.contains("CronCreate"),
+            "a <=1h cadence gets no cron-cadence escalation (task_765)"
+        );
+        assert!(
+            !k.contains("hard-clamped to a ONE-HOUR maximum"),
+            "no clamp note for a cadence the self-wake can honor"
+        );
     }
 
     #[test]
@@ -11004,30 +12404,63 @@ mod tests {
         // exceeds an hour (3h here) idle-polls hourly unless it rests off a CronCreate fixed-interval loop.
         // The kickoff must say so and hand it the concrete cron.
         let k = build_kickoff("v-mon", "/wt/v-mon", "3h", Some("op-x"), false);
-        assert!(k.contains("hard-clamped to a ONE-HOUR maximum"), "names the dynamic self-wake 1h clamp (the root cause)");
-        assert!(k.contains("CronCreate"), "routes a >1h cadence to a CronCreate fixed-interval loop");
-        assert!(k.contains("'0 */3 * * *'"), "hands a 3h cadence its concrete cron expression");
-        assert!(k.contains("do NOT also self-re-arm"), "warns against a dynamic re-arm fighting the cron (the v-hivemind failure)");
-        assert!(k.contains("never your revival latency"), "clarifies event-wake still revives immediately, so the cron only sets the idle floor");
+        assert!(
+            k.contains("hard-clamped to a ONE-HOUR maximum"),
+            "names the dynamic self-wake 1h clamp (the root cause)"
+        );
+        assert!(
+            k.contains("CronCreate"),
+            "routes a >1h cadence to a CronCreate fixed-interval loop"
+        );
+        assert!(
+            k.contains("'0 */3 * * *'"),
+            "hands a 3h cadence its concrete cron expression"
+        );
+        assert!(
+            k.contains("do NOT also self-re-arm"),
+            "warns against a dynamic re-arm fighting the cron (the v-hivemind failure)"
+        );
+        assert!(
+            k.contains("never your revival latency"),
+            "clarifies event-wake still revives immediately, so the cron only sets the idle floor"
+        );
         // A reactive responder with a >1h cadence hits the same clamp, so it carries the clause too.
         let r = build_kickoff("frank", "/wt/frank", "2h", None, true);
-        assert!(r.contains("CronCreate") && r.contains("'0 */2 * * *'"), "a >1h reactive cadence also gets the cron escalation");
+        assert!(
+            r.contains("CronCreate") && r.contains("'0 */2 * * *'"),
+            "a >1h reactive cadence also gets the cron escalation"
+        );
     }
 
     #[test]
     fn long_cadence_cron_clause_only_fires_above_one_hour_and_matches_the_cadence() {
         // <=1h (incl. exactly 1h = 3600s, the clamp ceiling) is schedulable by the dynamic self-wake -> empty.
-        assert!(long_cadence_cron_clause("30m").is_empty(), "30m needs no escalation");
-        assert!(long_cadence_cron_clause("1h").is_empty(), "exactly 1h is at the clamp ceiling, still schedulable");
-        assert!(long_cadence_cron_clause("3600s").is_empty(), "3600s == 1h, no escalation");
+        assert!(
+            long_cadence_cron_clause("30m").is_empty(),
+            "30m needs no escalation"
+        );
+        assert!(
+            long_cadence_cron_clause("1h").is_empty(),
+            "exactly 1h is at the clamp ceiling, still schedulable"
+        );
+        assert!(
+            long_cadence_cron_clause("3600s").is_empty(),
+            "3600s == 1h, no escalation"
+        );
         // Whole-hour cadences over 1h get a concrete `0 */H * * *` cron.
         assert!(long_cadence_cron_clause("2h").contains("'0 */2 * * *'"));
         assert!(long_cadence_cron_clause("6h").contains("'0 */6 * * *'"));
         // A non-whole-hour cadence over 1h (90m) still escalates, but with the generic form (cron is
         // minute-granular, so there is no tidy `0 */H` to suggest) — never a bogus hourly cron.
         let c = long_cadence_cron_clause("90m");
-        assert!(c.contains("a fixed-interval cron matching your cadence"), "90m gets the generic cron form");
-        assert!(!c.contains("*/1"), "never suggests an hourly cron for a 90m cadence");
+        assert!(
+            c.contains("a fixed-interval cron matching your cadence"),
+            "90m gets the generic cron form"
+        );
+        assert!(
+            !c.contains("*/1"),
+            "never suggests an hourly cron for a 90m cadence"
+        );
         // A garbage interval parses to nothing -> no clause (never panics).
         assert!(long_cadence_cron_clause("nonsense").is_empty());
     }
@@ -11067,28 +12500,58 @@ mod tests {
             "membrain-skynet-bridge"
         ));
         // A clean (non-deleted) binary matches by basename too.
-        assert!(exe_matches_daemon("/nix/store/abc/bin/membrain-skynet-bridge", "membrain-skynet-bridge"));
+        assert!(exe_matches_daemon(
+            "/nix/store/abc/bin/membrain-skynet-bridge",
+            "membrain-skynet-bridge"
+        ));
         // A different binary does not match.
-        assert!(!exe_matches_daemon("/usr/bin/other (deleted)", "membrain-skynet-bridge"));
+        assert!(!exe_matches_daemon(
+            "/usr/bin/other (deleted)",
+            "membrain-skynet-bridge"
+        ));
         // A sibling whose name merely starts with the daemon is NOT a basename match (no false positive).
-        assert!(!exe_matches_daemon("/x/membrain-skynet-bridge-helper", "membrain-skynet-bridge"));
+        assert!(!exe_matches_daemon(
+            "/x/membrain-skynet-bridge-helper",
+            "membrain-skynet-bridge"
+        ));
         // The strip is SUFFIX-only: a mid-path `(deleted)` directory never corrupts the basename match.
-        assert!(exe_matches_daemon("/x/y (deleted)/membrain-skynet-bridge", "membrain-skynet-bridge"));
+        assert!(exe_matches_daemon(
+            "/x/y (deleted)/membrain-skynet-bridge",
+            "membrain-skynet-bridge"
+        ));
     }
 
     #[test]
     fn redeploy_action_rebuilds_only_when_behind_clean_and_on_main() {
         // Built rev already matches origin/main -> nothing to do (even if dirty / off main).
-        assert_eq!(redeploy_action("abc123", "abc123", false, true), RedeployAction::UpToDate);
-        assert_eq!(redeploy_action("abc123", "abc123", true, false), RedeployAction::UpToDate);
+        assert_eq!(
+            redeploy_action("abc123", "abc123", false, true),
+            RedeployAction::UpToDate
+        );
+        assert_eq!(
+            redeploy_action("abc123", "abc123", true, false),
+            RedeployAction::UpToDate
+        );
         // A -dirty build of the SAME commit is current (compares by base sha).
-        assert_eq!(redeploy_action("abc123-dirty", "abc123", false, true), RedeployAction::UpToDate);
+        assert_eq!(
+            redeploy_action("abc123-dirty", "abc123", false, true),
+            RedeployAction::UpToDate
+        );
         // Behind + clean + on main -> safe to fast-forward + rebuild.
-        assert_eq!(redeploy_action("old111", "new222", false, true), RedeployAction::Rebuild);
+        assert_eq!(
+            redeploy_action("old111", "new222", false, true),
+            RedeployAction::Rebuild
+        );
         // Behind but DIRTY -> refuse (never clobber uncommitted work).
-        assert!(matches!(redeploy_action("old111", "new222", true, true), RedeployAction::NeedsManual(_)));
+        assert!(matches!(
+            redeploy_action("old111", "new222", true, true),
+            RedeployAction::NeedsManual(_)
+        ));
         // Behind but OFF main (a feature branch) -> refuse (a ff-only would fail / clobber intent).
-        assert!(matches!(redeploy_action("old111", "new222", false, false), RedeployAction::NeedsManual(_)));
+        assert!(matches!(
+            redeploy_action("old111", "new222", false, false),
+            RedeployAction::NeedsManual(_)
+        ));
     }
 
     #[test]
@@ -11096,11 +12559,26 @@ mod tests {
         // Each build is non-empty cargo args, and the set covers BOTH daemon binaries: the `fleet` bin
         // (fleet-watchdog + fleet-notify) and the separate fleet-tunnel bin (its own crate + transport
         // feature). The #451 regression guard: dropping fleet-tunnel here restarts it stale.
-        assert!(REDEPLOY_BUILDS.iter().all(|b| !b.is_empty()), "no empty build arg-set");
-        let flat: Vec<&str> = REDEPLOY_BUILDS.iter().flat_map(|b| b.iter().copied()).collect();
-        assert!(flat.contains(&"fleet") && flat.windows(2).any(|w| w == ["--bin", "fleet"]), "builds --bin fleet");
-        assert!(flat.contains(&"fleet-tunnel"), "builds the fleet-tunnel crate");
-        assert!(flat.contains(&"transport"), "fleet-tunnel needs its transport feature");
+        assert!(
+            REDEPLOY_BUILDS.iter().all(|b| !b.is_empty()),
+            "no empty build arg-set"
+        );
+        let flat: Vec<&str> = REDEPLOY_BUILDS
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        assert!(
+            flat.contains(&"fleet") && flat.windows(2).any(|w| w == ["--bin", "fleet"]),
+            "builds --bin fleet"
+        );
+        assert!(
+            flat.contains(&"fleet-tunnel"),
+            "builds the fleet-tunnel crate"
+        );
+        assert!(
+            flat.contains(&"transport"),
+            "fleet-tunnel needs its transport feature"
+        );
         // Every service backed by a binary that must exist has a build (both counts stay aligned).
         assert!(!REDEPLOY_BUILDS.is_empty() && !DEFAULT_REDEPLOY_SERVICES.is_empty());
     }
@@ -11109,25 +12587,49 @@ mod tests {
     fn build_kickoff_reactive_mode_only_acts_when_addressed() {
         let r = build_kickoff("frank", "/wt/frank", "30m", Some("op-x"), true);
         // Still self-discovering + explicit-identity like every kickoff (the boot contract is shared).
-        assert!(r.contains("register_agent") && r.contains("get_agent"), "reactive kickoff still self-discovers");
+        assert!(
+            r.contains("register_agent") && r.contains("get_agent"),
+            "reactive kickoff still self-discovers"
+        );
         assert!(r.contains("'frank'"), "carries the agent id");
         assert!(r.contains("/loop run one tick"), "still a dynamic /loop");
         // The reactive discipline (#438): only being ADDRESSED is actionable; ambient chatter is NOT work.
         assert!(r.contains("REACTIVE responder"), "declares reactive mode");
-        assert!(r.contains("EXPLICITLY") && r.contains("ADDRESSED"), "an explicit address is a trigger");
+        assert!(
+            r.contains("EXPLICITLY") && r.contains("ADDRESSED"),
+            "an explicit address is a trigger"
+        );
         // #438 thread-engagement: an in-thread follow-up on a conversation it is already in ALSO triggers it —
         // the live thread-subscription delivery wakes it on a reply_to=subscribed-root post, and the prompt
         // must count that as addressed so it continues the exchange instead of treating it as ambient chatter.
-        assert!(r.contains("reply_to") && r.contains("thread_subscribed"), "an in-thread follow-up is a trigger");
-        assert!(r.contains("FOLLOW-UP"), "names the thread follow-up trigger");
-        assert!(r.contains("WAIT TO BE WOKEN"), "goes idle and waits for an event-wake when unaddressed");
+        assert!(
+            r.contains("reply_to") && r.contains("thread_subscribed"),
+            "an in-thread follow-up is a trigger"
+        );
+        assert!(
+            r.contains("FOLLOW-UP"),
+            "names the thread follow-up trigger"
+        );
+        assert!(
+            r.contains("WAIT TO BE WOKEN"),
+            "goes idle and waits for an event-wake when unaddressed"
+        );
         // CRITICAL: it must NOT carry the work-conserving 'unread => keep going SOON' pacing that mis-fires on
         // ambient channel chatter (the exact anti-pattern the observer caught in Frank's boot).
-        assert!(!r.contains("WORK-CONSERVING PACING"), "reactive mode drops the work-conserving pacing");
-        assert!(!r.contains("keep going — schedule your next tick SOON"), "no SOON re-poll on unread chatter");
+        assert!(
+            !r.contains("WORK-CONSERVING PACING"),
+            "reactive mode drops the work-conserving pacing"
+        );
+        assert!(
+            !r.contains("keep going — schedule your next tick SOON"),
+            "no SOON re-poll on unread chatter"
+        );
         // And the default (non-reactive) kickoff must be UNCHANGED — it keeps the work-conserving pacing.
         let w = build_kickoff("v-x", "/wt/v-x", "30m", Some("op-x"), false);
-        assert!(w.contains("WORK-CONSERVING PACING") && !w.contains("REACTIVE responder"), "default worker unchanged");
+        assert!(
+            w.contains("WORK-CONSERVING PACING") && !w.contains("REACTIVE responder"),
+            "default worker unchanged"
+        );
     }
 
     #[test]
@@ -11136,21 +12638,47 @@ mod tests {
         let c = build_launch_cmd("claude", "claude-x", "high", None).expect("claude wired");
         assert!(c.starts_with("exec claude "));
         assert!(c.contains("--model 'claude-x'") && c.contains("--effort 'high'"));
-        assert!(c.contains("\"$CDZ_KICKOFF\""), "kickoff rides in the env var, not interpolated");
+        assert!(
+            c.contains("\"$CDZ_KICKOFF\""),
+            "kickoff rides in the env var, not interpolated"
+        );
         // devshell (#214): opt-in launch inside the workdir's flake devShell so the pinned toolchain is on PATH.
-        let d = build_launch_cmd("claude", "claude-x", "high", Some("/wt/v-x")).expect("claude wired");
-        assert!(d.starts_with("exec nix develop \"path:/wt/v-x\" --command claude "), "wrapped in nix develop");
-        assert!(d.contains("--model 'claude-x'") && d.contains("\"$CDZ_KICKOFF\""), "same claude args inside the devShell");
+        let d =
+            build_launch_cmd("claude", "claude-x", "high", Some("/wt/v-x")).expect("claude wired");
+        assert!(
+            d.starts_with("exec nix develop \"path:/wt/v-x\" --command claude "),
+            "wrapped in nix develop"
+        );
+        assert!(
+            d.contains("--model 'claude-x'") && d.contains("\"$CDZ_KICKOFF\""),
+            "same claude args inside the devShell"
+        );
         // codex is wired: bypass flag for unattended run, model passed through single-quoted, kickoff from env.
         let x = build_launch_cmd("codex", "codex-m", "high", None).expect("codex wired");
         assert!(x.starts_with("exec codex "));
-        assert!(x.contains("--dangerously-bypass-approvals-and-sandbox"), "unattended: no approval/sandbox gate");
-        assert!(x.contains("--model 'codex-m'"), "model passed through (board data supplies the concrete name)");
-        assert!(x.contains("\"$CDZ_KICKOFF\""), "codex reads the same kickoff env var, not an interpolated prompt");
-        assert!(!x.contains("--effort"), "codex takes no --effort flag (claude-only)");
+        assert!(
+            x.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "unattended: no approval/sandbox gate"
+        );
+        assert!(
+            x.contains("--model 'codex-m'"),
+            "model passed through (board data supplies the concrete name)"
+        );
+        assert!(
+            x.contains("\"$CDZ_KICKOFF\""),
+            "codex reads the same kickoff env var, not an interpolated prompt"
+        );
+        assert!(
+            !x.contains("--effort"),
+            "codex takes no --effort flag (claude-only)"
+        );
         // codex honors the same devShell wrapping as claude.
-        let xd = build_launch_cmd("codex", "codex-m", "high", Some("/wt/v-x")).expect("codex wired");
-        assert!(xd.starts_with("exec nix develop \"path:/wt/v-x\" --command codex "), "codex wrapped in nix develop too");
+        let xd =
+            build_launch_cmd("codex", "codex-m", "high", Some("/wt/v-x")).expect("codex wired");
+        assert!(
+            xd.starts_with("exec nix develop \"path:/wt/v-x\" --command codex "),
+            "codex wrapped in nix develop too"
+        );
         // an unknown/typo'd harness fails loudly.
         let u = build_launch_cmd("gpt5", "m", "high", None).unwrap_err();
         assert!(u.contains("unknown harness 'gpt5'"));
@@ -11184,25 +12712,40 @@ mod tests {
         assert_eq!(t, "\n[projects.\"/wt/v-x\"]\ntrust_level = \"trusted\"\n");
         // The appended table must parse, and it must read back as trusted (round-trips through the check).
         let v: toml::Value = t.parse().expect("appended table is valid toml");
-        assert!(!codex_trust_missing(&v, "/wt/v-x"), "the rendered table marks the dir trusted");
+        assert!(
+            !codex_trust_missing(&v, "/wt/v-x"),
+            "the rendered table marks the dir trusted"
+        );
         // A key with TOML-special chars is escaped so the table still parses and round-trips.
         let weird = codex_trust_table(r#"/wt/a"b\c"#);
         let vw: toml::Value = weird.parse().expect("escaped key is valid toml");
-        assert!(!codex_trust_missing(&vw, r#"/wt/a"b\c"#), "escaped key round-trips to the same dir");
+        assert!(
+            !codex_trust_missing(&vw, r#"/wt/a"b\c"#),
+            "escaped key round-trips to the same dir"
+        );
     }
 
     #[test]
     fn spin_down_action_covers_native_busy_window_and_windowless() {
         use SpinDownAction::*;
         // Not board-native → refuse regardless of window/assignments/force (file-hub uses cargo xtask fleet remove).
-        assert_eq!(spin_down_action(false, true, false, 0, false), NotBoardNative);
-        assert_eq!(spin_down_action(false, false, false, 3, true), NotBoardNative);
+        assert_eq!(
+            spin_down_action(false, true, false, 0, false),
+            NotBoardNative
+        );
+        assert_eq!(
+            spin_down_action(false, false, false, 3, true),
+            NotBoardNative
+        );
         // Native + a working pane + no --force → refuse so a running agent is never killed mid-turn.
         assert_eq!(spin_down_action(true, true, true, 0, false), RefuseBusy);
         // --force overrides the busy refusal → offline + kill.
         assert_eq!(spin_down_action(true, true, true, 0, true), OfflineAndKill);
         // Native + an IDLE live window → offline then kill (stops the loop).
-        assert_eq!(spin_down_action(true, true, false, 0, false), OfflineAndKill);
+        assert_eq!(
+            spin_down_action(true, true, false, 0, false),
+            OfflineAndKill
+        );
         // Native + no window → offline ONLY (still mark offline so up-board leaves it stood down); force moot.
         assert_eq!(spin_down_action(true, false, false, 0, false), OfflineOnly);
         assert_eq!(spin_down_action(true, false, true, 0, true), OfflineOnly);
@@ -11210,10 +12753,14 @@ mod tests {
 
     #[test]
     fn batch_targets_excludes_the_stay_up_set_and_sorts() {
-        let native: Vec<String> =
-            ["v-b", "concierge", "v-a", "v-fleet-tooling", "v-nix", "v-c"].iter().map(|s| s.to_string()).collect();
-        let except: std::collections::BTreeSet<String> =
-            ["concierge", "v-nix", "v-fleet-tooling"].iter().map(|s| s.to_string()).collect();
+        let native: Vec<String> = ["v-b", "concierge", "v-a", "v-fleet-tooling", "v-nix", "v-c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let except: std::collections::BTreeSet<String> = ["concierge", "v-nix", "v-fleet-tooling"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // Only non-excepted natives, sorted; the stay-up set (incl. self) is never a target.
         assert_eq!(batch_targets(&native, &except), vec!["v-a", "v-b", "v-c"]);
         // Empty except = every native is a candidate.
@@ -11224,16 +12771,29 @@ mod tests {
     #[test]
     fn reconstitute_targets_excludes_up_and_except_sorts_and_waves() {
         // down_native carries a dup (v-a) and is unsorted — the selector sorts + dedups like batch_targets.
-        let down: Vec<String> = ["v-b", "v-a", "v-c", "v-a"].iter().map(|s| s.to_string()).collect();
-        let except: std::collections::BTreeSet<String> = ["v-c"].iter().map(|s| s.to_string()).collect();
+        let down: Vec<String> = ["v-b", "v-a", "v-c", "v-a"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let except: std::collections::BTreeSet<String> =
+            ["v-c"].iter().map(|s| s.to_string()).collect();
         // No limit: sorted, deduped, the leave-as-is set removed.
-        assert_eq!(reconstitute_targets(&down, &except, None), vec!["v-a", "v-b"]);
+        assert_eq!(
+            reconstitute_targets(&down, &except, None),
+            vec!["v-a", "v-b"]
+        );
         // --limit caps the wave to the first N (sorted) candidates — the next wave picks up the rest.
         assert_eq!(reconstitute_targets(&down, &except, Some(1)), vec!["v-a"]);
         // Empty except = every DOWN agent is a candidate (deduped), still wave-limited.
         let none = std::collections::BTreeSet::new();
-        assert_eq!(reconstitute_targets(&down, &none, Some(2)), vec!["v-a", "v-b"]);
-        assert_eq!(reconstitute_targets(&down, &none, None), vec!["v-a", "v-b", "v-c"]);
+        assert_eq!(
+            reconstitute_targets(&down, &none, Some(2)),
+            vec!["v-a", "v-b"]
+        );
+        assert_eq!(
+            reconstitute_targets(&down, &none, None),
+            vec!["v-a", "v-b", "v-c"]
+        );
     }
 
     #[test]
@@ -11265,9 +12825,16 @@ mod tests {
         assert_eq!(by_alias.name, "svc-proxy");
         assert_eq!(by_port.name, "svc-proxy");
         assert!(by_name.lifeline && by_name.owner == "owner-a");
-        assert_eq!(find_host_service(&reg.service, "SVC-PROXY").map(|s| s.name.as_str()), Some("svc-proxy"));
+        assert_eq!(
+            find_host_service(&reg.service, "SVC-PROXY").map(|s| s.name.as_str()),
+            Some("svc-proxy")
+        );
         // `lifeline` defaults to false when omitted; an unknown query resolves to None.
-        assert!(!find_host_service(&reg.service, "svc-worker").expect("worker present").lifeline);
+        assert!(
+            !find_host_service(&reg.service, "svc-worker")
+                .expect("worker present")
+                .lifeline
+        );
         assert!(find_host_service(&reg.service, "no-such-service").is_none());
     }
 
@@ -11277,14 +12844,26 @@ mod tests {
         // task_786: the stranding guard — an agent holding open assignments must not be stood down. Refuse in
         // BOTH the windowless (the task_311 class — spun down yet still holding dispatched work) and windowed
         // cases, taking priority over the busy check so the operator sees the reassign requirement first.
-        assert_eq!(spin_down_action(true, false, false, 1, false), RefuseHoldsAssignments { open: 1 });
-        assert_eq!(spin_down_action(true, true, false, 2, false), RefuseHoldsAssignments { open: 2 });
-        assert_eq!(spin_down_action(true, true, true, 5, false), RefuseHoldsAssignments { open: 5 });
+        assert_eq!(
+            spin_down_action(true, false, false, 1, false),
+            RefuseHoldsAssignments { open: 1 }
+        );
+        assert_eq!(
+            spin_down_action(true, true, false, 2, false),
+            RefuseHoldsAssignments { open: 2 }
+        );
+        assert_eq!(
+            spin_down_action(true, true, true, 5, false),
+            RefuseHoldsAssignments { open: 5 }
+        );
         // --force overrides the stranding refusal → it falls through to the normal window/windowless action.
         assert_eq!(spin_down_action(true, true, false, 3, true), OfflineAndKill);
         assert_eq!(spin_down_action(true, false, false, 3, true), OfflineOnly);
         // Zero open assignments → the guard is inert (normal behavior).
-        assert_eq!(spin_down_action(true, true, false, 0, false), OfflineAndKill);
+        assert_eq!(
+            spin_down_action(true, true, false, 0, false),
+            OfflineAndKill
+        );
     }
 
     #[test]
@@ -11292,7 +12871,10 @@ mod tests {
         use BounceAction::*;
         // Not board-native → refuse regardless of window/working/cooldown/force (only board-native agents
         // relaunch via the fleet; there is nothing for a bounce to relaunch otherwise).
-        assert_eq!(bounce_action(false, true, false, false, false), NotBoardNative);
+        assert_eq!(
+            bounce_action(false, true, false, false, false),
+            NotBoardNative
+        );
         assert_eq!(bounce_action(false, true, true, true, true), NotBoardNative);
         // Native but no live window → nothing to bounce (not running); --force does not conjure a session.
         assert_eq!(bounce_action(true, false, false, false, false), NoWindow);
@@ -11345,12 +12927,24 @@ mod tests {
         // task_818: a stranded agent auto-revive is suppressed only while the last revive is within the window,
         // so a revive that did not immediately clear the stranded state is not retried every sweep.
         // Never revived → not on cooldown.
-        assert!(!revive_stranded_on_cooldown(None, 10_000, REVIVE_STRANDED_COOLDOWN_SECS));
+        assert!(!revive_stranded_on_cooldown(
+            None,
+            10_000,
+            REVIVE_STRANDED_COOLDOWN_SECS
+        ));
         // Within the window → on cooldown.
         assert!(revive_stranded_on_cooldown(Some(10_000), 10_000, 3_600));
-        assert!(revive_stranded_on_cooldown(Some(10_000), 10_000 + 3_599, 3_600));
+        assert!(revive_stranded_on_cooldown(
+            Some(10_000),
+            10_000 + 3_599,
+            3_600
+        ));
         // At / past the window → no longer on cooldown (eligible to re-revive if still stranded).
-        assert!(!revive_stranded_on_cooldown(Some(10_000), 10_000 + 3_600, 3_600));
+        assert!(!revive_stranded_on_cooldown(
+            Some(10_000),
+            10_000 + 3_600,
+            3_600
+        ));
         assert!(!revive_stranded_on_cooldown(Some(10_000), 20_000, 3_600));
         // Clock skew (now < last) saturates to 0 elapsed → treated as on cooldown (fail-safe, no re-revive).
         assert!(revive_stranded_on_cooldown(Some(10_000), 9_000, 3_600));
@@ -11360,10 +12954,22 @@ mod tests {
     fn recover_wedged_on_cooldown_suppresses_only_within_the_window() {
         // task_582: a wedged-agent auto-recovery (force spin-down + spin-up) is suppressed only while the last
         // recovery is within the window, so a fresh session that re-wedges on the same input is not thrashed.
-        assert!(!recover_wedged_on_cooldown(None, 10_000, RECOVER_WEDGED_COOLDOWN_SECS));
+        assert!(!recover_wedged_on_cooldown(
+            None,
+            10_000,
+            RECOVER_WEDGED_COOLDOWN_SECS
+        ));
         assert!(recover_wedged_on_cooldown(Some(10_000), 10_000, 3_600));
-        assert!(recover_wedged_on_cooldown(Some(10_000), 10_000 + 3_599, 3_600));
-        assert!(!recover_wedged_on_cooldown(Some(10_000), 10_000 + 3_600, 3_600));
+        assert!(recover_wedged_on_cooldown(
+            Some(10_000),
+            10_000 + 3_599,
+            3_600
+        ));
+        assert!(!recover_wedged_on_cooldown(
+            Some(10_000),
+            10_000 + 3_600,
+            3_600
+        ));
         assert!(!recover_wedged_on_cooldown(Some(10_000), 20_000, 3_600));
         // Clock skew (now < last) saturates to 0 elapsed → on cooldown (fail-safe, no re-recover).
         assert!(recover_wedged_on_cooldown(Some(10_000), 9_000, 3_600));
@@ -11410,9 +13016,15 @@ mod tests {
         // Absent → install ours.
         assert_eq!(fmt_hook_install_action(None), Install);
         // Our own hook (marker present) → refresh (idempotent).
-        assert_eq!(fmt_hook_install_action(Some(&fmt_precommit_hook_body())), Refresh);
+        assert_eq!(
+            fmt_hook_install_action(Some(&fmt_precommit_hook_body())),
+            Refresh
+        );
         // A foreign hook → NEVER clobber.
-        assert_eq!(fmt_hook_install_action(Some("#!/bin/sh\n# someone else's pre-commit\n")), SkipForeign);
+        assert_eq!(
+            fmt_hook_install_action(Some("#!/bin/sh\n# someone else's pre-commit\n")),
+            SkipForeign
+        );
     }
 
     #[test]
@@ -11423,9 +13035,18 @@ mod tests {
         // task_617: no bare `cargo fmt --all --check` left in the installed script — that was the bug (a
         // pre-existing skew in an unrelated crate tripped it on every commit). The smart per-crate logic now
         // lives in `fmt_hook_run`, tested separately; the script only delegates to it.
-        assert!(!b.contains("--all"), "no workspace-wide fmt check in the installed script");
-        assert!(b.contains("fleet fmt-hook-run"), "delegates the real logic to the testable Rust subcommand");
-        assert!(b.trim_end().ends_with("exit 0"), "FAIL-OPEN: the hook never blocks a commit regardless of fleet's exit code");
+        assert!(
+            !b.contains("--all"),
+            "no workspace-wide fmt check in the installed script"
+        );
+        assert!(
+            b.contains("fleet fmt-hook-run"),
+            "delegates the real logic to the testable Rust subcommand"
+        );
+        assert!(
+            b.trim_end().ends_with("exit 0"),
+            "FAIL-OPEN: the hook never blocks a commit regardless of fleet's exit code"
+        );
         // Syntax-check with `bash -n` (a broken hook would fail every commit in the shared mirror); skip if absent.
         let dir = std::env::temp_dir().join(format!("fleet-fmthook-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -11433,8 +13054,16 @@ mod tests {
         if std::fs::write(&f, &b).is_err() {
             return; // can't stage the file — skip the syntax check rather than false-fail
         }
-        if let Ok(o) = std::process::Command::new("bash").arg("-n").arg(&f).output() {
-            assert!(o.status.success(), "hook bash syntax error:\n{}", String::from_utf8_lossy(&o.stderr));
+        if let Ok(o) = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&f)
+            .output()
+        {
+            assert!(
+                o.status.success(),
+                "hook bash syntax error:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11492,31 +13121,72 @@ mod tests {
         assert!(s.body.contains("v-example"), "body names the target");
         assert!(s.body.contains("sess-abc"), "body names the session");
         assert!(s.body.contains("1200"), "body names the offset");
-        assert!(s.body.contains("CHILD proposal task"), "body states the child-filing contract");
-        assert!(s.body.contains("Close this task"), "body states the close-on-done contract");
+        assert!(
+            s.body.contains("CHILD proposal task"),
+            "body states the child-filing contract"
+        );
+        assert!(
+            s.body.contains("Close this task"),
+            "body states the close-on-done contract"
+        );
     }
 
     #[test]
     fn observer_kickoff_drives_from_the_observation_task_when_given_one() {
-        let with = build_observer_kickoff("v-t", "sess-9", 42, "loops/observer.md", "/abs/fleet", Some(207));
+        let with = build_observer_kickoff(
+            "v-t",
+            "sess-9",
+            42,
+            "loops/observer.md",
+            "/abs/fleet",
+            Some(207),
+        );
         // The observation-task variant carries the child-filing + close-the-parent contract.
-        assert!(with.contains("OBSERVATION TASK #207"), "names the observation task");
-        assert!(with.contains("parent_id=207"), "proposals are children of the observation task");
-        assert!(with.contains("update_task 207"), "closes the observation task");
+        assert!(
+            with.contains("OBSERVATION TASK #207"),
+            "names the observation task"
+        );
+        assert!(
+            with.contains("parent_id=207"),
+            "proposals are children of the observation task"
+        );
+        assert!(
+            with.contains("update_task 207"),
+            "closes the observation task"
+        );
         assert!(with.contains("status=\"done\""), "close = mark done");
 
-        let without = build_observer_kickoff("v-t", "sess-9", 42, "loops/observer.md", "/abs/fleet", None);
+        let without =
+            build_observer_kickoff("v-t", "sess-9", 42, "loops/observer.md", "/abs/fleet", None);
         // The rollout-compat variant files standalone proposals — no parent linkage, no task close. ("update_task"
         // alone appears in the shared identity preamble; the CLOSE contract is `status="done"` on the task.)
-        assert!(!without.contains("parent_id="), "no child linkage without an observation task");
-        assert!(!without.contains("OBSERVATION TASK #"), "not driven by an observation task");
-        assert!(!without.contains("status=\"done\""), "no task close without an observation task");
-        assert!(without.contains("above-floor"), "still files curated proposals");
+        assert!(
+            !without.contains("parent_id="),
+            "no child linkage without an observation task"
+        );
+        assert!(
+            !without.contains("OBSERVATION TASK #"),
+            "not driven by an observation task"
+        );
+        assert!(
+            !without.contains("status=\"done\""),
+            "no task close without an observation task"
+        );
+        assert!(
+            without.contains("above-floor"),
+            "still files curated proposals"
+        );
 
         // Both variants keep the invariant boot + confirm contract.
         for k in [&with, &without] {
-            assert!(k.contains("register_agent 'observer'"), "binds the observer identity");
-            assert!(k.contains("observe-record v-t --session sess-9"), "confirms via observe-record last");
+            assert!(
+                k.contains("register_agent 'observer'"),
+                "binds the observer identity"
+            );
+            assert!(
+                k.contains("observe-record v-t --session sess-9"),
+                "confirms via observe-record last"
+            );
             assert!(k.contains("/abs/fleet"), "uses this binary's absolute path");
         }
     }
@@ -11528,13 +13198,31 @@ mod tests {
         let keys: Vec<&str> = REVIEW_ANGLES.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            vec!["correctness-completeness", "clarity-writing", "risk-security", "alternatives"]
+            vec![
+                "correctness-completeness",
+                "clarity-writing",
+                "risk-security",
+                "alternatives"
+            ]
         );
         // The clarity angle names the MAINTAINED lists as run-time truth (not a hardcoded pattern copy).
-        let clarity = REVIEW_ANGLES.iter().find(|(k, _)| *k == "clarity-writing").unwrap().1;
-        assert!(clarity.contains("three-pass"), "clarity angle applies the humanize three-pass");
-        assert!(clarity.contains("Document #7") && clarity.contains("Document #8"), "names the maintained writing lists");
-        assert!(clarity.contains("READ AT REVIEW TIME"), "reads the lists at review time, not a frozen copy");
+        let clarity = REVIEW_ANGLES
+            .iter()
+            .find(|(k, _)| *k == "clarity-writing")
+            .unwrap()
+            .1;
+        assert!(
+            clarity.contains("three-pass"),
+            "clarity angle applies the humanize three-pass"
+        );
+        assert!(
+            clarity.contains("Document #7") && clarity.contains("Document #8"),
+            "names the maintained writing lists"
+        );
+        assert!(
+            clarity.contains("READ AT REVIEW TIME"),
+            "reads the lists at review time, not a frozen copy"
+        );
     }
 
     #[test]
@@ -11542,23 +13230,62 @@ mod tests {
         let (key, focus) = REVIEW_ANGLES[0]; // correctness-completeness
         let k = build_reviewer_kickoff(88, key, focus, "/repo/loops/reviewer.md", "/abs/fleet");
         // Identity + ephemeral (one review, no loop) — the reviewer analog of the observer kickoff.
-        assert!(k.contains("register_agent 'reviewer'"), "binds the stable reviewer identity");
-        assert!(k.contains("author=\"reviewer\""), "authors board writes as reviewer");
-        assert!(k.contains("do NOT start a /loop") && k.contains("you do not loop"), "ephemeral one-shot, not a loop");
+        assert!(
+            k.contains("register_agent 'reviewer'"),
+            "binds the stable reviewer identity"
+        );
+        assert!(
+            k.contains("author=\"reviewer\""),
+            "authors board writes as reviewer"
+        );
+        assert!(
+            k.contains("do NOT start a /loop") && k.contains("you do not loop"),
+            "ephemeral one-shot, not a loop"
+        );
         // Drives from the review + its angle.
-        assert!(k.contains("review #88") && k.contains("get_review 88"), "reads the assigned review");
-        assert!(k.contains("ANGLE `correctness-completeness`"), "carries the assigned angle");
+        assert!(
+            k.contains("review #88") && k.contains("get_review 88"),
+            "reads the assigned review"
+        );
+        assert!(
+            k.contains("ANGLE `correctness-completeness`"),
+            "carries the assigned angle"
+        );
         assert!(k.contains(focus), "carries the angle's review lens");
-        assert!(k.contains("/repo/loops/reviewer.md") && k.contains("/abs/fleet"), "names the role + this binary");
+        assert!(
+            k.contains("/repo/loops/reviewer.md") && k.contains("/abs/fleet"),
+            "names the role + this binary"
+        );
         // Files findings on the review log (+ actionable child tasks); does NOT transition status (D17 person-gate).
-        assert!(k.contains("append_review_log") && k.contains("review_id=88"), "records findings on the review log");
+        assert!(
+            k.contains("append_review_log") && k.contains("review_id=88"),
+            "records findings on the review log"
+        );
         assert!(k.contains("finding"), "entries are findings");
-        assert!(k.contains("CHILD task"), "an actionable finding links a child task");
-        assert!(k.contains("DO NOT call set_review_status"), "the reviewer never transitions the review (D17 person-gate)");
-        assert!(k.contains("no-op finding"), "a clean angle still records that it ran");
+        assert!(
+            k.contains("CHILD task"),
+            "an actionable finding links a child task"
+        );
+        assert!(
+            k.contains("DO NOT call set_review_status"),
+            "the reviewer never transitions the review (D17 person-gate)"
+        );
+        assert!(
+            k.contains("no-op finding"),
+            "a clean angle still records that it ran"
+        );
         // The clarity angle carries the maintained-lists-at-review-time contract when built for it.
-        let clarity_k = build_reviewer_kickoff(88, REVIEW_ANGLES[1].0, REVIEW_ANGLES[1].1, "/r/loops/reviewer.md", "/abs/fleet");
-        assert!(clarity_k.contains("three-pass") && clarity_k.contains("Document #7"), "clarity kickoff points at the writing guide + three-pass");
+        let clarity_k = build_reviewer_kickoff(
+            88,
+            REVIEW_ANGLES[1].0,
+            REVIEW_ANGLES[1].1,
+            "/r/loops/reviewer.md",
+            "/abs/fleet",
+        );
+        assert!(
+            clarity_k.contains("three-pass") && clarity_k.contains("Document #7"),
+            "clarity kickoff points at the writing guide + three-pass"
+        );
     }
 
     #[test]
@@ -11575,7 +13302,10 @@ mod tests {
         });
         let p = parse_workspace_kind("v-example", "/home/u/.fleet", &rec, None);
         assert_eq!(p.name, "example-env");
-        assert_eq!(p.description.as_deref(), Some("a board-defined environment"));
+        assert_eq!(
+            p.description.as_deref(),
+            Some("a board-defined environment")
+        );
         assert_eq!(p.setup_script.as_deref(), Some("echo materialize\n"));
         assert_eq!(p.cwd, "/work/example", "absolute config.cwd is used as-is");
         // The launch cwd + the fleet root are always trusted, then the config pre_trust entries.
@@ -11598,8 +13328,14 @@ mod tests {
         let rec = serde_json::json!({ "name": "bare", "setup_script": "   \n" });
         let p = parse_workspace_kind("v-bare", "/home/u/.fleet", &rec, None);
         assert_eq!(p.cwd, workspace::agent_root_dir("/home/u/.fleet", "v-bare"));
-        assert_eq!(p.pre_trust, vec!["/home/u/.fleet".to_string(), p.cwd.clone()]);
-        assert!(p.setup_script.is_none(), "whitespace-only setup_script is treated as absent");
+        assert_eq!(
+            p.pre_trust,
+            vec!["/home/u/.fleet".to_string(), p.cwd.clone()]
+        );
+        assert!(
+            p.setup_script.is_none(),
+            "whitespace-only setup_script is treated as absent"
+        );
         // A relative config.cwd is taken under the fleet root.
         let rec2 = serde_json::json!({ "name": "rel", "config": { "cwd": "checkout/here" } });
         let p2 = parse_workspace_kind("v-rel", "/home/u/.fleet", &rec2, None);
@@ -11616,11 +13352,21 @@ mod tests {
             "config": { "cwd": "/shared/default", "env": { "K": "v" } }
         });
         let p = parse_workspace_kind("m-a", "/home/u/.fleet", &rec, Some("/work/agent-a"));
-        assert_eq!(p.cwd, "/work/agent-a", "per-agent override beats config.cwd");
-        assert_eq!(p.env, vec![("K".to_string(), "v".to_string())], "shared env still comes from the kind");
+        assert_eq!(
+            p.cwd, "/work/agent-a",
+            "per-agent override beats config.cwd"
+        );
+        assert_eq!(
+            p.env,
+            vec![("K".to_string(), "v".to_string())],
+            "shared env still comes from the kind"
+        );
         // A blank/whitespace override is ignored → falls back to config.cwd.
         let p2 = parse_workspace_kind("m-b", "/home/u/.fleet", &rec, Some("   "));
-        assert_eq!(p2.cwd, "/shared/default", "blank override falls back to config.cwd");
+        assert_eq!(
+            p2.cwd, "/shared/default",
+            "blank override falls back to config.cwd"
+        );
         // A relative override is taken under the fleet root, same as config.cwd.
         let p3 = parse_workspace_kind("m-c", "/home/u/.fleet", &rec, Some("rel/ws"));
         assert_eq!(p3.cwd, "/home/u/.fleet/rel/ws");
@@ -11645,7 +13391,10 @@ mod tests {
             vec![
                 ("FLEET_AGENT".to_string(), "m-a".to_string()),
                 ("FLEET_ROOT".to_string(), "/home/u/.fleet".to_string()),
-                ("FLEET_WORKSPACE_CWD".to_string(), "/work/agent-a".to_string()),
+                (
+                    "FLEET_WORKSPACE_CWD".to_string(),
+                    "/work/agent-a".to_string()
+                ),
                 ("K".to_string(), "v".to_string()),
             ],
             "built-ins first (incl. the resolved launch cwd), then the kind's config env"
@@ -11656,13 +13405,25 @@ mod tests {
     fn read_native_is_tristate_absent_is_unknown_not_false() {
         use serde_json::json;
         // Explicit true/false are decisive.
-        assert!(matches!(read_native(Some(&json!({"native": true}))), NativeVerdict::Native));
-        assert!(matches!(read_native(Some(&json!({"native": false}))), NativeVerdict::NotNative));
+        assert!(matches!(
+            read_native(Some(&json!({"native": true}))),
+            NativeVerdict::Native
+        ));
+        assert!(matches!(
+            read_native(Some(&json!({"native": false}))),
+            NativeVerdict::NotNative
+        ));
         // task_500: an ABSENT native key, entirely missing metadata, and a non-bool native are ALL Unknown
         // (fail-safe) — the task_418 regression dropped metadata, which must NOT read as a hard not-native.
-        assert!(matches!(read_native(Some(&json!({"interval": "3h"}))), NativeVerdict::Unknown));
+        assert!(matches!(
+            read_native(Some(&json!({"interval": "3h"}))),
+            NativeVerdict::Unknown
+        ));
         assert!(matches!(read_native(None), NativeVerdict::Unknown));
-        assert!(matches!(read_native(Some(&json!({"native": "true"}))), NativeVerdict::Unknown));
+        assert!(matches!(
+            read_native(Some(&json!({"native": "true"}))),
+            NativeVerdict::Unknown
+        ));
     }
 
     #[test]
@@ -11686,9 +13447,21 @@ mod tests {
         assert_eq!(watchdog_verdict(ivi - 1, iv), "ok", "within one interval");
         assert_eq!(watchdog_verdict(ivi, iv), "late", "at one interval → late");
         assert_eq!(watchdog_verdict(ivi * 3 - 1, iv), "late");
-        assert_eq!(watchdog_verdict(ivi * 3, iv), "STALE", "beyond the overdue window → re-arm candidate");
-        assert_eq!(watchdog_verdict(-120, iv), "ok", "clock skew (future last_seen) is ok");
-        assert_eq!(watchdog_verdict(999999, 0), "ok", "unknown interval → never flagged");
+        assert_eq!(
+            watchdog_verdict(ivi * 3, iv),
+            "STALE",
+            "beyond the overdue window → re-arm candidate"
+        );
+        assert_eq!(
+            watchdog_verdict(-120, iv),
+            "ok",
+            "clock skew (future last_seen) is ok"
+        );
+        assert_eq!(
+            watchdog_verdict(999999, 0),
+            "ok",
+            "unknown interval → never flagged"
+        );
     }
 
     #[test]
@@ -11697,17 +13470,35 @@ mod tests {
         // mission-complete agent that lengthened its own cadence is doing sanctioned idle, not stalling, so
         // re-arming it ("keep looping until your queue drains") is a phantom nag (v-capmeshd / v-nmidid: 0 open
         // tasks yet STALE against a short registered interval).
-        assert!(!is_retighten_candidate("STALE", 0, 600), "drained + STALE → NOT a candidate (was the bug)");
-        assert!(!is_retighten_candidate("late", 0, 600), "late is normal idle, and the queue is empty anyway");
-        assert!(!is_retighten_candidate("ok", 0, 6 * 3600), "drained on a long interval → sanctioned idle");
+        assert!(
+            !is_retighten_candidate("STALE", 0, 600),
+            "drained + STALE → NOT a candidate (was the bug)"
+        );
+        assert!(
+            !is_retighten_candidate("late", 0, 600),
+            "late is normal idle, and the queue is empty anyway"
+        );
+        assert!(
+            !is_retighten_candidate("ok", 0, 6 * 3600),
+            "drained on a long interval → sanctioned idle"
+        );
         // HOLDS open work → candidate when the loop stalled (STALE) or it idles on a long interval it should
         // be draining tighter.
-        assert!(is_retighten_candidate("STALE", 1, 600), "stalled loop holding work → re-arm");
+        assert!(
+            is_retighten_candidate("STALE", 1, 600),
+            "stalled loop holding work → re-arm"
+        );
         assert!(is_retighten_candidate("ok", 2, 3600), "1h+ with open tasks");
         assert!(is_retighten_candidate("late", 1, 6 * 3600));
         // Open work on a SHORT interval that is cycling (ok/late) is fine — it's already tight.
-        assert!(!is_retighten_candidate("ok", 3, 600), "10m with tasks is already tight");
-        assert!(!is_retighten_candidate("late", 3, 600), "short-interval late is the normal cycling band");
+        assert!(
+            !is_retighten_candidate("ok", 3, 600),
+            "10m with tasks is already tight"
+        );
+        assert!(
+            !is_retighten_candidate("late", 3, 600),
+            "short-interval late is the normal cycling band"
+        );
     }
 
     #[test]
@@ -11716,7 +13507,10 @@ mod tests {
         // Holds work and has been quiet beyond the short work cadence → candidate, even though (elsewhere) its
         // interval may be moderate and is_retighten_candidate would call it "already tight" (the #535 gap).
         assert!(work_driven_rearm(1, Some(wc), false));
-        assert!(work_driven_rearm(3, Some(wc * 100), false), "long quiet with work → still a candidate");
+        assert!(
+            work_driven_rearm(3, Some(wc * 100), false),
+            "long quiet with work → still a candidate"
+        );
         // Below the work cadence → not yet (it is cycling tightly enough / may be mid-tick).
         assert!(!work_driven_rearm(1, Some(wc - 1), false));
         // No actionable work → never a work-driven candidate (a drained/idle agent rests on its interval).
@@ -11734,26 +13528,48 @@ mod tests {
         let long = WATCHDOG_LONG_INTERVAL_SECS; // already at a long cadence
         // Args: (open_tasks, interval, stood_down, reactive, deliberate_monitor, patrol, verdict).
         // Live, drained (0 actionable), short interval, none of the exclusions → lengthen it.
-        assert!(drained_idle_candidate(0, short, false, false, false, false, "ok"));
-        assert!(drained_idle_candidate(0, short, false, false, false, false, "late"), "late still counts (ticking)");
+        assert!(drained_idle_candidate(
+            0, short, false, false, false, false, "ok"
+        ));
+        assert!(
+            drained_idle_candidate(0, short, false, false, false, false, "late"),
+            "late still counts (ticking)"
+        );
         // Has actionable work → not this path (the work-driven/retighten paths own that).
-        assert!(!drained_idle_candidate(1, short, false, false, false, false, "ok"));
+        assert!(!drained_idle_candidate(
+            1, short, false, false, false, false, "ok"
+        ));
         // Already at a long interval → nothing to lengthen (this is what convergence looks like).
-        assert!(!drained_idle_candidate(0, long, false, false, false, false, "ok"));
+        assert!(!drained_idle_candidate(
+            0, long, false, false, false, false, "ok"
+        ));
         // Stood down → a spun-down agent is left alone, not lengthened.
-        assert!(!drained_idle_candidate(0, short, true, false, false, false, "ok"));
+        assert!(!drained_idle_candidate(
+            0, short, true, false, false, false, "ok"
+        ));
         // Reactive responder paces on mentions, not on an idle interval → excluded.
-        assert!(!drained_idle_candidate(0, short, false, true, false, false, "ok"));
+        assert!(!drained_idle_candidate(
+            0, short, false, true, false, false, "ok"
+        ));
         // Deliberate continuous monitor (holds a monitor_exempt task) is MEANT to poll → never lengthened.
-        assert!(!drained_idle_candidate(0, short, false, false, true, false, "ok"));
+        assert!(!drained_idle_candidate(
+            0, short, false, false, true, false, "ok"
+        ));
         // #544 fix: a PATROL/sweep agent (board-follow-up / board-triage) runs 0 tasks at a short cadence BY
         // DESIGN — lengthening it would blind the anti-stall layer, so it is excluded even though every other
         // signal says "drained self-poller".
-        assert!(!drained_idle_candidate(0, short, false, false, false, true, "ok"), "patrol agent is never lengthened");
+        assert!(
+            !drained_idle_candidate(0, short, false, false, false, true, "ok"),
+            "patrol agent is never lengthened"
+        );
         // STALE = a stopped loop (a re-arm/relaunch case), not an over-eager poller → not this path.
-        assert!(!drained_idle_candidate(0, short, false, false, false, false, "STALE"));
+        assert!(!drained_idle_candidate(
+            0, short, false, false, false, false, "STALE"
+        ));
         // Unknown/zero interval → can't call it a short self-poller.
-        assert!(!drained_idle_candidate(0, 0, false, false, false, false, "ok"));
+        assert!(!drained_idle_candidate(
+            0, 0, false, false, false, false, "ok"
+        ));
     }
 
     #[test]
@@ -11765,13 +13581,16 @@ mod tests {
         ];
         let owners = monitor_exempt_task_owners(&tasks);
         assert!(owners.contains("v-monitor"));
-        assert!(!owners.contains("v-worker"), "a non-exempt task's owner is not a deliberate monitor");
+        assert!(
+            !owners.contains("v-worker"),
+            "a non-exempt task's owner is not a deliberate monitor"
+        );
         assert_eq!(owners.len(), 1);
     }
 
     #[test]
     fn agent_never_ticked_flags_a_launched_but_dead_on_arrival_loop() {
-        use time::{format_description::well_known::Rfc3339, Duration};
+        use time::{Duration, format_description::well_known::Rfc3339};
         let now = time::OffsetDateTime::now_utc();
         let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
         let grace = 600; // 10m
@@ -11779,26 +13598,41 @@ mod tests {
         // last_seen never advanced past created_at, and it registered well before the grace window → the
         // #417 launch-crash signature (board-triage/board-follow-up: online but never ticked).
         let old = stamp(Duration::minutes(20));
-        assert!(agent_never_ticked(&old, &old, now, grace), "equal stamps past the grace window → never-ticked");
+        assert!(
+            agent_never_ticked(&old, &old, now, grace),
+            "equal stamps past the grace window → never-ticked"
+        );
 
         // Still inside the grace window: a just-registered agent legitimately has last_seen == created_at
         // until its first tick lands — must NOT flag.
         let fresh = stamp(Duration::minutes(2));
-        assert!(!agent_never_ticked(&fresh, &fresh, now, grace), "within grace → still booting, not a crash");
+        assert!(
+            !agent_never_ticked(&fresh, &fresh, now, grace),
+            "within grace → still booting, not a crash"
+        );
 
         // Ticked at least once (last_seen advanced past created_at) → live/idle, never a never-ticked flag,
         // however old the heartbeat is.
         let created = stamp(Duration::hours(4));
         let seen = stamp(Duration::minutes(30));
-        assert!(!agent_never_ticked(&created, &seen, now, grace), "advanced last_seen → it ticked, not dead-on-arrival");
+        assert!(
+            !agent_never_ticked(&created, &seen, now, grace),
+            "advanced last_seen → it ticked, not dead-on-arrival"
+        );
 
         // Epsilon: a sub-2s precision difference between the two columns still counts as equal ...
         let created_eps = stamp(Duration::minutes(20));
         let seen_eps = stamp(Duration::minutes(20) - Duration::seconds(1));
-        assert!(agent_never_ticked(&created_eps, &seen_eps, now, grace), "1s column drift is within epsilon");
+        assert!(
+            agent_never_ticked(&created_eps, &seen_eps, now, grace),
+            "1s column drift is within epsilon"
+        );
         // ... but a real multi-second advance is a genuine tick.
         let seen_ticked = stamp(Duration::minutes(20) - Duration::seconds(5));
-        assert!(!agent_never_ticked(&created_eps, &seen_ticked, now, grace), "5s advance is a real tick");
+        assert!(
+            !agent_never_ticked(&created_eps, &seen_ticked, now, grace),
+            "5s advance is a real tick"
+        );
 
         // Unparseable stamps never flag (degrade safe).
         assert!(!agent_never_ticked("", "", now, grace));
@@ -11817,7 +13651,10 @@ mod tests {
             match_session_id_in("2ac1ff53-859a-4205-8a04-2be2f6f2e1b4", &candidates),
             Some(candidates[0].clone())
         );
-        assert_eq!(match_session_id_in("sess-9", &candidates), Some(candidates[1].clone()));
+        assert_eq!(
+            match_session_id_in("sess-9", &candidates),
+            Some(candidates[1].clone())
+        );
         // An unknown id matches nothing → the caller emits a clear error rather than reading a wrong file.
         assert!(match_session_id_in("no-such-session", &candidates).is_none());
         assert!(match_session_id_in("sess-9", &[]).is_none());
@@ -11829,7 +13666,10 @@ mod tests {
         // remnant (the exact false-positive the idle-prompt override guards against).
         let idle = "some earlier output\n↓ 4.2k tokens\n⏵⏵ bypass permissions · esc to interrupt · ← for agents\n❯";
         assert!(pane_shows_idle_prompt(idle));
-        assert!(!pane_shows_working(idle), "idle ❯ overrides lingering footer/token remnant");
+        assert!(
+            !pane_shows_working(idle),
+            "idle ❯ overrides lingering footer/token remnant"
+        );
         // A turn in flight → working (no bare ❯ prompt while generating).
         assert!(pane_shows_working("Percolating… (2m 3s · ↓ 12.0k tokens)"));
         assert!(pane_shows_working("doing a thing  esc to interrupt"));
@@ -11870,7 +13710,9 @@ mod tests {
         ];
         assert!(!roster_metadata_stripped(&has_some));
         // A normal roster with metadata is fine.
-        assert!(!roster_metadata_stripped(&[serde_json::json!({"id":"a","metadata":{"native":true}})]));
+        assert!(!roster_metadata_stripped(&[
+            serde_json::json!({"id":"a","metadata":{"native":true}})
+        ]));
         // An empty roster is a board outage / no agents, NOT a metadata-stripping bug → do not warn.
         assert!(!roster_metadata_stripped(&[]));
     }
@@ -11881,12 +13723,16 @@ mod tests {
             serde_json::json!({"id":1,"assignee":"v-bolero","status":"in_progress"}),
             serde_json::json!({"id":2,"assignee":"v-bolero","status":"in_progress"}), // same owner → deduped
             serde_json::json!({"id":3,"assignee":"librarian","status":"in_progress"}),
-            serde_json::json!({"id":4,"assignee":"","status":"in_progress"}),          // unassigned → dropped
-            serde_json::json!({"id":5,"status":"in_progress"}),                          // no assignee → dropped
+            serde_json::json!({"id":4,"assignee":"","status":"in_progress"}), // unassigned → dropped
+            serde_json::json!({"id":5,"status":"in_progress"}), // no assignee → dropped
         ];
         let owners = inprogress_task_assignees(&tasks);
         assert!(owners.contains("v-bolero") && owners.contains("librarian"));
-        assert_eq!(owners.len(), 2, "deduped, and empty/absent assignees dropped");
+        assert_eq!(
+            owners.len(),
+            2,
+            "deduped, and empty/absent assignees dropped"
+        );
         // Empty task list → empty set (a board query error degrades here → no false #506 violations).
         assert!(inprogress_task_assignees(&[]).is_empty());
     }
@@ -11894,13 +13740,22 @@ mod tests {
     #[test]
     fn presence_is_at_rest_covers_offline_and_away_only() {
         // task_506 Phase A.5: a not-working presence while holding a live in_progress task is a violation.
-        assert!(presence_is_at_rest(Some("offline")), "stood down is at-rest (Phase A)");
-        assert!(presence_is_at_rest(Some("away")), "away is a not-working presence (Phase A.5)");
+        assert!(
+            presence_is_at_rest(Some("offline")),
+            "stood down is at-rest (Phase A)"
+        );
+        assert!(
+            presence_is_at_rest(Some("away")),
+            "away is a not-working presence (Phase A.5)"
+        );
         // Working presences are never a violation.
         assert!(!presence_is_at_rest(Some("online")), "online is working");
         assert!(!presence_is_at_rest(Some("busy")), "busy is working");
         // Unknown/absent presence is not treated as a violation (fail-safe: no false flag).
-        assert!(!presence_is_at_rest(None), "unknown presence is not a violation");
+        assert!(
+            !presence_is_at_rest(None),
+            "unknown presence is not a violation"
+        );
     }
 
     #[test]
@@ -11917,7 +13772,10 @@ mod tests {
         ];
         let owners = inprogress_task_assignees(&tasks);
         assert!(owners.contains("v-worker") && owners.contains("v-both"));
-        assert!(!owners.contains("v-monitor"), "a purely monitor-exempt owner is not holding work at rest");
+        assert!(
+            !owners.contains("v-monitor"),
+            "a purely monitor-exempt owner is not holding work at rest"
+        );
         assert_eq!(owners.len(), 2);
     }
 
@@ -11933,7 +13791,10 @@ mod tests {
         ];
         let owners = blocked_task_owners(&tasks);
         assert!(owners.contains("v-a") && owners.contains("v-b"));
-        assert!(!owners.contains("v-c") && !owners.contains("v-d"), "a blocked task with no blocker is excluded");
+        assert!(
+            !owners.contains("v-c") && !owners.contains("v-d"),
+            "a blocked task with no blocker is excluded"
+        );
         assert_eq!(owners.len(), 2);
         assert!(blocked_task_owners(&[]).is_empty());
     }
@@ -11954,8 +13815,12 @@ mod tests {
 
     #[test]
     fn task_is_monitor_exempt_reads_the_derived_bool_defaulting_false() {
-        assert!(task_is_monitor_exempt(&serde_json::json!({"id":1,"monitor_exempt":true})));
-        assert!(!task_is_monitor_exempt(&serde_json::json!({"id":1,"monitor_exempt":false})));
+        assert!(task_is_monitor_exempt(
+            &serde_json::json!({"id":1,"monitor_exempt":true})
+        ));
+        assert!(!task_is_monitor_exempt(
+            &serde_json::json!({"id":1,"monitor_exempt":false})
+        ));
         // Absent (pre-#167 payload or a non-exempt row) → false, so nothing is wrongly skipped.
         assert!(!task_is_monitor_exempt(&serde_json::json!({"id":1})));
     }
@@ -11963,41 +13828,72 @@ mod tests {
     #[test]
     fn task_is_parked_on_blocker_flags_any_non_empty_blocked_on_kind() {
         // task-board#178: an external/infra wait is parked, not stalled → skip its nudge.
-        assert!(task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":"external"})));
+        assert!(task_is_parked_on_blocker(
+            &serde_json::json!({"id":1,"blocked_on_kind":"external"})
+        ));
         // Any other blocker kind (operator/task) is likewise parked.
-        assert!(task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":"operator"})));
-        assert!(task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":"task"})));
+        assert!(task_is_parked_on_blocker(
+            &serde_json::json!({"id":1,"blocked_on_kind":"operator"})
+        ));
+        assert!(task_is_parked_on_blocker(
+            &serde_json::json!({"id":1,"blocked_on_kind":"task"})
+        ));
         // Absent or empty blocker → NOT parked, so a genuinely stale unblocked task is still nudged.
         assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1})));
-        assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":""})));
-        assert!(!task_is_parked_on_blocker(&serde_json::json!({"id":1,"blocked_on_kind":null})));
+        assert!(!task_is_parked_on_blocker(
+            &serde_json::json!({"id":1,"blocked_on_kind":""})
+        ));
+        assert!(!task_is_parked_on_blocker(
+            &serde_json::json!({"id":1,"blocked_on_kind":null})
+        ));
     }
 
     #[test]
     fn seam_glob_matches_handles_star_doublestar_and_literals() {
         // Literal exact path.
-        assert!(seam_glob_matches("crates/foo/perform_arg_ground.rs", "crates/foo/perform_arg_ground.rs"));
-        assert!(!seam_glob_matches("crates/foo/other.rs", "crates/foo/perform_arg_ground.rs"));
+        assert!(seam_glob_matches(
+            "crates/foo/perform_arg_ground.rs",
+            "crates/foo/perform_arg_ground.rs"
+        ));
+        assert!(!seam_glob_matches(
+            "crates/foo/other.rs",
+            "crates/foo/perform_arg_ground.rs"
+        ));
         // `**` spans path segments.
         assert!(seam_glob_matches("crates/foo/a/b.rs", "crates/foo/**"));
         assert!(seam_glob_matches("crates/foo/a/b/c.rs", "crates/foo/**"));
         assert!(!seam_glob_matches("crates/bar/a.rs", "crates/foo/**"));
         // `**/<file>` matches that file at ANY depth.
-        assert!(seam_glob_matches("a/b/perform_arg_ground.rs", "**/perform_arg_ground.rs"));
-        assert!(seam_glob_matches("perform_arg_ground.rs", "**/perform_arg_ground.rs"));
+        assert!(seam_glob_matches(
+            "a/b/perform_arg_ground.rs",
+            "**/perform_arg_ground.rs"
+        ));
+        assert!(seam_glob_matches(
+            "perform_arg_ground.rs",
+            "**/perform_arg_ground.rs"
+        ));
         // Single `*` is one segment only — does NOT cross `/`.
         assert!(seam_glob_matches("crates/foo/mod.rs", "crates/*/mod.rs"));
-        assert!(!seam_glob_matches("crates/foo/bar/mod.rs", "crates/*/mod.rs"), "* must not cross a slash");
+        assert!(
+            !seam_glob_matches("crates/foo/bar/mod.rs", "crates/*/mod.rs"),
+            "* must not cross a slash"
+        );
         // `*.rs` is top-level only.
         assert!(seam_glob_matches("x.rs", "*.rs"));
-        assert!(!seam_glob_matches("a/x.rs", "*.rs"), "*.rs is one segment, not recursive");
+        assert!(
+            !seam_glob_matches("a/x.rs", "*.rs"),
+            "*.rs is one segment, not recursive"
+        );
         // `**.rs` (or **/*.rs) matches nested.
         assert!(seam_glob_matches("a/x.rs", "**/*.rs"));
     }
 
     #[test]
     fn seam_touched_returns_only_on_seam_paths_and_is_green_when_empty() {
-        let seams = vec!["crates/effects/**".to_string(), "**/const_fold.rs".to_string()];
+        let seams = vec![
+            "crates/effects/**".to_string(),
+            "**/const_fold.rs".to_string(),
+        ];
         let changed = vec![
             "crates/effects/perform_arg_ground.rs".to_string(), // on seam (** dir)
             "crates/opt/const_fold.rs".to_string(),             // on seam (** file)
@@ -12005,10 +13901,22 @@ mod tests {
             "crates/syntax/lexer.rs".to_string(),               // off seam
         ];
         let hit = seam_touched(&changed, &seams);
-        assert_eq!(hit, vec!["crates/effects/perform_arg_ground.rs", "crates/opt/const_fold.rs"]);
+        assert_eq!(
+            hit,
+            vec![
+                "crates/effects/perform_arg_ground.rs",
+                "crates/opt/const_fold.rs"
+            ]
+        );
         // No seam-touching change -> GREEN (empty) -> caller need not wake the model.
-        let clean = vec!["docs/x.md".to_string(), "crates/syntax/lexer.rs".to_string()];
-        assert!(seam_touched(&clean, &seams).is_empty(), "no on-seam change is GREEN");
+        let clean = vec![
+            "docs/x.md".to_string(),
+            "crates/syntax/lexer.rs".to_string(),
+        ];
+        assert!(
+            seam_touched(&clean, &seams).is_empty(),
+            "no on-seam change is GREEN"
+        );
         // No declared seam -> nothing can match -> GREEN (the command treats 'no seam' separately).
         assert!(seam_touched(&changed, &[]).is_empty());
     }
@@ -12036,8 +13944,8 @@ mod tests {
             "!backend/cadenza/select/**".to_string(),
         ];
         let changed = vec![
-            "backend/cadenza/lower.rs".to_string(),          // owned seam -> on
-            "backend/cadenza/opt.rs".to_string(),            // owned seam -> on
+            "backend/cadenza/lower.rs".to_string(), // owned seam -> on
+            "backend/cadenza/opt.rs".to_string(),   // owned seam -> on
             "backend/cadenza/select/marshal.rs".to_string(), // shared, excluded -> off
             "backend/cadenza/select/reclaim.rs".to_string(), // shared, excluded -> off
         ];
@@ -12048,35 +13956,61 @@ mod tests {
         );
         // An exclude that shadows the ONLY changed path -> GREEN (do not wake).
         let only_shared = vec!["backend/cadenza/select/marshal.rs".to_string()];
-        assert!(seam_touched(&only_shared, &seams).is_empty(), "only-excluded change is GREEN");
+        assert!(
+            seam_touched(&only_shared, &seams).is_empty(),
+            "only-excluded change is GREEN"
+        );
     }
 
     #[test]
     fn assistant_stop_reason_reads_only_completed_assistant_turns() {
         assert_eq!(
-            assistant_stop_reason(&serde_json::json!({"type":"assistant","message":{"stop_reason":"refusal"}})),
+            assistant_stop_reason(
+                &serde_json::json!({"type":"assistant","message":{"stop_reason":"refusal"}})
+            ),
             Some("refusal".to_string())
         );
         assert_eq!(
-            assistant_stop_reason(&serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn"}})),
+            assistant_stop_reason(
+                &serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn"}})
+            ),
             Some("end_turn".to_string())
         );
         // Non-assistant records / missing stop_reason -> None (not counted as a turn).
-        assert_eq!(assistant_stop_reason(&serde_json::json!({"type":"user","message":{"stop_reason":"refusal"}})), None);
-        assert_eq!(assistant_stop_reason(&serde_json::json!({"type":"assistant","message":{"role":"assistant"}})), None);
-        assert_eq!(assistant_stop_reason(&serde_json::json!({"type":"system"})), None);
+        assert_eq!(
+            assistant_stop_reason(
+                &serde_json::json!({"type":"user","message":{"stop_reason":"refusal"}})
+            ),
+            None
+        );
+        assert_eq!(
+            assistant_stop_reason(
+                &serde_json::json!({"type":"assistant","message":{"role":"assistant"}})
+            ),
+            None
+        );
+        assert_eq!(
+            assistant_stop_reason(&serde_json::json!({"type":"system"})),
+            None
+        );
     }
 
     #[test]
     fn safeguard_wedge_flags_only_a_trailing_run_of_refusals() {
         let r = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // A trailing run of >= threshold refusals -> WEDGED.
-        assert!(safeguard_wedge(&r(&["end_turn", "refusal", "refusal", "refusal"]), 3));
+        assert!(safeguard_wedge(
+            &r(&["end_turn", "refusal", "refusal", "refusal"]),
+            3
+        ));
         assert!(safeguard_wedge(&r(&["refusal", "refusal"]), 2));
         // Fewer than threshold trailing refusals -> not wedged.
         assert!(!safeguard_wedge(&r(&["refusal", "refusal"]), 3));
         // A refusal run that is NOT at the tail (recovered after) -> not wedged (the agent is working again).
-        assert!(!safeguard_wedge(&r(&["refusal", "refusal", "refusal", "end_turn"]), 3));
+        assert!(!safeguard_wedge(
+            &r(&["refusal", "refusal", "refusal", "end_turn"]),
+            3
+        ));
         // Mixed tail -> not wedged.
         assert!(!safeguard_wedge(&r(&["refusal", "tool_use", "refusal"]), 3));
         // Empty / threshold 0 -> never wedged (no false positive on a fresh or empty transcript).
@@ -12086,7 +14020,8 @@ mod tests {
 
     #[test]
     fn tail_stop_reasons_parses_only_trailing_assistant_turns() {
-        let line = |t: &str, sr: &str| format!(r#"{{"type":"{t}","message":{{"stop_reason":"{sr}"}}}}"#);
+        let line =
+            |t: &str, sr: &str| format!(r#"{{"type":"{t}","message":{{"stop_reason":"{sr}"}}}}"#);
         // Mixed transcript: a user line (no stop_reason) and a non-JSON line are both dropped; assistant
         // stop_reasons are returned in chronological order (newest last).
         let content = [
@@ -12097,17 +14032,24 @@ mod tests {
             line("assistant", "refusal"),
         ]
         .join("\n");
-        assert_eq!(tail_stop_reasons(&content, 80), vec!["end_turn", "refusal", "refusal"]);
+        assert_eq!(
+            tail_stop_reasons(&content, 80),
+            vec!["end_turn", "refusal", "refusal"]
+        );
         // A small tail window keeps only the LAST N lines (here the two trailing refusals).
         assert_eq!(tail_stop_reasons(&content, 2), vec!["refusal", "refusal"]);
     }
 
     #[test]
     fn read_file_tail_bounds_the_read_and_drops_a_partial_leading_line() {
-        let path = std::env::temp_dir().join(format!("fleet-tail-{}-{}.txt", std::process::id(), line!()));
+        let path =
+            std::env::temp_dir().join(format!("fleet-tail-{}-{}.txt", std::process::id(), line!()));
         std::fs::write(&path, "aaaa\nbbbb\ncccc\ndddd\n").unwrap();
         // A budget covering the whole 20-byte file starts at offset 0 -> returned verbatim (no partial drop).
-        assert_eq!(read_file_tail(&path, 10_000).as_deref(), Some("aaaa\nbbbb\ncccc\ndddd\n"));
+        assert_eq!(
+            read_file_tail(&path, 10_000).as_deref(),
+            Some("aaaa\nbbbb\ncccc\ndddd\n")
+        );
         // A 7-byte budget reads bytes [13..20] = "c\ndddd\n"; starting mid-file drops the partial first line.
         assert_eq!(read_file_tail(&path, 7).as_deref(), Some("dddd\n"));
         let _ = std::fs::remove_file(&path);
@@ -12120,7 +14062,11 @@ mod tests {
         // A 4h-interval agent re-armed 1h ago is still on cooldown (< its own interval).
         assert!(rearm_on_cooldown(Some(10_000), 10_000 + 3_600, 4 * 3_600));
         // …and free again once a full interval has elapsed.
-        assert!(!rearm_on_cooldown(Some(10_000), 10_000 + 4 * 3_600, 4 * 3_600));
+        assert!(!rearm_on_cooldown(
+            Some(10_000),
+            10_000 + 4 * 3_600,
+            4 * 3_600
+        ));
         // A short/zero interval is floored at 5 min: a re-arm 60s ago is still on cooldown.
         assert!(rearm_on_cooldown(Some(10_000), 10_000 + 60, 0));
         assert!(!rearm_on_cooldown(Some(10_000), 10_000 + 301, 0));
@@ -12129,64 +14075,117 @@ mod tests {
     #[test]
     fn hire_signal_cooldown_suppresses_within_the_window_and_lapses_after() {
         // task_794: never signalled → free to post.
-        assert!(!hire_signal_on_cooldown(None, 10_000, HIRE_SIGNAL_COOLDOWN_SECS));
+        assert!(!hire_signal_on_cooldown(
+            None,
+            10_000,
+            HIRE_SIGNAL_COOLDOWN_SECS
+        ));
         // Signalled 1h ago with a 6h cooldown → still suppressed.
-        assert!(hire_signal_on_cooldown(Some(10_000), 10_000 + 3_600, HIRE_SIGNAL_COOLDOWN_SECS));
+        assert!(hire_signal_on_cooldown(
+            Some(10_000),
+            10_000 + 3_600,
+            HIRE_SIGNAL_COOLDOWN_SECS
+        ));
         // …free once the full 6h window has elapsed (no floor, unlike the re-arm cooldown).
-        assert!(!hire_signal_on_cooldown(Some(10_000), 10_000 + HIRE_SIGNAL_COOLDOWN_SECS, HIRE_SIGNAL_COOLDOWN_SECS));
+        assert!(!hire_signal_on_cooldown(
+            Some(10_000),
+            10_000 + HIRE_SIGNAL_COOLDOWN_SECS,
+            HIRE_SIGNAL_COOLDOWN_SECS
+        ));
         // The window is exactly `cooldown_secs`: one second short is still suppressed.
-        assert!(hire_signal_on_cooldown(Some(10_000), 10_000 + HIRE_SIGNAL_COOLDOWN_SECS - 1, HIRE_SIGNAL_COOLDOWN_SECS));
+        assert!(hire_signal_on_cooldown(
+            Some(10_000),
+            10_000 + HIRE_SIGNAL_COOLDOWN_SECS - 1,
+            HIRE_SIGNAL_COOLDOWN_SECS
+        ));
     }
 
     #[test]
     fn inbox_pending_count_counts_files_not_the_processed_dir() {
         let (base, fleet) = tmp_hub();
         fleet.ensure_inbox("a1"); // creates inbox/a1/processed
-        assert_eq!(inbox_pending_count(&fleet, "a1"), 0, "empty inbox (processed dir excluded)");
+        assert_eq!(
+            inbox_pending_count(&fleet, "a1"),
+            0,
+            "empty inbox (processed dir excluded)"
+        );
         std::fs::write(fleet.inbox("a1").join("0001-msg.json"), "{}").unwrap();
         std::fs::write(fleet.inbox("a1").join("0002-msg.json"), "{}").unwrap();
-        assert_eq!(inbox_pending_count(&fleet, "a1"), 2, "two undrained messages; processed/ not counted");
+        assert_eq!(
+            inbox_pending_count(&fleet, "a1"),
+            2,
+            "two undrained messages; processed/ not counted"
+        );
         // A non-message kickoff SEED file (not `.json`) must NOT count — else a lingering seed reads as a
         // perpetual pending message and the watchdog false-nudges the agent every sweep (v-s2n-quic/v-etude).
         std::fs::write(fleet.inbox("a1").join("s2n_seed.txt"), "seed").unwrap();
         std::fs::write(fleet.inbox("a1").join("seed-a1.md"), "seed").unwrap();
-        assert_eq!(inbox_pending_count(&fleet, "a1"), 2, "seed files excluded; only .json messages count");
+        assert_eq!(
+            inbox_pending_count(&fleet, "a1"),
+            2,
+            "seed files excluded; only .json messages count"
+        );
         assert_eq!(inbox_pending_count(&fleet, "nobody"), 0, "absent inbox → 0");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn parse_repo_spec_splits_branch_and_defaults_to_main() {
-        assert_eq!(parse_repo_spec("camshaft/bolero@master"), serde_json::json!({"repo":"camshaft/bolero","branch":"master"}));
-        assert_eq!(parse_repo_spec("camshaft/backbeat"), serde_json::json!({"repo":"camshaft/backbeat","branch":"main"}));
-        assert_eq!(parse_repo_spec("camshaft/x@"), serde_json::json!({"repo":"camshaft/x","branch":"main"}), "empty branch → main");
+        assert_eq!(
+            parse_repo_spec("camshaft/bolero@master"),
+            serde_json::json!({"repo":"camshaft/bolero","branch":"master"})
+        );
+        assert_eq!(
+            parse_repo_spec("camshaft/backbeat"),
+            serde_json::json!({"repo":"camshaft/backbeat","branch":"main"})
+        );
+        assert_eq!(
+            parse_repo_spec("camshaft/x@"),
+            serde_json::json!({"repo":"camshaft/x","branch":"main"}),
+            "empty branch → main"
+        );
     }
 
     #[test]
     fn normalize_repos_accepts_structured_bare_string_and_csv_shapes() {
         // Canonical structured form (what `fleet set-meta --repo` writes) → kept as-is.
         let structured = serde_json::json!([{"repo":"camshaft/fleet"},{"repo":"camshaft/cadenza","branch":"main"}]);
-        assert_eq!(normalize_repos(Some(&structured)), vec![
-            serde_json::json!({"repo":"camshaft/fleet"}),
-            serde_json::json!({"repo":"camshaft/cadenza","branch":"main"}),
-        ]);
+        assert_eq!(
+            normalize_repos(Some(&structured)),
+            vec![
+                serde_json::json!({"repo":"camshaft/fleet"}),
+                serde_json::json!({"repo":"camshaft/cadenza","branch":"main"}),
+            ]
+        );
         // A CSV STRING (the hand-mint shape, #472) → split + trimmed into {repo} entries, NOT silently dropped.
         let csv = serde_json::json!("Membrain, MembrainCDK, ElasticShuffleCDK");
-        assert_eq!(normalize_repos(Some(&csv)), vec![
-            serde_json::json!({"repo":"Membrain"}),
-            serde_json::json!({"repo":"MembrainCDK"}),
-            serde_json::json!({"repo":"ElasticShuffleCDK"}),
-        ]);
+        assert_eq!(
+            normalize_repos(Some(&csv)),
+            vec![
+                serde_json::json!({"repo":"Membrain"}),
+                serde_json::json!({"repo":"MembrainCDK"}),
+                serde_json::json!({"repo":"ElasticShuffleCDK"}),
+            ]
+        );
         // A bare-string array → each wrapped as {repo}.
-        let bare = serde_json::json!(["Membrain","MembrainCDK"]);
-        assert_eq!(normalize_repos(Some(&bare)), vec![
-            serde_json::json!({"repo":"Membrain"}),
-            serde_json::json!({"repo":"MembrainCDK"}),
-        ]);
+        let bare = serde_json::json!(["Membrain", "MembrainCDK"]);
+        assert_eq!(
+            normalize_repos(Some(&bare)),
+            vec![
+                serde_json::json!({"repo":"Membrain"}),
+                serde_json::json!({"repo":"MembrainCDK"}),
+            ]
+        );
         // Absent / empty / other shapes → no entries (the workspace_kind path handles off-tree agents).
         assert!(normalize_repos(None).is_empty());
-        assert!(normalize_repos(Some(&serde_json::json!(""))).is_empty(), "empty string → no entries");
-        assert!(normalize_repos(Some(&serde_json::json!("  ,  , "))).is_empty(), "blank CSV parts filtered out");
+        assert!(
+            normalize_repos(Some(&serde_json::json!(""))).is_empty(),
+            "empty string → no entries"
+        );
+        assert!(
+            normalize_repos(Some(&serde_json::json!("  ,  , "))).is_empty(),
+            "blank CSV parts filtered out"
+        );
         assert!(normalize_repos(Some(&serde_json::json!(42))).is_empty());
     }
 
@@ -12197,7 +14196,12 @@ mod tests {
         assert_eq!(p["interval"], "2m");
         // repos only — no interval/host/native/devshell key
         let p = build_meta_patch(&["o/r".to_string()], None, None, None, None).unwrap();
-        assert!(p.get("interval").is_none() && p.get("host").is_none() && p.get("native").is_none() && p.get("devshell").is_none());
+        assert!(
+            p.get("interval").is_none()
+                && p.get("host").is_none()
+                && p.get("native").is_none()
+                && p.get("devshell").is_none()
+        );
         assert!(p.get("repos").is_some());
         // interval only — no repos key
         let p = build_meta_patch(&[], Some("30m"), None, None, None).unwrap();
@@ -12207,19 +14211,45 @@ mod tests {
         let p = build_meta_patch(&[], None, Some("host-b"), None, None).unwrap();
         assert_eq!(p["host"], "host-b");
         let p = build_meta_patch(&[], None, Some(""), None, None).unwrap();
-        assert_eq!(p["host"], serde_json::Value::Null, "empty host clears the pin");
+        assert_eq!(
+            p["host"],
+            serde_json::Value::Null,
+            "empty host clears the pin"
+        );
         // native: tri-state — Some(true)/Some(false) emit the bool; None omits the key entirely
         let p = build_meta_patch(&[], None, None, Some(true), None).unwrap();
-        assert_eq!(p["native"], serde_json::Value::Bool(true), "--native true → the board-native marker");
+        assert_eq!(
+            p["native"],
+            serde_json::Value::Bool(true),
+            "--native true → the board-native marker"
+        );
         let p = build_meta_patch(&[], None, None, Some(false), None).unwrap();
-        assert_eq!(p["native"], serde_json::Value::Bool(false), "--native false → clear back to file-hub");
-        assert!(build_meta_patch(&["o/r".to_string()], None, None, None, None).unwrap().get("native").is_none(),
-            "native untouched when not requested");
+        assert_eq!(
+            p["native"],
+            serde_json::Value::Bool(false),
+            "--native false → clear back to file-hub"
+        );
+        assert!(
+            build_meta_patch(&["o/r".to_string()], None, None, None, None)
+                .unwrap()
+                .get("native")
+                .is_none(),
+            "native untouched when not requested"
+        );
         // devshell: tri-state, same shape (#214 opt-in launch-in-nix-develop marker)
         let p = build_meta_patch(&[], None, None, None, Some(true)).unwrap();
-        assert_eq!(p["devshell"], serde_json::Value::Bool(true), "--devshell true → launch inside the flake devShell");
-        assert!(build_meta_patch(&["o/r".to_string()], None, None, None, None).unwrap().get("devshell").is_none(),
-            "devshell untouched when not requested");
+        assert_eq!(
+            p["devshell"],
+            serde_json::Value::Bool(true),
+            "--devshell true → launch inside the flake devShell"
+        );
+        assert!(
+            build_meta_patch(&["o/r".to_string()], None, None, None, None)
+                .unwrap()
+                .get("devshell")
+                .is_none(),
+            "devshell untouched when not requested"
+        );
         // nothing requested → error (guards a no-op PATCH)
         assert!(build_meta_patch(&[], None, None, None, None).is_err());
     }
@@ -12228,53 +14258,107 @@ mod tests {
     fn agent_host_matches_honors_pin_and_treats_unset_as_run_anywhere() {
         // unpinned (no host / null / empty) → managed everywhere
         assert!(agent_host_matches(Some(&serde_json::json!({})), "host-a"));
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":null})), "host-a"));
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":""})), "host-a"));
+        assert!(agent_host_matches(
+            Some(&serde_json::json!({"host":null})),
+            "host-a"
+        ));
+        assert!(agent_host_matches(
+            Some(&serde_json::json!({"host":""})),
+            "host-a"
+        ));
         assert!(agent_host_matches(None, "host-a"));
         // string pin: matches only its host
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":"host-b"})), "host-b"));
-        assert!(!agent_host_matches(Some(&serde_json::json!({"host":"host-b"})), "host-a"));
+        assert!(agent_host_matches(
+            Some(&serde_json::json!({"host":"host-b"})),
+            "host-b"
+        ));
+        assert!(!agent_host_matches(
+            Some(&serde_json::json!({"host":"host-b"})),
+            "host-a"
+        ));
         // array pin: matches if listed; empty array = unpinned
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":["host-b","host-a"]})), "host-a"));
-        assert!(!agent_host_matches(Some(&serde_json::json!({"host":["host-b"]})), "host-a"));
-        assert!(agent_host_matches(Some(&serde_json::json!({"host":[]})), "host-a"));
+        assert!(agent_host_matches(
+            Some(&serde_json::json!({"host":["host-b","host-a"]})),
+            "host-a"
+        ));
+        assert!(!agent_host_matches(
+            Some(&serde_json::json!({"host":["host-b"]})),
+            "host-a"
+        ));
+        assert!(agent_host_matches(
+            Some(&serde_json::json!({"host":[]})),
+            "host-a"
+        ));
     }
 
     #[test]
     fn version_line_reports_package_version_and_a_baked_rev() {
         let v = version_line();
-        assert!(v.starts_with(&format!("fleet {} (rev ", env!("CARGO_PKG_VERSION"))), "names the pkg version");
+        assert!(
+            v.starts_with(&format!("fleet {} (rev ", env!("CARGO_PKG_VERSION"))),
+            "names the pkg version"
+        );
         assert!(v.ends_with(")"), "wraps the rev");
         // build.rs always bakes a non-empty rev (a real short-sha, or the "unknown" fallback).
-        assert!(!env!("FLEET_BUILD_REV").is_empty(), "the build rev is always baked");
+        assert!(
+            !env!("FLEET_BUILD_REV").is_empty(),
+            "the build rev is always baked"
+        );
     }
 
     #[test]
     fn build_freshness_warning_flags_only_a_binary_behind_its_checkout() {
-        assert!(build_freshness_warning("abc123", Some("def456")).is_some(), "baked != head → stale");
-        assert!(build_freshness_warning("abc123", Some("abc123")).is_none(), "baked == head → current");
+        assert!(
+            build_freshness_warning("abc123", Some("def456")).is_some(),
+            "baked != head → stale"
+        );
+        assert!(
+            build_freshness_warning("abc123", Some("abc123")).is_none(),
+            "baked == head → current"
+        );
         assert!(
             build_freshness_warning("abc123-dirty", Some("abc123")).is_none(),
             "a dirty build of the same commit is not stale"
         );
-        assert!(build_freshness_warning("unknown", Some("abc123")).is_none(), "unknown baked rev → can't tell");
-        assert!(build_freshness_warning("", Some("abc123")).is_none(), "empty baked rev → can't tell");
-        assert!(build_freshness_warning("abc123", None).is_none(), "no checkout (deployed binary) → not applicable");
+        assert!(
+            build_freshness_warning("unknown", Some("abc123")).is_none(),
+            "unknown baked rev → can't tell"
+        );
+        assert!(
+            build_freshness_warning("", Some("abc123")).is_none(),
+            "empty baked rev → can't tell"
+        );
+        assert!(
+            build_freshness_warning("abc123", None).is_none(),
+            "no checkout (deployed binary) → not applicable"
+        );
     }
 
     #[test]
     fn watchdog_exec_args_builds_the_liveness_base_plus_opt_ins() {
         // rearm base, opt-in observe + pinned.
-        assert_eq!(watchdog_exec_args(true, false, false, false, false, false), "watchdog --rearm --stale-only");
-        assert_eq!(watchdog_exec_args(true, true, false, false, false, false), "watchdog --rearm --stale-only --observe --spawn");
-        assert_eq!(watchdog_exec_args(true, false, true, false, false, false), "watchdog --rearm --stale-only --pinned-only");
+        assert_eq!(
+            watchdog_exec_args(true, false, false, false, false, false),
+            "watchdog --rearm --stale-only"
+        );
+        assert_eq!(
+            watchdog_exec_args(true, true, false, false, false, false),
+            "watchdog --rearm --stale-only --observe --spawn"
+        );
+        assert_eq!(
+            watchdog_exec_args(true, false, true, false, false, false),
+            "watchdog --rearm --stale-only --pinned-only"
+        );
         // The secondary-box go-live shape: liveness + observer cadence + host filter.
         assert_eq!(
             watchdog_exec_args(true, true, true, false, false, false),
             "watchdog --rearm --stale-only --observe --spawn --pinned-only"
         );
         // OBSERVER-ONLY (rearm=false): coexists with an existing rearm watchdog without double-rearming (host-a).
-        assert_eq!(watchdog_exec_args(false, true, false, false, false, false), "watchdog --observe --spawn");
+        assert_eq!(
+            watchdog_exec_args(false, true, false, false, false, false),
+            "watchdog --observe --spawn"
+        );
         // --self-redeploy (#388) appends last: a local-checkout host installs the self-healing watchdog.
         assert_eq!(
             watchdog_exec_args(true, false, false, true, false, false),
@@ -12305,8 +14389,14 @@ mod tests {
     #[test]
     fn classify_wake_path_prefers_webhook_then_tunnel_then_poll_only() {
         // A non-empty webhook is a direct POST target — it wins even if a tunnel also covers the agent.
-        assert_eq!(classify_wake_path(Some("http://127.0.0.1:8899/wake"), true), WakePath::Webhook);
-        assert_eq!(classify_wake_path(Some("http://127.0.0.1:8899/wake"), false), WakePath::Webhook);
+        assert_eq!(
+            classify_wake_path(Some("http://127.0.0.1:8899/wake"), true),
+            WakePath::Webhook
+        );
+        assert_eq!(
+            classify_wake_path(Some("http://127.0.0.1:8899/wake"), false),
+            WakePath::Webhook
+        );
         // No webhook (None, empty, or whitespace) but a live tunnel → tunnel-woken.
         assert_eq!(classify_wake_path(None, true), WakePath::Tunnel);
         assert_eq!(classify_wake_path(Some(""), true), WakePath::Tunnel);
@@ -12320,42 +14410,78 @@ mod tests {
     #[test]
     fn classify_observe_coverage_flags_the_host_local_blind_spot() {
         use serde_json::json;
-        let dev = ObserveCadence { host: "host-a".to_string(), pinned_only: false };
-        let green = ObserveCadence { host: "host-b".to_string(), pinned_only: true };
+        let dev = ObserveCadence {
+            host: "host-a".to_string(),
+            pinned_only: false,
+        };
+        let green = ObserveCadence {
+            host: "host-b".to_string(),
+            pinned_only: true,
+        };
 
         // task_711: an agent pinned to host-b, with ONLY host-a observing, is covered by nobody → BLIND.
         let green_pinned = json!({"host": "host-b"});
         assert_eq!(
-            classify_observe_coverage(Some(&green_pinned), std::slice::from_ref(&dev), "host-a", None),
+            classify_observe_coverage(
+                Some(&green_pinned),
+                std::slice::from_ref(&dev),
+                "host-a",
+                None
+            ),
             ObserveCoverage::Blind
         );
         // Add the host-b pinned-only cadence and the SAME agent becomes covered (assumed — host-b is not the
         // local host, so transcript presence is not probed here).
         assert_eq!(
-            classify_observe_coverage(Some(&green_pinned), &[dev.clone(), green.clone()], "host-a", None),
+            classify_observe_coverage(
+                Some(&green_pinned),
+                &[dev.clone(), green.clone()],
+                "host-a",
+                None
+            ),
             ObserveCoverage::CoveredAssumed
         );
 
         // An agent managed by the LOCAL cadence: transcript present → verified; absent → soft gap.
         let dev_pinned = json!({"host": "host-a"});
         assert_eq!(
-            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "host-a", Some(true)),
+            classify_observe_coverage(
+                Some(&dev_pinned),
+                std::slice::from_ref(&dev),
+                "host-a",
+                Some(true)
+            ),
             ObserveCoverage::CoveredLocalTranscript
         );
         assert_eq!(
-            classify_observe_coverage(Some(&dev_pinned), std::slice::from_ref(&dev), "host-a", Some(false)),
+            classify_observe_coverage(
+                Some(&dev_pinned),
+                std::slice::from_ref(&dev),
+                "host-a",
+                Some(false)
+            ),
             ObserveCoverage::ManagedNoLocalTranscript
         );
 
         // An UNPINNED agent is covered by the non-pinned local cadence (transcript present here).
         let unpinned = json!({});
         assert_eq!(
-            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&dev), "host-a", Some(true)),
+            classify_observe_coverage(
+                Some(&unpinned),
+                std::slice::from_ref(&dev),
+                "host-a",
+                Some(true)
+            ),
             ObserveCoverage::CoveredLocalTranscript
         );
         // ...but if EVERY declared cadence is pinned-only, an unpinned agent is served by none → BLIND.
         assert_eq!(
-            classify_observe_coverage(Some(&unpinned), std::slice::from_ref(&green), "host-a", None),
+            classify_observe_coverage(
+                Some(&unpinned),
+                std::slice::from_ref(&green),
+                "host-a",
+                None
+            ),
             ObserveCoverage::Blind
         );
 
@@ -12378,7 +14504,10 @@ mod tests {
         assert_eq!(host_pin_display(Some(&json!({"host": "  "}))), "unpinned");
         assert_eq!(host_pin_display(Some(&json!({"host": []}))), "unpinned");
         assert_eq!(host_pin_display(Some(&json!({"host": "host-b"}))), "host-b");
-        assert_eq!(host_pin_display(Some(&json!({"host": ["host-b", "host-a"]}))), "[host-b, host-a]");
+        assert_eq!(
+            host_pin_display(Some(&json!({"host": ["host-b", "host-a"]}))),
+            "[host-b, host-a]"
+        );
     }
 
     #[test]
@@ -12445,22 +14574,36 @@ mod tests {
     fn path_is_live_matches_the_checkout_and_nested_cwds_only() {
         let wt = PathBuf::from("/home/u/.fleet/agents/a1/repo");
         // A process cwd'd exactly at the worktree → live.
-        assert!(path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1/repo")]));
+        assert!(path_is_live(
+            &wt,
+            &[PathBuf::from("/home/u/.fleet/agents/a1/repo")]
+        ));
         // A process cwd'd in a SUBDIR of the worktree → live.
-        assert!(path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1/repo/crates/fleet")]));
+        assert!(path_is_live(
+            &wt,
+            &[PathBuf::from("/home/u/.fleet/agents/a1/repo/crates/fleet")]
+        ));
         // A process elsewhere → not live.
         assert!(!path_is_live(&wt, &[PathBuf::from("/home/u/other")]));
         // A PARENT of the worktree is NOT a match (prefix must be the worktree, not the other way round).
-        assert!(!path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1")]));
+        assert!(!path_is_live(
+            &wt,
+            &[PathBuf::from("/home/u/.fleet/agents/a1")]
+        ));
         // A sibling that shares a path PREFIX string but not a path component → not live.
-        assert!(!path_is_live(&wt, &[PathBuf::from("/home/u/.fleet/agents/a1/repo-two")]));
+        assert!(!path_is_live(
+            &wt,
+            &[PathBuf::from("/home/u/.fleet/agents/a1/repo-two")]
+        ));
         // No live cwds → not live.
         assert!(!path_is_live(&wt, &[]));
     }
 
     #[test]
     fn is_agent_suffix_worktree_matches_the_dot_v_infix() {
-        assert!(is_agent_suffix_worktree(Path::new("/wt/backbeat.v-backbeat")));
+        assert!(is_agent_suffix_worktree(Path::new(
+            "/wt/backbeat.v-backbeat"
+        )));
         assert!(is_agent_suffix_worktree(Path::new("/wt/bolero.v-bolero")));
         // A plain repo or a linked topic worktree is not an off-tree-agent dir.
         assert!(!is_agent_suffix_worktree(Path::new("/wt/cadenza")));
@@ -12493,7 +14636,8 @@ detached
             ]
         );
         // A normal (non-bare) repo: its own worktree is kept.
-        let paths = parse_worktree_paths("worktree /home/u/repo\nHEAD aaa\nbranch refs/heads/main\n");
+        let paths =
+            parse_worktree_paths("worktree /home/u/repo\nHEAD aaa\nbranch refs/heads/main\n");
         assert_eq!(paths, vec![PathBuf::from("/home/u/repo")]);
         // Empty / no worktree lines → empty.
         assert!(parse_worktree_paths("").is_empty());
@@ -12514,7 +14658,13 @@ detached
         // An arbitrary primary is kept first and the full fallback set follows.
         assert_eq!(
             mainline_candidates("origin/release"),
-            vec!["origin/release", "mainline", "origin/mainline", "main", "origin/main"]
+            vec![
+                "origin/release",
+                "mainline",
+                "origin/mainline",
+                "main",
+                "origin/main"
+            ]
         );
     }
 
@@ -12528,7 +14678,9 @@ detached
         assert!(!execstart_is_nix_store(
             "ExecStart={ path=/home/u/Projects/camshaft/fleet/target/release/fleet ; argv[]=... }"
         ));
-        assert!(!execstart_is_nix_store("ExecStart={ path=/run/fleet/bin/fleet ; argv[]=... }"));
+        assert!(!execstart_is_nix_store(
+            "ExecStart={ path=/run/fleet/bin/fleet ; argv[]=... }"
+        ));
         // Empty / absent ExecStart carries no nix signal.
         assert!(!execstart_is_nix_store("ExecStart="));
         assert!(!execstart_is_nix_store(""));
@@ -12540,12 +14692,32 @@ detached
         // the task_720 trap (a local gate that does not match CI).
         let full = gate_steps(false);
         assert_eq!(full.len(), 2);
-        assert_eq!(full[0].1, vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]);
+        assert_eq!(
+            full[0].1,
+            vec![
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
         assert_eq!(full[1].1, vec!["test", "--workspace"]);
         // --clippy-only drops the test step but keeps the identical clippy command.
         let clippy_only = gate_steps(true);
         assert_eq!(clippy_only.len(), 1);
-        assert_eq!(clippy_only[0].1, vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]);
+        assert_eq!(
+            clippy_only[0].1,
+            vec![
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
     }
 
     #[test]
@@ -12561,28 +14733,57 @@ detached
     #[test]
     fn monitor_tick_wakes_only_skips_the_model_on_green() {
         // GREEN is the ONLY verdict that skips the model turn.
-        assert!(!monitor_tick_wakes(&SeamVerdict::Green { incoming: 0, seams: 2, head: "abc123".into() }));
+        assert!(!monitor_tick_wakes(&SeamVerdict::Green {
+            incoming: 0,
+            seams: 2,
+            head: "abc123".into()
+        }));
         // Everything else wakes — including the fail-safe no-seam / error cases (never silently skip a tick we
         // could not gate).
-        assert!(monitor_tick_wakes(&SeamVerdict::Changed(vec!["crates/x/seam.rs".into()])));
+        assert!(monitor_tick_wakes(&SeamVerdict::Changed(vec![
+            "crates/x/seam.rs".into()
+        ])));
         assert!(monitor_tick_wakes(&SeamVerdict::NoSeam));
-        assert!(monitor_tick_wakes(&SeamVerdict::Error("git fetch failed".into())));
+        assert!(monitor_tick_wakes(&SeamVerdict::Error(
+            "git fetch failed".into()
+        )));
     }
 
     #[test]
     fn classify_worktree_health_flags_a_stale_pointer_and_unlanded_commits() {
         // No metadata.worktree -> nothing to check (resolvable/path/ahead irrelevant).
-        assert_eq!(classify_worktree_health(false, false, false, 0), WorktreeHealth::Unset);
-        assert_eq!(classify_worktree_health(false, true, true, 5), WorktreeHealth::Unset);
+        assert_eq!(
+            classify_worktree_health(false, false, false, 0),
+            WorktreeHealth::Unset
+        );
+        assert_eq!(
+            classify_worktree_health(false, true, true, 5),
+            WorktreeHealth::Unset
+        );
         // Relative path with no hub to resolve -> Indeterminate, NEVER a false stale (the false-positive guard).
-        assert_eq!(classify_worktree_health(true, false, false, 0), WorktreeHealth::Indeterminate);
+        assert_eq!(
+            classify_worktree_health(true, false, false, 0),
+            WorktreeHealth::Indeterminate
+        );
         // task_730: set + resolvable but the resolved path is gone -> STALE, regardless of commit count.
-        assert_eq!(classify_worktree_health(true, true, false, 0), WorktreeHealth::MissingPath);
-        assert_eq!(classify_worktree_health(true, true, false, 9), WorktreeHealth::MissingPath);
+        assert_eq!(
+            classify_worktree_health(true, true, false, 0),
+            WorktreeHealth::MissingPath
+        );
+        assert_eq!(
+            classify_worktree_health(true, true, false, 9),
+            WorktreeHealth::MissingPath
+        );
         // Exists + commits ahead of mainline -> at-risk unlanded work.
-        assert_eq!(classify_worktree_health(true, true, true, 2), WorktreeHealth::UnlandedCommits);
+        assert_eq!(
+            classify_worktree_health(true, true, true, 2),
+            WorktreeHealth::UnlandedCommits
+        );
         // Exists + level/behind -> healthy.
-        assert_eq!(classify_worktree_health(true, true, true, 0), WorktreeHealth::Clean);
+        assert_eq!(
+            classify_worktree_health(true, true, true, 0),
+            WorktreeHealth::Clean
+        );
     }
 
     #[test]
@@ -12590,15 +14791,33 @@ detached
         use WorktreeSyncVerdict::*;
         let real = "/f/agents/a/cadenza";
         // No worktree set -> sync never ADDS one (only corrects an existing pointer).
-        assert_eq!(classify_worktree_sync(1, Some(real), true, None), NoWorktree);
-        assert_eq!(classify_worktree_sync(1, Some(real), true, Some("   ")), NoWorktree);
+        assert_eq!(
+            classify_worktree_sync(1, Some(real), true, None),
+            NoWorktree
+        );
+        assert_eq!(
+            classify_worktree_sync(1, Some(real), true, Some("   ")),
+            NoWorktree
+        );
         // Multi-repo or repo-less -> AMBIGUOUS primary, never guessed.
-        assert_eq!(classify_worktree_sync(2, None, false, Some(".claude/worktrees/a")), AmbiguousRepos);
-        assert_eq!(classify_worktree_sync(0, None, false, Some(".claude/worktrees/a")), AmbiguousRepos);
+        assert_eq!(
+            classify_worktree_sync(2, None, false, Some(".claude/worktrees/a")),
+            AmbiguousRepos
+        );
+        assert_eq!(
+            classify_worktree_sync(0, None, false, Some(".claude/worktrees/a")),
+            AmbiguousRepos
+        );
         // Single repo but the real fleet tree is missing -> leave the pointer untouched (never point at nothing).
-        assert_eq!(classify_worktree_sync(1, Some(real), false, Some(".claude/worktrees/a")), NoRealTree);
+        assert_eq!(
+            classify_worktree_sync(1, Some(real), false, Some(".claude/worktrees/a")),
+            NoRealTree
+        );
         // Already pointing at the real tree -> no-op (idempotent).
-        assert_eq!(classify_worktree_sync(1, Some(real), true, Some(real)), AlreadyCorrect);
+        assert_eq!(
+            classify_worktree_sync(1, Some(real), true, Some(real)),
+            AlreadyCorrect
+        );
         // Stale pointer + real tree exists -> fixable, carrying the correction target.
         assert_eq!(
             classify_worktree_sync(1, Some(real), true, Some(".claude/worktrees/a")),
@@ -12748,7 +14967,13 @@ detached
     fn worktree_metadata_patch_is_idempotent_and_syncs_a_stale_pointer() {
         use serde_json::json;
         // Already pointing at the real workdir -> no patch (idempotent re-provision).
-        assert_eq!(worktree_metadata_patch(Some("/home/u/.fleet/agents/a/repo"), "/home/u/.fleet/agents/a/repo"), None);
+        assert_eq!(
+            worktree_metadata_patch(
+                Some("/home/u/.fleet/agents/a/repo"),
+                "/home/u/.fleet/agents/a/repo"
+            ),
+            None
+        );
         // Stale pointer (the task_730 symptom: charter names an old/retired tree) -> patch to the real path.
         assert_eq!(
             worktree_metadata_patch(Some(".claude/worktrees/a"), "/home/u/.fleet/agents/a/repo"),
@@ -12765,35 +14990,65 @@ detached
     fn agent_expected_running_excludes_non_running_statuses_kinds_and_standdown() {
         use serde_json::json;
         // A live loop agent (vertical/named/worker/legacy-None kind) in a running status is in scope.
-        assert!(agent_expected_running(&json!({"status": "online", "kind": "vertical"})));
-        assert!(agent_expected_running(&json!({"status": "away", "kind": "named-agent"})));
+        assert!(agent_expected_running(
+            &json!({"status": "online", "kind": "vertical"})
+        ));
+        assert!(agent_expected_running(
+            &json!({"status": "away", "kind": "named-agent"})
+        ));
         assert!(agent_expected_running(&json!({"status": "busy"}))); // kind absent → legacy loop agent
         // Not-running statuses (any case) are excluded — a stood-down/finished/cancelled agent needs no wake.
         assert!(!agent_expected_running(&json!({"status": "offline"})));
         assert!(!agent_expected_running(&json!({"status": "OFFLINE"})));
-        assert!(!agent_expected_running(&json!({"status": "done", "kind": "worker"})));
+        assert!(!agent_expected_running(
+            &json!({"status": "done", "kind": "worker"})
+        ));
         assert!(!agent_expected_running(&json!({"status": "cancelled"})));
         // A pending stand-down request winds the agent down even before status flips.
-        assert!(!agent_expected_running(&json!({"status": "online", "stand_down_requested_at": "2026-09-30T00:00:00Z"})));
+        assert!(!agent_expected_running(
+            &json!({"status": "online", "stand_down_requested_at": "2026-09-30T00:00:00Z"})
+        ));
         // A null stand-down field is NOT a stand-down.
-        assert!(agent_expected_running(&json!({"status": "online", "stand_down_requested_at": null})));
+        assert!(agent_expected_running(
+            &json!({"status": "online", "stand_down_requested_at": null})
+        ));
         // Non-loop kinds have no event loop to strand: an interactive assistant session, an ephemeral observer.
-        assert!(!agent_expected_running(&json!({"status": "online", "kind": "assistant"})));
-        assert!(!agent_expected_running(&json!({"status": "online", "kind": "observer"})));
+        assert!(!agent_expected_running(
+            &json!({"status": "online", "kind": "assistant"})
+        ));
+        assert!(!agent_expected_running(
+            &json!({"status": "online", "kind": "observer"})
+        ));
         // A STAGED reserve helper (#392) is expected-dormant — wake wired at launch — so not a poll-only gap,
         // mirroring the watchdog's own staged skip (PR #122).
-        assert!(!agent_expected_running(&json!({"status": "online", "kind": "vertical", "metadata": {"staged": true}})));
-        assert!(agent_expected_running(&json!({"status": "online", "kind": "vertical", "metadata": {"staged": false}})));
+        assert!(!agent_expected_running(
+            &json!({"status": "online", "kind": "vertical", "metadata": {"staged": true}})
+        ));
+        assert!(agent_expected_running(
+            &json!({"status": "online", "kind": "vertical", "metadata": {"staged": false}})
+        ));
     }
 
     #[test]
     fn watchdog_stale_self_action_gates_redeploy_on_the_flag() {
         // Fresh binary (baked == HEAD) → nothing, regardless of the flag.
-        assert_eq!(watchdog_stale_self_action("abc123", Some("abc123"), false), StaleSelfAction::Fresh);
-        assert_eq!(watchdog_stale_self_action("abc123", Some("abc123"), true), StaleSelfAction::Fresh);
+        assert_eq!(
+            watchdog_stale_self_action("abc123", Some("abc123"), false),
+            StaleSelfAction::Fresh
+        );
+        assert_eq!(
+            watchdog_stale_self_action("abc123", Some("abc123"), true),
+            StaleSelfAction::Fresh
+        );
         // Can't tell (unknown rev / no checkout) → Fresh, never a spurious redeploy.
-        assert_eq!(watchdog_stale_self_action("unknown", Some("def456"), true), StaleSelfAction::Fresh);
-        assert_eq!(watchdog_stale_self_action("abc123", None, true), StaleSelfAction::Fresh);
+        assert_eq!(
+            watchdog_stale_self_action("unknown", Some("def456"), true),
+            StaleSelfAction::Fresh
+        );
+        assert_eq!(
+            watchdog_stale_self_action("abc123", None, true),
+            StaleSelfAction::Fresh
+        );
         // Stale + flag OFF → warn only (the long-standing report-only behavior).
         assert!(matches!(
             watchdog_stale_self_action("abc123", Some("def456"), false),
@@ -12808,25 +15063,49 @@ detached
 
     #[test]
     fn render_watchdog_units_is_a_oneshot_service_plus_timer() {
-        let u = render_watchdog_units("/run/fleet/bin/fleet", &watchdog_exec_args(true, true, true, false, false, false), 60, "");
+        let u = render_watchdog_units(
+            "/run/fleet/bin/fleet",
+            &watchdog_exec_args(true, true, true, false, false, false),
+            60,
+            "",
+        );
         // A oneshot service (the watchdog is single-sweep) driven by a timer — not a Restart loop.
-        assert!(u.contains("Type=oneshot"), "single-sweep → oneshot, not a loop");
+        assert!(
+            u.contains("Type=oneshot"),
+            "single-sweep → oneshot, not a loop"
+        );
         assert!(u.contains("ExecStart=/run/fleet/bin/fleet watchdog --rearm --stale-only --observe --spawn --pinned-only"));
-        assert!(u.contains("OnUnitActiveSec=60"), "the timer re-fires on the cadence");
+        assert!(
+            u.contains("OnUnitActiveSec=60"),
+            "the timer re-fires on the cadence"
+        );
         // Ordered after the wake path it complements (the secondary box's request), and installable as a user timer.
-        assert!(u.contains("After=fleet-notify.service") && u.contains("Wants=fleet-notify.service"));
+        assert!(
+            u.contains("After=fleet-notify.service") && u.contains("Wants=fleet-notify.service")
+        );
         assert!(u.contains("WantedBy=timers.target"));
     }
 
     #[test]
     fn watchdog_unit_files_splits_service_and_timer_cleanly() {
         // Observer-only exec, for the host-a coexistence install.
-        let (service, timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(false, true, false, false, false, false), 90, "");
+        let (service, timer) = watchdog_unit_files(
+            "/bin/fleet",
+            &watchdog_exec_args(false, true, false, false, false, false),
+            90,
+            "",
+        );
         // The service file has the oneshot + ExecStart, NO timer/header lines.
         assert!(service.contains("Type=oneshot"));
         assert!(service.contains("ExecStart=/bin/fleet watchdog --observe --spawn"));
-        assert!(!service.contains("OnUnitActiveSec"), "timer stanza belongs in the timer file, not the service");
-        assert!(!service.contains("# ----"), "unit files carry no display headers");
+        assert!(
+            !service.contains("OnUnitActiveSec"),
+            "timer stanza belongs in the timer file, not the service"
+        );
+        assert!(
+            !service.contains("# ----"),
+            "unit files carry no display headers"
+        );
         // The timer file drives the cadence + is enable-able.
         assert!(timer.contains("OnUnitActiveSec=90") && timer.contains("WantedBy=timers.target"));
         assert!(!timer.contains("ExecStart"), "no ExecStart in the timer");
@@ -12837,14 +15116,25 @@ detached
         // task_948: a declared host emits Environment="FLEET_HOST=<host>" -- the unit text names the host as
         // DATA, never a literal baked into the ExecStart/args, so a target-swap (task_937 Phase B) is a
         // different --host value through the SAME generator, not a re-landing.
-        let with_host = render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".to_string()))]);
-        let (service, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false, false, false), 60, &with_host);
+        let with_host =
+            render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".to_string()))]);
+        let (service, _) = watchdog_unit_files(
+            "/bin/fleet",
+            &watchdog_exec_args(true, false, false, false, false, false),
+            60,
+            &with_host,
+        );
         assert!(service.contains("Environment=\"FLEET_HOST=dev-dsk-foo\""));
 
         // No host declared -> no FLEET_HOST line at all (today's green-machine-less behavior, unchanged).
         let no_host = render_service_env_lines(&[("FLEET_HOST", None)]);
         assert_eq!(no_host, "");
-        let (service2, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false, false, false), 60, &no_host);
+        let (service2, _) = watchdog_unit_files(
+            "/bin/fleet",
+            &watchdog_exec_args(true, false, false, false, false, false),
+            60,
+            &no_host,
+        );
         assert!(!service2.contains("FLEET_HOST"));
     }
 
@@ -12857,7 +15147,10 @@ detached
         ]);
         assert!(block.contains("Environment=\"PATH=/home/u/.local/bin:/usr/bin\"\n"));
         assert!(block.contains("Environment=\"CLAUDE_CODE_USE_BEDROCK=1\"\n"));
-        assert!(!block.contains("AWS_PROFILE"), "an unset var is skipped, not emitted empty");
+        assert!(
+            !block.contains("AWS_PROFILE"),
+            "an unset var is skipped, not emitted empty"
+        );
     }
 
     #[test]
@@ -12865,13 +15158,31 @@ detached
         // The captured env block sits in [Service] ahead of ExecStart so the spawned observer inherits PATH
         // (else `exec claude` is not found under the stripped systemd env and the window closes with 127).
         let env = render_service_env_lines(&[("PATH", Some("/home/u/.local/bin".into()))]);
-        let (service, _timer) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, true, false, false, false, false), 60, &env);
-        let env_at = service.find("Environment=\"PATH=").expect("env line present");
+        let (service, _timer) = watchdog_unit_files(
+            "/bin/fleet",
+            &watchdog_exec_args(true, true, false, false, false, false),
+            60,
+            &env,
+        );
+        let env_at = service
+            .find("Environment=\"PATH=")
+            .expect("env line present");
         let exec_at = service.find("ExecStart=").expect("ExecStart present");
-        assert!(env_at < exec_at, "Environment= must precede ExecStart in the unit");
+        assert!(
+            env_at < exec_at,
+            "Environment= must precede ExecStart in the unit"
+        );
         // A rearm-only unit (no observe) is emitted with an empty env block — no launch environment needed.
-        let (rearm_only, _) = watchdog_unit_files("/bin/fleet", &watchdog_exec_args(true, false, false, false, false, false), 60, "");
-        assert!(!rearm_only.contains("Environment="), "rearm-only watchdog spawns nothing → no env block");
+        let (rearm_only, _) = watchdog_unit_files(
+            "/bin/fleet",
+            &watchdog_exec_args(true, false, false, false, false, false),
+            60,
+            "",
+        );
+        assert!(
+            !rearm_only.contains("Environment="),
+            "rearm-only watchdog spawns nothing → no env block"
+        );
     }
 
     #[test]
@@ -12885,11 +15196,20 @@ detached
     fn up_unit_files_is_a_oneshot_launcher_plus_boot_and_reconcile_timer() {
         let (service, timer) = up_unit_files("/run/fleet/bin/fleet", &up_exec_args(false), 300, "");
         // The launcher is a oneshot that reconstitutes the fleet, ordered after the network (it reads the board).
-        assert!(service.contains("Type=oneshot"), "launcher is a single reconcile pass, not long-running");
-        assert!(service.contains("After=network-online.target"), "needs the network/board up");
+        assert!(
+            service.contains("Type=oneshot"),
+            "launcher is a single reconcile pass, not long-running"
+        );
+        assert!(
+            service.contains("After=network-online.target"),
+            "needs the network/board up"
+        );
         assert!(service.contains("ExecStart=/run/fleet/bin/fleet up-board --launch"));
         // The timer fires it at boot (bring the fleet up) and periodically (reconcile a died window).
-        assert!(timer.contains("OnBootSec=30") && timer.contains("OnUnitActiveSec=300"), "boot + reconcile");
+        assert!(
+            timer.contains("OnBootSec=30") && timer.contains("OnUnitActiveSec=300"),
+            "boot + reconcile"
+        );
         assert!(timer.contains("Persistent=true") && timer.contains("WantedBy=timers.target"));
     }
 
@@ -12897,13 +15217,17 @@ detached
     fn up_unit_host_line_is_present_or_omitted_per_the_host_arg() {
         // task_937 Phase A: a declared host emits Environment="FLEET_HOST=<host>" so the unit text never hardcodes
         // a box -- the host is a generator argument, making the Phase-B target-swap a one-argument change.
-        let with_host = render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".to_string()))]);
+        let with_host =
+            render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".to_string()))]);
         let (service, _) = up_unit_files("/bin/fleet", &up_exec_args(true), 300, &with_host);
         assert!(service.contains("Environment=\"FLEET_HOST=dev-dsk-foo\""));
         assert!(service.contains("up-board --launch --pinned-only"));
         // No host declared → no FLEET_HOST line at all (the host-less default, same as the watchdog unit).
         let (service2, _) = up_unit_files("/bin/fleet", &up_exec_args(false), 300, "");
-        assert!(!service2.contains("FLEET_HOST"), "no host arg → no FLEET_HOST line");
+        assert!(
+            !service2.contains("FLEET_HOST"),
+            "no host arg → no FLEET_HOST line"
+        );
     }
 
     #[test]
@@ -12912,13 +15236,27 @@ detached
         let u = daemon_unit_file("notifier", "/run/fleet/bin/fleet notify", 2, &env);
         // A long-running daemon that survives a crash — NOT a oneshot; this is the durable replacement for the
         // bare keep-alive tmux window a reap silently kills (#359).
-        assert!(u.contains("Type=simple"), "long-running daemon, not oneshot");
-        assert!(u.contains("Restart=on-failure") && u.contains("RestartSec=2"), "restarts on crash");
+        assert!(
+            u.contains("Type=simple"),
+            "long-running daemon, not oneshot"
+        );
+        assert!(
+            u.contains("Restart=on-failure") && u.contains("RestartSec=2"),
+            "restarts on crash"
+        );
         assert!(u.contains("ExecStart=/run/fleet/bin/fleet notify"));
-        assert!(u.contains("WantedBy=default.target"), "enabled comes up on login/boot");
+        assert!(
+            u.contains("WantedBy=default.target"),
+            "enabled comes up on login/boot"
+        );
         // The captured PATH is seeded ahead of ExecStart so the daemon resolves tmux/git/curl at runtime (#347/#359).
-        let env_at = u.find("Environment=\"PATH=/usr/bin:/bin\"").expect("PATH env line present");
-        assert!(env_at < u.find("ExecStart=").expect("ExecStart present"), "env precedes ExecStart");
+        let env_at = u
+            .find("Environment=\"PATH=/usr/bin:/bin\"")
+            .expect("PATH env line present");
+        assert!(
+            env_at < u.find("ExecStart=").expect("ExecStart present"),
+            "env precedes ExecStart"
+        );
     }
 
     #[test]
@@ -12927,16 +15265,26 @@ detached
         // like watchdog-unit/up-unit — the flake passes --host and a Phase-B retarget is a one-value change. The
         // FLEET_HOST line is seeded ahead of ExecStart alongside the captured PATH (the env_block daemon_unit builds).
         let mut env = render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".into()))]);
-        env.push_str(&render_service_env_lines(&[("PATH", Some("/usr/bin".into()))]));
+        env.push_str(&render_service_env_lines(&[(
+            "PATH",
+            Some("/usr/bin".into()),
+        )]));
         let u = daemon_unit_file("tunnel", "/run/fleet/bin/fleet tunnel", 2, &env);
-        assert!(u.contains("Environment=\"FLEET_HOST=dev-dsk-foo\""), "declared host emits a FLEET_HOST line");
+        assert!(
+            u.contains("Environment=\"FLEET_HOST=dev-dsk-foo\""),
+            "declared host emits a FLEET_HOST line"
+        );
         assert!(
             u.find("FLEET_HOST").unwrap() < u.find("ExecStart=").expect("ExecStart present"),
             "FLEET_HOST must precede ExecStart"
         );
         // No host → no FLEET_HOST line at all (host-less default, same as watchdog-unit/up-unit).
-        let no_host = render_service_env_lines(&[("FLEET_HOST", None), ("PATH", Some("/usr/bin".into()))]);
-        assert!(!daemon_unit_file("tunnel", "x", 2, &no_host).contains("FLEET_HOST"), "no host arg → no line");
+        let no_host =
+            render_service_env_lines(&[("FLEET_HOST", None), ("PATH", Some("/usr/bin".into()))]);
+        assert!(
+            !daemon_unit_file("tunnel", "x", 2, &no_host).contains("FLEET_HOST"),
+            "no host arg → no line"
+        );
     }
 
     #[test]
@@ -12946,9 +15294,21 @@ detached
         let dir = std::env::temp_dir().join(format!("fleet-out-dir-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let d = dir.to_str().expect("temp dir path is utf8");
-        write_units_to_dir(d, &[("fleet-up.service", "SVC-BODY"), ("fleet-up.timer", "TIMER-BODY")]);
-        assert_eq!(std::fs::read_to_string(dir.join("fleet-up.service")).unwrap(), "SVC-BODY");
-        assert_eq!(std::fs::read_to_string(dir.join("fleet-up.timer")).unwrap(), "TIMER-BODY");
+        write_units_to_dir(
+            d,
+            &[
+                ("fleet-up.service", "SVC-BODY"),
+                ("fleet-up.timer", "TIMER-BODY"),
+            ],
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fleet-up.service")).unwrap(),
+            "SVC-BODY"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fleet-up.timer")).unwrap(),
+            "TIMER-BODY"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12958,11 +15318,22 @@ detached
         // Two invocations, IN ORDER: reload so systemd sees the freshly-written unit, THEN enable --now.
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0], vec!["--user", "daemon-reload"]);
-        assert_eq!(steps[1], vec!["--user", "enable", "--now", "fleet-notifier.service"]);
+        assert_eq!(
+            steps[1],
+            vec!["--user", "enable", "--now", "fleet-notifier.service"]
+        );
         // Every invocation is user-level (no sudo) — the same no-privilege install path as --install.
-        assert!(steps.iter().all(|a| a.first().map(String::as_str) == Some("--user")), "all user-level");
+        assert!(
+            steps
+                .iter()
+                .all(|a| a.first().map(String::as_str) == Some("--user")),
+            "all user-level"
+        );
         // The unit name is carried verbatim into the enable step (a tunnel unit enables the same way).
-        assert_eq!(enable_argv("fleet-tunnel.service")[1].last().unwrap(), "fleet-tunnel.service");
+        assert_eq!(
+            enable_argv("fleet-tunnel.service")[1].last().unwrap(),
+            "fleet-tunnel.service"
+        );
     }
 
     #[test]
@@ -12971,21 +15342,40 @@ detached
         let unpinned = serde_json::json!({});
         // Default (loose): this-host-pinned OR unpinned are managed here.
         assert!(watchdog_manages_agent(Some(&green), "host-b", false));
-        assert!(watchdog_manages_agent(Some(&unpinned), "host-b", false), "unpinned managed everywhere by default");
-        assert!(!watchdog_manages_agent(Some(&green), "host-a", false), "other-box pin never managed here");
+        assert!(
+            watchdog_manages_agent(Some(&unpinned), "host-b", false),
+            "unpinned managed everywhere by default"
+        );
+        assert!(
+            !watchdog_manages_agent(Some(&green), "host-a", false),
+            "other-box pin never managed here"
+        );
         // --pinned-only: ONLY agents explicitly pinned here — unpinned run-anywhere agents are excluded, so a
         // secondary box never re-arms/observes an agent whose window/transcript is on another box.
         assert!(watchdog_manages_agent(Some(&green), "host-b", true));
-        assert!(!watchdog_manages_agent(Some(&unpinned), "host-b", true), "unpinned EXCLUDED under --pinned-only");
+        assert!(
+            !watchdog_manages_agent(Some(&unpinned), "host-b", true),
+            "unpinned EXCLUDED under --pinned-only"
+        );
         assert!(!watchdog_manages_agent(Some(&green), "host-a", true));
     }
 
     #[test]
     fn agent_is_staged_reads_the_reserve_flag() {
-        assert!(agent_is_staged(Some(&serde_json::json!({ "staged": true }))));
-        assert!(!agent_is_staged(Some(&serde_json::json!({ "staged": false }))));
-        assert!(!agent_is_staged(Some(&serde_json::json!({}))), "absent flag → not staged");
-        assert!(!agent_is_staged(Some(&serde_json::json!({ "staged": "true" }))), "non-bool → not staged");
+        assert!(agent_is_staged(Some(
+            &serde_json::json!({ "staged": true })
+        )));
+        assert!(!agent_is_staged(Some(
+            &serde_json::json!({ "staged": false })
+        )));
+        assert!(
+            !agent_is_staged(Some(&serde_json::json!({}))),
+            "absent flag → not staged"
+        );
+        assert!(
+            !agent_is_staged(Some(&serde_json::json!({ "staged": "true" }))),
+            "non-bool → not staged"
+        );
         assert!(!agent_is_staged(None));
     }
 
@@ -13001,18 +15391,42 @@ detached
     #[test]
     fn agent_host_is_explicit_requires_a_deliberate_pin_to_this_box() {
         // EXPLICIT pin → true only for the named box (this is the --pinned-only launch predicate).
-        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":"host-b"})), "host-b"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":"host-b"})), "host-a"));
-        assert!(agent_host_is_explicit(Some(&serde_json::json!({"host":["host-b","host-a"]})), "host-a"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":["host-b"]})), "host-a"));
+        assert!(agent_host_is_explicit(
+            Some(&serde_json::json!({"host":"host-b"})),
+            "host-b"
+        ));
+        assert!(!agent_host_is_explicit(
+            Some(&serde_json::json!({"host":"host-b"})),
+            "host-a"
+        ));
+        assert!(agent_host_is_explicit(
+            Some(&serde_json::json!({"host":["host-b","host-a"]})),
+            "host-a"
+        ));
+        assert!(!agent_host_is_explicit(
+            Some(&serde_json::json!({"host":["host-b"]})),
+            "host-a"
+        ));
         // UNPINNED (unset / null / empty string / empty array) → FALSE — the key difference from
         // agent_host_matches: an unpinned run-anywhere agent is NOT an explicit launch candidate here, so a
         // second box's --pinned-only reconcile won't double-launch it.
         assert!(!agent_host_is_explicit(None, "host-a"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({})), "host-a"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":null})), "host-a"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":""})), "host-a"));
-        assert!(!agent_host_is_explicit(Some(&serde_json::json!({"host":[]})), "host-a"));
+        assert!(!agent_host_is_explicit(
+            Some(&serde_json::json!({})),
+            "host-a"
+        ));
+        assert!(!agent_host_is_explicit(
+            Some(&serde_json::json!({"host":null})),
+            "host-a"
+        ));
+        assert!(!agent_host_is_explicit(
+            Some(&serde_json::json!({"host":""})),
+            "host-a"
+        ));
+        assert!(!agent_host_is_explicit(
+            Some(&serde_json::json!({"host":[]})),
+            "host-a"
+        ));
     }
 
     #[test]
@@ -13036,8 +15450,14 @@ detached
         // Board roster: two unpinned, one pinned here, one pinned elsewhere.
         let agents = vec![
             ("v-a".to_string(), Some(serde_json::json!({}))),
-            ("v-b".to_string(), Some(serde_json::json!({"host": "host-a"}))),
-            ("v-elsewhere".to_string(), Some(serde_json::json!({"host": "host-b"}))),
+            (
+                "v-b".to_string(),
+                Some(serde_json::json!({"host": "host-a"})),
+            ),
+            (
+                "v-elsewhere".to_string(),
+                Some(serde_json::json!({"host": "host-b"})),
+            ),
             ("v-nometa".to_string(), None),
         ];
         // tmux windows: some agents, plus daemon/scratch windows that are NOT board agents, plus a board
@@ -13047,27 +15467,46 @@ detached
             "v-b".to_string(),
             "v-elsewhere".to_string(), // pinned to host-b → dropped even though a window exists here
             "v-nometa".to_string(),
-            "notify".to_string(),   // a daemon window, not a board agent → dropped
-            "scratch".to_string(),  // not a board agent → dropped
+            "notify".to_string(), // a daemon window, not a board agent → dropped
+            "scratch".to_string(), // not a board agent → dropped
         ];
         // A board agent with NO window here (v-c) must also be absent (nothing to wake on this host).
         let mut with_windowless = agents.clone();
         with_windowless.push(("v-c".to_string(), Some(serde_json::json!({}))));
         let served = derive_served_set(&windows, &with_windowless, "host-a");
-        assert_eq!(served, vec!["v-a", "v-b", "v-nometa"], "window∩board, minus off-host pins and non-agents");
+        assert_eq!(
+            served,
+            vec!["v-a", "v-b", "v-nometa"],
+            "window∩board, minus off-host pins and non-agents"
+        );
         // sorted + deduped even if the board lists a duplicate id
         let dupe = vec![("v-a".to_string(), None), ("v-a".to_string(), None)];
-        assert_eq!(derive_served_set(&["v-a".to_string()], &dupe, "host-a"), vec!["v-a"]);
+        assert_eq!(
+            derive_served_set(&["v-a".to_string()], &dupe, "host-a"),
+            vec!["v-a"]
+        );
     }
 
     #[test]
     fn liveness_verdict_buckets_by_heartbeat_age() {
-        assert_eq!(liveness_verdict(-30), "live", "clock skew (future) is not stale");
+        assert_eq!(
+            liveness_verdict(-30),
+            "live",
+            "clock skew (future) is not stale"
+        );
         assert_eq!(liveness_verdict(0), "live");
         assert_eq!(liveness_verdict(LIVE_SECS - 1), "live");
-        assert_eq!(liveness_verdict(LIVE_SECS), "quiet", "at the live bound → quiet");
+        assert_eq!(
+            liveness_verdict(LIVE_SECS),
+            "quiet",
+            "at the live bound → quiet"
+        );
         assert_eq!(liveness_verdict(QUIET_SECS - 1), "quiet");
-        assert_eq!(liveness_verdict(QUIET_SECS), "STALE", "at the quiet bound → STALE");
+        assert_eq!(
+            liveness_verdict(QUIET_SECS),
+            "STALE",
+            "at the quiet bound → STALE"
+        );
         assert_eq!(liveness_verdict(6 * 60 * 60), "STALE");
     }
 
@@ -13086,7 +15525,10 @@ detached
     fn ensure_trusted_adds_missing_is_idempotent_and_creates_projects() {
         let mut v = serde_json::json!({"projects": {"/x": {"hasTrustDialogAccepted": true}}});
         assert!(ensure_trusted(&mut v, "/root/.fleet")); // new dir -> changed
-        assert_eq!(v["projects"]["/root/.fleet"]["hasTrustDialogAccepted"], true);
+        assert_eq!(
+            v["projects"]["/root/.fleet"]["hasTrustDialogAccepted"],
+            true
+        );
         assert!(!ensure_trusted(&mut v, "/root/.fleet")); // now trusted -> no change
         assert!(!ensure_trusted(&mut v, "/x")); // already trusted -> no change
         let mut empty = serde_json::json!({"other": 1});
@@ -13318,7 +15760,10 @@ detached
         assert_eq!(resolve_model("sonnet"), "us.anthropic.claude-sonnet-5");
         // The bare Anthropic-API id is remapped to the valid Bedrock id (the board-triage/-follow-up outage:
         // `claude-sonnet-5-5` 400s on this fleet's endpoint), so a mis-registered agent self-heals on launch.
-        assert_eq!(resolve_model("claude-sonnet-5-5"), "us.anthropic.claude-sonnet-5");
+        assert_eq!(
+            resolve_model("claude-sonnet-5-5"),
+            "us.anthropic.claude-sonnet-5"
+        );
         assert_eq!(resolve_model("sonnet-5-5"), "us.anthropic.claude-sonnet-5");
         assert_eq!(
             resolve_model("some.custom.model-id"),
@@ -13479,9 +15924,18 @@ detached
 
     #[test]
     fn observe_spawn_cooldown_holds_within_window_and_lapses_after() {
-        assert!(!observe_on_spawn_cooldown(None, 10_000, 1800), "never spawned → not on cooldown");
-        assert!(observe_on_spawn_cooldown(Some(9_000), 10_000, 1800), "1000s < 1800 → on cooldown");
-        assert!(!observe_on_spawn_cooldown(Some(8_000), 10_000, 1800), "2000s ≥ 1800 → lapsed");
+        assert!(
+            !observe_on_spawn_cooldown(None, 10_000, 1800),
+            "never spawned → not on cooldown"
+        );
+        assert!(
+            observe_on_spawn_cooldown(Some(9_000), 10_000, 1800),
+            "1000s < 1800 → on cooldown"
+        );
+        assert!(
+            !observe_on_spawn_cooldown(Some(8_000), 10_000, 1800),
+            "2000s ≥ 1800 → lapsed"
+        );
         // saturating: a future stamp (clock skew) is treated as just-spawned → on cooldown, never underflows.
         assert!(observe_on_spawn_cooldown(Some(11_000), 10_000, 1800));
     }
@@ -13489,38 +15943,83 @@ detached
     #[test]
     fn observe_respawn_cooldown_backs_off_per_unconfirmed_attempt_capped() {
         // task_610: 0 or 1 prior attempt → base; then doubles per attempt, capped at max_doublings.
-        assert_eq!(observe_respawn_cooldown(1800, 0, 3), 1800, "first spawn → base 30m");
-        assert_eq!(observe_respawn_cooldown(1800, 1, 3), 1800, "1 prior → still base (no backoff yet)");
-        assert_eq!(observe_respawn_cooldown(1800, 2, 3), 3600, "2 prior → 2x = 1h");
-        assert_eq!(observe_respawn_cooldown(1800, 3, 3), 7200, "3 prior → 4x = 2h");
-        assert_eq!(observe_respawn_cooldown(1800, 4, 3), 14400, "4 prior → 8x = 4h");
-        assert_eq!(observe_respawn_cooldown(1800, 9, 3), 14400, "capped at 8x even after many attempts");
+        assert_eq!(
+            observe_respawn_cooldown(1800, 0, 3),
+            1800,
+            "first spawn → base 30m"
+        );
+        assert_eq!(
+            observe_respawn_cooldown(1800, 1, 3),
+            1800,
+            "1 prior → still base (no backoff yet)"
+        );
+        assert_eq!(
+            observe_respawn_cooldown(1800, 2, 3),
+            3600,
+            "2 prior → 2x = 1h"
+        );
+        assert_eq!(
+            observe_respawn_cooldown(1800, 3, 3),
+            7200,
+            "3 prior → 4x = 2h"
+        );
+        assert_eq!(
+            observe_respawn_cooldown(1800, 4, 3),
+            14400,
+            "4 prior → 8x = 4h"
+        );
+        assert_eq!(
+            observe_respawn_cooldown(1800, 9, 3),
+            14400,
+            "capped at 8x even after many attempts"
+        );
     }
 
     #[test]
     fn observe_spawn_attempts_roundtrip_and_reset_on_watermark_change() {
         let (_base, fleet) = tmp_hub();
         // Absent → ("", 0): never a spurious backoff.
-        assert_eq!(read_observe_spawn_attempts(&fleet, "v-x"), (String::new(), 0));
+        assert_eq!(
+            read_observe_spawn_attempts(&fleet, "v-x"),
+            (String::new(), 0)
+        );
         // Record attempts against a watermark; they read back verbatim.
         write_observe_spawn_attempts(&fleet, "v-x", "sess-a:100", 2);
-        assert_eq!(read_observe_spawn_attempts(&fleet, "v-x"), ("sess-a:100".to_string(), 2));
+        assert_eq!(
+            read_observe_spawn_attempts(&fleet, "v-x"),
+            ("sess-a:100".to_string(), 2)
+        );
         // The spawn loop treats a DIFFERENT current watermark (a confirmed observation advanced it) as a reset:
         // rec_wm != cur_wm ⇒ attempts = 0, so the backoff reverts to base. (The loop's own `if rec_wm == cur_wm`.)
         let (rec_wm, prior) = read_observe_spawn_attempts(&fleet, "v-x");
         let attempts_after_advance = if rec_wm == "sess-a:200" { prior } else { 0 };
-        assert_eq!(attempts_after_advance, 0, "watermark advanced ⇒ attempts reset ⇒ base cooldown");
+        assert_eq!(
+            attempts_after_advance, 0,
+            "watermark advanced ⇒ attempts reset ⇒ base cooldown"
+        );
     }
 
     #[test]
     fn observer_window_is_stale_spares_a_recent_in_flight_observer_only() {
         let bound = 3600;
         // Recent stamp (a healthy in-flight observer) → NOT stale, never reaped.
-        assert!(!observer_window_is_stale(Some(10_000), 10_500, bound), "500s < 3600 → in-flight, spare it");
-        assert!(!observer_window_is_stale(Some(10_000), 13_599, bound), "just under the bound → still spare");
+        assert!(
+            !observer_window_is_stale(Some(10_000), 10_500, bound),
+            "500s < 3600 → in-flight, spare it"
+        );
+        assert!(
+            !observer_window_is_stale(Some(10_000), 13_599, bound),
+            "just under the bound → still spare"
+        );
         // Stamp older than the bound → the observer crashed before observe-record → reap.
-        assert!(observer_window_is_stale(Some(10_000), 13_600, bound), "exactly the bound → stale");
-        assert!(observer_window_is_stale(Some(10_000), 99_999, bound), "long overdue → stale");
+        assert!(
+            observer_window_is_stale(Some(10_000), 13_600, bound),
+            "exactly the bound → stale"
+        );
+        assert!(
+            observer_window_is_stale(Some(10_000), 99_999, bound),
+            "long overdue → stale"
+        );
         // No stamp on a still-open window → confirmed-but-self-close-missed (nothing in-flight) → reap.
         assert!(observer_window_is_stale(None, 10_000, bound));
         // saturating: a future stamp (clock skew) → treated as just-spawned → not stale (never underflows).
@@ -13537,34 +16036,67 @@ detached
     #[test]
     fn observe_watermark_round_trips_and_defaults_when_absent() {
         let (base, fleet) = tmp_hub();
-        assert_eq!(read_observe_watermark(&fleet, "a"), (String::new(), 0), "absent → empty/0");
+        assert_eq!(
+            read_observe_watermark(&fleet, "a"),
+            (String::new(), 0),
+            "absent → empty/0"
+        );
         write_observe_watermark(&fleet, "a", "sess-1", 4200);
-        assert_eq!(read_observe_watermark(&fleet, "a"), ("sess-1".to_string(), 4200));
+        assert_eq!(
+            read_observe_watermark(&fleet, "a"),
+            ("sess-1".to_string(), 4200)
+        );
         // observe-record advances it (and a later read sees the new offset).
         write_observe_watermark(&fleet, "a", "sess-1", 5000);
-        assert_eq!(read_observe_watermark(&fleet, "a"), ("sess-1".to_string(), 5000));
+        assert_eq!(
+            read_observe_watermark(&fleet, "a"),
+            ("sess-1".to_string(), 5000)
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn build_observer_kickoff_carries_identity_window_and_completion_command() {
-        let k = build_observer_kickoff("v-x", "sess-9", 1200, "/repo/loops/observer.md", "/repo/target/release/fleet", None);
+        let k = build_observer_kickoff(
+            "v-x",
+            "sess-9",
+            1200,
+            "/repo/loops/observer.md",
+            "/repo/target/release/fleet",
+            None,
+        );
         // Ephemeral + single stable board identity (one-shot; author as `observer`).
         assert!(k.contains("EPHEMERAL"));
-        assert!(k.contains("ONE observation") && k.contains("do NOT start a /loop"), "one-shot, not looping");
+        assert!(
+            k.contains("ONE observation") && k.contains("do NOT start a /loop"),
+            "one-shot, not looping"
+        );
         assert!(k.contains("`observer`") && k.contains("register_agent"));
         // Author identity must be PASSED explicitly on each board write (board defaults to null) — the gap
         // the first live dry-run surfaced (created_by came out null).
         assert!(k.contains("created_by=\"observer\"") && k.contains("author=\"observer\""));
         // Uses the ABSOLUTE standalone binary (not PATH `fleet`) for transcripts + observe-record, with the
         // exact target window (agent, session, offset).
-        assert!(k.contains("/repo/target/release/fleet transcripts v-x --session sess-9 --since sess-9:1200"));
-        assert!(k.contains("/repo/target/release/fleet observe-record v-x --session sess-9 --offset"));
-        assert!(k.contains("/repo/loops/observer.md"), "points at the full role body");
-        assert!(k.contains("project #28"), "files into the fleet-self-improve lane");
+        assert!(k.contains(
+            "/repo/target/release/fleet transcripts v-x --session sess-9 --since sess-9:1200"
+        ));
+        assert!(
+            k.contains("/repo/target/release/fleet observe-record v-x --session sess-9 --offset")
+        );
+        assert!(
+            k.contains("/repo/loops/observer.md"),
+            "points at the full role body"
+        );
+        assert!(
+            k.contains("project #28"),
+            "files into the fleet-self-improve lane"
+        );
         // No commit/PR attribution lines in the observer's board task bodies (board-pm; the observer was
         // leaking a "Generated with ..." line into task bodies).
-        assert!(k.contains("Co-Authored-By:") && k.contains("not board content"), "observer kickoff bans attribution lines in board bodies");
+        assert!(
+            k.contains("Co-Authored-By:") && k.contains("not board content"),
+            "observer kickoff bans attribution lines in board bodies"
+        );
     }
 
     #[test]
@@ -13575,7 +16107,10 @@ detached
         // A manual `observe-record` from any other window must NOT self-close (only obs- windows are observers).
         assert!(!observer_should_self_close(true, "main"));
         assert!(!observer_should_self_close(true, "v-fleet-tooling"));
-        assert!(!observer_should_self_close(true, "observer"), "the identity name is not the window prefix");
+        assert!(
+            !observer_should_self_close(true, "observer"),
+            "the identity name is not the window prefix"
+        );
         // Not inside tmux → never close (nothing to close; e.g. run from a plain shell / systemd).
         assert!(!observer_should_self_close(false, "obs-v-x"));
     }
@@ -13662,8 +16197,14 @@ detached
 
     #[test]
     fn agent_from_cwd_extracts_the_segment_after_agents() {
-        assert_eq!(agent_from_cwd("/local/home/u/.fleet/agents/ticket-ingest/fleet"), Some("ticket-ingest"));
-        assert_eq!(agent_from_cwd("/home/u/.fleet/agents/membrain-ops"), Some("membrain-ops"));
+        assert_eq!(
+            agent_from_cwd("/local/home/u/.fleet/agents/ticket-ingest/fleet"),
+            Some("ticket-ingest")
+        );
+        assert_eq!(
+            agent_from_cwd("/home/u/.fleet/agents/membrain-ops"),
+            Some("membrain-ops")
+        );
         // No `agents/` component (e.g. a worktree-based agent) -> cannot name an agent.
         assert_eq!(agent_from_cwd("/home/u/.claude/worktrees/some-topic"), None);
         // `agents` with nothing after it -> None.
@@ -13708,7 +16249,10 @@ detached
             (100u32, "ticket-ingest".to_string(), 5u64),
             (300u32, "membrain-ops".to_string(), 7u64),
         ];
-        assert_eq!(dedup_decision(&inst), vec![("ticket-ingest".to_string(), 100u32, vec![200u32])]);
+        assert_eq!(
+            dedup_decision(&inst),
+            vec![("ticket-ingest".to_string(), 100u32, vec![200u32])]
+        );
         // All-singleton -> empty (clean 1:1).
         assert!(dedup_decision(&[(1, "a".to_string(), 1), (2, "b".to_string(), 1)]).is_empty());
         // Three instances of one agent -> keep oldest, kill the other two (newest-first order preserved by start).
@@ -13717,7 +16261,10 @@ detached
             (7u32, "x".to_string(), 10u64),
             (8u32, "x".to_string(), 20u64),
         ];
-        assert_eq!(dedup_decision(&three), vec![("x".to_string(), 7u32, vec![8u32, 9u32])]);
+        assert_eq!(
+            dedup_decision(&three),
+            vec![("x".to_string(), 7u32, vec![8u32, 9u32])]
+        );
     }
 
     #[test]
@@ -13734,14 +16281,25 @@ detached
         // No task-board entry -> absent.
         assert!(!taskboard_identity_config(&serde_json::json!({"mcpServers": {}})).present);
         // Entry with neither header nor helper -> present but unwired.
-        let bare = taskboard_identity_config(&serde_json::json!({"mcpServers": {"task-board": {"url": "http://x"}}}));
+        let bare = taskboard_identity_config(
+            &serde_json::json!({"mcpServers": {"task-board": {"url": "http://x"}}}),
+        );
         assert!(bare.present && !bare.has_helper && bare.static_header.is_none());
     }
 
     #[test]
     fn mcp_check_passes_when_fleet_agent_matches_and_header_wired() {
-        let tb = TaskboardIdentityConfig { present: true, static_header: Some("${FLEET_AGENT}".to_string()), has_helper: true };
-        let r = mcp_check_decision("membrain-ops", Some("membrain-ops"), &["claude".to_string()], &tb);
+        let tb = TaskboardIdentityConfig {
+            present: true,
+            static_header: Some("${FLEET_AGENT}".to_string()),
+            has_helper: true,
+        };
+        let r = mcp_check_decision(
+            "membrain-ops",
+            Some("membrain-ops"),
+            &["claude".to_string()],
+            &tb,
+        );
         assert_eq!(r.verdict, McpCheckVerdict::Pass);
         assert!(r.fleet_agent_matches && r.identity_wired && !r.uses_config_override);
     }
@@ -13749,10 +16307,21 @@ detached
     #[test]
     fn mcp_check_fails_when_fleet_agent_unset_or_unwired() {
         // FLEET_AGENT absent -> the ${FLEET_AGENT} header expands empty, no identity forced.
-        let wired = TaskboardIdentityConfig { present: true, static_header: Some("${FLEET_AGENT}".to_string()), has_helper: true };
-        assert_eq!(mcp_check_decision("x", None, &[], &wired).verdict, McpCheckVerdict::Fail);
+        let wired = TaskboardIdentityConfig {
+            present: true,
+            static_header: Some("${FLEET_AGENT}".to_string()),
+            has_helper: true,
+        };
+        assert_eq!(
+            mcp_check_decision("x", None, &[], &wired).verdict,
+            McpCheckVerdict::Fail
+        );
         // No header and no helper -> nothing to force from.
-        let unwired = TaskboardIdentityConfig { present: true, static_header: None, has_helper: false };
+        let unwired = TaskboardIdentityConfig {
+            present: true,
+            static_header: None,
+            has_helper: false,
+        };
         let r = mcp_check_decision("x", Some("x"), &[], &unwired);
         assert_eq!(r.verdict, McpCheckVerdict::Fail);
         assert!(!r.identity_wired);
@@ -13760,31 +16329,56 @@ detached
 
     #[test]
     fn mcp_check_warns_on_mismatch_or_shadowing_override() {
-        let tb = TaskboardIdentityConfig { present: true, static_header: Some("${FLEET_AGENT}".to_string()), has_helper: false };
+        let tb = TaskboardIdentityConfig {
+            present: true,
+            static_header: Some("${FLEET_AGENT}".to_string()),
+            has_helper: false,
+        };
         // FLEET_AGENT set but to the wrong id -> would force the wrong identity.
         let mismatch = mcp_check_decision("want", Some("other"), &[], &tb);
         assert_eq!(mismatch.verdict, McpCheckVerdict::Warn);
         assert!(!mismatch.fleet_agent_matches);
         // A --mcp-config override may shadow the user-scope entry this check read.
-        let argv = ["claude".to_string(), "--mcp-config".to_string(), "/x.json".to_string()];
+        let argv = [
+            "claude".to_string(),
+            "--mcp-config".to_string(),
+            "/x.json".to_string(),
+        ];
         let shadow = mcp_check_decision("a", Some("a"), &argv, &tb);
         assert_eq!(shadow.verdict, McpCheckVerdict::Warn);
         assert!(shadow.uses_config_override);
         // A static header that is neither ${FLEET_AGENT} nor the agent name, with no helper -> warn.
-        let hardcoded = TaskboardIdentityConfig { present: true, static_header: Some("someone-else".to_string()), has_helper: false };
-        assert_eq!(mcp_check_decision("a", Some("a"), &["claude".to_string()], &hardcoded).verdict, McpCheckVerdict::Warn);
+        let hardcoded = TaskboardIdentityConfig {
+            present: true,
+            static_header: Some("someone-else".to_string()),
+            has_helper: false,
+        };
+        assert_eq!(
+            mcp_check_decision("a", Some("a"), &["claude".to_string()], &hardcoded).verdict,
+            McpCheckVerdict::Warn
+        );
     }
 
     #[test]
     fn board_window_argv_exports_fleet_agent_and_kickoff_into_the_window_env() {
-        let argv = board_window_argv("main", "ticket-ingest", "/wt/ti", "do a tick", "claude --model x");
+        let argv = board_window_argv(
+            "main",
+            "ticket-ingest",
+            "/wt/ti",
+            "do a tick",
+            "claude --model x",
+        );
         // The agent identity is in the window env so the per-session X-Fleet-Agent header (task_1039) is
         // non-empty for a board-native launch (which never execs window.sh). Window name == FLEET_AGENT value.
         assert!(
-            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "FLEET_AGENT=ticket-ingest"),
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "FLEET_AGENT=ticket-ingest"),
             "board-native launch must export FLEET_AGENT: {argv:?}"
         );
-        assert!(argv.windows(2).any(|w| w[0] == "-e" && w[1] == "CDZ_KICKOFF=do a tick"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "CDZ_KICKOFF=do a tick")
+        );
         assert_eq!(argv.first().map(String::as_str), Some("new-window"));
         assert_eq!(argv.last().map(String::as_str), Some("claude --model x"));
     }
@@ -13798,7 +16392,10 @@ detached
         // Absent -> launchable.
         assert!(!window_exists(listing, "v-nix"));
         // Whole-line match only: a prefix/substring is NOT a window (so `obs-ticket-ingest` != `ticket-ingest`).
-        assert!(!window_exists("obs-ticket-ingest\nticket-ingest-helper\n", "ticket-ingest"));
+        assert!(!window_exists(
+            "obs-ticket-ingest\nticket-ingest-helper\n",
+            "ticket-ingest"
+        ));
         assert!(!window_exists("", "anything"));
     }
 
@@ -13842,11 +16439,26 @@ detached
 
     #[test]
     fn registry_set_interval_updates_a_present_row_and_reports_absent() {
-        let mut reg = Registry { agents: vec![mk_agent("a", "active"), mk_agent("b", "active")] };
-        assert!(registry_set_interval(&mut reg, "a", "2h"), "row present → updated");
-        assert_eq!(reg.agents.iter().find(|x| x.name == "a").unwrap().interval, "2h");
-        assert_eq!(reg.agents.iter().find(|x| x.name == "b").unwrap().interval, "10m", "other rows untouched");
-        assert!(!registry_set_interval(&mut reg, "nobody", "5m"), "absent agent → false, no-op");
+        let mut reg = Registry {
+            agents: vec![mk_agent("a", "active"), mk_agent("b", "active")],
+        };
+        assert!(
+            registry_set_interval(&mut reg, "a", "2h"),
+            "row present → updated"
+        );
+        assert_eq!(
+            reg.agents.iter().find(|x| x.name == "a").unwrap().interval,
+            "2h"
+        );
+        assert_eq!(
+            reg.agents.iter().find(|x| x.name == "b").unwrap().interval,
+            "10m",
+            "other rows untouched"
+        );
+        assert!(
+            !registry_set_interval(&mut reg, "nobody", "5m"),
+            "absent agent → false, no-op"
+        );
     }
 
     #[test]
@@ -13914,14 +16526,29 @@ detached
     #[test]
     fn nudge_run_is_outage_only_when_apply_attempted_but_landed_zero() {
         // task_609: a healthy quiet sweep (no stale tasks → posted 0, failed 0) is NOT an outage, so it exits 0.
-        assert!(!nudge_run_is_outage(true, 0, 0), "no stale tasks is a healthy run, not an outage");
+        assert!(
+            !nudge_run_is_outage(true, 0, 0),
+            "no stale tasks is a healthy run, not an outage"
+        );
         // Total outage: posts were attempted and every one failed (posted 0, failed>0) → outage, exit non-zero.
-        assert!(nudge_run_is_outage(true, 0, 3), "attempted>0 && posted==0 is a total outage");
+        assert!(
+            nudge_run_is_outage(true, 0, 3),
+            "attempted>0 && posted==0 is a total outage"
+        );
         // Partial: at least one landed → the path is up, not an outage.
-        assert!(!nudge_run_is_outage(true, 1, 2), "any successful post means the board path is up");
-        assert!(!nudge_run_is_outage(true, 5, 0), "all posts succeeded → not an outage");
+        assert!(
+            !nudge_run_is_outage(true, 1, 2),
+            "any successful post means the board path is up"
+        );
+        assert!(
+            !nudge_run_is_outage(true, 5, 0),
+            "all posts succeeded → not an outage"
+        );
         // A dry run posts nothing by design, so it is never an outage regardless of the counts.
-        assert!(!nudge_run_is_outage(false, 0, 3), "a dry run never posts, so never an outage");
+        assert!(
+            !nudge_run_is_outage(false, 0, 3),
+            "a dry run never posts, so never an outage"
+        );
     }
 
     #[test]
@@ -13946,13 +16573,43 @@ detached
         // task_540 acked-cooldown: a fresh assignee ack extends the re-nudge cooldown to `acked`.
         // Prior nudge past the NORMAL cooldown but within the ACKED cooldown → suppressed WHEN acked, fired
         // when not (so acking a queued todo buys the longer quiet).
-        assert!(!stale_task_should_nudge(threshold * 5, Some(cooldown + 1), true, threshold, cooldown, acked));
-        assert!(stale_task_should_nudge(threshold * 5, Some(cooldown + 1), false, threshold, cooldown, acked));
+        assert!(!stale_task_should_nudge(
+            threshold * 5,
+            Some(cooldown + 1),
+            true,
+            threshold,
+            cooldown,
+            acked
+        ));
+        assert!(stale_task_should_nudge(
+            threshold * 5,
+            Some(cooldown + 1),
+            false,
+            threshold,
+            cooldown,
+            acked
+        ));
         // Anti-parking: even with a fresh ack, once the prior nudge is past the ACKED cooldown it re-nudges.
-        assert!(stale_task_should_nudge(threshold * 5, Some(acked), true, threshold, cooldown, acked));
+        assert!(stale_task_should_nudge(
+            threshold * 5,
+            Some(acked),
+            true,
+            threshold,
+            cooldown,
+            acked
+        ));
         // The ack flag never overrides the threshold gate, and never fabricates a first nudge early.
-        assert!(!stale_task_should_nudge(threshold - 1, None, true, threshold, cooldown, acked));
-        assert!(stale_task_should_nudge(threshold, None, true, threshold, cooldown, acked));
+        assert!(!stale_task_should_nudge(
+            threshold - 1,
+            None,
+            true,
+            threshold,
+            cooldown,
+            acked
+        ));
+        assert!(stale_task_should_nudge(
+            threshold, None, true, threshold, cooldown, acked
+        ));
     }
 
     #[test]
@@ -13970,7 +16627,7 @@ detached
 
     #[test]
     fn newest_assignee_comment_age_secs_picks_the_assignees_most_recent_comment() {
-        use time::{format_description::well_known::Rfc3339, Duration};
+        use time::{Duration, format_description::well_known::Rfc3339};
         let now = time::OffsetDateTime::now_utc();
         let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
         let task = serde_json::json!({
@@ -13983,14 +16640,20 @@ detached
         });
         // Picks v-x's MOST RECENT comment (1h), ignoring the daemon's and others' newer comments.
         let age = newest_assignee_comment_age_secs(&task, "v-x", now).unwrap();
-        assert!((age - 3600).abs() < 2, "newest assignee comment is 1h old, got {age}");
+        assert!(
+            (age - 3600).abs() < 2,
+            "newest assignee comment is 1h old, got {age}"
+        );
         // An assignee who never commented → None.
-        assert_eq!(newest_assignee_comment_age_secs(&task, "v-never", now), None);
+        assert_eq!(
+            newest_assignee_comment_age_secs(&task, "v-never", now),
+            None
+        );
     }
 
     #[test]
     fn nudge_round_count_counts_daemon_nudges_since_the_last_owner_comment() {
-        use time::{format_description::well_known::Rfc3339, Duration};
+        use time::{Duration, format_description::well_known::Rfc3339};
         let now = time::OffsetDateTime::now_utc();
         let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
         const DAEMON: &str = "fleet-nudge-daemon";
@@ -14012,7 +16675,11 @@ detached
                 { "author": "v-x", "created_at": stamp(Duration::minutes(10)) },
             ],
         });
-        assert_eq!(nudge_round_count(&answered, now), 0, "an owner reply after the nudges resets the rounds");
+        assert_eq!(
+            nudge_round_count(&answered, now),
+            0,
+            "an owner reply after the nudges resets the rounds"
+        );
         // No owner comment ever → every daemon nudge counts.
         let never_answered = serde_json::json!({
             "comments": [
@@ -14030,8 +16697,16 @@ detached
         use NudgeTier::{Owner, PmTag, Reassign};
         // Defaults: pm-tag at round 2, reassign at round 3.
         assert_eq!(nudge_tier(1, 2, 3), Owner, "round 1 is the owner's alone");
-        assert_eq!(nudge_tier(2, 2, 3), PmTag, "round 2 tags the router to make the call");
-        assert_eq!(nudge_tier(3, 2, 3), Reassign, "round 3 escalates to a reassign");
+        assert_eq!(
+            nudge_tier(2, 2, 3),
+            PmTag,
+            "round 2 tags the router to make the call"
+        );
+        assert_eq!(
+            nudge_tier(3, 2, 3),
+            Reassign,
+            "round 3 escalates to a reassign"
+        );
         assert_eq!(nudge_tier(9, 2, 3), Reassign, "stays escalated past N");
         // reassign takes precedence when both thresholds are met.
         assert_eq!(nudge_tier(5, 2, 2), Reassign);
@@ -14042,31 +16717,65 @@ detached
     #[test]
     fn pm_tag_body_tags_the_router_with_the_full_set_of_options() {
         let b = pm_tag_body(1.0, "v-x", 7200, 1, "board-pm");
-        assert!(b.contains("board-pm") && b.contains("make the call"), "tags the router to decide");
-        assert!(b.contains("v-x") && b.contains("reassign") && b.contains("close"), "names the owner + the options");
+        assert!(
+            b.contains("board-pm") && b.contains("make the call"),
+            "tags the router to decide"
+        );
+        assert!(
+            b.contains("v-x") && b.contains("reassign") && b.contains("close"),
+            "names the owner + the options"
+        );
     }
 
     #[test]
     fn escalation_body_tags_the_router_to_reassign() {
         let b = escalation_body(1.0, "v-x", 7200, 3, "board-pm");
-        assert!(b.contains("REASSIGN") && b.contains("board-pm"), "escalation tags the router to reassign");
-        assert!(b.contains("v-x") && b.contains('3'), "names the silent owner + the unanswered round count");
+        assert!(
+            b.contains("REASSIGN") && b.contains("board-pm"),
+            "escalation tags the router to reassign"
+        );
+        assert!(
+            b.contains("v-x") && b.contains('3'),
+            "names the silent owner + the unanswered round count"
+        );
         assert!(b.contains("mint a helper"), "offers minting a fresh owner");
     }
 
     #[test]
     fn accountability_digest_lists_escalations_router_first_with_typed_refs() {
         let esc = vec![
-            Escalation { id: 10, title: "pm one".into(), owner: "v-a".into(), idle_secs: 7200, unanswered_rounds: 1, reassign: false },
-            Escalation { id: 20, title: "reassign one".into(), owner: "v-b".into(), idle_secs: 10800, unanswered_rounds: 2, reassign: true },
+            Escalation {
+                id: 10,
+                title: "pm one".into(),
+                owner: "v-a".into(),
+                idle_secs: 7200,
+                unanswered_rounds: 1,
+                reassign: false,
+            },
+            Escalation {
+                id: 20,
+                title: "reassign one".into(),
+                owner: "v-b".into(),
+                idle_secs: 10800,
+                unanswered_rounds: 2,
+                reassign: true,
+            },
         ];
         let b = accountability_digest_body(&esc);
         // Counts both tiers and names the router to make the call.
-        assert!(b.contains("2 task(s) escalated") && b.contains("1 reassign") && b.contains("1 pm-tag"));
+        assert!(
+            b.contains("2 task(s) escalated") && b.contains("1 reassign") && b.contains("1 pm-tag")
+        );
         assert!(b.contains("board-pm"), "names the router");
         // Typed task_<id> refs only — never a bare #<id>, which board content hard-rejects.
-        assert!(b.contains("task_10") && b.contains("task_20"), "uses typed task refs");
-        assert!(!b.contains("#10") && !b.contains("#20"), "no bare #N refs (board hard-rejects them)");
+        assert!(
+            b.contains("task_10") && b.contains("task_20"),
+            "uses typed task refs"
+        );
+        assert!(
+            !b.contains("#10") && !b.contains("#20"),
+            "no bare #N refs (board hard-rejects them)"
+        );
         // Reassign (more urgent) is listed before the PM-tag.
         let r = b.find("REASSIGN").expect("has a reassign line");
         let p = b.find("PM-TAG").expect("has a pm-tag line");
@@ -14084,7 +16793,11 @@ detached
         assert_eq!(acked_cooldown_with_backoff(base, 2), 2 * base, "8h");
         assert_eq!(acked_cooldown_with_backoff(base, 3), 4 * base, "16h");
         assert_eq!(acked_cooldown_with_backoff(base, 4), 8 * base, "32h");
-        assert_eq!(acked_cooldown_with_backoff(base, 9), 8 * base, "capped at 8x, never grows unbounded");
+        assert_eq!(
+            acked_cooldown_with_backoff(base, 9),
+            8 * base,
+            "capped at 8x, never grows unbounded"
+        );
     }
 
     #[test]
@@ -14098,16 +16811,32 @@ detached
                 { "author": NUDGE_AUTHOR, "body": "n3" },
             ],
         });
-        assert_eq!(nudge_comment_count(&t), 3, "counts the 3 daemon nudges, not the owner/pm comments");
-        assert_eq!(nudge_comment_count(&serde_json::json!({})), 0, "no comments -> 0");
+        assert_eq!(
+            nudge_comment_count(&t),
+            3,
+            "counts the 3 daemon nudges, not the owner/pm comments"
+        );
+        assert_eq!(
+            nudge_comment_count(&serde_json::json!({})),
+            0,
+            "no comments -> 0"
+        );
     }
 
     #[test]
     fn responsive_owner_is_never_escalated() {
         use NudgeTier::{Owner, PmTag, Reassign};
         // A responsive owner (acked since the last nudge) is capped at the Owner tier regardless of round.
-        assert_eq!(responsive_capped_tier(PmTag, true), Owner, "a responsive owner is never PM-tagged");
-        assert_eq!(responsive_capped_tier(Reassign, true), Owner, "a responsive owner is never reassigned");
+        assert_eq!(
+            responsive_capped_tier(PmTag, true),
+            Owner,
+            "a responsive owner is never PM-tagged"
+        );
+        assert_eq!(
+            responsive_capped_tier(Reassign, true),
+            Owner,
+            "a responsive owner is never reassigned"
+        );
         // A silent owner (ack not fresher) escalates normally.
         assert_eq!(responsive_capped_tier(PmTag, false), PmTag);
         assert_eq!(responsive_capped_tier(Reassign, false), Reassign);
@@ -14116,7 +16845,7 @@ detached
 
     #[test]
     fn task_latest_activity_age_secs_is_the_freshest_of_updated_at_and_any_comment() {
-        use time::{format_description::well_known::Rfc3339, Duration};
+        use time::{Duration, format_description::well_known::Rfc3339};
         let now = time::OffsetDateTime::now_utc();
         let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
 
@@ -14135,7 +16864,10 @@ detached
             ],
         });
         let age = task_latest_activity_age_secs(&fresh_comment, now).unwrap();
-        assert!(age < 3600, "the 20m-old comment wins over the 10h-old updated_at, got {age}");
+        assert!(
+            age < 3600,
+            "the 20m-old comment wins over the 10h-old updated_at, got {age}"
+        );
 
         // Every comment older than updated_at: updated_at (the most recent real event) wins.
         let stale_comments = serde_json::json!({
@@ -14143,12 +16875,15 @@ detached
             "comments": [{ "author": "someone", "created_at": stamp(Duration::hours(4)) }],
         });
         let age = task_latest_activity_age_secs(&stale_comments, now).unwrap();
-        assert!(age < 600, "updated_at (5m old) beats an older comment, got {age}");
+        assert!(
+            age < 600,
+            "updated_at (5m old) beats an older comment, got {age}"
+        );
     }
 
     #[test]
     fn task_last_nudge_age_secs_only_counts_this_daemons_own_comments() {
-        use time::{format_description::well_known::Rfc3339, Duration};
+        use time::{Duration, format_description::well_known::Rfc3339};
         let now = time::OffsetDateTime::now_utc();
         let stamp = |d: Duration| (now - d).format(&Rfc3339).unwrap();
 
@@ -14165,7 +16900,10 @@ detached
             ],
         });
         let age = task_last_nudge_age_secs(&nudged_twice, now).unwrap();
-        assert!((age - 3600).abs() < 2, "picks the MOST RECENT own nudge (1h), not the older one, got {age}");
+        assert!(
+            (age - 3600).abs() < 2,
+            "picks the MOST RECENT own nudge (1h), not the older one, got {age}"
+        );
     }
 
     #[test]
@@ -14192,10 +16930,25 @@ detached
         ]});
         let rollup = open_children_rollup(&parent);
         assert_eq!(rollup.len(), 4, "done + cancelled excluded, 4 open remain");
-        assert!(rollup.iter().any(|l| l == "task_841 [in_progress] authoring"));
-        assert!(rollup.iter().any(|l| l == "task_495 [blocked, blocked_on operator] install window"));
-        assert!(rollup.iter().any(|l| l == "task_500 [blocked, blocked_on task task_499] waits on dep"));
-        assert!(!rollup.iter().any(|l| l.contains("task_816")) && !rollup.iter().any(|l| l.contains("task_845")));
+        assert!(
+            rollup
+                .iter()
+                .any(|l| l == "task_841 [in_progress] authoring")
+        );
+        assert!(
+            rollup
+                .iter()
+                .any(|l| l == "task_495 [blocked, blocked_on operator] install window")
+        );
+        assert!(
+            rollup
+                .iter()
+                .any(|l| l == "task_500 [blocked, blocked_on task task_499] waits on dep")
+        );
+        assert!(
+            !rollup.iter().any(|l| l.contains("task_816"))
+                && !rollup.iter().any(|l| l.contains("task_845"))
+        );
         // No children → empty (a leaf task falls through to the normal nudge).
         assert!(open_children_rollup(&serde_json::json!({"title": "leaf"})).is_empty());
         assert!(open_children_rollup(&serde_json::json!({"children": []})).is_empty());
@@ -14214,13 +16967,24 @@ detached
 
     #[test]
     fn parent_rollup_body_lists_the_open_children() {
-        let body = parent_rollup_body(4.0, "v-x", 7200, &[
-            "task_495 [blocked, blocked_on operator] install window".to_string(),
-            "task_843 [todo] materialize".to_string(),
-        ]);
-        assert!(body.contains("no activity of its OWN"), "idle is the parent's own, not rolled up from children");
+        let body = parent_rollup_body(
+            4.0,
+            "v-x",
+            7200,
+            &[
+                "task_495 [blocked, blocked_on operator] install window".to_string(),
+                "task_843 [todo] materialize".to_string(),
+            ],
+        );
+        assert!(
+            body.contains("no activity of its OWN"),
+            "idle is the parent's own, not rolled up from children"
+        );
         assert!(body.contains("v-x"));
-        assert!(body.contains("task_495 [blocked, blocked_on operator]") && body.contains("task_843 [todo]"));
+        assert!(
+            body.contains("task_495 [blocked, blocked_on operator]")
+                && body.contains("task_843 [todo]")
+        );
     }
 
     #[test]
@@ -14230,20 +16994,26 @@ detached
         assert!(task_has_worker_activity(&planned));
         // Only the nudge daemon's own comments do NOT count — a bare todo the daemon has never legitimately
         // nudged can't self-qualify (and this avoids a self-sustaining nudge loop).
-        let only_nudges = serde_json::json!({"comments":[{"author":NUDGE_AUTHOR,"body":"fleet nudge: ..."}]});
+        let only_nudges =
+            serde_json::json!({"comments":[{"author":NUDGE_AUTHOR,"body":"fleet nudge: ..."}]});
         assert!(!task_has_worker_activity(&only_nudges));
         // No comments at all → untouched backlog, not a stall.
-        assert!(!task_has_worker_activity(&serde_json::json!({"comments":[]})));
+        assert!(!task_has_worker_activity(
+            &serde_json::json!({"comments":[]})
+        ));
         assert!(!task_has_worker_activity(&serde_json::json!({})));
         // A mix (worker + nudge) still counts — the worker comment is present.
-        let mixed = serde_json::json!({"comments":[{"author":NUDGE_AUTHOR},{"author":"v-runtime"}]});
+        let mixed =
+            serde_json::json!({"comments":[{"author":NUDGE_AUTHOR},{"author":"v-runtime"}]});
         assert!(task_has_worker_activity(&mixed));
     }
 
     #[test]
     fn owner_is_gone_flags_only_an_owner_absent_from_the_roster() {
-        let board: std::collections::BTreeSet<String> =
-            ["v-alpha", "v-beta"].iter().map(|s| s.to_string()).collect();
+        let board: std::collections::BTreeSet<String> = ["v-alpha", "v-beta"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // The declared manifest mirrors the board here (the steady-state fleet).
         let declared = board.clone();
         // A registered owner is present regardless of its status (offline is deliberate/resumable, board-pm
@@ -14260,12 +17030,18 @@ detached
         // task_1032: a mass spin-down can drop an agent's BOARD record while its registry.json entry survives
         // (parked-resumable). Board-roster absence alone would falsely orphan it; declared-manifest membership
         // is the resume-vs-retire marker, so a deregistered-but-declared owner is NOT gone — its task stays.
-        let board: std::collections::BTreeSet<String> = ["v-still-up"].iter().map(|s| s.to_string()).collect();
-        let declared: std::collections::BTreeSet<String> =
-            ["v-still-up", "v-parked"].iter().map(|s| s.to_string()).collect();
+        let board: std::collections::BTreeSet<String> =
+            ["v-still-up"].iter().map(|s| s.to_string()).collect();
+        let declared: std::collections::BTreeSet<String> = ["v-still-up", "v-parked"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // v-parked fell off the board (deregistered) but is still a declared fleet member → spun-down-resumable.
         assert!(!board.contains("v-parked") && declared.contains("v-parked"));
-        assert!(!owner_is_gone("v-parked", &board, &declared), "a declared-but-deregistered owner must not reroute");
+        assert!(
+            !owner_is_gone("v-parked", &board, &declared),
+            "a declared-but-deregistered owner must not reroute"
+        );
         // Only an owner absent from BOTH is a true orphan.
         assert!(owner_is_gone("v-retired", &board, &declared));
     }
@@ -14297,10 +17073,16 @@ detached
     #[test]
     fn watchdog_action_gated_by_flag_and_quiesce() {
         // task_1032: the opt-in auto-action runs only when its flag is set AND the fleet is not quiesced.
-        assert!(watchdog_action_enabled(true, false), "flag set, not quiesced -> act");
+        assert!(
+            watchdog_action_enabled(true, false),
+            "flag set, not quiesced -> act"
+        );
         // Quiesce (mass spin-down) stands the action down even when the flag is set — reviving would fight the
         // operator spin-down; a hire-signal post is a board write mid-freeze.
-        assert!(!watchdog_action_enabled(true, true), "flag set but quiesced -> suppressed");
+        assert!(
+            !watchdog_action_enabled(true, true),
+            "flag set but quiesced -> suppressed"
+        );
         // The flag unset is a no-op regardless of quiesce.
         assert!(!watchdog_action_enabled(false, false));
         assert!(!watchdog_action_enabled(false, true));
@@ -14310,44 +17092,78 @@ detached
     fn spin_up_hold_reason_holds_unlaunchable_agents_by_default() {
         let host = "dev-dsk-a";
         // A plain this-host-pinned native agent (or unpinned) is launchable → no hold.
-        assert_eq!(spin_up_hold_reason(Some(&serde_json::json!({"host": host})), host), None);
-        assert_eq!(spin_up_hold_reason(Some(&serde_json::json!({})), host), None);
+        assert_eq!(
+            spin_up_hold_reason(Some(&serde_json::json!({"host": host})), host),
+            None
+        );
+        assert_eq!(
+            spin_up_hold_reason(Some(&serde_json::json!({})), host),
+            None
+        );
         assert_eq!(spin_up_hold_reason(None, host), None);
         // Staged reserve helper (board-core-helper) → HELD. This is the task_1037 mistaken-launch case.
-        assert!(spin_up_hold_reason(Some(&serde_json::json!({"staged": true})), host)
-            .is_some_and(|r| r.contains("staged")));
+        assert!(
+            spin_up_hold_reason(Some(&serde_json::json!({"staged": true})), host)
+                .is_some_and(|r| r.contains("staged"))
+        );
         // Pinned to another box (green-machine-ops) → HELD off-host.
-        assert!(spin_up_hold_reason(Some(&serde_json::json!({"host": "green"})), host)
-            .is_some_and(|r| r.contains("off-host")));
+        assert!(
+            spin_up_hold_reason(Some(&serde_json::json!({"host": "green"})), host)
+                .is_some_and(|r| r.contains("off-host"))
+        );
         // Launch-gated (frank) → HELD, via either marker shape.
-        assert!(spin_up_hold_reason(Some(&serde_json::json!({"host": host, "launch_gated": true})), host)
-            .is_some_and(|r| r.contains("launch-gated")));
+        assert!(
+            spin_up_hold_reason(
+                Some(&serde_json::json!({"host": host, "launch_gated": true})),
+                host
+            )
+            .is_some_and(|r| r.contains("launch-gated"))
+        );
         assert!(spin_up_hold_reason(
             Some(&serde_json::json!({"host": host, "launch_gated_on": "daemon mention-wake wiring"})),
             host
         )
         .is_some_and(|r| r.contains("launch-gated")));
         // Charter-deferred vertical (v-cas-http / v-bach) → HELD.
-        assert!(spin_up_hold_reason(Some(&serde_json::json!({"host": host, "charter_projection": "deferred"})), host)
-            .is_some_and(|r| r.contains("deferred")));
+        assert!(
+            spin_up_hold_reason(
+                Some(&serde_json::json!({"host": host, "charter_projection": "deferred"})),
+                host
+            )
+            .is_some_and(|r| r.contains("deferred"))
+        );
         // Staged wins the report order even when other markers also apply (common reserve case first).
-        assert!(spin_up_hold_reason(
-            Some(&serde_json::json!({"staged": true, "host": "green"})),
-            host
-        )
-        .is_some_and(|r| r.contains("staged")));
+        assert!(
+            spin_up_hold_reason(
+                Some(&serde_json::json!({"staged": true, "host": "green"})),
+                host
+            )
+            .is_some_and(|r| r.contains("staged"))
+        );
     }
 
     #[test]
     fn launch_gated_and_charter_deferred_markers() {
         assert!(!agent_is_launch_gated(None));
-        assert!(!agent_is_launch_gated(Some(&serde_json::json!({"launch_gated": false}))));
-        assert!(!agent_is_launch_gated(Some(&serde_json::json!({"launch_gated_on": serde_json::Value::Null}))));
-        assert!(agent_is_launch_gated(Some(&serde_json::json!({"launch_gated": true}))));
-        assert!(agent_is_launch_gated(Some(&serde_json::json!({"launch_gated_on": "x"}))));
+        assert!(!agent_is_launch_gated(Some(
+            &serde_json::json!({"launch_gated": false})
+        )));
+        assert!(!agent_is_launch_gated(Some(
+            &serde_json::json!({"launch_gated_on": serde_json::Value::Null})
+        )));
+        assert!(agent_is_launch_gated(Some(
+            &serde_json::json!({"launch_gated": true})
+        )));
+        assert!(agent_is_launch_gated(Some(
+            &serde_json::json!({"launch_gated_on": "x"})
+        )));
         assert!(!agent_charter_deferred(None));
-        assert!(!agent_charter_deferred(Some(&serde_json::json!({"charter_projection": "active"}))));
-        assert!(agent_charter_deferred(Some(&serde_json::json!({"charter_projection": "deferred"}))));
+        assert!(!agent_charter_deferred(Some(
+            &serde_json::json!({"charter_projection": "active"})
+        )));
+        assert!(agent_charter_deferred(Some(
+            &serde_json::json!({"charter_projection": "deferred"})
+        )));
     }
 
     #[test]
@@ -14365,8 +17181,14 @@ detached
     fn route_body_names_the_router_reason_and_actions() {
         let b = route_body("unassigned", 1.0, 7200);
         assert!(b.contains(NUDGE_ROUTER), "names the router (board-pm)");
-        assert!(b.contains("unassigned") && b.contains("idle 2h"), "carries the reason + idle age");
-        assert!(b.contains("assign it to a capable agent") && b.contains("update its status"), "actionable for the router");
+        assert!(
+            b.contains("unassigned") && b.contains("idle 2h"),
+            "carries the reason + idle age"
+        );
+        assert!(
+            b.contains("assign it to a capable agent") && b.contains("update its status"),
+            "actionable for the router"
+        );
         // The idle-owner reason is carried verbatim too.
         assert!(route_body("owner v-x is idle/dead", 1.0, 3600).contains("owner v-x is idle/dead"));
     }
@@ -14377,9 +17199,21 @@ detached
         // Names the assignee and the idle duration.
         assert!(b.contains("v-runtime") && b.contains("idle 2h"));
         // Spells out the actionable choices the operator asked for (#540), not just "post an update".
-        assert!(b.contains("progress update or ETA"), "keeps the update/ETA option");
-        assert!(b.contains("reassign"), "offers reassignment when the owner can't progress it");
-        assert!(b.contains("done") && b.contains("blocked with a blocked_on note"), "offers the status transitions");
-        assert!(b.contains("unsure whether it is blocked"), "covers the maybe-blocked case");
+        assert!(
+            b.contains("progress update or ETA"),
+            "keeps the update/ETA option"
+        );
+        assert!(
+            b.contains("reassign"),
+            "offers reassignment when the owner can't progress it"
+        );
+        assert!(
+            b.contains("done") && b.contains("blocked with a blocked_on note"),
+            "offers the status transitions"
+        );
+        assert!(
+            b.contains("unsure whether it is blocked"),
+            "covers the maybe-blocked case"
+        );
     }
 }

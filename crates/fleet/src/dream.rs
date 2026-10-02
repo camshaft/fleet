@@ -179,7 +179,11 @@ fn build_backlinks(recs: &[Rec]) -> HashMap<(String, String), Vec<String>> {
             if !seen.insert(link.clone()) {
                 continue; // the Python iterates set(findall(...)): each distinct link once
             }
-            if link != r.slug && slugs_by_repo.get(repo).is_some_and(|s| s.contains(link.as_str())) {
+            if link != r.slug
+                && slugs_by_repo
+                    .get(repo)
+                    .is_some_and(|s| s.contains(link.as_str()))
+            {
                 backlinks
                     .entry((repo.to_string(), link))
                     .or_default()
@@ -225,8 +229,16 @@ fn pick_survivor<'a>(group: &[&'a Rec]) -> &'a Rec {
         .iter()
         .enumerate()
         .min_by(|(ia, a), (ib, b)| {
-            let ka = (Reverse(char_len(a.description.as_deref().unwrap_or(""))), char_len(a.path()), *ia);
-            let kb = (Reverse(char_len(b.description.as_deref().unwrap_or(""))), char_len(b.path()), *ib);
+            let ka = (
+                Reverse(char_len(a.description.as_deref().unwrap_or(""))),
+                char_len(a.path()),
+                *ia,
+            );
+            let kb = (
+                Reverse(char_len(b.description.as_deref().unwrap_or(""))),
+                char_len(b.path()),
+                *ib,
+            );
             ka.cmp(&kb)
         })
         .map(|(_, r)| *r)
@@ -364,7 +376,11 @@ fn detect_near_duplicates(
     for r in recs {
         by_path.insert(r.path(), r);
         let sh = shingles(r.body());
-        let sig = if sh.is_empty() { None } else { Some(minhash_sig(&sh, &coeffs)) };
+        let sig = if sh.is_empty() {
+            None
+        } else {
+            Some(minhash_sig(&sh, &coeffs))
+        };
         shing.insert(r.path().to_string(), sh);
         sigs.insert(r.path().to_string(), sig);
     }
@@ -376,7 +392,10 @@ fn detect_near_duplicates(
         let mut buckets: HashMap<Vec<u64>, Vec<&str>> = HashMap::new();
         for (p, sig) in &sigs {
             if let Some(sig) = sig {
-                buckets.entry(sig[lo..lo + rows].to_vec()).or_default().push(p);
+                buckets
+                    .entry(sig[lo..lo + rows].to_vec())
+                    .or_default()
+                    .push(p);
             }
         }
         for grp in buckets.values() {
@@ -384,7 +403,11 @@ fn detect_near_duplicates(
                 for i in 0..grp.len() {
                     for j in (i + 1)..grp.len() {
                         let (a, b) = (grp[i], grp[j]);
-                        let pair = if a <= b { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) };
+                        let pair = if a <= b {
+                            (a.to_string(), b.to_string())
+                        } else {
+                            (b.to_string(), a.to_string())
+                        };
                         candidates.insert(pair);
                     }
                 }
@@ -443,8 +466,15 @@ fn detect_near_duplicates(
 
         let group: Vec<&Rec> = comp.iter().map(|p| by_path[p.as_str()]).collect();
         let targets: Vec<Value> = group.iter().map(|r| target_json(r, backlinks)).collect();
-        let any_prot: Vec<&&Rec> = group.iter().filter(|r| prot.contains_key(r.path())).collect();
-        let lane = if any_prot.is_empty() { "standard" } else { "protected" };
+        let any_prot: Vec<&&Rec> = group
+            .iter()
+            .filter(|r| prot.contains_key(r.path()))
+            .collect();
+        let lane = if any_prot.is_empty() {
+            "standard"
+        } else {
+            "protected"
+        };
         let prot_reason = {
             let mut set = BTreeSet::new();
             for r in &any_prot {
@@ -481,7 +511,11 @@ fn detect_near_duplicates(
             if cross {
                 let repos_py = format!(
                     "[{}]",
-                    repos.iter().map(|r| format!("'{r}'")).collect::<Vec<_>>().join(", ")
+                    repos
+                        .iter()
+                        .map(|r| format!("'{r}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 format!("; spans repos {repos_py} -> keep-both/keep-in-sync, not merge")
             } else {
@@ -573,8 +607,15 @@ fn detect_exact_duplicates(
         let group: Vec<&Rec> = idxs.iter().map(|&i| &recs[i]).collect();
         let targets: Vec<Value> = group.iter().map(|r| target_json(r, backlinks)).collect();
 
-        let any_prot: Vec<&&Rec> = group.iter().filter(|r| prot.contains_key(r.path())).collect();
-        let lane = if any_prot.is_empty() { "standard" } else { "protected" };
+        let any_prot: Vec<&&Rec> = group
+            .iter()
+            .filter(|r| prot.contains_key(r.path()))
+            .collect();
+        let lane = if any_prot.is_empty() {
+            "standard"
+        } else {
+            "protected"
+        };
         let prot_reason = {
             let mut set = BTreeSet::new();
             for r in &any_prot {
@@ -590,8 +631,10 @@ fn detect_exact_duplicates(
         if repos.len() == 1 {
             // within-repo: merge-safe. survivor = max description length, then shortest path (stable).
             let survivor = pick_survivor(&group);
-            let superseded: Vec<&&Rec> =
-                group.iter().filter(|r| r.path() != survivor.path()).collect();
+            let superseded: Vec<&&Rec> = group
+                .iter()
+                .filter(|r| r.path() != survivor.path())
+                .collect();
             let stranded: Vec<&Value> = targets
                 .iter()
                 .filter(|t| {
@@ -655,7 +698,11 @@ fn detect_exact_duplicates(
             // Render the repo list in Python list style (`['a', 'b']`) so the rationale matches the Python.
             let repos_py = format!(
                 "[{}]",
-                repos.iter().map(|r| format!("'{r}'")).collect::<Vec<_>>().join(", ")
+                repos
+                    .iter()
+                    .map(|r| format!("'{r}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             let rationale = format!(
                 "byte-identical copies across repos {} (sha256 {}); cross-repo presence is usually intentional and [[links]] resolve within-repo only -- keep both, watch for drift{}",
@@ -664,7 +711,10 @@ fn detect_exact_duplicates(
                 if orphans.is_empty() {
                     String::new()
                 } else {
-                    format!("; NOTE {} copy has zero local backlinks (possible orphan)", orphans.len())
+                    format!(
+                        "; NOTE {} copy has zero local backlinks (possible orphan)",
+                        orphans.len()
+                    )
                 }
             );
             out.push(json!({
@@ -756,7 +806,9 @@ fn kebab_tokens(text: &str) -> BTreeSet<String> {
         if at_boundary && (b[i].is_ascii_lowercase() || b[i].is_ascii_digit()) {
             let start = i;
             let mut j = i;
-            while j < b.len() && (b[j].is_ascii_lowercase() || b[j].is_ascii_digit() || b[j] == b'-') {
+            while j < b.len()
+                && (b[j].is_ascii_lowercase() || b[j].is_ascii_digit() || b[j] == b'-')
+            {
                 j += 1;
             }
             // Right boundary: the char after the run must be a non-word char (or end). If it is a word char
@@ -791,7 +843,10 @@ fn detect_write_later_candidates(
 ) -> Vec<Value> {
     let mut slugs_by_repo: HashMap<&str, BTreeSet<&str>> = HashMap::new();
     for r in recs {
-        slugs_by_repo.entry(r.repo()).or_default().insert(r.slug.as_str());
+        slugs_by_repo
+            .entry(r.repo())
+            .or_default()
+            .insert(r.slug.as_str());
     }
     let mut out = Vec::new();
     for r in recs {
@@ -799,13 +854,18 @@ fn detect_write_later_candidates(
             continue; // canon/index only
         };
         let repo = r.repo();
-        let links: BTreeSet<String> = find_links(r.body()).iter().map(|l| l.trim().to_string()).collect();
+        let links: BTreeSet<String> = find_links(r.body())
+            .iter()
+            .map(|l| l.trim().to_string())
+            .collect();
         let mut candidates: Vec<String> = links
             .iter()
             .filter(|l| {
                 !l.is_empty()
                     && l.as_str() != r.slug
-                    && !slugs_by_repo.get(repo).is_some_and(|s| s.contains(l.as_str()))
+                    && !slugs_by_repo
+                        .get(repo)
+                        .is_some_and(|s| s.contains(l.as_str()))
                     && is_slug(l)
                     && l.as_str() != "MEMORY"
                     && !catalogued.contains(*l)
@@ -845,18 +905,245 @@ fn detect_write_later_candidates(
     out
 }
 
+/// Source/doc file extensions a path-shaped token must end in to be a staleness candidate (task_1141).
+/// Restricting to real source/doc extensions is a first-cut false-positive guard: a bare word or a prose
+/// ratio like `and/or` has no such extension and is never a candidate.
+const STALE_SOURCE_EXTS: &[&str] = &[
+    "rs", "toml", "md", "nix", "py", "lean", "cdz", "sh", "json", "yaml", "yml", "lock", "txt",
+    "rb", "go", "ts", "tsx", "js", "jsx", "c", "h", "cc", "cpp", "hpp", "wit", "proto", "sql",
+    "cfg", "ron", "wat", "wast", "ll",
+];
+
+/// Drop fenced code blocks (``` or ~~~ delimited) from `body`: a path appearing only inside an illustrative
+/// snippet is not a live reference, so it is never flagged (the librarian's caution, comment on task_1141).
+/// Inline `backtick` spans are KEPT -- a path in backticks is the normal way a memory cites a real file;
+/// `extract_file_path_refs` trims the backtick chars off the token instead. Pure.
+fn strip_fenced_code(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_fence = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue; // drop the fence delimiter line itself
+        }
+        if !in_fence {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Extract repo-relative file-path references from `body` (the caller strips fenced code first). A candidate
+/// must: contain a `/`; after trimming surrounding markdown punctuation (backticks, quotes, brackets, parens,
+/// trailing sentence punctuation) and a trailing `:line[:col]` locator, end in a known source/doc extension;
+/// not be a URL (`://` or an `http` lead); not be absolute or an explicit relative climb (`/`, `~`, `./`,
+/// `../` -- a host path, not a repo-root-relative artifact); and contain only plausible path chars. A bare
+/// filename with no `/` (e.g. `MEMORY.md`) is NOT a candidate -- prose names a filename far more often than it
+/// names a real missing path. Pure.
+fn extract_file_path_refs(body: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for raw in body.split(char::is_whitespace) {
+        let mut t = raw.trim_matches(|c| {
+            matches!(
+                c,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | '!'
+                    | '?'
+                    | '*'
+                    | '|'
+            )
+        });
+        // Strip a trailing `:123` or `:123:45` line/col locator (the clickable file:line[:col] form).
+        for _ in 0..2 {
+            if let Some(colon) = t.rfind(':') {
+                let tail = &t[colon + 1..];
+                if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                    t = &t[..colon];
+                    continue;
+                }
+            }
+            break;
+        }
+        let t = t.trim_end_matches(['.', ',', ';', ':']);
+        if t.len() < 3 || !t.contains('/') {
+            continue;
+        }
+        if t.contains("://") || t.starts_with("http") {
+            continue;
+        }
+        if t.starts_with('/') || t.starts_with('~') || t.starts_with("./") || t.starts_with("../") {
+            continue;
+        }
+        if !t
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_'))
+        {
+            continue;
+        }
+        let ext = t.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        if ext == t || !STALE_SOURCE_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        out.insert(t.to_string());
+    }
+    out
+}
+
+/// Return the subset of `paths` that the repo's ignore rules match, via one `git -C <root> check-ignore
+/// --stdin` (so a gitignored, regenerable path -- e.g. cadenza's `implementation/` tree -- is suppressed, not
+/// flagged as stale). `Err` on any git failure (root is not a git repo, git missing) so the caller can skip
+/// the detector rather than risk flagging regenerable paths. `check-ignore` exits 0 when >=1 path is ignored,
+/// 1 when none are, 128 on error.
+fn git_check_ignore(repo_root: &Path, paths: &[String]) -> Result<BTreeSet<String>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if paths.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["check-ignore", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("git check-ignore spawn failed: {e}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("git check-ignore: no stdin handle")?;
+        stdin
+            .write_all(paths.join("\n").as_bytes())
+            .map_err(|e| format!("git check-ignore write: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git check-ignore wait: {e}"))?;
+    match out.status.code() {
+        Some(0) | Some(1) => Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()),
+        other => Err(format!(
+            "git check-ignore exited {other:?} (is {} a git repo?)",
+            repo_root.display()
+        )),
+    }
+}
+
+/// Detect verified-dangling FILE-PATH references (task_1141, doc_102 A4): a memory body cites a repo-relative
+/// source path that does NOT exist on disk under `repo_root` AND is not gitignored. PROPOSE-ONLY, confidence
+/// 0.5 -- verified-absent is high-signal but prose extraction can misread, so a human disposes. Three
+/// false-positive guards (doc_102 A4 + the librarian's caution): fenced code blocks are stripped (illustrative
+/// snippets), a bare filename with no `/` is never a candidate, and a gitignored/regenerable path (cadenza's
+/// `implementation/` tree) is suppressed. If the gitignore check cannot run (root is not a git repo), the
+/// detector emits NOTHING rather than risk flagging regenerable paths. The caller runs this ONLY when
+/// `--repo-root` is given -- with no worktree there is nothing to resolve against, so it never runs on a
+/// corpus-only pass.
+fn detect_stale_refs(
+    recs: &[Rec],
+    prot: &HashMap<String, Vec<String>>,
+    backlinks: &HashMap<(String, String), Vec<String>>,
+    repo_root: &Path,
+) -> Vec<Value> {
+    let mut missing_by_rec: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut all_missing: BTreeSet<String> = BTreeSet::new();
+    for (i, r) in recs.iter().enumerate() {
+        let stripped = strip_fenced_code(r.body());
+        let mut missing: Vec<String> = extract_file_path_refs(&stripped)
+            .into_iter()
+            .filter(|p| !repo_root.join(p).exists())
+            .collect();
+        missing.sort();
+        if !missing.is_empty() {
+            all_missing.extend(missing.iter().cloned());
+            missing_by_rec.push((i, missing));
+        }
+    }
+    if missing_by_rec.is_empty() {
+        return Vec::new();
+    }
+    let all_missing_vec: Vec<String> = all_missing.into_iter().collect();
+    let ignored = match git_check_ignore(repo_root, &all_missing_vec) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("dream-analyze: staleness detector skipped -- {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (i, missing) in missing_by_rec {
+        let flagged: Vec<String> = missing
+            .into_iter()
+            .filter(|p| !ignored.contains(p))
+            .collect();
+        if flagged.is_empty() {
+            continue;
+        }
+        let r = &recs[i];
+        let lane = if prot.contains_key(r.path()) {
+            "protected"
+        } else {
+            "standard"
+        };
+        let prot_reason = prot.get(r.path()).map(|v| v.join("; ")).unwrap_or_default();
+        out.push(json!({
+            "proposal_id": format!("dp-staleref-{}", &sha256_hex(r.path())[..12]),
+            "kind": "stale_file_ref",
+            "lane": lane,
+            "protected_reason": prot_reason,
+            "confidence": 0.5,
+            "rationale": format!(
+                "memory {} cites {} file path(s) absent from the repo worktree and matching no .gitignore rule -- a recalled memory that names a file should be verified before it is recommended; update or remove the ref (verified-dangling, NOT auto-applied)",
+                r.path(),
+                flagged.len()
+            ),
+            "targets": [ target_json(r, backlinks) ],
+            "proposed_change": {
+                "op": "annotate",
+                "diff": {
+                    "memory_path": r.path(),
+                    "dangling_file_refs": flagged,
+                    "checked_under": repo_root.display().to_string(),
+                    "note": "advisory: these path refs resolve to no file in the repo worktree and match no .gitignore rule; update the memory or confirm the path",
+                },
+                "reversible_via": "n/a (annotation only)",
+            },
+            "status": "proposed",
+        }));
+    }
+    out
+}
+
 /// Load the JSONL corpus (one memory record per line). An empty line is skipped; a malformed line is an
 /// error (naming the line number) so a corrupt corpus never silently drops memories.
 fn load_corpus(path: &Path) -> Result<Vec<Rec>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read corpus {}: {e}", path.display()))?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read corpus {}: {e}", path.display()))?;
     let mut recs = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let mut rec: Rec = serde_json::from_str(line)
-            .map_err(|e| format!("corpus line {}: {e}", n + 1))?;
+        let mut rec: Rec =
+            serde_json::from_str(line).map_err(|e| format!("corpus line {}: {e}", n + 1))?;
         if rec.path.is_none() {
             rec.path = Some(format!("repos/{}/{}", rec.repo(), rec.slug));
         }
@@ -913,10 +1200,18 @@ fn load_corpus_from_board(board_api: &str, scope: &str) -> Result<Vec<Rec>, Stri
         let id_str = match id {
             Value::Number(n) => n.to_string(),
             Value::String(s) => s.clone(),
-            other => return Err(format!("wiki entry id is neither number nor string: {other}")),
+            other => {
+                return Err(format!(
+                    "wiki entry id is neither number nor string: {other}"
+                ));
+            }
         };
         let doc = board_get_json(board_api, &format!("/documents/{id_str}?include_body=true"))?;
-        let path = doc.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let path = doc
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if path.is_empty() {
             continue; // a doc with no filed path is not a memory in a scope
         }
@@ -932,7 +1227,10 @@ fn load_corpus_from_board(board_api: &str, scope: &str) -> Result<Vec<Rec>, Stri
             slug,
             repo: Some(namespace),
             name: doc.get("title").and_then(Value::as_str).map(str::to_string),
-            description: md.get("description").and_then(Value::as_str).map(str::to_string),
+            description: md
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             rtype: md.get("type").and_then(Value::as_str).map(str::to_string),
             body: doc.get("body").and_then(Value::as_str).map(str::to_string),
             source: md
@@ -981,16 +1279,28 @@ fn proposal_fingerprint(p: &Value) -> String {
 /// `proposal_id -> (fingerprint, disposition)`. Absent/garbled block => empty (treated as a first run). Pure.
 fn parse_dream_state(body: &str) -> HashMap<String, (String, String)> {
     let mut m = HashMap::new();
-    let Some(start) = body.find("<!-- dream-state") else { return m };
+    let Some(start) = body.find("<!-- dream-state") else {
+        return m;
+    };
     let after = &body[start..];
     let Some(nl) = after.find('\n') else { return m };
     let rest = &after[nl + 1..];
-    let Some(end) = rest.find("-->") else { return m };
+    let Some(end) = rest.find("-->") else {
+        return m;
+    };
     let json_str = rest[..end].trim();
     if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(json_str) {
         for (id, v) in o {
-            let h = v.get("hash").and_then(Value::as_str).unwrap_or("").to_string();
-            let d = v.get("disposition").and_then(Value::as_str).unwrap_or("new").to_string();
+            let h = v
+                .get("hash")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let d = v
+                .get("disposition")
+                .and_then(Value::as_str)
+                .unwrap_or("new")
+                .to_string();
             m.insert(id, (h, d));
         }
     }
@@ -1001,9 +1311,15 @@ fn parse_dream_state(body: &str) -> HashMap<String, (String, String)> {
 /// evidence / carried disposition) plus the trailing machine-tracked `dream-state` block. `state` is the
 /// per-proposal `(id, fingerprint, disposition)` to record. Pure.
 fn render_dream_doc(scope: &str, report: &Value, state: &[(String, String, String)]) -> String {
-    let disp: HashMap<&str, &str> = state.iter().map(|(id, _, d)| (id.as_str(), d.as_str())).collect();
+    let disp: HashMap<&str, &str> = state
+        .iter()
+        .map(|(id, _, d)| (id.as_str(), d.as_str()))
+        .collect();
     let empty = Vec::new();
-    let proposals = report.get("proposals").and_then(Value::as_array).unwrap_or(&empty);
+    let proposals = report
+        .get("proposals")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
     let mut out = String::new();
     out.push_str(&format!("# dream: {scope}\n\n"));
     out.push_str(&format!(
@@ -1029,7 +1345,9 @@ fn render_dream_doc(scope: &str, report: &Value, state: &[(String, String, Strin
             let kind = p.get("kind").and_then(Value::as_str).unwrap_or("?");
             let conf = p.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
             let d = disp.get(id).copied().unwrap_or("new");
-            out.push_str(&format!("\n### {id}  ({kind}, confidence {conf})  [disposition: {d}]\n"));
+            out.push_str(&format!(
+                "\n### {id}  ({kind}, confidence {conf})  [disposition: {d}]\n"
+            ));
             if let Some(r) = p.get("rationale").and_then(Value::as_str) {
                 out.push_str(r);
                 out.push('\n');
@@ -1037,7 +1355,11 @@ fn render_dream_doc(scope: &str, report: &Value, state: &[(String, String, Strin
             let paths: Vec<&str> = p
                 .get("targets")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|t| t.get("path").and_then(Value::as_str)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.get("path").and_then(Value::as_str))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !paths.is_empty() {
                 out.push_str(&format!("Targets: {}\n", paths.join(", ")));
@@ -1049,7 +1371,8 @@ fn render_dream_doc(scope: &str, report: &Value, state: &[(String, String, Strin
         .iter()
         .map(|(id, h, d)| (id.clone(), json!({ "hash": h, "disposition": d })))
         .collect();
-    let state_json = serde_json::to_string(&Value::Object(state_obj)).unwrap_or_else(|_| "{}".into());
+    let state_json =
+        serde_json::to_string(&Value::Object(state_obj)).unwrap_or_else(|_| "{}".into());
     out.push_str("\n<!-- dream-state v1 (machine-tracked; set a disposition to accepted|declined|deferred to stop a proposal re-notifying)\n");
     out.push_str(&state_json);
     out.push_str("\n-->\n");
@@ -1057,16 +1380,28 @@ fn render_dream_doc(scope: &str, report: &Value, state: &[(String, String, Strin
 }
 
 /// Run the `board-memory` shim with `args` and an optional stdin body.
-fn run_board_memory(bin: &str, args: &[&str], stdin: Option<&str>) -> std::io::Result<std::process::Output> {
+fn run_board_memory(
+    bin: &str,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> std::io::Result<std::process::Output> {
     use std::io::Write;
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
     let mut child = cmd.spawn()?;
     if let Some(body) = stdin {
-        child.stdin.take().expect("stdin piped").write_all(body.as_bytes())?;
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(body.as_bytes())?;
     }
     child.wait_with_output()
 }
@@ -1082,7 +1417,10 @@ fn publish_board(scope: &str, report: &Value, bin: &str) -> Result<(usize, Vec<S
     let prior_body = match run_board_memory(bin, &["get", "--path", &doc_path], None) {
         Ok(o) if o.status.success() => {
             let v: Value = serde_json::from_slice(&o.stdout).unwrap_or(Value::Null);
-            v.get("body").and_then(Value::as_str).unwrap_or("").to_string()
+            v.get("body")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
         }
         Ok(_) => String::new(), // no prior doc
         Err(e) => return Err(format!("board-memory get failed to spawn: {e}")),
@@ -1090,11 +1428,18 @@ fn publish_board(scope: &str, report: &Value, bin: &str) -> Result<(usize, Vec<S
     let prior = parse_dream_state(&prior_body);
 
     let empty = Vec::new();
-    let proposals = report.get("proposals").and_then(Value::as_array).unwrap_or(&empty);
+    let proposals = report
+        .get("proposals")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
     let mut state: Vec<(String, String, String)> = Vec::with_capacity(proposals.len());
     let mut new_ids: Vec<String> = Vec::new();
     for p in proposals {
-        let id = p.get("proposal_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = p
+            .get("proposal_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let fp = proposal_fingerprint(p);
         match prior.get(&id) {
             Some((prior_fp, disp)) if *prior_fp == fp => state.push((id, fp, disp.clone())),
@@ -1108,12 +1453,24 @@ fn publish_board(scope: &str, report: &Value, bin: &str) -> Result<(usize, Vec<S
     let body = to_ascii(&render_dream_doc(scope, report, &state));
     let name = format!("dream: {scope}");
     let args = [
-        "write", "--path", &doc_path, "--name", &name, "--type", "reference", "--tags", "dream-report",
-        "--author", "v-agent-memory",
+        "write",
+        "--path",
+        &doc_path,
+        "--name",
+        &name,
+        "--type",
+        "reference",
+        "--tags",
+        "dream-report",
+        "--author",
+        "v-agent-memory",
     ];
     match run_board_memory(bin, &args, Some(&body)) {
         Ok(o) if o.status.success() => Ok((new_ids.len(), new_ids)),
-        Ok(o) => Err(format!("board-memory write failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Ok(o) => Err(format!(
+            "board-memory write failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
         Err(e) => Err(format!("board-memory write failed to spawn: {e}")),
     }
 }
@@ -1127,7 +1484,9 @@ fn rank_and_section(proposals: &mut [Value]) -> (usize, usize, usize) {
     fn section_of(kind: &str) -> &'static str {
         match kind {
             "cross_repo_twin" => "cross_repo_twin",
-            "write_later_candidate" => "fyi",
+            // write_later (intentional forward-refs) + stale_file_ref (verified-dangling file nudge) are
+            // advisory ref-hygiene, not structural edits -- keep them FYI below the merges/add-links.
+            "write_later_candidate" | "stale_file_ref" => "fyi",
             _ => "actionable", // near_duplicate (merges) + cross_link (orphan add-links)
         }
     }
@@ -1181,10 +1540,13 @@ pub fn analyze_cmd(
     sample: usize,
     publish_board_doc: bool,
     board_memory: &str,
+    repo_root: Option<&Path>,
 ) -> i32 {
     let recs = if from_board {
         let Some(scope) = scope else {
-            eprintln!("dream-analyze: --from-board requires --scope <wiki-prefix> (e.g. repos/<repo> or agents/<agent>)");
+            eprintln!(
+                "dream-analyze: --from-board requires --scope <wiki-prefix> (e.g. repos/<repo> or agents/<agent>)"
+            );
             return 2;
         };
         match load_corpus_from_board(board_api, scope) {
@@ -1226,21 +1588,47 @@ pub fn analyze_cmd(
 
     let mut proposals = Vec::new();
     proposals.extend(detect_exact_duplicates(&recs, &prot, &backlinks));
-    proposals.extend(detect_near_duplicates(&recs, &prot, &backlinks, &exact_hashes));
+    proposals.extend(detect_near_duplicates(
+        &recs,
+        &prot,
+        &backlinks,
+        &exact_hashes,
+    ));
     let catalogued = load_forward_ref_catalogue(&recs);
-    proposals.extend(detect_write_later_candidates(&recs, &prot, &backlinks, &catalogued));
+    proposals.extend(detect_write_later_candidates(
+        &recs,
+        &prot,
+        &backlinks,
+        &catalogued,
+    ));
+    // Verified-dangling file refs -- only with a repo worktree to resolve against (never on a corpus-only run).
+    if let Some(root) = repo_root {
+        proposals.extend(detect_stale_refs(&recs, &prot, &backlinks, root));
+    }
 
     // Section + rank for the librarian's review surface (actionable first, write-later as FYI).
     let (sec_actionable, sec_twin, sec_fyi) = rank_and_section(&mut proposals);
 
     let standard = proposals.iter().filter(|p| p["lane"] == "standard").count();
-    let protected = proposals.iter().filter(|p| p["lane"] == "protected").count();
+    let protected = proposals
+        .iter()
+        .filter(|p| p["lane"] == "protected")
+        .count();
+    let mut detectors_run = vec![
+        "exact_duplicate",
+        "orphan_add_links",
+        "near_duplicate_minhash",
+        "write_later_candidate",
+    ];
+    if repo_root.is_some() {
+        detectors_run.push("stale_file_ref");
+    }
     let report = json!({
         "schema": "dream-report/v1 (task_827 comment_3869, librarian-blessed comment_3873)",
         "generated_by": "v-agent-memory/dream analyze (Rust port, task_956)",
         "corpus_size": recs.len(),
         "protected_memories": prot.len(),
-        "detectors_run": ["exact_duplicate", "orphan_add_links", "near_duplicate_minhash", "write_later_candidate"],
+        "detectors_run": detectors_run,
         "proposal_count": proposals.len(),
         "by_lane": { "standard": standard, "protected": protected },
         "by_section": { "actionable": sec_actionable, "cross_repo_twin": sec_twin, "fyi": sec_fyi },
@@ -1259,7 +1647,11 @@ pub fn analyze_cmd(
         return 1;
     }
 
-    eprintln!("corpus: {} memories; protected-class: {}", recs.len(), prot.len());
+    eprintln!(
+        "corpus: {} memories; protected-class: {}",
+        recs.len(),
+        prot.len()
+    );
     eprintln!(
         "proposals: {} (standard {standard}, protected {protected})",
         report["proposal_count"]
@@ -1269,7 +1661,9 @@ pub fn analyze_cmd(
     // Publish to the versioned board doc dreams/<scope> + emit the notify-on-new signal (automatic dreaming).
     if publish_board_doc {
         let Some(scope) = scope else {
-            eprintln!("dream-analyze: --publish-board requires --scope (the dreams/<scope> doc path)");
+            eprintln!(
+                "dream-analyze: --publish-board requires --scope (the dreams/<scope> doc path)"
+            );
             return 2;
         };
         match publish_board(scope, &report, board_memory) {
@@ -1277,7 +1671,10 @@ pub fn analyze_cmd(
                 eprintln!("published: dreams/{scope} ({new_count} new proposal(s))");
                 // The scheduler notifies the librarian on this stdout signal, ONLY when new>0.
                 if new_count > 0 {
-                    println!("DREAM-NEW scope={scope} new={new_count} ids={}", new_ids.join(","));
+                    println!(
+                        "DREAM-NEW scope={scope} new={new_count} ids={}",
+                        new_ids.join(",")
+                    );
                 }
             }
             Err(e) => {
@@ -1287,7 +1684,9 @@ pub fn analyze_cmd(
         }
     }
 
-    if sample > 0 && let Some(arr) = report["proposals"].as_array() {
+    if sample > 0
+        && let Some(arr) = report["proposals"].as_array()
+    {
         for p in arr.iter().take(sample) {
             let s = p.to_string();
             eprintln!("{}", &s[..s.len().min(400)]);
@@ -1340,15 +1739,26 @@ mod tests {
     #[test]
     fn norm_body_trims_and_rstrips_lines() {
         // The whole body is trimmed first (so line one's leading spaces go), then each line is right-trimmed.
-        assert_eq!(norm_body("\n  line one  \n  line two\t\n\n"), "line one\n  line two");
+        assert_eq!(
+            norm_body("\n  line one  \n  line two\t\n\n"),
+            "line one\n  line two"
+        );
     }
 
     #[test]
     fn protected_flags_index_and_operator_directive() {
         let idx = rec("index-foo", "r", "body");
-        assert!(protected_reasons(&idx).iter().any(|s| s.contains("sub-index canon")));
+        assert!(
+            protected_reasons(&idx)
+                .iter()
+                .any(|s| s.contains("sub-index canon"))
+        );
         let op = rec("operator-standing-directive-x", "r", "b");
-        assert!(protected_reasons(&op).iter().any(|s| s.contains("operator-directive")));
+        assert!(
+            protected_reasons(&op)
+                .iter()
+                .any(|s| s.contains("operator-directive"))
+        );
         let plain = rec("a-plain-memory", "r", "nothing special");
         assert!(protected_reasons(&plain).is_empty());
     }
@@ -1356,13 +1766,27 @@ mod tests {
     #[test]
     fn protected_canon_pointer_needs_8plus_links_and_60pct() {
         // 8 links on 8 nonblank lines -> 100% >= 60% and >=8 -> canon pointer.
-        let body = (0..8).map(|i| format!("[[link-{i}]]")).collect::<Vec<_>>().join("\n");
+        let body = (0..8)
+            .map(|i| format!("[[link-{i}]]"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r = rec("mostly-pointers", "r", &body);
-        assert!(protected_reasons(&r).iter().any(|s| s.contains("canon pointer")));
+        assert!(
+            protected_reasons(&r)
+                .iter()
+                .any(|s| s.contains("canon pointer"))
+        );
         // 7 links is below the 8 floor.
-        let body7 = (0..7).map(|i| format!("[[link-{i}]]")).collect::<Vec<_>>().join("\n");
+        let body7 = (0..7)
+            .map(|i| format!("[[link-{i}]]"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r7 = rec("few-pointers", "r", &body7);
-        assert!(!protected_reasons(&r7).iter().any(|s| s.contains("canon pointer")));
+        assert!(
+            !protected_reasons(&r7)
+                .iter()
+                .any(|s| s.contains("canon pointer"))
+        );
     }
 
     #[test]
@@ -1469,14 +1893,20 @@ mod tests {
     fn near_duplicate_skips_exact_duplicate_pairs() {
         // Byte-identical bodies are the exact-dup detector's job; near-dup must skip them.
         let body = "identical bodies are handled by the exact duplicate detector not the fuzzy one here now";
-        let recs = vec![near_rec("twin-a-slug", "r1", body), near_rec("twin-b-slug", "r1", body)];
+        let recs = vec![
+            near_rec("twin-a-slug", "r1", body),
+            near_rec("twin-b-slug", "r1", body),
+        ];
         let backlinks = build_backlinks(&recs);
         let exact: HashMap<String, String> = recs
             .iter()
             .map(|r| (r.path().to_string(), sha256_hex(&norm_body(r.body()))))
             .collect();
         let props = detect_near_duplicates(&recs, &HashMap::new(), &backlinks, &exact);
-        assert!(props.is_empty(), "exact-dup pair is skipped by the near-dup detector");
+        assert!(
+            props.is_empty(),
+            "exact-dup pair is skipped by the near-dup detector"
+        );
     }
 
     #[test]
@@ -1488,7 +1918,11 @@ mod tests {
                  "rationale":"two memories share a body","targets":[{"path":"repos/r/a"},{"path":"repos/r/b"}]}
             ]
         });
-        let state = vec![("dp-x-1".to_string(), "abc123def456".to_string(), "declined".to_string())];
+        let state = vec![(
+            "dp-x-1".to_string(),
+            "abc123def456".to_string(),
+            "declined".to_string(),
+        )];
         let body = render_dream_doc("repos/r", &report, &state);
         // Rendered doc shows the section + the carried disposition inline.
         assert!(body.contains("## Actionable"));
@@ -1496,7 +1930,10 @@ mod tests {
         assert!(body.contains("Targets: repos/r/a, repos/r/b"));
         // The machine state block round-trips back to the same (fingerprint, disposition).
         let parsed = parse_dream_state(&body);
-        assert_eq!(parsed.get("dp-x-1"), Some(&("abc123def456".to_string(), "declined".to_string())));
+        assert_eq!(
+            parsed.get("dp-x-1"),
+            Some(&("abc123def456".to_string(), "declined".to_string()))
+        );
         // A body with no state block parses empty (first run).
         assert!(parse_dream_state("# just a doc, no state").is_empty());
     }
@@ -1523,7 +1960,10 @@ mod tests {
         // sections tagged
         assert_eq!(props[0]["section"], "actionable");
         // actionable block first, by confidence desc: m2 (1.0), m1 (0.85), o1 (0.6)
-        let ids: Vec<&str> = props.iter().map(|p| p["proposal_id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = props
+            .iter()
+            .map(|p| p["proposal_id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["m2", "m1", "o1", "t1", "w1"]);
         // the cross-repo twin is its own section, write-later is FYI last.
         assert_eq!(props[3]["section"], "cross_repo_twin");
@@ -1546,6 +1986,73 @@ mod tests {
         assert_eq!(props.len(), 1);
         assert_eq!(props[0]["kind"], "cross_repo_twin");
         assert_eq!(props[0]["proposed_change"]["op"], "annotate");
-        assert_eq!(props[0]["proposed_change"]["diff"]["flag"], "cross-repo-twin-fuzzy");
+        assert_eq!(
+            props[0]["proposed_change"]["diff"]["flag"],
+            "cross-repo-twin-fuzzy"
+        );
+    }
+
+    #[test]
+    fn extract_file_path_refs_rules() {
+        let refs = extract_file_path_refs(
+            "see `crates/fleet/src/dream.rs` and src/main.rs:1551 but not MEMORY.md or and/or; \
+             skip https://x.com/a/b.rs and /abs/host/path.rs and ./rel/x.rs; keep spec/syntax/foo.md.",
+        );
+        assert!(refs.contains("crates/fleet/src/dream.rs")); // backtick-wrapped, kept
+        assert!(refs.contains("src/main.rs")); // trailing :1551 locator stripped
+        assert!(refs.contains("spec/syntax/foo.md")); // trailing sentence '.' trimmed
+        assert!(!refs.contains("MEMORY.md")); // no '/', a bare filename is never a candidate
+        assert!(!refs.iter().any(|r| r.contains("x.com"))); // URL (scheme) excluded
+        assert!(!refs.iter().any(|r| r.starts_with("/abs"))); // absolute/host path excluded
+        assert!(!refs.iter().any(|r| r.contains("rel/x.rs"))); // ./ relative climb excluded
+        assert!(!refs.contains("and/or")); // has '/' but no source extension -> not a candidate
+    }
+
+    #[test]
+    fn strip_fenced_code_drops_fenced_keeps_inline() {
+        let body = "real `inline/path.rs` here\n```\nfenced/example.rs\n```\nafter line\n";
+        let out = strip_fenced_code(body);
+        assert!(out.contains("inline/path.rs")); // inline-code path survives (a real citation)
+        assert!(!out.contains("fenced/example.rs")); // fenced snippet is illustrative, dropped
+        assert!(out.contains("after line"));
+    }
+
+    #[test]
+    fn detect_stale_refs_flags_missing_but_not_existing_or_gitignored() {
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!("dream-stale-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let inited = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status();
+        if inited.map(|s| !s.success()).unwrap_or(true) {
+            // No usable git here: the detector is designed to skip (git_check_ignore -> Err), nothing to assert.
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        std::fs::write(root.join(".gitignore"), "implementation/\n").unwrap();
+        std::fs::write(root.join("src/exists.rs"), "// present\n").unwrap();
+        // src/missing.rs is never created; implementation/seed/gen.rs is both absent and gitignored.
+        let body =
+            "live `src/exists.rs`, dangling src/missing.rs, regen implementation/seed/gen.rs.";
+        let recs = vec![rec("mem-with-refs", "r", body)];
+        let backlinks = build_backlinks(&recs);
+        let props = detect_stale_refs(&recs, &HashMap::new(), &backlinks, &root);
+        assert_eq!(props.len(), 1, "one memory carries a real dangling ref");
+        assert_eq!(props[0]["kind"], "stale_file_ref");
+        assert_eq!(props[0]["lane"], "standard");
+        assert_eq!(props[0]["confidence"], 0.5);
+        let flagged: Vec<&str> = props[0]["proposed_change"]["diff"]["dangling_file_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Only the genuine dangle: exists.rs is present, implementation/ is gitignored (regenerable).
+        assert_eq!(flagged, vec!["src/missing.rs"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
