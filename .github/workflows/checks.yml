@@ -171,3 +171,28 @@ jobs:
               sys.exit(1)
           print("content guardrail: clean -- no secret-shaped findings beyond the audited baseline")
           PY
+
+  # task_1319: the clean-prose gate. Comments in crates/fleet and the loops markdown must read as plain prose:
+  # no filler emphatics (matched against crates/fleet/prose-style.toml, a projection of the board
+  # banned-phrases list) and no caps-for-emphasis. The pre-existing findings are suppressed by
+  # crates/fleet/prose-style.baseline.json, so this fires only on a new comment finding; the baseline burns
+  # down in a later cleanup. The gate logic lives in the `fleet` binary, not a shell script (the no-bash
+  # directive). ft-nix extends THIS job with the clippy.toml disallowed-methods and `fleet lint-no-shell`
+  # steps for task_1318 -- one job, grown incrementally, not a parallel job.
+  tooling-gates:
+    name: tooling gates (clean-prose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fleet lint-prose (a new emphatic or caps-for-emphasis comment fails the gate)
+        run: >
+          cargo run -q -p fleet -- lint-prose
+          --ruleset crates/fleet/prose-style.toml
+          --dir crates/fleet --dir loops
+          --baseline crates/fleet/prose-style.baseline.json
