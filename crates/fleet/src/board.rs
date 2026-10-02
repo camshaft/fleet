@@ -205,6 +205,29 @@ impl Board {
         self.get_json(&format!("/agents/{agent}"))
     }
 
+    /// The board banned-phrases wordlist (`GET /banned-phrases` -> an array of records, each with a `phrase`
+    /// field), as the deduped, sorted phrase strings. This is the one authoritative source the prose-lint
+    /// projection is synced from (task_1319); public CI cannot reach the board, so a maintenance tick syncs
+    /// it into a checked-in file rather than fetching at gate time.
+    pub fn banned_phrases(&self) -> Result<Vec<String>, String> {
+        let arr = match self.get_json("/banned-phrases")? {
+            Value::Array(a) => a,
+            other => {
+                return Err(format!(
+                    "board /banned-phrases: expected an array, got {other}"
+                ));
+            }
+        };
+        let mut phrases: Vec<String> = arr
+            .iter()
+            .filter_map(|r| r.get("phrase").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        phrases.sort();
+        phrases.dedup();
+        Ok(phrases)
+    }
+
     /// The set of agent ids the board currently has a LIVE reverse tunnel for (`GET /tunnels` →
     /// `{"tunnels":[{"agent_id","host"},…]}`). This is the board's authoritative "is this agent reachable via
     /// a tunnel wake" signal — an off-LAN agent with no `webhook_url` is push-woken only if it appears here.

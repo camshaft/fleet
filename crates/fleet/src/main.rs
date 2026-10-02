@@ -3234,6 +3234,20 @@ enum Cmd {
         #[arg(long)]
         warn_only: bool,
     },
+    /// Refresh (or `--check`-verify) the committed emphatics projection from the live board banned-phrases
+    /// list, preserving the hand-maintained caps allow-list (task_1319). This reaches the board, so it runs
+    /// as a dev refresh or a board-host maintenance tick, never in public CI. Exit 1 on drift under --check.
+    ProseSync {
+        /// Path to the committed ruleset TOML to refresh or check (else `$FLEET_PROSE_RULESET`).
+        #[arg(long)]
+        ruleset: Option<String>,
+        /// Drift mode: compare only, exit 1 on a mismatch, write nothing.
+        #[arg(long)]
+        check: bool,
+        /// Explicit board base URL (else the configured board).
+        #[arg(long)]
+        board_api: Option<String>,
+    },
     /// Keep a browser-facing tunnel's CLI client CONNECTED, not merely alive (task_1182): probe connectivity
     /// end-to-end THROUGH the tunnel and, when it is down (alive-but-not-forwarding — the failure a plain
     /// process-liveness supervisor misses), shed the stale client by its exact pid and re-run the host-provided
@@ -3922,6 +3936,15 @@ fn main() {
             files,
             dirs,
             warn_only,
+        }),
+        Cmd::ProseSync {
+            ruleset,
+            check,
+            board_api,
+        } => prose_lint::prose_sync(prose_lint::SyncOpts {
+            ruleset,
+            check,
+            board_api,
         }),
         Cmd::TunnelGuard {
             name,
