@@ -88,3 +88,35 @@ jobs:
       - name: Skip (no voice-assistant-relevant changes)
         if: steps.filter.outputs.relevant != 'true'
         run: echo "No voice-assistant / flake / workspace-manifest changes on this PR; skipping the ~4min runtime build. The fast 'clippy + test (workspace)' job is the merge gate — it already compiles voice-assistant's lib, so a cross-crate break is still caught."
+
+  # Isolated builds of the feature-gated daemon crates (task_959). The `clippy + test (workspace)` job runs
+  # DEFAULT features only, and these crates gate their daemon binary behind `required-features` (slack-bridge
+  # `transport`, github-bridge `daemon`) — so the whole-workspace build NEVER compiles that daemon code or its
+  # heavy async tree, and a break in it reaches main uncaught (the exact gap task_959 names). Building each
+  # crate with `-p <crate>` (resolver v2, so features resolve for ONLY that crate's subgraph, not the workspace
+  # union) WITH its shipping feature compiles the daemon bin + its tests, so a feature-unification or
+  # daemon-code break fails HERE. kb is NOT listed: its default lib is already in the workspace build and its
+  # load-dynamic link path is covered by the `.#kb` nix package, the same way voice-assistant's runtime is.
+  daemon-crate-builds:
+    name: build (feature-gated daemon crates, isolated)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: slack-bridge
+            features: transport
+          - crate: github-bridge
+            features: daemon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `-p <crate>` builds only this crate's dependency subgraph (resolver v2 → no workspace feature-union),
+      # and `--features <shipping feature>` satisfies the bin's `required-features` so the daemon code compiles.
+      - name: cargo check -p ${{ matrix.crate }} --features ${{ matrix.features }} (isolated, all targets)
+        run: cargo check -p ${{ matrix.crate }} --features ${{ matrix.features }} --all-targets
