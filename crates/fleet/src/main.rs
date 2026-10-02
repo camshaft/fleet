@@ -20,6 +20,7 @@ mod concierge_mint;
 mod config;
 mod dream;
 mod dream_apply;
+mod drift;
 mod memory;
 mod notify;
 mod scan;
