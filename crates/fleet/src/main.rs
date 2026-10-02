@@ -4226,9 +4226,17 @@ fn status(stale_only: bool) {
     }
 }
 
-/// The committed host-service ownership registry (task_1027), embedded so the lookup is a cheap local call
-/// with no runtime file dependency. Edited by PR as services are added or ownership moves.
-const HOST_SERVICES_TOML: &str = include_str!("../host-services.toml");
+/// The host-service ownership registry (task_1027) is a LOCAL, host-specific resource — NOT committed to this
+/// public repo, because the real registry names internal host/service topology (task_1031 / task_934). It
+/// lives at `$XDG_CONFIG_HOME/fleet/host-services.toml` (fallback `$HOME/.config/fleet/host-services.toml`),
+/// injected by the deploy; the repo carries only `host-services.toml.example` (placeholder shape). An absent
+/// file yields an empty registry + a hint pointing at the path, never an error.
+fn host_services_path() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+    });
+    base.join("fleet").join("host-services.toml")
+}
 
 /// One managed host service's ownership record: who owns it, where its authoritative definition lives, and
 /// whether it is a fleet-wide `lifeline` (board / MCP / event-wake) whose changes are attended-only.
@@ -4251,10 +4259,23 @@ struct HostServiceRegistry {
     service: Vec<HostService>,
 }
 
-/// Parse the embedded registry. The TOML is committed + unit-tested, so a parse failure is a build/test-time
-/// bug, not a runtime condition — surface it loudly rather than silently returning an empty registry.
+/// Load the registry from its local path. Absent → an empty registry (the caller prints a hint); a parse
+/// error → empty + a warning (never a panic — a malformed local file must not break the `fleet` binary).
 fn host_service_registry() -> HostServiceRegistry {
-    toml::from_str(HOST_SERVICES_TOML).expect("host-services.toml is committed + test-parsed; must deserialize")
+    let path = host_services_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_host_service_registry(&text).unwrap_or_else(|e| {
+            eprintln!("fleet services: {} failed to parse: {e}", path.display());
+            HostServiceRegistry { service: Vec::new() }
+        }),
+        Err(_) => HostServiceRegistry { service: Vec::new() },
+    }
+}
+
+/// Pure TOML → registry parse, split out so it is unit-testable against an inline fixture without touching the
+/// filesystem (the real registry is a local, uncommitted resource).
+fn parse_host_service_registry(text: &str) -> Result<HostServiceRegistry, toml::de::Error> {
+    toml::from_str(text)
 }
 
 /// Resolve a query (service name, alias, or port like `:8880`) to a service, case-insensitively. A leading
@@ -4273,6 +4294,13 @@ fn find_host_service<'a>(reg: &'a [HostService], query: &str) -> Option<&'a Host
 /// definition" resolve an agent must do BEFORE touching shared infra it does not own.
 fn services(query: Option<&str>) {
     let reg = host_service_registry();
+    if reg.service.is_empty() {
+        eprintln!(
+            "fleet services: no host-service registry at {} — it is a LOCAL, deploy-injected resource (not in the public repo). Copy crates/fleet/host-services.toml.example there and fill in this host's real services.",
+            host_services_path().display()
+        );
+        std::process::exit(1);
+    }
     match query {
         None => {
             println!("Host-service ownership registry ({} services) — `fleet services <name>` for detail:", reg.service.len());
@@ -10097,24 +10125,36 @@ mod tests {
 
     #[test]
     fn host_service_registry_parses_and_resolves_by_name_alias_and_port() {
-        // task_1027: the committed registry must deserialize (a parse failure here is a build-time bug, not
-        // a runtime surprise), and the lookup must resolve by name, alias, AND a port alias, case-insensitively.
-        let reg = host_service_registry();
-        assert!(!reg.service.is_empty(), "the seed registry is non-empty");
-        // Resolve the lifeline the near-miss was about, by name, by a word alias, and by its port — all one service.
-        let by_name = find_host_service(&reg.service, "edge-proxy").expect("resolve by name");
-        let by_alias = find_host_service(&reg.service, "green-mcp-proxy").expect("resolve by alias");
-        let by_port = find_host_service(&reg.service, ":8880").expect("resolve by port alias");
-        assert_eq!(by_name.name, "edge-proxy");
-        assert_eq!(by_alias.name, "edge-proxy");
-        assert_eq!(by_port.name, "edge-proxy");
-        // The :8880 board/MCP proxy is a lifeline owned by v-nix — the exact facts an agent must see before touching it.
-        assert!(by_name.lifeline, "edge-proxy is a lifeline");
-        assert_eq!(by_name.owner, "v-nix");
-        // Case-insensitive, and the notifier is also flagged lifeline (event-wake path).
-        assert_eq!(find_host_service(&reg.service, "EDGE-PROXY").map(|s| s.name.as_str()), Some("edge-proxy"));
-        assert!(find_host_service(&reg.service, "fleet-notify").expect("notifier present").lifeline);
-        // An unknown service resolves to None (the command then prints the known list + exits nonzero).
+        // task_1027 lookup, task_1031 fix: the real registry is a LOCAL, uncommitted resource (host topology
+        // must not live in the public repo), so this tests the pure parser + lookup against an INLINE fixture
+        // — no include_str!, no filesystem, no real host/service names in the repo.
+        let fixture = r#"
+            [[service]]
+            name = "svc-proxy"
+            aliases = [":9999", "svc-proxy-alias"]
+            owner = "owner-a"
+            definition = "<pointer>"
+            lifeline = true
+            note = "example lifeline"
+
+            [[service]]
+            name = "svc-worker"
+            owner = "owner-b"
+            definition = "<pointer>"
+        "#;
+        let reg = parse_host_service_registry(fixture).expect("fixture parses");
+        assert_eq!(reg.service.len(), 2);
+        // Resolve by name, by a word alias, and by a port alias — all the one service, case-insensitively.
+        let by_name = find_host_service(&reg.service, "svc-proxy").expect("by name");
+        let by_alias = find_host_service(&reg.service, "svc-proxy-alias").expect("by alias");
+        let by_port = find_host_service(&reg.service, ":9999").expect("by port alias");
+        assert_eq!(by_name.name, "svc-proxy");
+        assert_eq!(by_alias.name, "svc-proxy");
+        assert_eq!(by_port.name, "svc-proxy");
+        assert!(by_name.lifeline && by_name.owner == "owner-a");
+        assert_eq!(find_host_service(&reg.service, "SVC-PROXY").map(|s| s.name.as_str()), Some("svc-proxy"));
+        // `lifeline` defaults to false when omitted; an unknown query resolves to None.
+        assert!(!find_host_service(&reg.service, "svc-worker").expect("worker present").lifeline);
         assert!(find_host_service(&reg.service, "no-such-service").is_none());
     }
 
