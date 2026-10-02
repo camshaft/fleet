@@ -3,7 +3,7 @@
 # A fleet host has no inbound path, so this daemon dials OUT to the board's websocket endpoint
 # (/tunnel/ws) and lets the board ride HTTP requests back down the socket; each request is
 # forwarded to a single local upstream (the `fleet notify` notifier on 127.0.0.1:8899) and the
-# response returned over the same socket. Mirror image of a cloudflared tunnel. Ported 1:1 from
+# response returned over the same socket. Mirror image of a reverse out-dial tunnel. Ported 1:1 from
 # the original Python daemon (operator seq-1392: fleet tooling is Rust).
 #
 # Same layout as `slack-bridge`: the pure core (config parse/validate, frame ser/de, base64 body)
