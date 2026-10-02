@@ -33,6 +33,10 @@ mod rerank;
 mod search;
 mod store;
 mod webhook;
+// Phase-2 board-wiki → KB auto-sync connector (`kb wiki-sync`, task_1089): re-ingests a doc's approved
+// version on `document.approved`, culls stale/archived points. This module is the pure, tested core
+// (classification + scope + cull); its own `allow(dead_code)` covers landing ahead of the worker + CLI role.
+mod wiki_sync;
 
 use std::path::PathBuf;
 use std::process;
