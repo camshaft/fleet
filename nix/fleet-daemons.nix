@@ -274,10 +274,14 @@ let
       };
     })
     # Group A: fleet-watchdog (periodic oneshot; rearm/observe/spawn; --self-redeploy DROPPED under the flake).
+    # --reap-stale-observers (task_1045): the observer cadence SPAWNS obs-<target> windows, and an observer that
+    # crashes/hangs before `observe-record` (or whose self-close is missed) leaks its window; without the reaper
+    # in the always-on sweep those obs-* windows accumulate unbounded (157 leaked before this landed). The reaper
+    # only kills windows whose spawn stamp is stale/absent, so a healthy in-flight observer is never touched.
     // (mkTimer {
       name = "fleet-watchdog";
       description = "Fleet watchdog";
-      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn";
+      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn --reap-stale-observers";
       intervalSecs = 60;
       onBootSec = 60;
       persistent = true;
