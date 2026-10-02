@@ -3310,6 +3310,22 @@ enum Cmd {
         #[arg(long)]
         repo_root: Option<PathBuf>,
     },
+    /// Run automatic dreaming over EVERY repos/* scope on the board (task_1123): the scheduled RUNNER the
+    /// fleet-dream systemd timer invokes. Pulls all repo-scoped memory, groups by repo, and runs the
+    /// analyze+publish pass per scope -- refreshing each versioned `dreams/<scope>` review doc and writing a
+    /// per-scope report under `<state-dir>/dreams`. Emits a `DREAM-NEW` stdout line per scope with new
+    /// proposals (the notify-on-new signal). Corpus-only first cut (no repo-root -> staleness skips).
+    DreamRun {
+        /// Board REST base for the live-board pull (default the fleet board base).
+        #[arg(long)]
+        board_api: Option<String>,
+        /// Directory for the per-scope report files (default `$XDG_STATE_HOME/fleet`, else `~/.local/state/fleet`).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Path to the board-memory CLI (used to publish each `dreams/<scope>` doc).
+        #[arg(long, default_value = "board-memory")]
+        board_memory: String,
+    },
     /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
     /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
     /// lane / KB-side op is EMITTED for the librarian (never script-executed), destructive ops archive
@@ -3737,6 +3753,18 @@ fn main() {
                 &board_memory,
                 repo_root.as_deref(),
             );
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Cmd::DreamRun {
+            board_api,
+            state_dir,
+            board_memory,
+        } => {
+            let api = board_api.unwrap_or_else(board::Board::base_url);
+            let state_dir = state_dir.unwrap_or_else(default_state_dir);
+            let code = dream::run_cmd(&api, &state_dir, &board_memory);
             if code != 0 {
                 std::process::exit(code);
             }
@@ -6111,6 +6139,18 @@ fn status(stale_only: bool) {
     if stale_only && shown == 0 {
         println!("(all {} agents live)", agents.len());
     }
+}
+
+/// The default state dir for regenerable fleet artifacts (the `dream-run` per-scope reports): `$XDG_STATE_HOME/
+/// fleet` (fallback `$HOME/.local/state/fleet`). State, not config — reports are regenerable each run.
+fn default_state_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".local/state"))
+        .join("fleet")
 }
 
 /// The host-service ownership registry (task_1027) is a LOCAL, host-specific resource — NOT committed to this
