@@ -828,8 +828,10 @@ mod tests {
 
     #[test]
     fn advertise_host_prefers_explicit_config_over_detection() {
-        let mut cfg = config::Config::default();
-        cfg.webhook_advertise_host = "198.51.100.7".to_string();
+        let cfg = config::Config {
+            webhook_advertise_host: "198.51.100.7".to_string(),
+            ..Default::default()
+        };
         assert_eq!(advertise_host(&cfg), "198.51.100.7"); // explicit value used verbatim, no detection
     }
 
