@@ -199,7 +199,8 @@ let
     };
 
   fleetBin = "${fleet}/bin/fleet";
-  fleetTunnelBin = "${fleetTunnel}/bin/fleet-tunnel";
+  # fleet-tunnel RETIRED 2026-10-02 (task_937) — its daemon is gone (see below); the `fleetTunnel` arg is now
+  # vestigial (left in the formal set so the caller need not change in lockstep; prune in a follow-up).
 
   # The watchdog spawns Claude sessions via window.sh, which need the full known-good login PATH (dropping an
   # entry is the task_347 broken-PATH failure mode) plus this Bedrock env. PATH is intentionally NOT set here:
@@ -242,19 +243,12 @@ let
       after = [ "default.target" ];
       wants = [ ];
     })
-    # Group A: fleet-tunnel (long-running reverse HTTP-over-websocket bridge; ordered after notify).
-    // (mkService {
-      name = "fleet-tunnel";
-      description = "Fleet reverse tunnel bridge";
-      exec = "${fleetTunnelBin} --config %h/.config/fleet/tunnel.toml";
-      restart = "always";
-      restartSec = 5;
-      after = [
-        "network-online.target"
-        "fleet-notify.service"
-      ];
-      wants = [ "network-online.target" ];
-    })
+    # fleet-tunnel RETIRED (task_937 host migration, 2026-10-02): the green-era reverse HTTP-over-websocket
+    # event-wake bridge is SUPERSEDED on the co-resident dev-dsk — board->agent is pure localhost, so the
+    # notifier (fleet-notify :8899) + the board's own push-wake WS (reachable via edge-proxy :8880) deliver
+    # event-wake with no reverse tunnel. v-nix (ingress owner) confirmed edge-proxy fully subsumes it. The unit
+    # is dropped from the managed set here; install-fleet-daemons PRUNES the now-unmanaged fleet-tunnel.service
+    # on its next reconcile (the live unit was already disabled + removed by v-fleet-tooling).
     # Group A: fleet-litellm (long-running local litellm proxy; external binary, unit-only migration).
     // (mkService {
       name = "fleet-litellm";
@@ -276,6 +270,22 @@ let
       exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn";
       intervalSecs = 60;
       onBootSec = 60;
+      persistent = true;
+      after = [ "fleet-notify.service" ];
+      wants = [ "fleet-notify.service" ];
+      environment = watchdogEnv;
+    })
+    # fleet-up (task_937 reboot-survival / task_464 launcher relocation): periodic oneshot that reconstitutes
+    # the board-native roster pinned to this host from the BOARD (not the file-hub) — `up-board --launch` skips
+    # staged/stood-down/off-host agents, so the fleet comes up shortly after boot and is reconciled every 300s.
+    # Mirrors the watchdog's launcher env (watchdogEnv; the full login PATH is injected by install-fleet-daemons
+    # at install time, same as the watchdog). This replaces the prior v-fleet-tooling hand-install of fleet-up.
+    // (mkTimer {
+      name = "fleet-up";
+      description = "Fleet launcher — reconstitute board-native agents (up-board)";
+      exec = "${fleetBin} up-board --launch";
+      intervalSecs = 300;
+      onBootSec = 30;
       persistent = true;
       after = [ "fleet-notify.service" ];
       wants = [ "fleet-notify.service" ];
