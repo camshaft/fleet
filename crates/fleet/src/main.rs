@@ -153,6 +153,18 @@ fn spin_up_hold_reason(md: Option<&serde_json::Value>, this_host: &str) -> Optio
     }
 }
 
+/// task_1152: whether the ACTIVE watchdog should RELAUNCH a managed board-native agent whose tmux window is
+/// gone. Relaunch only an agent that SHOULD be up but crashed/vanished — never one deliberately stood down and
+/// never one held out of auto-launch. Gated on: no live window AND board presence is NOT `offline` (an offline
+/// agent is intentionally stood down — the [`board_reconcile_plan`] stood_down case — and is left down, e.g. a
+/// `spin-down --all` migration wind-down like membrain-core) AND it is a launch candidate
+/// ([`spin_up_hold_reason`] is `None`: not staged / off-host / launch-gated / charter-deferred). The per-agent
+/// relaunch COOLDOWN is applied separately by the watchdog's act pass (mirroring revive-stranded), so a
+/// crash-looping agent is relaunched a bounded number of times, not every sweep. Pure — unit-tested.
+fn relaunch_missing_candidate(has_window: bool, is_offline: bool, hold_reason: Option<&str>) -> bool {
+    !has_window && !is_offline && hold_reason.is_none()
+}
+
 /// Whether the watchdog should manage an agent on this host. A STAGED agent ([`agent_is_staged`]) is never
 /// managed — it is a reserve helper that is not meant to be running, so re-arming or spawning an observer
 /// against it would be a spurious wake of an intentionally-down agent. Otherwise, under `pinned_only` (a
@@ -1899,6 +1911,17 @@ enum Cmd {
         /// detection never force-restarts an agent; without it the wedge stays report-only (a WARNING line).
         #[arg(long)]
         recover_wedged: bool,
+        /// ACT on the task_1152 MISSING-WINDOW signal (active liveness enforcement): for each managed
+        /// board-native agent that SHOULD be up but has no live tmux window — board presence NOT `offline`
+        /// (an offline agent is deliberately stood down and left down) and a launch candidate (not staged /
+        /// off-host / launch-gated / charter-deferred) — RELAUNCH it via `fleet spin-up <id> --apply`, instead
+        /// of only the passive mtime/last_seen liveness proxy. Cooldown-fenced per agent
+        /// (CDZ_RELAUNCH_MISSING_COOLDOWN_SECS, default 3600) so a crash-looping agent is relaunched a bounded
+        /// number of times, not every sweep, and suppressed during a fleet-quiesce (a mass spin-down must not be
+        /// fought). OPT-IN so merely shipping this never auto-relaunches; without it the missing window stays
+        /// report-only (a WARNING line).
+        #[arg(long)]
+        relaunch_missing: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -2593,6 +2616,7 @@ fn main() {
             revive_stranded,
             bounce_stale,
             recover_wedged,
+            relaunch_missing,
         } => watchdog(
             stale_only,
             rearm,
@@ -2606,6 +2630,7 @@ fn main() {
             revive_stranded,
             bounce_stale,
             recover_wedged,
+            relaunch_missing,
         ),
         Cmd::ObserveRecord {
             agent,
@@ -5590,6 +5615,36 @@ fn write_revive_stranded_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+/// task_1152 default relaunch-missing cooldown: at most one auto-relaunch (spin-up) per missing-window agent
+/// per this window, so a crash-looping agent (relaunch → crash → relaunch) is relaunched a bounded number of
+/// times, not every sweep. Matches the revive-stranded cadence; `CDZ_RELAUNCH_MISSING_COOLDOWN_SECS` tunes it.
+const RELAUNCH_MISSING_COOLDOWN_SECS: u64 = 3600;
+
+/// The per-agent last-relaunch stamp path: `<hub>/.claude/fleet/watchdog/<name>.relaunch` (contents = unix
+/// secs). Distinct from the `.revive` (revive-stranded) stamp so the two cooldowns never collide.
+fn relaunch_missing_stamp_path(fleet: &Fleet, name: &str) -> PathBuf {
+    fleet.root.join("watchdog").join(format!("{name}.relaunch"))
+}
+
+/// Read an agent's last-relaunch unix time; `None` on an absent/unparseable stamp (never relaunched).
+fn read_relaunch_missing_stamp(fleet: &Fleet, name: &str) -> Option<u64> {
+    std::fs::read_to_string(relaunch_missing_stamp_path(fleet, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record that an agent's missing window was just auto-relaunched at `now` (best-effort — a write failure only
+/// means the cooldown is not enforced for that agent on the next sweep).
+fn write_relaunch_missing_stamp(fleet: &Fleet, name: &str, now: u64) {
+    let p = relaunch_missing_stamp_path(fleet, name);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
 /// task_582 default recover-wedged cooldown: at most one auto-recovery (force spin-down + spin-up) per wedged
 /// agent per this window, so a recovery that does not immediately clear the safeguard-refusal loop is not
 /// retried every sweep (a fresh session that re-wedges on the same input must not be thrashed). 1h matches the
@@ -6262,6 +6317,7 @@ fn watchdog(
     // Named distinctly from the `bounce_stale` function it gates (a same-name binding would shadow the fn).
     sweep_stale: bool,
     recover_wedged: bool,
+    relaunch_missing: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -6313,6 +6369,7 @@ fn watchdog(
                     hire_signal,
                     revive_stranded,
                     recover_wedged,
+                    relaunch_missing,
                 );
                 // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
                 // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
@@ -6658,6 +6715,7 @@ fn watchdog_board(
     hire_signal: bool,
     revive_stranded: bool,
     recover_wedged: bool,
+    relaunch_missing: bool,
 ) {
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
@@ -6739,6 +6797,10 @@ fn watchdog_board(
     // task_786 corrective (report-only this slice): STOOD-DOWN agents still holding open assignments — the
     // cr-reviewer stranding class a wake cannot fix (windowless). (id, open_count), surfaced in one WARNING.
     let mut stranded_ids: Vec<(String, usize)> = Vec::new();
+    // task_1152: the live tmux window set, read once, so the per-agent loop can tell a should-be-up agent whose
+    // window is GONE (crashed/vanished — a relaunch candidate) from one that is merely stale-but-running.
+    let wd_windows = tmux_window_names(&session);
+    let mut missing_window_ids: Vec<String> = Vec::new();
     // task_794 (report-only this slice): RUNNING agents whose open backlog exceeds the depth threshold — the
     // PM hire/route signal. (id, open_count), surfaced in one WARNING; the auto board-signal is the opt-in next.
     let backlog_depth = std::env::var("CDZ_BACKLOG_DEPTH")
@@ -6850,6 +6912,15 @@ fn watchdog_board(
         }
         if backlog_over_depth(stood_down, open_tasks, backlog_depth) {
             backlog_overflow_ids.push((id.to_string(), open_tasks));
+        }
+        // task_1152: a managed agent that SHOULD be up but has no live tmux window — relaunch candidate (the
+        // active-liveness signal, distinct from the stale/age signals). `stood_down` (offline) is excluded so
+        // a deliberate spin-down is never relaunched; `spin_up_hold_reason` excludes staged/off-host (redundant
+        // with the host filter above, harmless)/launch-gated/charter-deferred. The cooldown is applied in the
+        // act pass below.
+        let has_window = wd_windows.iter().any(|w| w == id);
+        if relaunch_missing_candidate(has_window, stood_down, spin_up_hold_reason(md, &host)) {
+            missing_window_ids.push(id.to_string());
         }
         let retighten = is_retighten_candidate(verdict, open_tasks, interval_secs);
         // #535 work-driven tight cadence: a work-holder quiet beyond the short work cadence is a candidate even
@@ -7193,6 +7264,68 @@ fn watchdog_board(
             }
             println!(
                 "-- revive-stranded (task_818): revived {revived}, {cooled} on cooldown, {failed} failed (opt-in auto-spin-up of stranded agents; cooldown {cooldown}s per agent)"
+            );
+        }
+    }
+    if !missing_window_ids.is_empty() {
+        // task_1152 active liveness enforcement: managed board-native agents that SHOULD be up (presence not
+        // offline, launchable) but have NO live tmux window — crashed/vanished, not merely stale. The WARNING
+        // always prints (the report); with --relaunch-missing it ALSO auto-relaunches each via spin-up,
+        // cooldown-fenced per agent and suppressed during a fleet-quiesce (a mass spin-down must not be fought).
+        // Mirrors the revive-stranded pass; the spin-up runs as a SUBPROCESS so a per-agent failure (spin_up
+        // signals via process::exit) is contained in the child and never aborts the sweep.
+        println!(
+            "-- WARNING: {} managed agent(s) MISSING their tmux window (task_1152: should be up — presence not offline, launchable — but no live window): {}. Relaunch each (`fleet spin-up <agent> --apply`), or run the watchdog with --relaunch-missing to auto-relaunch.",
+            missing_window_ids.len(),
+            missing_window_ids.join(", ")
+        );
+        if relaunch_missing && fleet_quiesced {
+            println!(
+                "-- relaunch-missing SUPPRESSED (task_1032): fleet-quiesce in effect (mass spin-down) — holding {} missing-window agent(s) rather than relaunching into the operator spin-down",
+                missing_window_ids.len()
+            );
+        } else if watchdog_action_enabled(relaunch_missing, fleet_quiesced) {
+            let cooldown = std::env::var("CDZ_RELAUNCH_MISSING_COOLDOWN_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(RELAUNCH_MISSING_COOLDOWN_SECS);
+            let self_bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "fleet".to_string());
+            let (mut relaunched, mut cooled, mut failed) = (0usize, 0usize, 0usize);
+            for id in &missing_window_ids {
+                // Reuse the generic revive-stranded cooldown gate against the SEPARATE relaunch stamp.
+                if revive_stranded_on_cooldown(
+                    read_relaunch_missing_stamp(&fleet, id),
+                    now_unix,
+                    cooldown,
+                ) {
+                    cooled += 1;
+                    continue;
+                }
+                match std::process::Command::new(&self_bin)
+                    .args(["spin-up", id, "--apply"])
+                    .status()
+                {
+                    Ok(s) if s.success() => {
+                        write_relaunch_missing_stamp(&fleet, id, now_unix);
+                        relaunched += 1;
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "  ! relaunch-missing: spin-up '{id}' failed (nonzero exit) — not stamping, will retry next sweep"
+                        );
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  ! relaunch-missing: could not launch spin-up '{id}': {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            println!(
+                "-- relaunch-missing (task_1152): relaunched {relaunched}, {cooled} on cooldown, {failed} failed (opt-in auto-spin-up of missing-window agents; cooldown {cooldown}s per agent)"
             );
         }
     }
@@ -17175,6 +17308,24 @@ detached
             )
             .is_some_and(|r| r.contains("staged"))
         );
+    }
+
+    #[test]
+    fn relaunch_missing_candidate_only_fires_for_a_crashed_should_be_up_launchable_agent() {
+        // task_1152: relaunch ONLY a managed agent that should be up but lost its window.
+        // Crashed/vanished — no window, not offline, launchable -> relaunch.
+        assert!(relaunch_missing_candidate(false, false, None));
+        // Has a live window -> running, nothing to do.
+        assert!(!relaunch_missing_candidate(true, false, None));
+        // Deliberately stood down (offline) + windowless -> left down, never relaunched (the membrain-core /
+        // spin-down --all wind-down case).
+        assert!(!relaunch_missing_candidate(false, true, None));
+        // Held out of auto-launch (staged / off-host / launch-gated / charter-deferred) -> never relaunched,
+        // even windowless-and-not-offline.
+        assert!(!relaunch_missing_candidate(false, false, Some("staged (reserve helper)")));
+        assert!(!relaunch_missing_candidate(false, false, Some("launch-gated (metadata.launch_gated)")));
+        // A window present AND offline AND held -> still nothing (all gates independently block).
+        assert!(!relaunch_missing_candidate(true, true, Some("off-host")));
     }
 
     #[test]
