@@ -4621,19 +4621,30 @@ fn bounce_stale(fleet: &Fleet, apply: bool, force: bool) {
 const FMT_HOOK_MARKER: &str = "# fleet:fmt-warn";
 
 /// The generic, repo-agnostic pre-commit hook `spin-up` installs into a materialized worktree's shared mirror
-/// hooks dir: a FAIL-OPEN rustfmt nudge, scoped per OWNING CRATE of the staged files rather than the whole
-/// workspace (task_617: a bare `cargo fmt --all --check` tripped on every commit over a pre-existing fmt skew
-/// in an unrelated crate — cry-wolf noise that trains agents to dismiss the warning unexamined, including a
-/// genuine problem in their OWN staged files). Delegates to `fleet fmt-hook-run` (testable Rust, not bash) so
-/// the installed script stays tiny and inert; NEVER blocks a commit (exit 0 unconditionally, ignoring
-/// `fleet`'s own exit code) and no-ops without `fleet` on PATH. Silence with FLEET_SKIP_FMT_HOOK=1. Kept
-/// generic (no cadenza- or fleet-specific checks) so it is correct for every repo an agent's worktree may be.
+/// hooks dir. Two steps:
+///
+/// 1. A FAIL-OPEN rustfmt nudge, scoped per OWNING CRATE of the staged files rather than the whole workspace
+///    (task_617: a bare `cargo fmt --all --check` tripped on every commit over a pre-existing fmt skew in an
+///    unrelated crate — cry-wolf noise that trains agents to dismiss the warning unexamined, including a
+///    genuine problem in their OWN staged files). Delegates to `fleet fmt-hook-run`; NEVER blocks a commit
+///    (exit 0 unconditionally, ignoring `fleet`'s own exit code). Silence with FLEET_SKIP_FMT_HOOK=1.
+/// 2. A FAIL-CLOSED content guardrail (task_782): `fleet scan-content --staged` blocks the commit when staged
+///    content hits an internal marker. OPT-IN per host/repo via FLEET_CONTENT_TAXONOMY (the private marker
+///    store, never committed to a public repo); where it is unset this step is a no-op, so a generic worktree
+///    is unchanged. Bypass with FLEET_SKIP_CONTENT_HOOK=1 — the pre-commit is defense-in-depth and bypassable,
+///    the CI required status check is the gate of record. The fmt silencer does NOT disable this step.
+///
+/// Both delegate to `fleet` subcommands (testable Rust, not bash) so the installed script stays tiny, and both
+/// no-op without `fleet` on PATH. Kept generic (no cadenza- or fleet-specific checks) so it is correct for
+/// every repo an agent's worktree may be.
 fn fmt_precommit_hook_body() -> String {
     format!(
         "#!/usr/bin/env bash\n\
-         {FMT_HOOK_MARKER} (installed by `fleet spin-up`; fail-open rustfmt nudge for board-native worktrees)\n\
-         [ \"${{FLEET_SKIP_FMT_HOOK:-}}\" = \"1\" ] && exit 0\n\
-         command -v fleet >/dev/null 2>&1 && fleet fmt-hook-run\n\
+         {FMT_HOOK_MARKER} (installed by `fleet spin-up`; fail-open fmt nudge + fail-closed content guardrail)\n\
+         [ \"${{FLEET_SKIP_FMT_HOOK:-}}\" != \"1\" ] && command -v fleet >/dev/null 2>&1 && fleet fmt-hook-run\n\
+         if [ \"${{FLEET_SKIP_CONTENT_HOOK:-}}\" != \"1\" ] && [ -n \"${{FLEET_CONTENT_TAXONOMY:-}}\" ] && command -v fleet >/dev/null 2>&1; then\n\
+         fleet scan-content --staged || exit 1\n\
+         fi\n\
          exit 0\n"
     )
 }
@@ -4698,7 +4709,7 @@ fn install_fmt_hook(hooks_dir: &std::path::Path) {
         let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755));
     }
     println!(
-        "  fmt hook: {} the fail-open rustfmt pre-commit at {}",
+        "  pre-commit hook: {} the fleet pre-commit (fmt nudge + content guardrail) at {}",
         if existing.is_some() {
             "refreshed"
         } else {
@@ -13310,9 +13321,29 @@ mod tests {
             b.contains("fleet fmt-hook-run"),
             "delegates the real logic to the testable Rust subcommand"
         );
+        // task_782: the content guardrail step delegates to `fleet scan-content --staged`, is OPT-IN via
+        // FLEET_CONTENT_TAXONOMY (no-op where unset, so a generic worktree is unchanged), is FAIL-CLOSED
+        // (`|| exit 1` blocks the commit on a hit), and has its OWN bypass so the fmt silencer cannot disable
+        // the guardrail.
+        assert!(
+            b.contains("fleet scan-content --staged"),
+            "runs the content guardrail on staged content"
+        );
+        assert!(
+            b.contains("FLEET_CONTENT_TAXONOMY"),
+            "the content guardrail is opt-in by the private-taxonomy env (no-op where unset)"
+        );
+        assert!(
+            b.contains("|| exit 1"),
+            "FAIL-CLOSED: a blocking content hit stops the commit"
+        );
+        assert!(
+            b.contains("FLEET_SKIP_CONTENT_HOOK"),
+            "content guardrail has its own bypass, independent of the fmt silencer"
+        );
         assert!(
             b.trim_end().ends_with("exit 0"),
-            "FAIL-OPEN: the hook never blocks a commit regardless of fleet's exit code"
+            "the hook still exits 0 by default (fmt is fail-open; only a content hit blocks)"
         );
         // Syntax-check with `bash -n` (a broken hook would fail every commit in the shared mirror); skip if absent.
         let dir = std::env::temp_dir().join(format!("fleet-fmthook-{}", std::process::id()));
