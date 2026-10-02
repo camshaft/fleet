@@ -3440,6 +3440,10 @@ enum Cmd {
         /// Path to the board-memory CLI (used to publish each `dreams/<scope>` doc).
         #[arg(long, default_value = "board-memory")]
         board_memory: String,
+        /// Board channel for the notify-on-new post (librarian's dedicated `dream-reports` feed; must match
+        /// `dream::DREAM_NOTIFY_CHANNEL`). Created-or-got by name; posted to only when a scope has new>0.
+        #[arg(long, default_value = "dream-reports")]
+        notify_channel: String,
     },
     /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
     /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
@@ -3891,10 +3895,11 @@ fn main() {
             board_api,
             state_dir,
             board_memory,
+            notify_channel,
         } => {
             let api = board_api.unwrap_or_else(board::Board::base_url);
             let state_dir = state_dir.unwrap_or_else(default_state_dir);
-            let code = dream::run_cmd(&api, &state_dir, &board_memory);
+            let code = dream::run_cmd(&api, &state_dir, &board_memory, &notify_channel);
             if code != 0 {
                 std::process::exit(code);
             }
