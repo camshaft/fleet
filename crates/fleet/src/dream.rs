@@ -1131,6 +1131,226 @@ fn detect_stale_refs(
     out
 }
 
+/// Concurrency window for the value-contradiction detector: two differing-value memories are a contradiction
+/// candidate only when their provenance timestamps are within this gap. A wider gap reads as temporal
+/// evolution (a budget/threshold that legitimately changed -- the rcdzc test-size limit, the MEMORY.md byte
+/// caps), which belongs to the supersede/staleness lane, NOT the contradiction surface. The librarian asked
+/// for a STRICT gate; 7 days is deliberately tight (tunable).
+const CONTRADICTION_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Parse a provenance timestamp `Value` to unix seconds: an RFC3339 string, or a number read as epoch
+/// seconds. `None` when absent or unparseable -- the value-contradiction detector treats `None` as "cannot
+/// prove concurrency" and suppresses, so a missing timestamp never produces a flag.
+fn provenance_unix_secs(ts: Option<&Value>) -> Option<i64> {
+    match ts? {
+        Value::String(s) => {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                .ok()
+                .map(|t| t.unix_timestamp())
+        }
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        _ => None,
+    }
+}
+
+/// Extract `(normalized_unit, value)` quantities from `text`: a numeric literal (digits, optional single
+/// decimal point) immediately followed -- no space, or exactly one space -- by a unit token (1-6 ASCII
+/// letters, or a single `%`). The unit is lowercased. A bare number with no unit is ignored (too ambiguous to
+/// key a contradiction on), so `task_827`, `comment_3869`, dates, and version strings never produce a
+/// quantity. Pure.
+fn extract_quantities(text: &str) -> Vec<(String, f64)> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let number_start =
+            b[i].is_ascii_digit() && (i == 0 || !(b[i - 1].is_ascii_digit() || b[i - 1] == b'.'));
+        if !number_start {
+            i += 1;
+            continue;
+        }
+        let nstart = i;
+        let mut j = i;
+        let mut seen_dot = false;
+        while j < b.len()
+            && (b[j].is_ascii_digit()
+                || (b[j] == b'.' && !seen_dot && j + 1 < b.len() && b[j + 1].is_ascii_digit()))
+        {
+            if b[j] == b'.' {
+                seen_dot = true;
+            }
+            j += 1;
+        }
+        let num_str = &text[nstart..j];
+        let mut k = j;
+        if k < b.len() && b[k] == b' ' {
+            k += 1;
+        }
+        let ustart = k;
+        if k < b.len() && b[k] == b'%' {
+            if let Ok(v) = num_str.parse::<f64>() {
+                out.push(("%".to_string(), v));
+            }
+            i = k + 1;
+            continue;
+        }
+        while k < b.len() && b[k].is_ascii_alphabetic() {
+            k += 1;
+        }
+        if k > ustart {
+            let unit = text[ustart..k].to_ascii_lowercase();
+            if (1..=6).contains(&unit.len())
+                && let Ok(v) = num_str.parse::<f64>()
+            {
+                out.push((unit, v));
+            }
+        }
+        i = k.max(j);
+    }
+    out
+}
+
+/// Detect VALUE contradictions (task_1141, librarian-confirmed scope B): two CONCURRENT memories that assert a
+/// different value for the same keyed quantity (same unit) on a shared subject. PROPOSE-ONLY, confidence 0.3,
+/// FYI. The precision gates, in order: (1) subject -- the two memories must share a distinctive multi-segment
+/// `kebab_tokens` identifier (so "both mention a KB number" is not enough; they must be about the same thing);
+/// (2) same unit, different value; (3) STRICT concurrency -- both provenance timestamps present and within
+/// `CONTRADICTION_WINDOW_SECS`. A wider age gap reads as temporal evolution (a budget that changed) and is
+/// suppressed, not flagged -- that is the supersede/staleness lane's concern. A missing timestamp suppresses
+/// (cannot prove concurrency). No LLM: this is a low-precision candidate surfacer for human review, never an
+/// adjudication.
+fn detect_value_contradictions(
+    recs: &[Rec],
+    prot: &HashMap<String, Vec<String>>,
+    backlinks: &HashMap<(String, String), Vec<String>>,
+) -> Vec<Value> {
+    // Index entries under a composite (unit, subject-token) key: only memories sharing BOTH a unit and a
+    // distinctive subject token are ever compared, which bounds the work and is the precision gate.
+    struct Entry {
+        idx: usize,
+        value: f64,
+        ts: Option<i64>,
+    }
+    let mut by_key: HashMap<(String, String), Vec<Entry>> = HashMap::new();
+    for (idx, r) in recs.iter().enumerate() {
+        let body = strip_fenced_code(r.body());
+        let quantities = extract_quantities(&body);
+        if quantities.is_empty() {
+            continue;
+        }
+        let subject = kebab_tokens(&format!("{} {}", r.name.as_deref().unwrap_or(""), body));
+        if subject.is_empty() {
+            continue;
+        }
+        let ts = provenance_unix_secs(r.provenance.as_ref().and_then(|p| p.timestamp.as_ref()));
+        // Dedup units within a memory to the set of distinct values it asserts for each unit.
+        let mut units: HashMap<String, BTreeSet<u64>> = HashMap::new();
+        for (unit, value) in &quantities {
+            units
+                .entry(unit.clone())
+                .or_default()
+                .insert(value.to_bits());
+        }
+        for (unit, vals) in units {
+            // A memory that itself states two different values for a unit is ambiguous -- skip that unit for it.
+            if vals.len() != 1 {
+                continue;
+            }
+            let value = f64::from_bits(*vals.iter().next().unwrap());
+            for tok in &subject {
+                by_key
+                    .entry((unit.clone(), tok.clone()))
+                    .or_default()
+                    .push(Entry { idx, value, ts });
+            }
+        }
+    }
+
+    // Emit one proposal per contradicting memory pair (deduped across keys by sorted path pair).
+    let mut seen_pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut keys: Vec<&(String, String)> = by_key.keys().collect();
+    keys.sort();
+    for key in keys {
+        let entries = &by_key[key];
+        if entries.len() < 2 {
+            continue;
+        }
+        let (unit, token) = key;
+        for a in 0..entries.len() {
+            for b in (a + 1)..entries.len() {
+                let (ea, eb) = (&entries[a], &entries[b]);
+                if ea.idx == eb.idx || (ea.value - eb.value).abs() < f64::EPSILON {
+                    continue;
+                }
+                // STRICT concurrency gate: both timestamps present and within the window.
+                let (Some(ta), Some(tb)) = (ea.ts, eb.ts) else {
+                    continue;
+                };
+                if (ta - tb).abs() > CONTRADICTION_WINDOW_SECS {
+                    continue; // temporal evolution, not a contradiction
+                }
+                let (ra, rb) = (&recs[ea.idx], &recs[eb.idx]);
+                let (pa, pb) = (ra.path().to_string(), rb.path().to_string());
+                let pair = if pa <= pb {
+                    (pa.clone(), pb.clone())
+                } else {
+                    (pb.clone(), pa.clone())
+                };
+                if !seen_pairs.insert(pair.clone()) {
+                    continue;
+                }
+                let (first, second) = (&pair.0, &pair.1);
+                let (first_rec, second_rec, first_val, second_val) = if first == &pa {
+                    (ra, rb, ea.value, eb.value)
+                } else {
+                    (rb, ra, eb.value, ea.value)
+                };
+                let mut reasons = BTreeSet::new();
+                for p in [first.as_str(), second.as_str()] {
+                    if let Some(rs) = prot.get(p) {
+                        for r in rs {
+                            reasons.insert(r.clone());
+                        }
+                    }
+                }
+                let lane = if reasons.is_empty() {
+                    "standard"
+                } else {
+                    "protected"
+                };
+                out.push(json!({
+                    "proposal_id": format!("dp-valueconflict-{}", &sha256_hex(&format!("{first}|{second}|{unit}|{token}"))[..12]),
+                    "kind": "value_contradiction",
+                    "lane": lane,
+                    "protected_reason": reasons.into_iter().collect::<Vec<_>>().join("; "),
+                    "confidence": 0.3,
+                    "rationale": format!(
+                        "two concurrent memories assert different '{unit}' values on a shared subject ('{token}'): {first} says {first_val}, {second} says {second_val} -- possible contradiction, verify (timestamps within {}d, so NOT a temporal change; reconcile or confirm both are current)",
+                        CONTRADICTION_WINDOW_SECS / 86_400
+                    ),
+                    "targets": [ target_json(first_rec, backlinks), target_json(second_rec, backlinks) ],
+                    "proposed_change": {
+                        "op": "annotate",
+                        "diff": {
+                            "memory_a": first,
+                            "value_a": first_val,
+                            "memory_b": second,
+                            "value_b": second_val,
+                            "unit": unit,
+                            "shared_subject": token,
+                            "note": "advisory: concurrent memories disagree on a keyed value; reconcile or confirm both are current (NOT auto-applied)",
+                        },
+                        "reversible_via": "n/a (annotation only)",
+                    },
+                    "status": "proposed",
+                }));
+            }
+        }
+    }
+    out
+}
+
 /// Load the JSONL corpus (one memory record per line). An empty line is skipped; a malformed line is an
 /// error (naming the line number) so a corrupt corpus never silently drops memories.
 fn load_corpus(path: &Path) -> Result<Vec<Rec>, String> {
@@ -1484,9 +1704,10 @@ fn rank_and_section(proposals: &mut [Value]) -> (usize, usize, usize) {
     fn section_of(kind: &str) -> &'static str {
         match kind {
             "cross_repo_twin" => "cross_repo_twin",
-            // write_later (intentional forward-refs) + stale_file_ref (verified-dangling file nudge) are
-            // advisory ref-hygiene, not structural edits -- keep them FYI below the merges/add-links.
-            "write_later_candidate" | "stale_file_ref" => "fyi",
+            // write_later (intentional forward-refs) + stale_file_ref (verified-dangling file nudge) +
+            // value_contradiction (low-precision concurrent-value surfacer) are advisory, not structural
+            // edits -- keep them FYI below the merges/add-links.
+            "write_later_candidate" | "stale_file_ref" | "value_contradiction" => "fyi",
             _ => "actionable", // near_duplicate (merges) + cross_link (orphan add-links)
         }
     }
@@ -1601,6 +1822,7 @@ pub fn analyze_cmd(
         &backlinks,
         &catalogued,
     ));
+    proposals.extend(detect_value_contradictions(&recs, &prot, &backlinks));
     // Verified-dangling file refs -- only with a repo worktree to resolve against (never on a corpus-only run).
     if let Some(root) = repo_root {
         proposals.extend(detect_stale_refs(&recs, &prot, &backlinks, root));
@@ -1619,6 +1841,7 @@ pub fn analyze_cmd(
         "orphan_add_links",
         "near_duplicate_minhash",
         "write_later_candidate",
+        "value_contradiction",
     ];
     if repo_root.is_some() {
         detectors_run.push("stale_file_ref");
@@ -2054,5 +2277,128 @@ mod tests {
         // Only the genuine dangle: exists.rs is present, implementation/ is gitignored (regenerable).
         assert_eq!(flagged, vec!["src/missing.rs"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn ts_rec(slug: &str, body: &str, name: &str, ts: &str) -> Rec {
+        let mut r = rec(slug, "r", body);
+        r.name = Some(name.into());
+        r.provenance = Some(Provenance {
+            author: None,
+            timestamp: Some(json!(ts)),
+        });
+        r
+    }
+
+    #[test]
+    fn extract_quantities_parses_number_unit_pairs() {
+        let q = extract_quantities(
+            "limit 512KB, size 1 MB, ratio 60%, window 7 days, id task_827, date 2026-10-02",
+        );
+        assert!(q.contains(&("kb".to_string(), 512.0)));
+        assert!(q.contains(&("mb".to_string(), 1.0)));
+        assert!(q.contains(&("%".to_string(), 60.0)));
+        assert!(q.contains(&("days".to_string(), 7.0)));
+        // task_827 (no adjacent unit) and the date (no unit) produce nothing: exactly the four real quantities.
+        assert_eq!(q.len(), 4);
+    }
+
+    #[test]
+    fn provenance_unix_secs_parses_rfc3339_and_epoch() {
+        let s = provenance_unix_secs(Some(&json!("2026-01-01T00:00:00Z"))).unwrap();
+        assert!(s > 0);
+        assert_eq!(provenance_unix_secs(Some(&json!(s))), Some(s)); // epoch-number form round-trips
+        assert!(provenance_unix_secs(Some(&json!("not a date"))).is_none());
+        assert!(provenance_unix_secs(None).is_none());
+    }
+
+    #[test]
+    fn detect_value_contradictions_flags_concurrent_differing_values() {
+        let recs = vec![
+            ts_rec(
+                "limit-note-a",
+                "the rcdzc-test-size-limit is 512KB today",
+                "a",
+                "2026-09-01T00:00:00Z",
+            ),
+            ts_rec(
+                "limit-note-b",
+                "the rcdzc-test-size-limit is 1024KB now",
+                "b",
+                "2026-09-03T00:00:00Z",
+            ),
+        ];
+        let backlinks = build_backlinks(&recs);
+        let props = detect_value_contradictions(&recs, &HashMap::new(), &backlinks);
+        assert_eq!(
+            props.len(),
+            1,
+            "one concurrent differing-value pair on a shared subject"
+        );
+        assert_eq!(props[0]["kind"], "value_contradiction");
+        assert_eq!(props[0]["lane"], "standard");
+        assert_eq!(props[0]["confidence"], 0.3);
+        assert_eq!(props[0]["proposed_change"]["diff"]["unit"], "kb");
+        assert_eq!(
+            props[0]["proposed_change"]["diff"]["shared_subject"],
+            "rcdzc-test-size-limit"
+        );
+    }
+
+    #[test]
+    fn detect_value_contradictions_suppresses_temporal_gap() {
+        // Same subject + differing value, but ~8 months apart -> temporal evolution, not a contradiction.
+        let recs = vec![
+            ts_rec(
+                "limit-note-a",
+                "the rcdzc-test-size-limit is 512KB",
+                "a",
+                "2026-01-01T00:00:00Z",
+            ),
+            ts_rec(
+                "limit-note-b",
+                "the rcdzc-test-size-limit is 1024KB",
+                "b",
+                "2026-09-01T00:00:00Z",
+            ),
+        ];
+        let backlinks = build_backlinks(&recs);
+        assert!(detect_value_contradictions(&recs, &HashMap::new(), &backlinks).is_empty());
+    }
+
+    #[test]
+    fn detect_value_contradictions_needs_timestamps_and_shared_subject() {
+        // Concurrent + differing value + shared subject, but NO timestamp -> cannot prove concurrency.
+        let no_ts = vec![
+            {
+                let mut r = rec("a", "r", "the rcdzc-test-size-limit is 512KB");
+                r.name = Some("a".into());
+                r
+            },
+            {
+                let mut r = rec("b", "r", "the rcdzc-test-size-limit is 1024KB");
+                r.name = Some("b".into());
+                r
+            },
+        ];
+        let bl = build_backlinks(&no_ts);
+        assert!(detect_value_contradictions(&no_ts, &HashMap::new(), &bl).is_empty());
+
+        // Concurrent + same unit + differing value, but NO shared subject token -> not about the same thing.
+        let no_subject = vec![
+            ts_rec(
+                "c",
+                "alpha-beta-gamma budget is 512KB",
+                "c",
+                "2026-09-01T00:00:00Z",
+            ),
+            ts_rec(
+                "d",
+                "delta-epsilon-zeta cap is 1024KB",
+                "d",
+                "2026-09-02T00:00:00Z",
+            ),
+        ];
+        let bl2 = build_backlinks(&no_subject);
+        assert!(detect_value_contradictions(&no_subject, &HashMap::new(), &bl2).is_empty());
     }
 }
