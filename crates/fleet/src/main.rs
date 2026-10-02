@@ -2991,6 +2991,7 @@ fn spin_up_workspace_kind(
     interval: &str,
     devshell: bool,
     reactive: bool,
+    proactive_ownership: bool,
     apply: bool,
     cwd_override: Option<&str>,
     gate_clear: Option<serde_json::Value>,
@@ -3103,7 +3104,7 @@ fn spin_up_workspace_kind(
         }
     }
     match launch_board_agent(
-        agent, &plan.cwd, harness, model, effort, interval, devshell, reactive,
+        agent, &plan.cwd, harness, model, effort, interval, devshell, reactive, proactive_ownership,
     ) {
         Ok(win) => {
             println!(
@@ -3211,6 +3212,13 @@ fn spin_up(agent: &str, apply: bool) {
         .get("reactive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // task_1138 opt-in PROACTIVE-OWNERSHIP pacing: an agent that must continuously build a deliverable (a
+    // promo-assist owning a candidate's case) gets a kickoff that forbids idling until its charter's
+    // work-accomplished gate is met, rather than the work-conserving idle-when-no-task default. Off by default.
+    let proactive_ownership = md
+        .get("proactive_ownership")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Accept the canonical structured list AND the looser hand-authored shapes (bare-string array, CSV
     // string) so a repos written by hand is never silently dropped (#472 / operator seq-6269).
     if md.get("repos").is_some_and(serde_json::Value::is_string) {
@@ -3248,6 +3256,7 @@ fn spin_up(agent: &str, apply: bool) {
             &interval,
             devshell,
             reactive,
+            proactive_ownership,
             apply,
             cwd_override.as_deref(),
             gate_clear,
@@ -3421,7 +3430,7 @@ fn spin_up(agent: &str, apply: bool) {
         }
     }
     match launch_board_agent(
-        agent, &workdir, &harness, &model, &effort, &interval, devshell, reactive,
+        agent, &workdir, &harness, &model, &effort, &interval, devshell, reactive, proactive_ownership,
     ) {
         Ok(win) => {
             let loop_kind = if reactive {
@@ -3509,6 +3518,7 @@ fn build_kickoff(
     interval: &str,
     operator: Option<&str>,
     reactive: bool,
+    proactive_ownership: bool,
 ) -> String {
     // The operator-blocked dashboard convention (operator seq-2292, re-pointed task_936) applies only when this
     // deployment names an operator (config.operator_id); a generic fleet with no designated operator omits it.
@@ -3576,6 +3586,27 @@ fn build_kickoff(
              event-wake — a routed message or assignment nudges your window awake immediately regardless of \
              interval, so a long rest cadence never delays revival, it only cuts empty self-directed ticks."
         )
+    };
+    // task_1138 PROACTIVE-OWNERSHIP override: an agent that must continuously BUILD a deliverable (a promo-assist
+    // owning a candidate's case) is not a wake-check-sleep worker — its charter defines a STANDING production
+    // unit that is ALWAYS actionable, so the work-conserving "idle when no assigned task" default would wrongly
+    // let it sleep. Force the loop to treat "nothing acutely urgent" as the signal to ADVANCE the standing unit,
+    // never to idle, and to go passive ONLY once the charter's work-accomplished sleep-gate is met (the charter
+    // states the precondition; the loop enforces that it is not time-gated). The interval is then only the
+    // passive-monitor floor it drops to AFTER the gate holds. Off for a normal worker.
+    let tick = if proactive_ownership {
+        format!(
+            "{tick} PROACTIVE-OWNERSHIP OVERRIDE: your charter defines a STANDING production unit you must \
+             advance EVERY cycle (you are not a wake-check-sleep responder). You have actionable work WHENEVER \
+             that standing unit is not yet complete, so do NOT fall back to the idle cadence and do NOT go \
+             passive merely because you hold no assigned task and your inbox is drained — treat 'nothing acutely \
+             urgent' as the signal to advance the standing unit. You may drop to the passive-monitor cadence \
+             ONLY once your charter's work-accomplished gate is satisfied (the charter states the precondition, \
+             e.g. a significant corpus examined AND a substantial deliverable built); until then keep cycling \
+             and never idle-sleep. The gate is WORK-ACCOMPLISHED, not elapsed time."
+        )
+    } else {
+        tick
     };
     // A >1h idle cadence cannot be held by the dynamic self-wake (it clamps to 1h) — append the cron-cadence
     // escalation so a long-rest monitor rests off a CronCreate cron instead of idle-polling hourly (task_765).
@@ -4848,6 +4879,7 @@ fn launch_board_agent(
     interval: &str,
     devshell: bool,
     reactive: bool,
+    proactive_ownership: bool,
 ) -> Result<String, String> {
     let session = board_session();
     if let Ok(out) = std::process::Command::new("tmux")
@@ -4865,6 +4897,7 @@ fn launch_board_agent(
         interval,
         config::get().operator_id.as_deref(),
         reactive,
+        proactive_ownership,
     );
     let cmd = build_launch_cmd(harness, model, effort, devshell.then_some(workdir))?;
     let argv = board_window_argv(&session, agent, workdir, &kickoff, &cmd);
@@ -12340,8 +12373,32 @@ mod tests {
     }
 
     #[test]
+    fn build_kickoff_proactive_ownership_forces_a_work_accomplished_sleep_gate() {
+        // task_1138: a proactive-ownership agent's kickoff must FORBID idling until a work-accomplished gate,
+        // overriding the work-conserving idle-when-no-task default — the loop is the lever, not charter prose.
+        let p = build_kickoff("cameron-promo-assist", "/wt/x", "1h", None, false, true);
+        assert!(p.contains("PROACTIVE-OWNERSHIP OVERRIDE"), "carries the override clause");
+        assert!(p.contains("STANDING production unit"), "names the always-actionable standing unit");
+        assert!(
+            p.contains("do NOT fall back to the idle cadence") && p.contains("never idle-sleep"),
+            "forbids idling until the gate"
+        );
+        assert!(
+            p.contains("WORK-ACCOMPLISHED, not elapsed time"),
+            "the sleep-gate is work-accomplished, not time (cameron's rule)"
+        );
+        // A NON-proactive worker (the default) must NOT carry the override — it keeps the plain work-conserving
+        // pacing so a normal vertical is unchanged.
+        let n = build_kickoff("v-x", "/wt/x", "1h", None, false, false);
+        assert!(!n.contains("PROACTIVE-OWNERSHIP OVERRIDE"), "default worker is unchanged");
+        // Reactive responders are also unaffected by the proactive flag (mutually exclusive loop stances).
+        let r = build_kickoff("frank", "/wt/x", "30m", None, true, false);
+        assert!(!r.contains("PROACTIVE-OWNERSHIP OVERRIDE"));
+    }
+
+    #[test]
     fn build_kickoff_is_work_conserving_and_self_discovering() {
-        let k = build_kickoff("v-x", "/wt/v-x", "30m", Some("op-x"), false);
+        let k = build_kickoff("v-x", "/wt/v-x", "30m", Some("op-x"), false, false);
         // Identity (#336): the board does NOT bind the session (a fresh unbound board per call), so
         // register_agent can't make later id-less calls work — the kickoff must say pass ids EXPLICITLY on
         // EVERY call, and still register once + self-discover the charter via get_agent.
@@ -12504,7 +12561,7 @@ mod tests {
         );
         // No designated operator → the operator-blocked clause is omitted, but the surrounding external-dep
         // guidance stays intact (generic fleet with no operator; task_611).
-        let k_no_op = build_kickoff("v-x", "/wt/v-x", "30m", None, false);
+        let k_no_op = build_kickoff("v-x", "/wt/v-x", "30m", None, false, false);
         assert!(
             !k_no_op.contains("ON THE OPERATOR specifically"),
             "omits the operator-blocked clause when no operator is configured"
@@ -12571,7 +12628,7 @@ mod tests {
         // task_765 Tier A: the dynamic /loop self-wake clamps to a 1h max, so a monitor whose idle cadence
         // exceeds an hour (3h here) idle-polls hourly unless it rests off a CronCreate fixed-interval loop.
         // The kickoff must say so and hand it the concrete cron.
-        let k = build_kickoff("v-mon", "/wt/v-mon", "3h", Some("op-x"), false);
+        let k = build_kickoff("v-mon", "/wt/v-mon", "3h", Some("op-x"), false, false);
         assert!(
             k.contains("hard-clamped to a ONE-HOUR maximum"),
             "names the dynamic self-wake 1h clamp (the root cause)"
@@ -12593,7 +12650,7 @@ mod tests {
             "clarifies event-wake still revives immediately, so the cron only sets the idle floor"
         );
         // A reactive responder with a >1h cadence hits the same clamp, so it carries the clause too.
-        let r = build_kickoff("frank", "/wt/frank", "2h", None, true);
+        let r = build_kickoff("frank", "/wt/frank", "2h", None, true, false);
         assert!(
             r.contains("CronCreate") && r.contains("'0 */2 * * *'"),
             "a >1h reactive cadence also gets the cron escalation"
@@ -12753,7 +12810,7 @@ mod tests {
 
     #[test]
     fn build_kickoff_reactive_mode_only_acts_when_addressed() {
-        let r = build_kickoff("frank", "/wt/frank", "30m", Some("op-x"), true);
+        let r = build_kickoff("frank", "/wt/frank", "30m", Some("op-x"), true, false);
         // Still self-discovering + explicit-identity like every kickoff (the boot contract is shared).
         assert!(
             r.contains("register_agent") && r.contains("get_agent"),
@@ -12793,7 +12850,7 @@ mod tests {
             "no SOON re-poll on unread chatter"
         );
         // And the default (non-reactive) kickoff must be UNCHANGED — it keeps the work-conserving pacing.
-        let w = build_kickoff("v-x", "/wt/v-x", "30m", Some("op-x"), false);
+        let w = build_kickoff("v-x", "/wt/v-x", "30m", Some("op-x"), false, false);
         assert!(
             w.contains("WORK-CONSERVING PACING") && !w.contains("REACTIVE responder"),
             "default worker unchanged"
