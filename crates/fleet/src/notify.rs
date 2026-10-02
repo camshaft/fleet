@@ -81,8 +81,21 @@ pub fn notification_prompt(
         "task.commented" if subscribed && !reactive_unaddressed => {
             task_id.map(|id| format!("[notification] comment on task #{id}"))
         }
-        // A firehose-only task.commented, plus task.status_changed / task.updated / presence.updated and
-        // every other type, are INFORMATIONAL here — they accrue for the next poll and never inject a wake.
+        // A fresh task CREATED in a target the recipient DIRECTLY subscribes to wakes it (task_1104): the
+        // intake-triage case. board-triage subscribes to the intake projects (e.g. the uncategorized front
+        // door), so a fresh operator-filed create wakes it at once instead of waiting out its ~30-min idle poll
+        // — the "why did this take so long to get triaged" gap. Gated on `subscribed` for the same reason as a
+        // comment: a direct project subscriber (the triager) wakes, a firehose-only board-wide coordinator does
+        // not (it accrues for poll, so a create never loop-wakes a whole-board watcher). A reactive recipient
+        // the create does not address is suppressed identically. An assigned-at-create task still wakes its
+        // direct subscriber here (harmless: the triager sees it is already owned and moves on in one tick) — not
+        // gating on assignment keeps this free of any new payload field and can never MISS a triage wake.
+        "task.created" if subscribed && !reactive_unaddressed => {
+            task_id.map(|id| format!("[notification] new task #{id}"))
+        }
+        // A firehose-only task.commented / task.created, plus task.status_changed / task.updated /
+        // presence.updated and every other type, are INFORMATIONAL here — they accrue for the next poll and
+        // never inject a wake.
         _ => None,
     }
 }
@@ -602,6 +615,47 @@ mod tests {
             notification_prompt("task.updated", Some(5), None, None, true, false, None),
             None
         );
+    }
+
+    #[test]
+    fn task_created_wakes_a_direct_subscriber_not_a_firehose_recipient() {
+        // task_1104: a fresh create in a target the recipient DIRECTLY subscribes to wakes it (the intake-triage
+        // case — board-triage subscribes to the intake projects and must triage a fresh create at once, not wait
+        // out its idle poll). Gated on `subscribed` exactly like task.commented.
+        assert_eq!(
+            notification_prompt("task.created", Some(1182), Some(9), None, true, false, None).as_deref(),
+            Some("[notification] new task #1182"),
+            "a create on a directly-subscribed target wakes the triager"
+        );
+        // A firehose-only recipient (subscribed=false) does NOT wake on a create — it accrues for poll, so a
+        // create never loop-wakes a board-wide coordinator present via the whole-board firehose.
+        assert_eq!(
+            notification_prompt("task.created", Some(1182), Some(9), None, false, false, None),
+            None,
+            "a firehose-only create accrues for poll, never wakes"
+        );
+        // A reactive recipient the create does not address is suppressed, same as an ambient channel.post/comment.
+        assert_eq!(
+            notification_prompt("task.created", Some(1182), Some(9), None, true, true, None),
+            None,
+            "a reactive subscriber a create does not address is not woken (task_580 gate applies)"
+        );
+        // No task_id → can't form a prompt even when subscribed.
+        assert_eq!(
+            notification_prompt("task.created", None, Some(9), None, true, false, None),
+            None
+        );
+        // End-to-end through payload_to_wake: a subscribed create wakes the intake triager; a firehose one does not.
+        let subbed = serde_json::json!({"recipient":"board-triage","type":"task.created","task_id":1182,"event_seq":9,"subscribed":true});
+        assert_eq!(
+            payload_to_wake(&subbed),
+            Some(("board-triage".into(), "[notification] new task #1182".into()))
+        );
+        let firehose = serde_json::json!({"recipient":"board-pm","type":"task.created","task_id":1182,"event_seq":9,"subscribed":false});
+        assert_eq!(payload_to_wake(&firehose), None, "a firehose create does not wake");
+        // A pre-#384 payload with no `subscribed` field defaults false → drops to poll (never a spurious wake).
+        let no_hint = serde_json::json!({"recipient":"x","type":"task.created","task_id":1182,"event_seq":9});
+        assert_eq!(payload_to_wake(&no_hint), None);
     }
 
     #[test]
