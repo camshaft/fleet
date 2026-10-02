@@ -865,14 +865,123 @@ fn load_corpus(path: &Path) -> Result<Vec<Rec>, String> {
     Ok(recs)
 }
 
-/// Run the dream analyzer over `corpus` and write the dream-report JSON to `out`. Returns the process exit
-/// code. `sample` prints that many proposals to stderr for a quick eyeball.
-pub fn analyze_cmd(corpus: &Path, out: &Path, sample: usize) -> i32 {
-    let recs = match load_corpus(corpus) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            return 1;
+/// A browser-like User-Agent for board GETs — the public CF edge 403s a non-browser UA; harmless on loopback.
+const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) fleet-dream";
+
+/// Percent-encode a wiki path prefix (the board `/wiki?prefix=` query): keep RFC3986 unreserved bytes, encode
+/// everything else (notably `/`). Mirrors the shim's `jq @uri`. Pure.
+fn encode_prefix(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// One board REST GET returning parsed JSON (transient 5xx are the caller's concern; a background pass
+/// tolerates a slow board). `path` begins with `/` and is appended to `board_api`.
+fn board_get_json(board_api: &str, path: &str) -> Result<Value, String> {
+    let url = format!("{}{}", board_api.trim_end_matches('/'), path);
+    let resp = ureq::get(&url)
+        .set("accept", "application/json")
+        .set("user-agent", BOARD_UA)
+        .call()
+        .map_err(|e| format!("board GET {path} failed: {e}"))?;
+    let raw = resp
+        .into_string()
+        .map_err(|e| format!("board GET {path} read failed: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("board GET {path}: not JSON: {e}"))
+}
+
+/// Build the analyzer corpus from the LIVE board for one scope (a wiki path prefix, e.g. `repos/<repo>` or
+/// `agents/<agent>`): list the scope's memory docs via `/wiki?prefix=`, then fetch each doc's body + metadata
+/// via `/documents/<id>?include_body=true`, assembling the analyzer record. Replaces the --corpus JSONL for
+/// scheduled runs so dreaming reflects current board state. Within-repo link semantics are preserved by
+/// keying `repo` to the scope's namespace segment (the second path segment).
+fn load_corpus_from_board(board_api: &str, scope: &str) -> Result<Vec<Rec>, String> {
+    let index = board_get_json(board_api, &format!("/wiki?prefix={}", encode_prefix(scope)))?;
+    let items = index
+        .as_array()
+        .ok_or_else(|| format!("board /wiki?prefix={scope}: expected an array, got {index}"))?;
+    let mut recs = Vec::with_capacity(items.len());
+    for it in items {
+        let id = it.get("id").ok_or("wiki entry missing id")?;
+        let id_str = match id {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            other => return Err(format!("wiki entry id is neither number nor string: {other}")),
+        };
+        let doc = board_get_json(board_api, &format!("/documents/{id_str}?include_body=true"))?;
+        let path = doc.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        if path.is_empty() {
+            continue; // a doc with no filed path is not a memory in a scope
+        }
+        let slug = path.rsplit('/').next().unwrap_or(&path).to_string();
+        // namespace = the second path segment (repos/<X>/.. or agents/<X>/..), so [[links]] resolve within it.
+        let namespace = path.split('/').nth(1).unwrap_or("?").to_string();
+        let md = doc.get("metadata").cloned().unwrap_or(Value::Null);
+        let provenance: Option<Provenance> = md
+            .get("provenance")
+            .cloned()
+            .and_then(|p| serde_json::from_value(p).ok());
+        recs.push(Rec {
+            slug,
+            repo: Some(namespace),
+            name: doc.get("title").and_then(Value::as_str).map(str::to_string),
+            description: md.get("description").and_then(Value::as_str).map(str::to_string),
+            rtype: md.get("type").and_then(Value::as_str).map(str::to_string),
+            body: doc.get("body").and_then(Value::as_str).map(str::to_string),
+            source: md
+                .get("provenance")
+                .and_then(|p| p.get("source"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            doc_id: Some(id.clone()),
+            provenance,
+            path: Some(path),
+        });
+    }
+    Ok(recs)
+}
+
+/// Run the dream analyzer and write the dream-report JSON to `out`. The corpus comes from either a `--corpus`
+/// JSONL file or, when `from_board` is set, a live-board pull of `scope` (a wiki path prefix). Returns the
+/// process exit code; `sample` prints that many proposals to stderr for a quick eyeball.
+pub fn analyze_cmd(
+    corpus: Option<&Path>,
+    from_board: bool,
+    scope: Option<&str>,
+    board_api: &str,
+    out: &Path,
+    sample: usize,
+) -> i32 {
+    let recs = if from_board {
+        let Some(scope) = scope else {
+            eprintln!("dream-analyze: --from-board requires --scope <wiki-prefix> (e.g. repos/<repo> or agents/<agent>)");
+            return 2;
+        };
+        match load_corpus_from_board(board_api, scope) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    } else {
+        let Some(corpus) = corpus else {
+            eprintln!("dream-analyze: pass --corpus <jsonl> or --from-board --scope <wiki-prefix>");
+            return 2;
+        };
+        match load_corpus(corpus) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
         }
     };
 
