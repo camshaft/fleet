@@ -2111,6 +2111,98 @@ fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_c
     }
 }
 
+/// One board-hygiene retention sweep in the daily tick's table (task_1249): a POST to a project-scoped board
+/// endpoint with a day threshold. The table drives the whole family from one tick (archive-done +
+/// age-out-todos), so a future sweep is one more row, not another crontab line.
+struct HygieneSweep {
+    name: &'static str,
+    path: String,
+    older_than_days: u64,
+}
+
+/// Build the board-hygiene sweep table for a project (task_1249): the confirmed `archive-done` sweep always,
+/// and the `age-out-todos` sweep (board-side scoped to status=todo) unless skipped. Both target `project`; the
+/// daily tick POSTs each. Pure — unit-tested.
+fn board_hygiene_sweeps(
+    project: i64,
+    archive_done_days: u64,
+    age_out_days: u64,
+    skip_age_out: bool,
+) -> Vec<HygieneSweep> {
+    let mut sweeps = vec![HygieneSweep {
+        name: "archive-done",
+        path: format!("/api/projects/{project}/archive-done"),
+        older_than_days: archive_done_days,
+    }];
+    if !skip_age_out {
+        sweeps.push(HygieneSweep {
+            name: "age-out-todos",
+            path: format!("/api/projects/{project}/age-out-todos"),
+            older_than_days: age_out_days,
+        });
+    }
+    sweeps
+}
+
+/// The JSON body for a retention-sweep POST (task_1249): the day threshold plus the authenticating principal.
+/// Pure.
+fn hygiene_sweep_body(older_than_days: u64, principal: &str) -> serde_json::Value {
+    serde_json::json!({ "older_than_days": older_than_days, "principal": principal })
+}
+
+/// Run the daily board-hygiene retention tick (task_1249): drive the project-scoped sweeps (`archive-done`,
+/// `age-out-todos`) over the board REST API from one place so the project stays tight without a manual
+/// invocation. DRY-RUN by default (prints the plan, touches nothing); pass `--execute` to POST. Each sweep is
+/// restorable (restore_task) and auditable (task.archived reason=retention) on the board side, so a bad run is
+/// recoverable. A sweep failure logs and the tick continues to the next, so one bad endpoint never skips the
+/// rest; the process still exits non-zero if any sweep failed, so a supervisor sees it.
+fn board_hygiene(
+    project: i64,
+    archive_done_days: u64,
+    age_out_days: u64,
+    skip_age_out: bool,
+    execute: bool,
+) {
+    let sweeps = board_hygiene_sweeps(project, archive_done_days, age_out_days, skip_age_out);
+    if !execute {
+        println!("board-hygiene: DRY-RUN (pass --execute to POST). Plan for project {project}:");
+        for s in &sweeps {
+            println!(
+                "  {} -> POST {} (older_than_days={})",
+                s.name, s.path, s.older_than_days
+            );
+        }
+        return;
+    }
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("board-hygiene: {e}");
+        std::process::exit(1);
+    });
+    let mut failed = 0usize;
+    for s in &sweeps {
+        let body = hygiene_sweep_body(s.older_than_days, "v-fleet-tooling");
+        match board.post_json(&s.path, &body) {
+            Ok(resp) => {
+                let archived = resp
+                    .get("archived")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1);
+                println!(
+                    "board-hygiene: {} archived {archived} task(s) in project {project} (older_than_days={})",
+                    s.name, s.older_than_days
+                );
+            }
+            Err(e) => {
+                eprintln!("board-hygiene: {} FAILED: {e}", s.name);
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "fleet",
@@ -3176,6 +3268,26 @@ enum Cmd {
         #[arg(long, default_value_t = 3600)]
         alert_cooldown_secs: u64,
     },
+    /// Run the daily board-hygiene retention tick (task_1249): POST the project-scoped sweeps (archive-done +
+    /// age-out-todos) that keep a project tight. DRY-RUN by default (prints the plan); pass --execute to POST.
+    /// Each sweep is restorable + auditable on the board side.
+    BoardHygiene {
+        /// The project to sweep (both archive-done and age-out-todos target it).
+        #[arg(long)]
+        project: i64,
+        /// archive-done threshold in days (board default 7).
+        #[arg(long, default_value_t = 7)]
+        archive_done_days: u64,
+        /// age-out-todos threshold in days (board default 14).
+        #[arg(long, default_value_t = 14)]
+        age_out_days: u64,
+        /// Skip the age-out-todos sweep (run archive-done only).
+        #[arg(long)]
+        skip_age_out: bool,
+        /// Actually POST the sweeps (default is a dry-run that only prints the plan).
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 fn main() {
@@ -3303,6 +3415,19 @@ fn main() {
             alert,
             alert_cooldown_secs,
         } => intake_watch(&fleet, project, sla_secs, alert, alert_cooldown_secs),
+        Cmd::BoardHygiene {
+            project,
+            archive_done_days,
+            age_out_days,
+            skip_age_out,
+            execute,
+        } => board_hygiene(
+            project,
+            archive_done_days,
+            age_out_days,
+            skip_age_out,
+            execute,
+        ),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
                 eprintln!("{e}");
@@ -16420,6 +16545,36 @@ detached
         assert!(
             c.to_lowercase().contains("rout"),
             "asks to route it out of the inbox: {c}"
+        );
+    }
+
+    #[test]
+    fn board_hygiene_sweeps_builds_both_rows_and_respects_skip() {
+        let both = board_hygiene_sweeps(28, 7, 14, false);
+        assert_eq!(both.len(), 2, "archive-done + age-out-todos");
+        assert_eq!(both[0].name, "archive-done");
+        assert_eq!(both[0].path, "/api/projects/28/archive-done");
+        assert_eq!(both[0].older_than_days, 7);
+        assert_eq!(both[1].name, "age-out-todos");
+        assert_eq!(both[1].path, "/api/projects/28/age-out-todos");
+        assert_eq!(both[1].older_than_days, 14);
+        // skip_age_out drops the second row, leaving only the confirmed archive-done sweep.
+        let only = board_hygiene_sweeps(29, 7, 14, true);
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].name, "archive-done");
+        assert_eq!(only[0].path, "/api/projects/29/archive-done");
+    }
+
+    #[test]
+    fn hygiene_sweep_body_carries_days_and_principal() {
+        let b = hygiene_sweep_body(7, "v-fleet-tooling");
+        assert_eq!(
+            b.get("older_than_days").and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            b.get("principal").and_then(serde_json::Value::as_str),
+            Some("v-fleet-tooling")
         );
     }
 
