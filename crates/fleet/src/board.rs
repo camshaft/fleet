@@ -40,12 +40,12 @@ fn to_board_ascii(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '\u{2014}' | '\u{2013}' => out.push('-'),        // em / en dash
-            '\u{2018}' | '\u{2019}' => out.push('\''),       // curly single quotes
-            '\u{201C}' | '\u{201D}' => out.push('"'),        // curly double quotes
-            '\u{2026}' => out.push_str("..."),               // ellipsis
-            '\u{2192}' => out.push_str("->"),                // right arrow
-            '\u{2190}' => out.push_str("<-"),                // left arrow
+            '\u{2014}' | '\u{2013}' => out.push('-'),  // em / en dash
+            '\u{2018}' | '\u{2019}' => out.push('\''), // curly single quotes
+            '\u{201C}' | '\u{201D}' => out.push('"'),  // curly double quotes
+            '\u{2026}' => out.push_str("..."),         // ellipsis
+            '\u{2192}' => out.push_str("->"),          // right arrow
+            '\u{2190}' => out.push_str("<-"),          // left arrow
             c if c.is_ascii() => out.push(c),
             _ => {} // drop any other non-ASCII rather than eat a 400
         }
@@ -107,7 +107,10 @@ fn open_observation_query(project_id: i64, observes: &str) -> String {
 /// blip) or a transport-level error. A 4xx (e.g. a 404) or any other status is NOT transient — surface it so
 /// real errors are not masked. Pure — unit-tested.
 fn is_transient(err: &ureq::Error) -> bool {
-    matches!(err, ureq::Error::Status(502..=504, _) | ureq::Error::Transport(_))
+    matches!(
+        err,
+        ureq::Error::Status(502..=504, _) | ureq::Error::Transport(_)
+    )
 }
 
 /// Run a board request, retrying a TRANSIENT failure (see [`is_transient`]) up to 2 extra times with a short
@@ -157,7 +160,10 @@ impl Board {
 
     /// Build a client. No network round-trip — the REST API is sessionless, so there is no handshake.
     pub fn connect() -> Result<Board, String> {
-        Ok(Board { base: Self::base_url(), agent: ureq::agent() })
+        Ok(Board {
+            base: Self::base_url(),
+            agent: ureq::agent(),
+        })
     }
 
     fn get_json(&self, path: &str) -> Result<Value, String> {
@@ -173,7 +179,8 @@ impl Board {
         let raw = resp
             .into_string()
             .map_err(|e| format!("board GET {path} read failed: {e}"))?;
-        serde_json::from_str(&raw).map_err(|e| format!("board GET {path}: response was not JSON: {e}"))
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("board GET {path}: response was not JSON: {e}"))
     }
 
     /// The full agent roster (each record: id/charter/display_name/kind/status/metadata/…).
@@ -235,9 +242,9 @@ impl Board {
                 let raw = resp
                     .into_string()
                     .map_err(|e| format!("board GET /workspace-kinds/{kind} read failed: {e}"))?;
-                serde_json::from_str(&raw)
-                    .map(Some)
-                    .map_err(|e| format!("board GET /workspace-kinds/{kind}: response was not JSON: {e}"))
+                serde_json::from_str(&raw).map(Some).map_err(|e| {
+                    format!("board GET /workspace-kinds/{kind}: response was not JSON: {e}")
+                })
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(e) => Err(format!("board GET /workspace-kinds/{kind} failed: {e}")),
@@ -289,13 +296,19 @@ impl Board {
     /// `project_id`, or `None` if none is open. A non-empty result means an observation for that target is
     /// already in flight (or a crashed observer left one open) → reuse it rather than creating a duplicate.
     /// Uses the board's server-side metadata filter (both `meta_key` and `meta_value` set together).
-    pub fn open_observation_task(&self, project_id: i64, observes: &str) -> Result<Option<i64>, String> {
+    pub fn open_observation_task(
+        &self,
+        project_id: i64,
+        observes: &str,
+    ) -> Result<Option<i64>, String> {
         let path = open_observation_query(project_id, observes);
         let tasks = match self.get_json(&path)? {
             Value::Array(a) => a,
             other => return Err(format!("board {path}: expected an array, got {other}")),
         };
-        Ok(tasks.iter().find_map(|t| t.get("id").and_then(Value::as_i64)))
+        Ok(tasks
+            .iter()
+            .find_map(|t| t.get("id").and_then(Value::as_i64)))
     }
 
     /// Merge `metadata` into an agent's board record via `PATCH /agents/<id>`. The board merges at the KEY
@@ -320,7 +333,12 @@ impl Board {
     /// `patch_metadata` uses; verified to accept a `status` field). Used by `fleet spin-down` to mark a
     /// board-native agent `offline` so `up-board` leaves it stood down (offline + no window → never
     /// auto-launched) while its record stays intact for a later `spin-up`. `Err` on a non-2xx response.
-    pub fn set_status(&self, agent: &str, status: &str, status_message: &str) -> Result<(), String> {
+    pub fn set_status(
+        &self,
+        agent: &str,
+        status: &str,
+        status_message: &str,
+    ) -> Result<(), String> {
         let url = format!("{}/agents/{}", self.base, agent);
         let body =
             serde_json::json!({ "status": status, "status_message": status_message }).to_string();
@@ -382,7 +400,22 @@ impl Board {
     pub fn list_tasks_by_status(&self, status: &str) -> Result<Vec<Value>, String> {
         match self.get_json(&format!("/tasks?status={status}"))? {
             Value::Array(a) => Ok(a),
-            other => Err(format!("board /tasks?status={status}: expected an array, got {other}")),
+            other => Err(format!(
+                "board /tasks?status={status}: expected an array, got {other}"
+            )),
+        }
+    }
+
+    /// The list projection of every task currently in a project (`GET /tasks?project_id={id}`), each record
+    /// carrying `ref`/`status`/`created_at`/`blocked_on_kind` (comments omitted, as with
+    /// [`list_tasks_by_status`]). The intake dwell+state watchdog (task_1217) sweeps the uncategorized
+    /// project through this.
+    pub fn list_tasks_by_project(&self, project_id: i64) -> Result<Vec<Value>, String> {
+        match self.get_json(&format!("/tasks?project_id={project_id}"))? {
+            Value::Array(a) => Ok(a),
+            other => Err(format!(
+                "board /tasks?project_id={project_id}: expected an array, got {other}"
+            )),
         }
     }
 
@@ -398,7 +431,8 @@ impl Board {
         let url = format!("{}/tasks/{}/comments", self.base, task_id);
         // The board rejects non-ASCII content with a 400; normalize so a stray Unicode char never silently
         // fails the post (a whole-daemon outage class — see [`to_board_ascii`]).
-        let payload = serde_json::json!({ "author": author, "body": to_board_ascii(body) }).to_string();
+        let payload =
+            serde_json::json!({ "author": author, "body": to_board_ascii(body) }).to_string();
         self.agent
             .post(&url)
             .set("content-type", "application/json")
@@ -406,7 +440,12 @@ impl Board {
             .send_string(&payload)
             // Surface the board's response body on a non-2xx (e.g. the 400 validation message), not just the
             // status line — a bare "status code 400" left the nudge-daemon failure undiagnosable.
-            .map_err(|e| format!("board POST /tasks/{task_id}/comments failed: {}", status_err(e)))?;
+            .map_err(|e| {
+                format!(
+                    "board POST /tasks/{task_id}/comments failed: {}",
+                    status_err(e)
+                )
+            })?;
         Ok(())
     }
 
@@ -456,12 +495,18 @@ impl Board {
             .set("content-type", "application/json")
             .set("user-agent", BOARD_UA)
             .send_string(&payload.to_string())
-            .map_err(|e| format!("board POST /reviews/{review_id}/log failed: {}", status_err(e)))?;
+            .map_err(|e| {
+                format!(
+                    "board POST /reviews/{review_id}/log failed: {}",
+                    status_err(e)
+                )
+            })?;
         let raw = resp
             .into_string()
             .map_err(|e| format!("board POST /reviews/{review_id}/log read failed: {e}"))?;
-        let v: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("board POST /reviews/{review_id}/log: response was not JSON: {e}"))?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| {
+            format!("board POST /reviews/{review_id}/log: response was not JSON: {e}")
+        })?;
         parse_appended(&v)
     }
 
@@ -501,9 +546,15 @@ mod tests {
     #[test]
     fn to_board_ascii_replaces_the_content_that_400s_and_is_identity_on_clean_text() {
         // The exact char that took the nudge daemon down (U+2014 em dash) -> hyphen.
-        assert_eq!(to_board_ascii("routing — unassigned"), "routing - unassigned");
+        assert_eq!(
+            to_board_ascii("routing — unassigned"),
+            "routing - unassigned"
+        );
         // Other board-suggested substitutions.
-        assert_eq!(to_board_ascii("it\u{2019}s \u{201C}done\u{201D} \u{2026} next\u{2192}here"), "it's \"done\" ... next->here");
+        assert_eq!(
+            to_board_ascii("it\u{2019}s \u{201C}done\u{201D} \u{2026} next\u{2192}here"),
+            "it's \"done\" ... next->here"
+        );
         // Any other non-ASCII (emoji) is dropped rather than left to 400.
         assert_eq!(to_board_ascii("ship it \u{1F680} now"), "ship it  now");
         // Clean ASCII is returned unchanged (no needless churn).
@@ -528,14 +579,23 @@ mod tests {
     fn is_transient_matches_origin_5xx_and_transport_only() {
         // A synthetic Status error: ureq builds one from a Response. Construct via the HTTP builder.
         let mk = |code: u16| {
-            ureq::Error::Status(code, ureq::Response::new(code, "x", "").expect("build response"))
+            ureq::Error::Status(
+                code,
+                ureq::Response::new(code, "x", "").expect("build response"),
+            )
         };
         assert!(is_transient(&mk(502)), "502 bad gateway → transient");
         assert!(is_transient(&mk(503)), "503 → transient");
         assert!(is_transient(&mk(504)), "504 → transient");
-        assert!(!is_transient(&mk(404)), "404 is a real answer, not transient");
+        assert!(
+            !is_transient(&mk(404)),
+            "404 is a real answer, not transient"
+        );
         assert!(!is_transient(&mk(400)), "4xx is not transient");
-        assert!(!is_transient(&mk(500)), "a plain 500 is not retried (not a gateway blip)");
+        assert!(
+            !is_transient(&mk(500)),
+            "a plain 500 is not retried (not a gateway blip)"
+        );
     }
 
     #[test]
@@ -547,38 +607,60 @@ mod tests {
         assert!(!task_is_actionable(&mk("done")));
         assert!(!task_is_actionable(&mk("cancelled")));
         assert!(!task_is_actionable(&mk("blocked")));
-        assert!(!task_is_actionable(&serde_json::json!({})), "missing status is not actionable");
+        assert!(
+            !task_is_actionable(&serde_json::json!({})),
+            "missing status is not actionable"
+        );
         // A todo/in_progress task PARKED on a blocker is NOT actionable — either blocked_on shape.
         assert!(
-            !task_is_actionable(&serde_json::json!({ "status": "todo", "blocked_on_kind": "operator" })),
+            !task_is_actionable(
+                &serde_json::json!({ "status": "todo", "blocked_on_kind": "operator" })
+            ),
             "parked via blocked_on_kind (list shape) is not actionable"
         );
         assert!(
-            !task_is_actionable(&serde_json::json!({ "status": "in_progress", "blocked_on": {"kind": "task"} })),
+            !task_is_actionable(
+                &serde_json::json!({ "status": "in_progress", "blocked_on": {"kind": "task"} })
+            ),
             "parked via blocked_on (full-object shape) is not actionable"
         );
         // A null blocked_on does NOT mean parked.
-        assert!(task_is_actionable(&serde_json::json!({ "status": "todo", "blocked_on": null })));
+        assert!(task_is_actionable(
+            &serde_json::json!({ "status": "todo", "blocked_on": null })
+        ));
         // A monitor-exempt in_progress task is a continuous monitor, not actionable loop-tighter work (#535).
         assert!(
-            !task_is_actionable(&serde_json::json!({ "status": "in_progress", "monitor_exempt": true })),
+            !task_is_actionable(
+                &serde_json::json!({ "status": "in_progress", "monitor_exempt": true })
+            ),
             "monitor-exempt is not actionable work"
         );
-        assert!(task_is_actionable(&serde_json::json!({ "status": "in_progress", "monitor_exempt": false })));
+        assert!(task_is_actionable(
+            &serde_json::json!({ "status": "in_progress", "monitor_exempt": false })
+        ));
     }
 
     #[test]
     fn open_observation_query_sets_project_status_and_both_meta_params() {
         // The #290 idempotency query: project + open-status + the metadata tag (both meta params present).
         let q = open_observation_query(28, "v-example");
-        assert_eq!(q, "/tasks?project_id=28&status=todo&meta_key=observes&meta_value=v-example");
-        assert!(q.contains("meta_key=observes") && q.contains("meta_value=v-example"), "both meta params set");
+        assert_eq!(
+            q,
+            "/tasks?project_id=28&status=todo&meta_key=observes&meta_value=v-example"
+        );
+        assert!(
+            q.contains("meta_key=observes") && q.contains("meta_value=v-example"),
+            "both meta params set"
+        );
     }
 
     #[test]
     fn connect_is_sessionless_and_uses_the_configured_base() {
         // SAFETY: no network — connect() only builds the handle (REST is stateless).
-        let b = Board { base: "http://x/board/api".into(), agent: ureq::agent() };
+        let b = Board {
+            base: "http://x/board/api".into(),
+            agent: ureq::agent(),
+        };
         assert_eq!(b.base, "http://x/board/api");
     }
 }

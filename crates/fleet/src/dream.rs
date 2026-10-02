@@ -1141,7 +1141,7 @@ const CONTRADICTION_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 /// Parse a provenance timestamp `Value` to unix seconds: an RFC3339 string, or a number read as epoch
 /// seconds. `None` when absent or unparseable -- the value-contradiction detector treats `None` as "cannot
 /// prove concurrency" and suppresses, so a missing timestamp never produces a flag.
-fn provenance_unix_secs(ts: Option<&Value>) -> Option<i64> {
+pub(crate) fn provenance_unix_secs(ts: Option<&Value>) -> Option<i64> {
     match ts? {
         Value::String(s) => {
             time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
