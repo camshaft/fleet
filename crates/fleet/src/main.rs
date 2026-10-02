@@ -3489,6 +3489,13 @@ enum Cmd {
         /// is a separate unit path, so without this passthrough a flake deploy can never emit the reaper.
         #[arg(long)]
         reap_stale_observers: bool,
+        /// Include `--intake-watch` (task_1217): the installed watchdog runs the uncategorized-intake dwell+state
+        /// sweep each pass — the per-offender escalation + the once-per-sweep digest. Alert-only (no destructive
+        /// auto-action) and a no-op unless `config.intake_project` is set, so it is a safe cadence opt-in parallel
+        /// to `--hire-signal` / `--reap-stale-observers`. Opt-in per host so the sweep never runs until a host
+        /// turns it on; same passthrough rationale (a flake-generated unit can carry it).
+        #[arg(long)]
+        intake_watch: bool,
         /// INSTALL the units into `~/.config/systemd/user/` (user-level, no sudo) instead of printing them, and
         /// print the `systemctl --user enable` command — a clean, reversible install path for a host not on the
         /// declarative (nix) model. Reverse with `--uninstall`.
@@ -4101,6 +4108,7 @@ fn main() {
             self_redeploy,
             hire_signal,
             reap_stale_observers,
+            intake_watch,
             install,
             uninstall,
             host,
@@ -4112,6 +4120,7 @@ fn main() {
             self_redeploy,
             hire_signal,
             reap_stale_observers,
+            intake_watch,
             interval_secs,
             bin,
             install,
@@ -12627,6 +12636,7 @@ fn watchdog_exec_args(
     self_redeploy: bool,
     hire_signal: bool,
     reap_stale_observers: bool,
+    intake_watch: bool,
 ) -> String {
     let mut args = String::from("watchdog");
     if rearm {
@@ -12646,6 +12656,9 @@ fn watchdog_exec_args(
     }
     if reap_stale_observers {
         args.push_str(" --reap-stale-observers");
+    }
+    if intake_watch {
+        args.push_str(" --intake-watch");
     }
     args
 }
@@ -12794,6 +12807,7 @@ fn watchdog_unit(
     self_redeploy: bool,
     hire_signal: bool,
     reap_stale_observers: bool,
+    intake_watch: bool,
     interval_secs: u64,
     bin: Option<String>,
     install: bool,
@@ -12814,6 +12828,7 @@ fn watchdog_unit(
         self_redeploy,
         hire_signal,
         reap_stale_observers,
+        intake_watch,
     );
     // The target-host line (task_948) comes first regardless of --observe, so a bare rearm-only unit still
     // names which host it manages. Only an observer-spawning watchdog ALSO needs a launch environment (a
@@ -16626,51 +16641,61 @@ mod tests {
     fn watchdog_exec_args_builds_the_liveness_base_plus_opt_ins() {
         // rearm base, opt-in observe + pinned.
         assert_eq!(
-            watchdog_exec_args(true, false, false, false, false, false),
+            watchdog_exec_args(true, false, false, false, false, false, false),
             "watchdog --rearm --stale-only"
         );
         assert_eq!(
-            watchdog_exec_args(true, true, false, false, false, false),
+            watchdog_exec_args(true, true, false, false, false, false, false),
             "watchdog --rearm --stale-only --observe --spawn"
         );
         assert_eq!(
-            watchdog_exec_args(true, false, true, false, false, false),
+            watchdog_exec_args(true, false, true, false, false, false, false),
             "watchdog --rearm --stale-only --pinned-only"
         );
         // The secondary-box go-live shape: liveness + observer cadence + host filter.
         assert_eq!(
-            watchdog_exec_args(true, true, true, false, false, false),
+            watchdog_exec_args(true, true, true, false, false, false, false),
             "watchdog --rearm --stale-only --observe --spawn --pinned-only"
         );
         // OBSERVER-ONLY (rearm=false): coexists with an existing rearm watchdog without double-rearming (host-a).
         assert_eq!(
-            watchdog_exec_args(false, true, false, false, false, false),
+            watchdog_exec_args(false, true, false, false, false, false, false),
             "watchdog --observe --spawn"
         );
         // --self-redeploy (#388) appends last: a local-checkout host installs the self-healing watchdog.
         assert_eq!(
-            watchdog_exec_args(true, false, false, true, false, false),
+            watchdog_exec_args(true, false, false, true, false, false, false),
             "watchdog --rearm --stale-only --self-redeploy"
         );
         // --hire-signal (task_794) appends after self-redeploy: a host turns on the backlog hire-signal post.
         assert_eq!(
-            watchdog_exec_args(true, false, false, false, true, false),
+            watchdog_exec_args(true, false, false, false, true, false, false),
             "watchdog --rearm --stale-only --hire-signal"
         );
         assert_eq!(
-            watchdog_exec_args(true, false, false, true, true, false),
+            watchdog_exec_args(true, false, false, true, true, false, false),
             "watchdog --rearm --stale-only --self-redeploy --hire-signal"
         );
         // --reap-stale-observers (task_1045) appends last: this is the passthrough a flake-generated unit needs
         // so the observer-reaper reaches the deploy (the hardcoded fleet-daemons.nix ExecStart is a separate path).
         assert_eq!(
-            watchdog_exec_args(true, false, false, false, false, true),
+            watchdog_exec_args(true, false, false, false, false, true, false),
             "watchdog --rearm --stale-only --reap-stale-observers"
         );
         // The full installed-cadence shape AGENTS.md documents: liveness + observer cadence + reaper.
         assert_eq!(
-            watchdog_exec_args(true, true, false, false, false, true),
+            watchdog_exec_args(true, true, false, false, false, true, false),
             "watchdog --rearm --stale-only --observe --spawn --reap-stale-observers"
+        );
+        // --intake-watch (task_1217) appends last: the passthrough so a flake-generated / installed unit can
+        // carry the intake dwell+state sweep enable, parallel to --reap-stale-observers.
+        assert_eq!(
+            watchdog_exec_args(true, false, false, false, false, false, true),
+            "watchdog --rearm --stale-only --intake-watch"
+        );
+        assert_eq!(
+            watchdog_exec_args(true, true, false, false, false, true, true),
+            "watchdog --rearm --stale-only --observe --spawn --reap-stale-observers --intake-watch"
         );
     }
 
@@ -17646,7 +17671,7 @@ detached
     fn render_watchdog_units_is_a_oneshot_service_plus_timer() {
         let u = render_watchdog_units(
             "/run/fleet/bin/fleet",
-            &watchdog_exec_args(true, true, true, false, false, false),
+            &watchdog_exec_args(true, true, true, false, false, false, false),
             60,
             "",
         );
@@ -17672,7 +17697,7 @@ detached
         // Observer-only exec, for the host-a coexistence install.
         let (service, timer) = watchdog_unit_files(
             "/bin/fleet",
-            &watchdog_exec_args(false, true, false, false, false, false),
+            &watchdog_exec_args(false, true, false, false, false, false, false),
             90,
             "",
         );
@@ -17701,7 +17726,7 @@ detached
             render_service_env_lines(&[("FLEET_HOST", Some("dev-dsk-foo".to_string()))]);
         let (service, _) = watchdog_unit_files(
             "/bin/fleet",
-            &watchdog_exec_args(true, false, false, false, false, false),
+            &watchdog_exec_args(true, false, false, false, false, false, false),
             60,
             &with_host,
         );
@@ -17712,7 +17737,7 @@ detached
         assert_eq!(no_host, "");
         let (service2, _) = watchdog_unit_files(
             "/bin/fleet",
-            &watchdog_exec_args(true, false, false, false, false, false),
+            &watchdog_exec_args(true, false, false, false, false, false, false),
             60,
             &no_host,
         );
@@ -17741,7 +17766,7 @@ detached
         let env = render_service_env_lines(&[("PATH", Some("/home/u/.local/bin".into()))]);
         let (service, _timer) = watchdog_unit_files(
             "/bin/fleet",
-            &watchdog_exec_args(true, true, false, false, false, false),
+            &watchdog_exec_args(true, true, false, false, false, false, false),
             60,
             &env,
         );
@@ -17756,7 +17781,7 @@ detached
         // A rearm-only unit (no observe) is emitted with an empty env block — no launch environment needed.
         let (rearm_only, _) = watchdog_unit_files(
             "/bin/fleet",
-            &watchdog_exec_args(true, false, false, false, false, false),
+            &watchdog_exec_args(true, false, false, false, false, false, false),
             60,
             "",
         );
