@@ -282,10 +282,14 @@ let
     # (which keeps last_seen advancing, so the liveness sweep misses it) via a force spin-down + spin-up. Fenced:
     # fires only on a trailing run of stop_reason=refusal turns, per-agent 3600s cooldown, suppressed during a
     # fleet-quiesce. Cameron directed the detect-AND-restart capability (task_582) and approved enabling it here.
+    # --review-sweep (task_374 S2c): the automatic adversarial-review trigger — each pass, spawn the per-angle
+    # ephemeral reviewers for every review in_review + not yet vetted. Idempotent via the S2b per-angle claim (a
+    # review already covered re-spawns nothing), so running it on the 60s cadence is safe; this is what makes the
+    # review engine live without a manual `review-spawn`/`review-sweep` invocation.
     // (mkTimer {
       name = "fleet-watchdog";
       description = "Fleet watchdog";
-      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn --reap-stale-observers --recover-wedged";
+      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn --reap-stale-observers --recover-wedged --review-sweep";
       intervalSecs = 60;
       onBootSec = 60;
       persistent = true;

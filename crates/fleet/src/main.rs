@@ -2053,6 +2053,14 @@ enum Cmd {
         /// report-only (a WARNING line).
         #[arg(long)]
         relaunch_missing: bool,
+        /// Run the task_374 S2c adversarial-review SWEEP each pass (board-reachable only): spawn the per-angle
+        /// ephemeral reviewers for every review `in_review` and not yet `vetted`, via the same claim+spawn as
+        /// `review-sweep`. Idempotent (the S2b per-angle claim means a review already covered re-spawns nothing),
+        /// so running it on the watchdog cadence is the automatic trigger that makes the review engine live.
+        /// Honors `--dry-run` (preview the plan without claiming/spawning). OPT-IN: a host turns it on in its
+        /// watchdog unit's `ExecStart`, like `--observe --spawn`.
+        #[arg(long)]
+        review_sweep: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -2826,6 +2834,7 @@ fn main() {
             bounce_stale,
             recover_wedged,
             relaunch_missing,
+            review_sweep,
         } => watchdog(
             stale_only,
             rearm,
@@ -2840,6 +2849,7 @@ fn main() {
             bounce_stale,
             recover_wedged,
             relaunch_missing,
+            review_sweep,
         ),
         Cmd::ObserveRecord {
             agent,
@@ -6869,6 +6879,8 @@ fn watchdog(
     sweep_stale: bool,
     recover_wedged: bool,
     relaunch_missing: bool,
+    // Named distinctly from the `review_sweep` function it gates (a same-name binding would shadow the fn).
+    sweep_reviews: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -6932,6 +6944,14 @@ fn watchdog(
                         "-- bounce-stale (--bounce-stale: refreshing stale sessions' tools/list) --"
                     );
                     bounce_stale(&Fleet::resolve(), true, false);
+                }
+                // task_374 S2c: with --review-sweep, run the adversarial-review sweep this pass — spawn the
+                // per-angle reviewers for every in_review + unvetted review. Board-reachable only (we are inside
+                // the connected arm; review_sweep re-connects, which is sessionless/free). Idempotent via the S2b
+                // per-angle claim, so a review already covered re-spawns nothing. Honors --dry-run for a preview.
+                if sweep_reviews {
+                    println!("-- review-sweep (--review-sweep: adversarial-review spawn cadence) --");
+                    review_sweep(&board_session(), !spawn_dry_run);
                 }
                 native_ids
             }
