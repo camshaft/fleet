@@ -162,6 +162,16 @@ pub fn load_markers(explicit: Option<&str>) -> Result<Vec<Marker>, String> {
     parse_taxonomy(&src)
 }
 
+/// Non-empty, trimmed file names from a `git diff --name-only` listing. PURE (no I/O) so the parsing is
+/// unit-tested apart from the git invocation. Shared by [`staged_contents`] and [`diff_range_contents`].
+fn changed_names(listing: &str) -> Vec<&str> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// The staged content of every added/copied/modified file in the index, as (path, text) pairs, via `git`.
 /// Binary / non-UTF-8 blobs are skipped (nothing text-scannable); a deleted file has no staged content.
 fn staged_contents() -> Vec<(String, String)> {
@@ -176,7 +186,7 @@ fn staged_contents() -> Vec<(String, String)> {
         }
     };
     let mut out = Vec::new();
-    for name in names.lines().map(str::trim).filter(|s| !s.is_empty()) {
+    for name in changed_names(&names) {
         let Ok(b) = std::process::Command::new("git")
             .args(["show", &format!(":{name}")])
             .output()
@@ -193,6 +203,32 @@ fn staged_contents() -> Vec<(String, String)> {
     out
 }
 
+/// The current on-disk content of every added/copied/modified file in a git diff `range` (e.g.
+/// `origin/main...HEAD`), as (path, text) pairs. This is the CI-backstop primitive: in a PR checkout the
+/// working tree IS the head, so reading from disk scans exactly what the PR introduces. Unreadable / non-UTF-8
+/// files are skipped; a deleted file has no content to scan.
+///
+/// Returns `Err` when `git diff` itself FAILS (a bad range or not a git repo) so the caller can fail-closed:
+/// an empty result then unambiguously means "the range changed no scannable files" (a legitimate pass), never
+/// "the range was misconfigured" (which must NOT pass a CI gate silently).
+fn diff_range_contents(range: &str) -> Result<Vec<(String, String)>, String> {
+    let listing = std::process::Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=ACM", range])
+        .output();
+    let names = match listing {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Err(format!("`git diff {range}` failed (bad range, or not a git repo?)")),
+    };
+    Ok(changed_names(&names)
+        .into_iter()
+        .filter_map(|name| {
+            std::fs::read_to_string(name)
+                .ok()
+                .map(|c| (name.to_string(), c))
+        })
+        .collect())
+}
+
 /// Options for [`scan_content`], bundled into a struct so the handler stays clippy-clean (a flat bool pile
 /// trips `clippy::fn_params_excessive_bools`).
 pub struct ScanOpts {
@@ -200,6 +236,9 @@ pub struct ScanOpts {
     pub taxonomy: Option<String>,
     /// Explicit files to scan from disk; empty means scan the staged index.
     pub files: Vec<String>,
+    /// A git diff range (e.g. `origin/main...HEAD`): scan the current on-disk content of every file the range
+    /// adds/copies/modifies. The CI-backstop mode. Takes precedence over `--file` and the staged default.
+    pub diff: Option<String>,
     /// Force scanning the staged index even when `--file`s are given.
     pub staged: bool,
     /// Downgrade every blocking hit to advisory (report, exit 0).
@@ -228,7 +267,15 @@ pub fn scan_content(opts: ScanOpts) {
         }
     };
 
-    let targets: Vec<(String, String)> = if !opts.files.is_empty() && !opts.staged {
+    let targets: Vec<(String, String)> = if let Some(range) = opts.diff.as_deref() {
+        match diff_range_contents(range) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("scan-content: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else if !opts.files.is_empty() && !opts.staged {
         opts.files
             .iter()
             .filter_map(|f| std::fs::read_to_string(f).ok().map(|c| (f.clone(), c)))
@@ -404,6 +451,23 @@ mod tests {
         let hits = scan_text("src/main.rs", leak, &markers);
         assert_eq!(hits.len(), 1);
         assert!(has_blocking(&hits), "an internal identifier name is a blocking hit");
+    }
+
+    #[test]
+    fn changed_names_trims_and_drops_blank_lines() {
+        // git name-only listings are one path per line; tolerate trailing newline / stray blank lines and
+        // surrounding whitespace without emitting empty "" paths (which would then fail to read).
+        let listing = "crates/fleet/src/scan.rs\n\n  README.md  \ncrates/fleet/src/main.rs\n";
+        assert_eq!(
+            changed_names(listing),
+            vec![
+                "crates/fleet/src/scan.rs",
+                "README.md",
+                "crates/fleet/src/main.rs"
+            ]
+        );
+        assert!(changed_names("").is_empty());
+        assert!(changed_names("\n  \n\t\n").is_empty(), "all-blank listing yields no names");
     }
 
     #[test]
