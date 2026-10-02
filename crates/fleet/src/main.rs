@@ -2459,6 +2459,13 @@ enum Cmd {
         /// Print this many proposals to stderr for a quick eyeball (0 = none).
         #[arg(long, default_value_t = 0)]
         sample: usize,
+        /// Also publish the report to the versioned board doc `dreams/<scope>` (the librarian's review
+        /// surface) and print a `DREAM-NEW` signal when a run surfaces new proposals. Requires --scope.
+        #[arg(long)]
+        publish_board: bool,
+        /// Path to the board-memory CLI (used by --publish-board).
+        #[arg(long, default_value = "board-memory")]
+        board_memory: String,
     },
     /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
     /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
@@ -2652,9 +2659,11 @@ fn main() {
                 std::process::exit(code);
             }
         }
-        Cmd::DreamAnalyze { corpus, from_board, scope, board_api, out, sample } => {
+        Cmd::DreamAnalyze { corpus, from_board, scope, board_api, out, sample, publish_board, board_memory } => {
             let api = board_api.unwrap_or_else(board::Board::base_url);
-            let code = dream::analyze_cmd(corpus.as_deref(), from_board, scope.as_deref(), &api, &out, sample);
+            let code = dream::analyze_cmd(
+                corpus.as_deref(), from_board, scope.as_deref(), &api, &out, sample, publish_board, &board_memory,
+            );
             if code != 0 {
                 std::process::exit(code);
             }

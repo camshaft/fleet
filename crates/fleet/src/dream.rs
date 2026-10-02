@@ -948,6 +948,176 @@ fn load_corpus_from_board(board_api: &str, scope: &str) -> Result<Vec<Rec>, Stri
     Ok(recs)
 }
 
+/// Normalize text to the board's ASCII-only content rule (the board 400s on any non-ASCII char): apply the
+/// board's suggested substitutions (em/en dash, curly quotes, ellipsis, arrows) then drop any other
+/// non-ASCII. Keeps a published dream doc from being rejected for a stray Unicode char in a memory rationale.
+fn to_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{2014}' | '\u{2013}' => out.push('-'),
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            '\u{201C}' | '\u{201D}' => out.push('"'),
+            '\u{2026}' => out.push_str("..."),
+            '\u{2192}' => out.push_str("->"),
+            '\u{2190}' => out.push_str("<-"),
+            c if c.is_ascii() => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A stable fingerprint of a proposal's SUBSTANCE (its `proposed_change`): the dedup key for "materially
+/// changed". The proposal_id is already content-derived for most kinds, but a write-later advisory keeps its
+/// id (hashed from the memory path) while its slug list can shift -- the fingerprint catches that. Pure.
+fn proposal_fingerprint(p: &Value) -> String {
+    let pc = p.get("proposed_change").cloned().unwrap_or(Value::Null);
+    let s = serde_json::to_string(&pc).unwrap_or_default();
+    sha256_hex(&s)[..16].to_string()
+}
+
+/// Parse the machine-tracked `dream-state` block from a prior published doc body: a map
+/// `proposal_id -> (fingerprint, disposition)`. Absent/garbled block => empty (treated as a first run). Pure.
+fn parse_dream_state(body: &str) -> HashMap<String, (String, String)> {
+    let mut m = HashMap::new();
+    let Some(start) = body.find("<!-- dream-state") else { return m };
+    let after = &body[start..];
+    let Some(nl) = after.find('\n') else { return m };
+    let rest = &after[nl + 1..];
+    let Some(end) = rest.find("-->") else { return m };
+    let json_str = rest[..end].trim();
+    if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(json_str) {
+        for (id, v) in o {
+            let h = v.get("hash").and_then(Value::as_str).unwrap_or("").to_string();
+            let d = v.get("disposition").and_then(Value::as_str).unwrap_or("new").to_string();
+            m.insert(id, (h, d));
+        }
+    }
+    m
+}
+
+/// Render the review-surface markdown for a dream-report (sectioned, each proposal with id / confidence /
+/// evidence / carried disposition) plus the trailing machine-tracked `dream-state` block. `state` is the
+/// per-proposal `(id, fingerprint, disposition)` to record. Pure.
+fn render_dream_doc(scope: &str, report: &Value, state: &[(String, String, String)]) -> String {
+    let disp: HashMap<&str, &str> = state.iter().map(|(id, _, d)| (id.as_str(), d.as_str())).collect();
+    let empty = Vec::new();
+    let proposals = report.get("proposals").and_then(Value::as_array).unwrap_or(&empty);
+    let mut out = String::new();
+    out.push_str(&format!("# dream: {scope}\n\n"));
+    out.push_str(&format!(
+        "Propose-only dream-report (v-agent-memory, automatic pass). Apply via the human-gated dream-apply lane; nothing here is auto-applied. Corpus {} memories, {} proposals.\n",
+        report.get("corpus_size").and_then(Value::as_u64).unwrap_or(0),
+        proposals.len()
+    ));
+    for (sec, title) in [
+        ("actionable", "## Actionable"),
+        ("cross_repo_twin", "## Cross-repo twins"),
+        ("fyi", "## FYI (write-later advisories)"),
+    ] {
+        let in_sec: Vec<&Value> = proposals
+            .iter()
+            .filter(|p| p.get("section").and_then(Value::as_str) == Some(sec))
+            .collect();
+        if in_sec.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{title}\n"));
+        for p in in_sec {
+            let id = p.get("proposal_id").and_then(Value::as_str).unwrap_or("?");
+            let kind = p.get("kind").and_then(Value::as_str).unwrap_or("?");
+            let conf = p.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+            let d = disp.get(id).copied().unwrap_or("new");
+            out.push_str(&format!("\n### {id}  ({kind}, confidence {conf})  [disposition: {d}]\n"));
+            if let Some(r) = p.get("rationale").and_then(Value::as_str) {
+                out.push_str(r);
+                out.push('\n');
+            }
+            let paths: Vec<&str> = p
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|t| t.get("path").and_then(Value::as_str)).collect())
+                .unwrap_or_default();
+            if !paths.is_empty() {
+                out.push_str(&format!("Targets: {}\n", paths.join(", ")));
+            }
+        }
+    }
+    // Machine-tracked state block: set a disposition to accepted|declined|deferred to stop it re-notifying.
+    let state_obj: serde_json::Map<String, Value> = state
+        .iter()
+        .map(|(id, h, d)| (id.clone(), json!({ "hash": h, "disposition": d })))
+        .collect();
+    let state_json = serde_json::to_string(&Value::Object(state_obj)).unwrap_or_else(|_| "{}".into());
+    out.push_str("\n<!-- dream-state v1 (machine-tracked; set a disposition to accepted|declined|deferred to stop a proposal re-notifying)\n");
+    out.push_str(&state_json);
+    out.push_str("\n-->\n");
+    out
+}
+
+/// Run the `board-memory` shim with `args` and an optional stdin body.
+fn run_board_memory(bin: &str, args: &[&str], stdin: Option<&str>) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
+    let mut child = cmd.spawn()?;
+    if let Some(body) = stdin {
+        child.stdin.take().expect("stdin piped").write_all(body.as_bytes())?;
+    }
+    child.wait_with_output()
+}
+
+/// Publish the dream-report to the versioned board doc `dreams/<scope>` (via the board-memory shim),
+/// carrying the librarian's prior dispositions forward by stable id+fingerprint so a declined/deferred
+/// proposal never re-notifies. Returns `(new_count, new_ids)` -- the notify-on-new signal. A proposal is NEW
+/// when its id is unseen OR its fingerprint changed (materially different). Mutating the live board, so it
+/// runs only under `--publish-board`.
+fn publish_board(scope: &str, report: &Value, bin: &str) -> Result<(usize, Vec<String>), String> {
+    let doc_path = format!("dreams/{scope}");
+    // Read the prior doc (if any) to recover dispositions. A missing doc (exit 4) => empty prior.
+    let prior_body = match run_board_memory(bin, &["get", "--path", &doc_path], None) {
+        Ok(o) if o.status.success() => {
+            let v: Value = serde_json::from_slice(&o.stdout).unwrap_or(Value::Null);
+            v.get("body").and_then(Value::as_str).unwrap_or("").to_string()
+        }
+        Ok(_) => String::new(), // no prior doc
+        Err(e) => return Err(format!("board-memory get failed to spawn: {e}")),
+    };
+    let prior = parse_dream_state(&prior_body);
+
+    let empty = Vec::new();
+    let proposals = report.get("proposals").and_then(Value::as_array).unwrap_or(&empty);
+    let mut state: Vec<(String, String, String)> = Vec::with_capacity(proposals.len());
+    let mut new_ids: Vec<String> = Vec::new();
+    for p in proposals {
+        let id = p.get("proposal_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let fp = proposal_fingerprint(p);
+        match prior.get(&id) {
+            Some((prior_fp, disp)) if *prior_fp == fp => state.push((id, fp, disp.clone())),
+            _ => {
+                new_ids.push(id.clone());
+                state.push((id, fp, "new".to_string()));
+            }
+        }
+    }
+
+    let body = to_ascii(&render_dream_doc(scope, report, &state));
+    let name = format!("dream: {scope}");
+    let args = [
+        "write", "--path", &doc_path, "--name", &name, "--type", "reference", "--tags", "dream-report",
+        "--author", "v-agent-memory",
+    ];
+    match run_board_memory(bin, &args, Some(&body)) {
+        Ok(o) if o.status.success() => Ok((new_ids.len(), new_ids)),
+        Ok(o) => Err(format!("board-memory write failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Err(format!("board-memory write failed to spawn: {e}")),
+    }
+}
+
 /// Section + rank the proposals for the librarian's review surface: tag each with a `section` -- `actionable`
 /// (within-repo merges + orphan add-links), `cross_repo_twin` (the distinct cross-cutting twins), or `fyi`
 /// (the low-confidence write-later advisories) -- then order by section (actionable, then twins, then FYI),
@@ -1001,6 +1171,7 @@ fn rank_and_section(proposals: &mut [Value]) -> (usize, usize, usize) {
 /// Run the dream analyzer and write the dream-report JSON to `out`. The corpus comes from either a `--corpus`
 /// JSONL file or, when `from_board` is set, a live-board pull of `scope` (a wiki path prefix). Returns the
 /// process exit code; `sample` prints that many proposals to stderr for a quick eyeball.
+#[allow(clippy::too_many_arguments)]
 pub fn analyze_cmd(
     corpus: Option<&Path>,
     from_board: bool,
@@ -1008,6 +1179,8 @@ pub fn analyze_cmd(
     board_api: &str,
     out: &Path,
     sample: usize,
+    publish_board_doc: bool,
+    board_memory: &str,
 ) -> i32 {
     let recs = if from_board {
         let Some(scope) = scope else {
@@ -1092,6 +1265,28 @@ pub fn analyze_cmd(
         report["proposal_count"]
     );
     eprintln!("report: {}", out.display());
+
+    // Publish to the versioned board doc dreams/<scope> + emit the notify-on-new signal (automatic dreaming).
+    if publish_board_doc {
+        let Some(scope) = scope else {
+            eprintln!("dream-analyze: --publish-board requires --scope (the dreams/<scope> doc path)");
+            return 2;
+        };
+        match publish_board(scope, &report, board_memory) {
+            Ok((new_count, new_ids)) => {
+                eprintln!("published: dreams/{scope} ({new_count} new proposal(s))");
+                // The scheduler notifies the librarian on this stdout signal, ONLY when new>0.
+                if new_count > 0 {
+                    println!("DREAM-NEW scope={scope} new={new_count} ids={}", new_ids.join(","));
+                }
+            }
+            Err(e) => {
+                eprintln!("publish failed: {e}");
+                return 1;
+            }
+        }
+    }
+
     if sample > 0 && let Some(arr) = report["proposals"].as_array() {
         for p in arr.iter().take(sample) {
             let s = p.to_string();
@@ -1282,6 +1477,36 @@ mod tests {
             .collect();
         let props = detect_near_duplicates(&recs, &HashMap::new(), &backlinks, &exact);
         assert!(props.is_empty(), "exact-dup pair is skipped by the near-dup detector");
+    }
+
+    #[test]
+    fn dream_state_round_trips_through_render_and_parse() {
+        let report = json!({
+            "corpus_size": 3,
+            "proposals": [
+                {"proposal_id":"dp-x-1","kind":"near_duplicate","confidence":1.0,"section":"actionable",
+                 "rationale":"two memories share a body","targets":[{"path":"repos/r/a"},{"path":"repos/r/b"}]}
+            ]
+        });
+        let state = vec![("dp-x-1".to_string(), "abc123def456".to_string(), "declined".to_string())];
+        let body = render_dream_doc("repos/r", &report, &state);
+        // Rendered doc shows the section + the carried disposition inline.
+        assert!(body.contains("## Actionable"));
+        assert!(body.contains("[disposition: declined]"));
+        assert!(body.contains("Targets: repos/r/a, repos/r/b"));
+        // The machine state block round-trips back to the same (fingerprint, disposition).
+        let parsed = parse_dream_state(&body);
+        assert_eq!(parsed.get("dp-x-1"), Some(&("abc123def456".to_string(), "declined".to_string())));
+        // A body with no state block parses empty (first run).
+        assert!(parse_dream_state("# just a doc, no state").is_empty());
+    }
+
+    #[test]
+    fn proposal_fingerprint_is_stable_and_tracks_substance() {
+        let a = json!({"proposed_change": {"op":"merge","diff":{"survivor_path":"x"}}});
+        let b = json!({"proposed_change": {"op":"merge","diff":{"survivor_path":"y"}}});
+        assert_eq!(proposal_fingerprint(&a), proposal_fingerprint(&a)); // stable
+        assert_ne!(proposal_fingerprint(&a), proposal_fingerprint(&b)); // changes with the diff
     }
 
     #[test]
