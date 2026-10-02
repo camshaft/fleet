@@ -110,16 +110,45 @@ fn agent_is_launch_gated(md: Option<&serde_json::Value>) -> bool {
     .unwrap_or(false)
 }
 
-/// task_1144: a successful spin-up launch SATISFIES an agent's one-time bringup gate. `metadata.launch_gated` /
-/// `launch_gated_on` describe what an agent waited on before its FIRST launch (e.g. frank's "daemon mention-wake
-/// wiring"); the marker is set at mint but was never cleared once the agent went live, so a now-running
-/// production agent still read as launch-gated ([`agent_is_launch_gated`]) and was wrongly HELD out of a mass
-/// reconstitution — `spin-up-all` / `up-board` dropped `frank` on a reboot. Clearing the gate on launch makes
-/// the next reconstitution bring the agent back while a genuinely-never-launched gated agent (its marker still
-/// set) stays held. Returns the metadata-merge patch clearing both markers when either is set, else `None`
-/// (idempotent — once cleared it never re-writes). Pure — unit-tested.
-fn launch_gate_clear_patch(md: Option<&serde_json::Value>) -> Option<serde_json::Value> {
-    agent_is_launch_gated(md).then(|| serde_json::json!({ "launch_gated": false, "launch_gated_on": null }))
+/// task_1178: the version of the fleet-wide comms norms the kickoff carries — the operator-comms-via-concierge
+/// clause (do not DM a human identity) and the operator-block-needs-a-question clause. [`build_kickoff`] bakes
+/// both into every agent's boot prompt, and [`launch_metadata_patch`] stamps this version onto the agent's
+/// board record on launch, so v-task-board's seed-before-flip preflight can confirm every active agent carries
+/// the clauses (`metadata.comms_norm_ack >= 1`) before hard-rejecting a direct-to-human send (task_1164) or a
+/// questionless operator-block (task_1150). Bump when the clause materially changes.
+const COMMS_NORM_VERSION: i64 = 1;
+
+/// The metadata-merge patch applied to a board agent record on a successful spin-up launch. Two concerns:
+///
+/// 1. task_1144 — a launch SATISFIES an agent's one-time bringup gate. `metadata.launch_gated` /
+///    `launch_gated_on` describe what an agent waited on before its FIRST launch (e.g. frank's "daemon
+///    mention-wake wiring"); the marker is set at mint but was never cleared once the agent went live, so a
+///    now-running production agent still read as launch-gated ([`agent_is_launch_gated`]) and was wrongly HELD
+///    out of a mass reconstitution (`spin-up-all` / `up-board` dropped `frank`). Clearing the gate on launch
+///    makes the next reconstitution bring it back, while a genuinely-never-launched gated agent (marker still
+///    set) stays held.
+/// 2. task_1178 — the launch used the kickoff that carries the comms-norm clauses, so stamp
+///    `metadata.comms_norm_ack = COMMS_NORM_VERSION` to mark this agent carries them (v-task-board's flip
+///    preflight keys on it). Coverage builds as agents bounce onto the clause-bearing kickoff.
+///
+/// Returns `None` when nothing needs writing — no gate set AND already acked at the current version
+/// (idempotent, so a steady-state re-launch does not churn the record). Pure — unit-tested.
+fn launch_metadata_patch(md: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let gate_set = agent_is_launch_gated(md);
+    let acked = md
+        .and_then(|m| m.get("comms_norm_ack"))
+        .and_then(serde_json::Value::as_i64)
+        == Some(COMMS_NORM_VERSION);
+    if !gate_set && acked {
+        return None;
+    }
+    let mut patch = serde_json::Map::new();
+    patch.insert("comms_norm_ack".to_string(), serde_json::json!(COMMS_NORM_VERSION));
+    if gate_set {
+        patch.insert("launch_gated".to_string(), serde_json::json!(false));
+        patch.insert("launch_gated_on".to_string(), serde_json::Value::Null);
+    }
+    Some(serde_json::Value::Object(patch))
 }
 
 /// task_1037: whether an agent's charter is DEFERRED (`metadata.charter_projection == "deferred"`) — a
@@ -3051,7 +3080,7 @@ fn spin_up_workspace_kind(
     proactive_ownership: bool,
     apply: bool,
     cwd_override: Option<&str>,
-    gate_clear: Option<serde_json::Value>,
+    launch_patch: Option<serde_json::Value>,
 ) {
     let rec = match board.get_workspace_kind(kind) {
         Ok(Some(r)) => r,
@@ -3207,12 +3236,12 @@ fn spin_up_workspace_kind(
                 Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
                 Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
             }
-            // task_1144: launching satisfies a one-time bringup gate — clear it so a reconstitution includes
-            // this now-live agent instead of holding it out on a stale launch_gated_on. Idempotent + non-fatal.
-            if let Some(patch) = gate_clear {
+            // Apply the post-launch metadata patch: clears a satisfied one-time bringup gate (task_1144) and
+            // stamps the comms-norm acknowledgement (task_1178). Idempotent + non-fatal.
+            if let Some(patch) = launch_patch {
                 match board.patch_metadata(agent, patch) {
-                    Ok(()) => println!("  cleared launch gate (bringup gate satisfied — reconstitution will now include it)"),
-                    Err(e) => eprintln!("  WARN: launched but could not clear launch gate: {e}"),
+                    Ok(()) => println!("  stamped post-launch metadata (bringup gate cleared if set; comms-norm ack recorded)"),
+                    Err(e) => eprintln!("  WARN: launched but could not stamp post-launch metadata: {e}"),
                 }
             }
             // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
@@ -3324,9 +3353,10 @@ fn spin_up(agent: &str, apply: bool) {
         .clone()
         .unwrap_or_else(|| format!("{}/.fleet", std::env::var("HOME").unwrap_or_default()));
 
-    // task_1144: if this agent carries a one-time bringup gate, launching it satisfies the gate — compute the
-    // clear patch now (while the agent's own metadata is in hand) to apply after a successful launch below.
-    let gate_clear = launch_gate_clear_patch(Some(&md));
+    // Compute the post-launch metadata patch now, while the agent's own metadata is in hand, to apply after a
+    // successful launch below: clears a satisfied one-time bringup gate (task_1144) and stamps the comms-norm
+    // acknowledgement (task_1178).
+    let launch_patch = launch_metadata_patch(Some(&md));
 
     // A board-defined custom workspace kind (metadata.workspace_kind) takes precedence over `repos`: the
     // board resource named by the kind carries a setup_script that materializes the workspace and a
@@ -3351,7 +3381,7 @@ fn spin_up(agent: &str, apply: bool) {
             proactive_ownership,
             apply,
             cwd_override.as_deref(),
-            gate_clear,
+            launch_patch,
         );
     }
 
@@ -3542,13 +3572,13 @@ fn spin_up(agent: &str, apply: bool) {
                 Ok(()) => println!("  stamped metadata.native=true (board-native roster marker)"),
                 Err(e) => eprintln!("  WARN: launched but could not stamp native flag: {e}"),
             }
-            // task_1144: the launch satisfied any one-time bringup gate — clear it so a later reconstitution
-            // (spin-up-all / up-board) includes this now-live agent instead of holding it out on a stale
-            // launch_gated_on (the frank drop). Idempotent + non-fatal.
-            if let Some(patch) = gate_clear {
+            // Apply the post-launch metadata patch: clears a satisfied one-time bringup gate (task_1144, the
+            // frank drop) so a later reconstitution (spin-up-all / up-board) includes this now-live agent, and
+            // stamps the comms-norm acknowledgement (task_1178). Idempotent + non-fatal.
+            if let Some(patch) = launch_patch {
                 match board.patch_metadata(agent, patch) {
-                    Ok(()) => println!("  cleared launch gate (bringup gate satisfied — reconstitution will now include it)"),
-                    Err(e) => eprintln!("  WARN: launched but could not clear launch gate: {e}"),
+                    Ok(()) => println!("  stamped post-launch metadata (bringup gate cleared if set; comms-norm ack recorded)"),
+                    Err(e) => eprintln!("  WARN: launched but could not stamp post-launch metadata: {e}"),
                 }
             }
             // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
@@ -3626,7 +3656,13 @@ fn build_kickoff(
              YOU, never '{op}' — with blocked_on naming kind=operator and a note on what you need; the \
              dashboard '{op}' reads is the blocked_on=operator FILTER, so it surfaces there without you \
              giving up ownership. NEVER assign the task to '{op}'. When '{op}' answers, clear the block and \
-             continue — no reassignment, since you never gave ownership up."
+             continue — no reassignment, since you never gave ownership up. OPERATOR-BLOCK NEEDS A QUESTION \
+             (task_1150): to set blocked_on=operator you MUST first attach an actual ask — pose_question with \
+             routed_to=operator and blocking=true for the decision you need — THEN set blocked_on=operator; a \
+             bare operator-block with no open routed question is NOT a valid block. OPERATOR COMMS GO THROUGH \
+             CONCIERGE (task_1164): do NOT send_message or DM a human identity directly (including '{op}') — a \
+             person's inbox is unmonitored, so your message is NOT seen; to reach the operator, pose_question \
+             with routed_to=operator for a decision, or hand it to concierge."
         ),
         None => String::new(),
     };
@@ -3750,6 +3786,10 @@ fn build_kickoff(
          another agent's trace or diagnosis of a service you do NOT own, first confirm the exact command with \
          that service's OWNER (the authority on their live unit); if the owner cannot confirm in time, mark it \
          OWNER-UNCONFIRMED so the operator double-checks — partial visibility can read a stale unit as live. \
+         SHELL SAFETY (task_1107): never `pkill -f` / `pgrep -f` a pattern that can appear in your OWN argv — \
+         it self-matches the issuing shell and silently kills it (exit 143/144, no output) and has corrupted a \
+         live operation; use `fleet safe-pkill` (it excludes your pid, ancestors, and process group), or kill \
+         by a captured PID, and note that `timeout` already bounds a foreground process. \
          SHARED-TASK COORDINATION (task_565): when an escalation (e.g. an anti-stall judgment-check) flags a \
          dangling spin-off or follow-on on a SHARED task that has a LIVE owner, the OWNER files the spin-off — \
          a coordinator files only if the owner is absent/stalled or has not acted within a beat; never have \
@@ -12476,6 +12516,40 @@ mod tests {
     }
 
     #[test]
+    fn build_kickoff_carries_the_comms_norms_and_shell_safety_clauses() {
+        // task_1178: every agent's kickoff carries the two comms norms the hard-reject flips enforce
+        // (seed == enforce), and task_1107: the pkill self-match shell-safety line.
+        let k = build_kickoff("v-x", "/wt/x", "30m", Some("op-x"), false, false);
+        // task_1164: do not DM a human identity; reach the operator via a routed question or concierge.
+        assert!(
+            k.contains("OPERATOR COMMS GO THROUGH CONCIERGE")
+                && k.contains("do NOT send_message or DM a human identity"),
+            "carries the operator-comms-via-concierge clause"
+        );
+        assert!(
+            k.contains("routed_to=operator"),
+            "names the pose_question(routed_to=operator) path to the operator"
+        );
+        // task_1150: an operator-block must carry an open routed question first.
+        assert!(
+            k.contains("OPERATOR-BLOCK NEEDS A QUESTION") && k.contains("bare operator-block"),
+            "carries the operator-block-needs-a-question clause"
+        );
+        // task_1107: the pkill/pgrep self-match shell-safety line + the safe-pkill pointer.
+        assert!(k.contains("SHELL SAFETY"), "carries the shell-safety clause");
+        assert!(
+            k.contains("fleet safe-pkill"),
+            "points at the safe-pkill helper instead of raw pkill -f"
+        );
+        // Reactive + proactive variants carry them too (the clauses are outside the tick-mode branch).
+        for (reactive, proactive) in [(true, false), (false, true)] {
+            let v = build_kickoff("v-y", "/wt/y", "30m", Some("op-x"), reactive, proactive);
+            assert!(v.contains("OPERATOR COMMS GO THROUGH CONCIERGE"));
+            assert!(v.contains("SHELL SAFETY"));
+        }
+    }
+
+    #[test]
     fn build_kickoff_proactive_ownership_forces_a_work_accomplished_sleep_gate() {
         // task_1138: a proactive-ownership agent's kickoff must FORBID idling until a work-accomplished gate,
         // overriding the work-conserving idle-when-no-task default — the loop is the lever, not charter prose.
@@ -17544,17 +17618,19 @@ detached
     }
 
     #[test]
-    fn launch_gate_clear_patch_clears_a_set_gate_and_is_a_no_op_otherwise() {
-        // task_1144: a launch clears whichever gate marker is set, so a now-live agent (frank) is no longer
-        // held out of a reconstitution. The patch sets launch_gated=false AND launch_gated_on=null, which
-        // drives agent_is_launch_gated to false regardless of which marker (or both) was set.
+    fn launch_metadata_patch_stamps_comms_ack_and_clears_a_set_gate() {
+        // task_1178 + task_1144: a launch always stamps comms_norm_ack to the current version (unless already
+        // there), and when a bringup gate is set it ALSO clears both gate markers so a now-live agent (frank)
+        // is not held out of a reconstitution.
         for set in [
             serde_json::json!({"launch_gated_on": "daemon mention-wake wiring"}),
             serde_json::json!({"launch_gated": true}),
             serde_json::json!({"launch_gated": true, "launch_gated_on": "x"}),
         ] {
-            let patch = launch_gate_clear_patch(Some(&set)).expect("a set gate yields a clear patch");
-            assert_eq!(patch, serde_json::json!({"launch_gated": false, "launch_gated_on": null}));
+            let patch = launch_metadata_patch(Some(&set)).expect("a set gate yields a patch");
+            assert_eq!(patch["launch_gated"], serde_json::json!(false));
+            assert_eq!(patch["launch_gated_on"], serde_json::Value::Null);
+            assert_eq!(patch["comms_norm_ack"], serde_json::json!(COMMS_NORM_VERSION));
             // Applying the patch (metadata merge) makes the agent read as not-gated.
             let mut merged = set.clone();
             for (k, v) in patch.as_object().unwrap() {
@@ -17562,11 +17638,29 @@ detached
             }
             assert!(!agent_is_launch_gated(Some(&merged)), "cleared gate must read as not-gated");
         }
-        // Idempotent: no gate set (or already cleared) yields no patch, so no spurious write.
-        assert!(launch_gate_clear_patch(None).is_none());
-        assert!(launch_gate_clear_patch(Some(&serde_json::json!({}))).is_none());
-        assert!(launch_gate_clear_patch(Some(&serde_json::json!({"launch_gated": false}))).is_none());
-        assert!(launch_gate_clear_patch(Some(&serde_json::json!({"launch_gated": false, "launch_gated_on": null}))).is_none());
+        // No gate, not yet acked: the patch stamps ONLY the comms ack (no gate keys).
+        assert_eq!(
+            launch_metadata_patch(Some(&serde_json::json!({}))),
+            Some(serde_json::json!({"comms_norm_ack": COMMS_NORM_VERSION})),
+            "an un-acked agent with no gate is stamped with the ack"
+        );
+        // No metadata at all is still stamped (an agent record may carry none yet).
+        assert_eq!(
+            launch_metadata_patch(None),
+            Some(serde_json::json!({"comms_norm_ack": COMMS_NORM_VERSION}))
+        );
+        // Idempotent: already acked at the current version AND no gate set -> no patch (no churn on re-launch).
+        assert!(
+            launch_metadata_patch(Some(&serde_json::json!({"comms_norm_ack": COMMS_NORM_VERSION}))).is_none(),
+            "a steady-state re-launch of an acked, ungated agent writes nothing"
+        );
+        // Already acked but a gate is set -> still patches (the gate must clear), keeping the ack.
+        let gated_acked = launch_metadata_patch(Some(&serde_json::json!({
+            "comms_norm_ack": COMMS_NORM_VERSION, "launch_gated": true
+        })))
+        .expect("a set gate yields a patch even when already acked");
+        assert_eq!(gated_acked["launch_gated"], serde_json::json!(false));
+        assert_eq!(gated_acked["comms_norm_ack"], serde_json::json!(COMMS_NORM_VERSION));
     }
 
     #[test]
