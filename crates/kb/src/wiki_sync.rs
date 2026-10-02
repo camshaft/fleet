@@ -199,6 +199,14 @@ pub async fn ingest_document(
         let dim = embed::dim()?;
         store.ensure_collection(&collection, dim).await?;
 
+        // The shared per-document payload, assembled once and merged into each chunk.
+        let meta = doc_meta(
+            doc_id,
+            &path,
+            &doc.title,
+            doc.version_id,
+            doc.current_version_cid.as_deref(),
+        );
         let points: Vec<(String, Vec<f32>, Map<String, Value>)> = chunks
             .into_iter()
             .zip(vectors)
@@ -207,17 +215,7 @@ pub async fn ingest_document(
                 (
                     point_id(&path, idx),
                     vector,
-                    chunk_payload(
-                        cfg,
-                        &doc_meta(
-                            doc_id,
-                            &path,
-                            &doc.title,
-                            doc.current_version_cid.as_deref(),
-                        ),
-                        &text,
-                        idx,
-                    ),
+                    chunk_payload(cfg, &meta, &text, idx),
                 )
             })
             .collect();
@@ -255,12 +253,72 @@ pub async fn remove_document(
     Ok(old_count)
 }
 
+/// One reconcile pass over the board wiki: (re)ingest every approved, in-scope document whose current version
+/// is not already present, skipping unchanged docs. This is both the first-run backfill and the ongoing drift
+/// catch-up. The scope gate is applied from the wiki INDEX (one `list_wiki` call) so only a changed or new
+/// approved doc incurs a body fetch + embed; an already-ingested doc is detected by matching the stored
+/// `version_id` on its chunk 0 against the index's `current_version_id`. Returns (ingested, scanned).
+pub async fn reconcile(
+    docs: &board::Documents,
+    store: &store::Store,
+) -> Result<(usize, usize), String> {
+    let collection = &config::get().wiki_collection;
+    let entries = docs.list_wiki(None).await?;
+    let scanned = entries.len();
+    let mut ingested = 0usize;
+    for e in entries {
+        // Scope gate straight off the index: an approved version + a path not under the excluded tree.
+        if !in_scope(e.path.as_deref(), e.has_approved_version()) {
+            continue;
+        }
+        let path = e.path.as_deref().expect("in_scope requires a path");
+        // Skip if chunk 0 is already present at this version (the cheap change check — no body fetch).
+        if let Some(c) = store.get_point(collection, &point_id(path, 0)).await? {
+            let stored = c.payload.get("version_id").and_then(Value::as_i64);
+            if stored.is_some() && stored == e.current_version_id {
+                continue;
+            }
+        }
+        match ingest_document(docs, store, e.id).await {
+            Ok(Some(n)) => {
+                ingested += 1;
+                tracing::info!("wiki_sync: ingested {path} (doc {}, {n} chunks)", e.id);
+            }
+            Ok(None) => {} // raced out of scope between the index read and the fetch
+            Err(err) => tracing::warn!("wiki_sync: ingest {path} (doc {}) failed: {err}", e.id),
+        }
+    }
+    Ok((ingested, scanned))
+}
+
+/// Run the board-wiki -> KB auto-sync worker (`kb wiki-sync`): an initial backfill then a reconcile poll on
+/// the configured interval. A reactive doc-event webhook path (cutting freshness latency from the poll
+/// interval to instant via [`classify`]) is a follow-on; the poll is the robust core and the sole backstop
+/// while cross-host webhook wake is unreliable (task_1047).
+pub async fn run() -> Result<(), String> {
+    let docs = board::Documents::connect();
+    let store = store::Store::connect()?;
+    let poll = config::get().pipeline_poll_secs.max(60);
+    let collection = config::get().wiki_collection.clone();
+    tracing::info!("kb wiki-sync: reconcile poll every {poll}s into '{collection}'");
+    loop {
+        match reconcile(&docs, &store).await {
+            Ok((ingested, scanned)) => tracing::info!(
+                "wiki_sync: reconcile done ({ingested} (re)ingested / {scanned} wiki docs scanned)"
+            ),
+            Err(e) => tracing::warn!("wiki_sync: reconcile pass failed: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
+    }
+}
+
 /// The per-document payload fields shared by every chunk (identity + provenance + citation): assembled once
 /// per ingest and merged into each chunk's `base_payload`.
 fn doc_meta(
     doc_id: i64,
     path: &str,
     title: &Option<String>,
+    version_id: Option<i64>,
     version_cid: Option<&str>,
 ) -> Map<String, Value> {
     let mut m = Map::new();
@@ -270,6 +328,10 @@ fn doc_meta(
     m.insert("page".into(), Value::from(PAGE));
     if let Some(t) = title {
         m.insert("title".into(), Value::from(t.as_str()));
+    }
+    // The change key a reconcile pass reads off chunk 0 to skip a doc already ingested at this version.
+    if let Some(vid) = version_id {
+        m.insert("version_id".into(), Value::from(vid));
     }
     if let Some(cid) = version_cid {
         m.insert("version_cid".into(), Value::from(cid));
@@ -416,6 +478,7 @@ mod tests {
             3354,
             "charters/v-nix",
             &Some("Charter: v-nix".to_string()),
+            Some(5190),
             Some("QmAbc"),
         );
         let p = chunk_payload(&cfg, &meta, "the chunk text", 2);
@@ -428,6 +491,7 @@ mod tests {
         assert_eq!(p.get("path").unwrap(), "charters/v-nix");
         assert_eq!(p.get("page").unwrap(), 0);
         assert_eq!(p.get("title").unwrap(), "Charter: v-nix");
+        assert_eq!(p.get("version_id").unwrap(), 5190);
         assert_eq!(p.get("version_cid").unwrap(), "QmAbc");
         // curation defaults from base_payload: kind=doc (authority 0.8), active
         assert_eq!(p.get("kind").unwrap(), "doc");
@@ -437,9 +501,10 @@ mod tests {
 
     #[test]
     fn doc_meta_omits_absent_title_and_cid() {
-        let m = doc_meta(7, "tenets/x", &None, None);
+        let m = doc_meta(7, "tenets/x", &None, None, None);
         assert_eq!(m.get("source_doc").unwrap(), "doc_7");
         assert!(!m.contains_key("title"));
+        assert!(!m.contains_key("version_id"));
         assert!(!m.contains_key("version_cid"));
     }
 

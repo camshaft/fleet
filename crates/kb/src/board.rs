@@ -18,12 +18,24 @@ pub fn connect(agent_id: impl Into<String>) -> Board {
     Board::with_base(&crate::config::get().board_url, agent_id)
 }
 
-/// One board wiki-index entry (`GET /wiki`): the document id and its filed wiki path. The index carries more,
-/// but the wiki-sync reconcile pass only needs the id (to fetch) and the path (for the scope gate).
+/// One board wiki-index entry (`GET /wiki`). The index carries enough for the reconcile pass to decide what
+/// to (re)ingest WITHOUT a per-doc fetch: the id, path, approval status, and the current version id (the
+/// cheap change key — a bump means re-ingest). Only a changed/new approved doc then needs a body fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WikiEntry {
     pub id: i64,
     pub path: Option<String>,
+    pub status: Option<String>,
+    pub approved_version_id: Option<i64>,
+    pub current_version_id: Option<i64>,
+}
+
+impl WikiEntry {
+    /// Whether the entry has an approved version — the wiki-sync scope gate (approval admits a doc into the
+    /// KB board-wiki collection). True when `approved_version_id` is set or `status == "approved"`.
+    pub fn has_approved_version(&self) -> bool {
+        self.approved_version_id.is_some() || self.status.as_deref() == Some("approved")
+    }
 }
 
 /// A board document (`GET /documents/{id}`), reduced to what the wiki-sync connector needs: identity + path +
@@ -37,6 +49,9 @@ pub struct Document {
     /// Whether the document has an approved version (`approved_version_id` present / `status == "approved"`).
     /// This is the wiki-sync scope gate — approval is what admits a doc into the KB board-wiki collection.
     pub has_approved_version: bool,
+    /// The current version id — the change key stamped into each point's payload so a reconcile pass can skip
+    /// a doc whose current version is already ingested (matches the wiki index's `current_version_id`).
+    pub version_id: Option<i64>,
     /// The current version's markdown, present only when fetched with `include_body=true`.
     pub body: Option<String>,
     /// The current version's content id, used to stamp provenance / detect an unchanged re-ingest.
@@ -62,7 +77,16 @@ pub fn parse_wiki_index(v: &Value) -> Vec<WikiEntry> {
                 .filter_map(|it| {
                     let id = id_as_i64(it.get("id")?)?;
                     let path = it.get("path").and_then(Value::as_str).map(str::to_string);
-                    Some(WikiEntry { id, path })
+                    let status = it.get("status").and_then(Value::as_str).map(str::to_string);
+                    let approved_version_id = it.get("approved_version_id").and_then(Value::as_i64);
+                    let current_version_id = it.get("current_version_id").and_then(Value::as_i64);
+                    Some(WikiEntry {
+                        id,
+                        path,
+                        status,
+                        approved_version_id,
+                        current_version_id,
+                    })
                 })
                 .collect()
         })
@@ -85,12 +109,22 @@ pub fn parse_document(v: &Value) -> Option<Document> {
         .and_then(|cv| cv.get("cid"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Prefer the top-level `current_version_id`; fall back to `current_version.id`.
+    let version_id = v
+        .get("current_version_id")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            v.get("current_version")
+                .and_then(|cv| cv.get("id"))
+                .and_then(Value::as_i64)
+        });
     Some(Document {
         id,
         path: v.get("path").and_then(Value::as_str).map(str::to_string),
         title: v.get("title").and_then(Value::as_str).map(str::to_string),
         status,
         has_approved_version: approved,
+        version_id,
         body: v.get("body").and_then(Value::as_str).map(str::to_string),
         current_version_cid,
     })
@@ -164,23 +198,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn wiki_index_reads_id_and_path_skips_idless() {
+    fn wiki_index_reads_fields_approval_and_skips_idless() {
         let v = json!([
-            {"id": 3354, "path": "charters/v-nix", "title": "x"},
-            {"id": "3357", "path": "reference/membrain-metrics"}, // numeric string id
-            {"path": "no-id-entry"},                               // skipped
+            {"id": 3354, "path": "charters/v-nix", "status": "approved",
+             "approved_version_id": 5172, "current_version_id": 5172},
+            {"id": "3357", "path": "reference/membrain-metrics", "status": "draft",
+             "approved_version_id": null, "current_version_id": 5174}, // numeric string id
+            {"path": "no-id-entry"},                                   // skipped
         ]);
         let rows = parse_wiki_index(&v);
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0],
-            WikiEntry {
-                id: 3354,
-                path: Some("charters/v-nix".into())
-            }
-        );
+        assert_eq!(rows[0].id, 3354);
+        assert_eq!(rows[0].path.as_deref(), Some("charters/v-nix"));
+        assert!(rows[0].has_approved_version()); // approved_version_id set
+        assert_eq!(rows[0].current_version_id, Some(5172));
         assert_eq!(rows[1].id, 3357);
-        assert_eq!(rows[1].path.as_deref(), Some("reference/membrain-metrics"));
+        assert!(!rows[1].has_approved_version()); // draft, null approved_version_id
+        assert_eq!(rows[1].current_version_id, Some(5174));
     }
 
     #[test]
@@ -192,7 +226,7 @@ mod tests {
     fn document_approved_via_approved_version_id() {
         let v = json!({
             "id": 3354, "path": "charters/v-nix", "title": "Charter",
-            "status": "in_review", "approved_version_id": 5172,
+            "status": "in_review", "approved_version_id": 5172, "current_version_id": 5190,
             "current_version": {"cid": "QmAbc"}
         });
         let d = parse_document(&v).unwrap();
@@ -200,6 +234,7 @@ mod tests {
         assert_eq!(d.path.as_deref(), Some("charters/v-nix"));
         assert!(d.has_approved_version); // approved_version_id present
         assert_eq!(d.current_version_cid.as_deref(), Some("QmAbc"));
+        assert_eq!(d.version_id, Some(5190)); // top-level current_version_id
         assert!(d.body.is_none()); // no include_body
     }
 

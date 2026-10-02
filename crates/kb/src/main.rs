@@ -103,6 +103,9 @@ enum Command {
         #[arg(long)]
         role: String,
     },
+    /// Run the board-wiki -> KB auto-sync worker (task_1089): keep the `wiki_collection` current with the
+    /// board's approved wiki docs via a reconcile poll (backfill + ongoing drift catch-up + version culling).
+    WikiSync,
 }
 
 #[tokio::main]
@@ -148,6 +151,7 @@ async fn main() {
                 }
             }),
         Command::Pipeline { role } => pipeline::run_role(&role).await,
+        Command::WikiSync => wiki_sync::run().await,
     };
 
     if let Err(e) = result {
