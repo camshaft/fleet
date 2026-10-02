@@ -130,6 +130,16 @@ where
     }
 }
 
+/// Extract the `appended` flag from an `append_review_log` response (v-task-board contract comment_5794): a NEW
+/// entry returns `{…, "appended": true}`, a duplicate `external_id` returns `{…, "appended": false}` (reusing
+/// the prior entry). This is the per-angle CLAIM verdict — `true` = the caller won the claim and should spawn,
+/// `false` = already claimed, skip. `Err` if the field is absent or non-boolean (an unexpected response shape).
+fn parse_appended(v: &Value) -> Result<bool, String> {
+    v.get("appended")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("append_review_log: no boolean `appended` in response {v}"))
+}
+
 /// A handle to the board's REST API (stateless — each call is one `GET`).
 pub struct Board {
     base: String,
@@ -415,6 +425,66 @@ impl Board {
             .map_err(|e| format!("board PATCH /tasks/{task_id} (reassign) failed: {e}"))?;
         Ok(())
     }
+
+    /// Append an entry to a review's log (`POST /reviews/{review_id}/log`) — the review-lifecycle write
+    /// primitive (v-task-board contract comment_5794). The board is idempotent on `(review_id, external_id)`:
+    /// a NEW entry returns `appended: true`, a duplicate `external_id` returns `appended: false` (reusing the
+    /// prior entry). That makes a per-angle CLAIM race-safe — append FIRST with the claim's `external_id`, then
+    /// spawn the reviewer only when this returns `true` (append-first-then-spawn, the `open_observation_task`
+    /// idempotency analog). `entry_type` is required (e.g. `adversarial_review`); `principal` attributes the
+    /// acting agent; `body`, when present, is normalized to ASCII (the board 400s on non-ASCII — see
+    /// [`to_board_ascii`]). Returns the `appended` flag. `Err` on a non-2xx response or an unexpected shape.
+    pub fn append_review_log(
+        &self,
+        review_id: i64,
+        entry_type: &str,
+        principal: &str,
+        external_id: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<bool, String> {
+        let url = format!("{}/reviews/{}/log", self.base, review_id);
+        let mut payload = serde_json::json!({ "entry_type": entry_type, "principal": principal });
+        if let Some(x) = external_id {
+            payload["external_id"] = serde_json::json!(x);
+        }
+        if let Some(b) = body {
+            payload["body"] = serde_json::json!(to_board_ascii(b));
+        }
+        let resp = self
+            .agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("user-agent", BOARD_UA)
+            .send_string(&payload.to_string())
+            .map_err(|e| format!("board POST /reviews/{review_id}/log failed: {}", status_err(e)))?;
+        let raw = resp
+            .into_string()
+            .map_err(|e| format!("board POST /reviews/{review_id}/log read failed: {e}"))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("board POST /reviews/{review_id}/log: response was not JSON: {e}"))?;
+        parse_appended(&v)
+    }
+
+    /// One review's full record (`GET /reviews/{review_id}`), INCLUDING its `log` array (entries oldest-first);
+    /// the list projection ([`list_reviews`](Self::list_reviews)) omits the log. Top-level fields:
+    /// id/kind/source/target_ref/status/vetted/title/metadata/created_by/assignee/… . `Err` on a non-2xx
+    /// response (e.g. an unknown id).
+    pub fn get_review(&self, review_id: i64) -> Result<Value, String> {
+        self.get_json(&format!("/reviews/{review_id}"))
+    }
+
+    /// Reviews filtered by `status` (`GET /reviews?status=<status>`) — the LIST projection (no `log`), returning
+    /// the `reviews` array. The adversarial-pass sweep (S2c) passes `in_review` (the state entered on
+    /// `review.opened_for_review`) and keeps only `vetted == false` client-side, since the list endpoint has no
+    /// `vetted` filter (v-task-board contract comment_5794). `Err` on a non-2xx response or an unexpected shape.
+    pub fn list_reviews(&self, status: &str) -> Result<Vec<Value>, String> {
+        let path = format!("/reviews?status={status}");
+        let v = self.get_json(&path)?;
+        v.get("reviews")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| format!("board {path}: expected a `reviews` array, got {v}"))
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +511,17 @@ mod tests {
         assert_eq!(to_board_ascii(clean), clean);
         // The result is always pure ASCII.
         assert!(to_board_ascii("mixed \u{2014}\u{1F600}\u{201C}x\u{201D}").is_ascii());
+    }
+
+    #[test]
+    fn parse_appended_reads_the_claim_verdict_from_both_response_shapes() {
+        // v-task-board contract comment_5794: a NEW append -> appended:true (won the claim, spawn), a DUP
+        // external_id -> appended:false (already claimed, skip). An absent/non-bool field is an error.
+        let new = serde_json::json!({ "review_id": 42, "entry_id": 7, "appended": true, "entry_type": "adversarial_review" });
+        assert_eq!(parse_appended(&new), Ok(true));
+        let dup = serde_json::json!({ "review_id": 42, "entry_id": 7, "appended": false });
+        assert_eq!(parse_appended(&dup), Ok(false));
+        assert!(parse_appended(&serde_json::json!({ "review_id": 42 })).is_err());
     }
 
     #[test]

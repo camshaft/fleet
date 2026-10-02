@@ -6266,6 +6266,13 @@ fn reviewer_claim_external_id(review_id: i64, angle: &str) -> String {
     format!("adversarial-claim:{review_id}:{angle}")
 }
 
+/// The log `entry_type` the per-angle spawn CLAIM is appended as (v-task-board contract comment_5794:
+/// `adversarial_review`); an `appended:true` on this entry means the claim is won.
+const REVIEW_CLAIM_ENTRY_TYPE: &str = "adversarial_review";
+/// The principal attributed to the per-angle spawn CLAIM — the orchestrator doing append-first-then-spawn,
+/// distinct from the ephemeral `reviewer` agent it launches on a won claim.
+const REVIEW_SPAWN_PRINCIPAL: &str = "reviewer-spawn";
+
 /// Whether an `obs-<target>` window that is STILL ALIVE should be reaped (task_610). A healthy in-flight
 /// observer has a RECENT spawn stamp (< bound) → never reaped. A stamp older than the bound = the observer
 /// never confirmed (`observe-record` clears the stamp on success), so it crashed/hung → reap. An ABSENT stamp
@@ -6590,12 +6597,14 @@ fn spawn_reviewer(
     }
 }
 
-/// `fleet review-spawn <review_id> [--angle <key>] [--apply]` (task_374 S2a): spawn the per-angle ephemeral
-/// adversarial reviewers for ONE review on the existing spawn engine. Dry-run by default (prints the plan);
-/// `--apply` launches. `--angle` restricts to one [`REVIEW_ANGLES`] key (default: all). This is the MANUAL
-/// entry point; the board-side idempotent per-angle CLAIM (append_review_log, [`reviewer_claim_external_id`])
-/// and the automatic `review.opened_for_review` trigger are the next slices (S2b/S2c) — so re-running `--apply`
-/// re-spawns (no claim yet), which is acceptable for an operator-invoked command and called out in its help.
+/// `fleet review-spawn <review_id> [--angle <key>] [--apply]` (task_374 S2a+S2b): spawn the per-angle ephemeral
+/// adversarial reviewers for ONE review on the existing spawn engine. Dry-run by default (prints the plan and
+/// writes nothing to the board); `--apply` CLAIMS each angle on the board first and launches only the angles it
+/// wins. `--angle` restricts to one [`REVIEW_ANGLES`] key (default: all). The S2b claim
+/// ([`reviewer_claim_external_id`] appended via [`board::Board::append_review_log`]) makes `--apply` IDEMPOTENT:
+/// a re-run's duplicate append returns `appended:false` → already claimed → skip, so re-applying never
+/// double-spawns an angle. The automatic `review.opened_for_review` trigger is the next slice (S2c); this stays
+/// the manual entry point.
 fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply: bool) {
     let angles: Vec<&(&str, &str)> = match angle {
         Some(k) => {
@@ -6616,9 +6625,49 @@ fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply:
         angles.len(),
         if apply { "" } else { " (dry-run — pass --apply to launch)" }
     );
+    // S2b: on --apply, CLAIM each angle on the board FIRST (append an `adversarial_review` log entry carrying
+    // the per-angle external_id) and spawn only when the append is NEW (appended:true). A re-sweep's duplicate
+    // append returns appended:false → already claimed → skip, so --apply is idempotent (closes the S2a
+    // "re-apply re-spawns" gap). Dry-run never touches the board.
+    let board = if apply {
+        Some(board::Board::connect().unwrap_or_else(|e| {
+            eprintln!("review-spawn: board unavailable, cannot claim ({e})");
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
     for (key, focus) in angles {
-        let label = spawn_reviewer(board_session, review_id, key, focus, !apply);
-        println!("  {key}: {label}  [claim {}]", reviewer_claim_external_id(review_id, key));
+        let claim = reviewer_claim_external_id(review_id, key);
+        match &board {
+            // Dry-run: show what would be claimed + spawned, no board writes.
+            None => {
+                let label = spawn_reviewer(board_session, review_id, key, focus, true);
+                println!("  {key}: {label}  [would claim {claim}]");
+            }
+            Some(b) => {
+                let body = format!(
+                    "adversarial-review spawn claim for review #{review_id} angle '{key}' ({focus})"
+                );
+                match b.append_review_log(
+                    review_id,
+                    REVIEW_CLAIM_ENTRY_TYPE,
+                    REVIEW_SPAWN_PRINCIPAL,
+                    Some(&claim),
+                    Some(&body),
+                ) {
+                    // Won the claim → spawn the angle's reviewer.
+                    Ok(true) => {
+                        let label = spawn_reviewer(board_session, review_id, key, focus, false);
+                        println!("  {key}: {label}  [claimed {claim}]");
+                    }
+                    // Already claimed by a prior pass → skip (idempotent re-apply).
+                    Ok(false) => println!("  {key}: already-claimed, skip  [claim {claim}]"),
+                    // Claim failed → do NOT spawn: launching without a won claim risks a duplicate reviewer.
+                    Err(e) => eprintln!("  {key}: claim FAILED, not spawning ({e})  [claim {claim}]"),
+                }
+            }
+        }
     }
 }
 
