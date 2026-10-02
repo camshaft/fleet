@@ -22,11 +22,24 @@
 // code until they land — the same staging the sibling `webhook`/`chunk` modules use.
 #![allow(dead_code)]
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use crate::{board, chunk, config, curate, embed, store};
 
 /// The payload `source` tag and id-namespace for board-wiki points. Stable and distinct from the
 /// inbox/pipeline/crate sources, so a point id is version-independent per document.
 pub const SOURCE: &str = "board-wiki";
+
+/// Payload `kind` for board-wiki points — the curated canon is documentation (authority 0.8, non-decaying).
+const KIND: &str = "doc";
+
+/// All board-wiki chunks are stamped `page = 0` (a doc is one logical unit, like the text ingest path), so a
+/// per-document scroll filtered on `page == 0` recovers exactly the doc's chunk set for the cull count.
+const PAGE: i64 = 0;
+
+/// Upper bound on a single document's chunk count when scrolling its existing points for the cull — far above
+/// any real board doc, so the scroll returns the whole set in one page.
+const MAX_DOC_CHUNKS: usize = 10_000;
 
 /// Per-repo scratch tree, excluded from the KB — approval is the gate, and these are uncurated drafts.
 const EXCLUDED_PREFIX: &str = "repos/";
@@ -142,6 +155,140 @@ pub fn stale_point_ids(
     stale_chunk_indices(old_chunk_count, new_chunk_count)
         .map(|i| point_id(wiki_path, i))
         .collect()
+}
+
+/// Ingest a document's approved version into the board-wiki collection, culling any stale tail — the Ingest
+/// arm of the connector. Fetches the doc with its body, applies the [`in_scope`] gate (returns `Ok(None)`
+/// when out of scope — a draft, an unfiled doc, or the `repos/` scratch tree), then chunks + embeds the
+/// markdown and upserts with version-independent ids ([`point_id`]) so a re-approval overwrites in place.
+/// After writing the new `[0, new)` chunks it deletes the old document's leftover `[new, old)` tail
+/// ([`stale_point_ids`]). Returns `Ok(Some(chunk_count))` when ingested, `Ok(None)` when skipped.
+pub async fn ingest_document(
+    docs: &board::Documents,
+    store: &store::Store,
+    doc_id: i64,
+) -> Result<Option<usize>, String> {
+    let doc = docs.get_document(doc_id, true).await?;
+    if !in_scope(doc.path.as_deref(), doc.has_approved_version) {
+        return Ok(None);
+    }
+    // in_scope guaranteed a path.
+    let path = doc.path.clone().expect("in_scope requires a path");
+    let body = doc.body.ok_or_else(|| {
+        format!("wiki_sync: document {doc_id} ({path}) returned no body to ingest")
+    })?;
+
+    let cfg = config::get();
+    let collection = cfg.wiki_collection.clone();
+
+    // Existing chunk count for this doc (page==0, exact path), to know what tail to cull after the rewrite.
+    let old_count = store
+        .read_pages(&collection, &path, PAGE, PAGE, MAX_DOC_CHUNKS)
+        .await?
+        .len();
+
+    let chunks = chunk::chunk_default(&body);
+    let new_count = chunks.len();
+
+    if new_count > 0 {
+        // Embed off the reactor (CPU-heavy model) — the pipeline embedder's spawn_blocking pattern (#439).
+        let texts = chunks.clone();
+        let vectors = tokio::task::spawn_blocking(move || embed::embed_docs(&texts))
+            .await
+            .map_err(|e| format!("wiki_sync: embed task panicked: {e}"))??;
+        let dim = embed::dim()?;
+        store.ensure_collection(&collection, dim).await?;
+
+        let points: Vec<(String, Vec<f32>, Map<String, Value>)> = chunks
+            .into_iter()
+            .zip(vectors)
+            .enumerate()
+            .map(|(idx, (text, vector))| {
+                (
+                    point_id(&path, idx),
+                    vector,
+                    chunk_payload(
+                        cfg,
+                        &doc_meta(
+                            doc_id,
+                            &path,
+                            &doc.title,
+                            doc.current_version_cid.as_deref(),
+                        ),
+                        &text,
+                        idx,
+                    ),
+                )
+            })
+            .collect();
+        store.upsert(&collection, &points).await?;
+    }
+
+    // Cull the shrunk tail (empty when the doc grew/stayed the same, or on a first ingest).
+    let stale = stale_point_ids(&path, old_count, new_count);
+    store.delete_points(&collection, &stale).await?;
+
+    Ok(Some(new_count))
+}
+
+/// Remove all of a document's points from the board-wiki collection — the Remove arm (archived / deleted /
+/// deprecated). Resolves the doc's path, counts its existing chunks, and deletes `point_id(path, 0..old)`.
+/// Returns the number of points removed. A doc with no resolvable path removes nothing (nothing to key on).
+pub async fn remove_document(
+    docs: &board::Documents,
+    store: &store::Store,
+    doc_id: i64,
+) -> Result<usize, String> {
+    let doc = docs.get_document(doc_id, false).await?;
+    let Some(path) = doc.path else {
+        tracing::warn!("wiki_sync: document {doc_id} has no path; nothing to remove");
+        return Ok(0);
+    };
+    let cfg = config::get();
+    let collection = cfg.wiki_collection.clone();
+    let old_count = store
+        .read_pages(&collection, &path, PAGE, PAGE, MAX_DOC_CHUNKS)
+        .await?
+        .len();
+    let ids: Vec<String> = (0..old_count).map(|i| point_id(&path, i)).collect();
+    store.delete_points(&collection, &ids).await?;
+    Ok(old_count)
+}
+
+/// The per-document payload fields shared by every chunk (identity + provenance + citation): assembled once
+/// per ingest and merged into each chunk's `base_payload`.
+fn doc_meta(
+    doc_id: i64,
+    path: &str,
+    title: &Option<String>,
+    version_cid: Option<&str>,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("source".into(), Value::from(SOURCE));
+    m.insert("source_doc".into(), Value::from(format!("doc_{doc_id}")));
+    m.insert("path".into(), Value::from(path));
+    m.insert("page".into(), Value::from(PAGE));
+    if let Some(t) = title {
+        m.insert("title".into(), Value::from(t.as_str()));
+    }
+    if let Some(cid) = version_cid {
+        m.insert("version_cid".into(), Value::from(cid));
+    }
+    m
+}
+
+/// Build one chunk's payload: the shared `doc_meta` plus this chunk's `text` and `chunk` index, stamped with
+/// the curation defaults ([`curate::base_payload`], `kind = "doc"`).
+fn chunk_payload(
+    cfg: &config::Config,
+    doc_meta: &Map<String, Value>,
+    text: &str,
+    chunk_idx: usize,
+) -> Map<String, Value> {
+    let mut extra = doc_meta.clone();
+    extra.insert("text".into(), Value::from(text));
+    extra.insert("chunk".into(), Value::from(chunk_idx as i64));
+    curate::base_payload(cfg, KIND, None, extra)
 }
 
 #[cfg(test)]
@@ -260,6 +407,40 @@ mod tests {
         assert!(stale_chunk_indices(2, 5).is_empty()); // grew: nothing stale
         assert!(stale_chunk_indices(3, 3).is_empty()); // same size: nothing stale
         assert!(stale_chunk_indices(0, 0).is_empty());
+    }
+
+    #[test]
+    fn chunk_payload_carries_identity_provenance_and_curation() {
+        let cfg = config::Config::default();
+        let meta = doc_meta(
+            3354,
+            "charters/v-nix",
+            &Some("Charter: v-nix".to_string()),
+            Some("QmAbc"),
+        );
+        let p = chunk_payload(&cfg, &meta, "the chunk text", 2);
+        // chunk-specific
+        assert_eq!(p.get("text").unwrap(), "the chunk text");
+        assert_eq!(p.get("chunk").unwrap(), 2);
+        // shared identity + provenance
+        assert_eq!(p.get("source").unwrap(), SOURCE);
+        assert_eq!(p.get("source_doc").unwrap(), "doc_3354");
+        assert_eq!(p.get("path").unwrap(), "charters/v-nix");
+        assert_eq!(p.get("page").unwrap(), 0);
+        assert_eq!(p.get("title").unwrap(), "Charter: v-nix");
+        assert_eq!(p.get("version_cid").unwrap(), "QmAbc");
+        // curation defaults from base_payload: kind=doc (authority 0.8), active
+        assert_eq!(p.get("kind").unwrap(), "doc");
+        assert_eq!(p.get("status").unwrap(), "active");
+        assert!((p.get("authority").unwrap().as_f64().unwrap() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn doc_meta_omits_absent_title_and_cid() {
+        let m = doc_meta(7, "tenets/x", &None, None);
+        assert_eq!(m.get("source_doc").unwrap(), "doc_7");
+        assert!(!m.contains_key("title"));
+        assert!(!m.contains_key("version_cid"));
     }
 
     #[test]
