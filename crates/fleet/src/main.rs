@@ -946,6 +946,14 @@ fn new_window_argv(session: &str, name: &str, worktree: &str, window_sh: &str) -
     ]
 }
 
+/// Whether a tmux window named `name` is present in a `tmux list-windows -F '#W'` output (one window name per
+/// line). The idempotency check shared by both launch paths: an agent must never get a SECOND window while a
+/// live one exists, or two unattended instances race the same inbox and double-post (the ticket-ingest
+/// double-spawn). Pure — unit-tested.
+fn window_exists(window_list_output: &str, name: &str) -> bool {
+    window_list_output.lines().any(|w| w == name)
+}
+
 /// Launch agent `name`'s tmux window (ensure the session exists first). Side-effecting; a tmux hiccup is
 /// reported (not fatal) so one launch failure doesn't abort a batch. Returns whether the window launched.
 fn launch_window(session: &str, name: &str, worktree: &str, window_sh: &Path) -> bool {
@@ -959,6 +967,15 @@ fn launch_window(session: &str, name: &str, worktree: &str, window_sh: &Path) ->
     // Ensure the session exists (detached) before adding a window.
     if !tmux(&["has-session", "-t", session]) {
         let _ = tmux(&["new-session", "-d", "-s", session]);
+    }
+    // Idempotency guard (duplicate-instance prevention): never open a SECOND window for an agent that already
+    // has a live one. Mirrors launch_board_agent's guard so BOTH fleet launch paths are idempotent regardless
+    // of caller — a concurrent reconstitution/relaunch cannot double-spawn one identity.
+    if let Ok(out) = std::process::Command::new("tmux").args(["list-windows", "-t", session, "-F", "#W"]).output()
+        && window_exists(&String::from_utf8_lossy(&out.stdout), name)
+    {
+        eprintln!("  = '{name}': a tmux window already exists in '{session}' — skipping launch (already running)");
+        return false;
     }
     let ws = window_sh.to_string_lossy().to_string();
     let argv = new_window_argv(session, name, worktree, &ws);
@@ -4250,7 +4267,7 @@ fn launch_board_agent(agent: &str, workdir: &str, harness: &str, model: &str, ef
     if let Ok(out) = std::process::Command::new("tmux")
         .args(["list-windows", "-t", &session, "-F", "#W"])
         .output()
-        && String::from_utf8_lossy(&out.stdout).lines().any(|w| w == agent)
+        && window_exists(&String::from_utf8_lossy(&out.stdout), agent)
     {
         return Err(format!("a tmux window '{agent}' already exists in session '{session}' (already spun up?)"));
     }
@@ -13000,6 +13017,19 @@ detached
                 "v-x",
             ]
         );
+    }
+
+    #[test]
+    fn window_exists_matches_a_whole_window_name_line() {
+        let listing = "concierge\nticket-ingest\nv-fleet-tooling\n";
+        // Present -> the launch guard refuses a second window (idempotent launch, no double-spawn).
+        assert!(window_exists(listing, "ticket-ingest"));
+        assert!(window_exists(listing, "concierge"));
+        // Absent -> launchable.
+        assert!(!window_exists(listing, "v-nix"));
+        // Whole-line match only: a prefix/substring is NOT a window (so `obs-ticket-ingest` != `ticket-ingest`).
+        assert!(!window_exists("obs-ticket-ingest\nticket-ingest-helper\n", "ticket-ingest"));
+        assert!(!window_exists("", "anything"));
     }
 
     #[test]
