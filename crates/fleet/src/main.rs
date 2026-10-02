@@ -2405,10 +2405,10 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Spawn the per-angle ephemeral adversarial reviewers for one review on the existing spawn engine
-    /// (task_374 S2a). Dry-run by default; `--apply` launches. The board-side idempotent per-angle claim and
-    /// the automatic `review.opened_for_review` trigger are later slices — so this is the manual entry point,
-    /// and re-running `--apply` re-spawns until the claim lands.
+    /// Spawn the per-angle ephemeral adversarial reviewers for ONE review on the existing spawn engine
+    /// (task_374 S2a+S2b). Dry-run by default; `--apply` CLAIMS each angle on the board first and launches only
+    /// the angles it wins, so re-running `--apply` is idempotent per angle. This is the manual entry point; the
+    /// fleet-wide sweep is `review-sweep` (S2c).
     ReviewSpawn {
         /// The review id to spawn adversarial reviewers for.
         review_id: i64,
@@ -2416,6 +2416,16 @@ enum Cmd {
         #[arg(long)]
         angle: Option<String>,
         /// Actually launch the reviewers; without it, only print the spawn plan (dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Sweep EVERY review awaiting an adversarial pass (status `in_review`, not yet `vetted`) and run the
+    /// per-angle claim+spawn for each (task_374 S2c) — the automatic trigger that makes the adversarial-review
+    /// engine live, mirroring the observer `--spawn` cadence. Idempotent via the S2b per-angle claim, so it is
+    /// safe to run on a timer/watchdog cadence or on a `review.opened_for_review` wake. Dry-run by default;
+    /// `--apply` claims + launches.
+    ReviewSweep {
+        /// Actually claim + launch; without it, only print the sweep plan (dry-run).
         #[arg(long)]
         apply: bool,
     },
@@ -2939,6 +2949,7 @@ fn main() {
             angle,
             apply,
         } => review_spawn(&board_session(), review_id, angle.as_deref(), apply),
+        Cmd::ReviewSweep { apply } => review_sweep(&board_session(), apply),
         Cmd::SafePkill {
             pattern,
             dry_run,
@@ -6668,6 +6679,49 @@ fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply:
                 }
             }
         }
+    }
+}
+
+/// Whether a review (a [`board::Board::list_reviews`] record) still needs the adversarial pass: it is
+/// `in_review` AND not yet `vetted`. The list endpoint has no `vetted` filter (v-task-board contract
+/// comment_5794), so the sweep applies it client-side — `vetted==true` means the pass already ran and was
+/// addressed (the `/vetted` gate), so skip it; a non-`in_review` status needs no pass. A missing `vetted` is
+/// treated as not-yet-vetted (needs a pass), the safe default. Pure — unit-tested.
+fn review_needs_adversarial_pass(review: &serde_json::Value) -> bool {
+    review.get("status").and_then(serde_json::Value::as_str) == Some("in_review")
+        && !review.get("vetted").and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
+/// `fleet review-sweep [--apply]` (task_374 S2c): the fleet-wide automatic trigger. List every review the board
+/// has `in_review`, keep the ones not yet `vetted` ([`review_needs_adversarial_pass`]), and run the per-angle
+/// claim+spawn ([`review_spawn`]) for each. The S2b per-angle claim makes this IDEMPOTENT — a review already
+/// swept has every angle claimed, so a re-sweep claims nothing and spawns nothing — which is what lets it run
+/// safely on a timer/watchdog cadence or on a `review.opened_for_review` wake (mirroring the observer `--spawn`
+/// cadence). Dry-run by default (lists the plan, no board writes); `--apply` claims + launches.
+fn review_sweep(board_session: &str, apply: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("review-sweep: board unavailable ({e})");
+        std::process::exit(1);
+    });
+    let reviews = board.list_reviews("in_review").unwrap_or_else(|e| {
+        eprintln!("review-sweep: list_reviews failed ({e})");
+        std::process::exit(1);
+    });
+    let pending: Vec<i64> = reviews
+        .iter()
+        .filter(|r| review_needs_adversarial_pass(r))
+        .filter_map(|r| r.get("id").and_then(serde_json::Value::as_i64))
+        .collect();
+    println!(
+        "review-sweep: {} review(s) in_review awaiting an adversarial pass{}",
+        pending.len(),
+        if apply { "" } else { " (dry-run — pass --apply to claim + launch)" }
+    );
+    // Per-review: run the full per-angle claim+spawn. review_spawn is idempotent under --apply (the S2b claim),
+    // so a review already swept re-claims nothing. Board::connect is sessionless, so re-connecting per review
+    // inside review_spawn is free.
+    for id in pending {
+        review_spawn(board_session, id, None, apply);
     }
 }
 
@@ -16821,6 +16875,22 @@ detached
             attempts_after_advance, 0,
             "watermark advanced ⇒ attempts reset ⇒ base cooldown"
         );
+    }
+
+    #[test]
+    fn review_needs_adversarial_pass_only_for_unvetted_in_review() {
+        // task_374 S2c sweep filter (v-task-board contract comment_5794): the list endpoint has no vetted
+        // filter, so review-sweep keeps status==in_review AND vetted!=true client-side.
+        let needs = |v: serde_json::Value| review_needs_adversarial_pass(&v);
+        // in_review + not vetted → needs the pass.
+        assert!(needs(serde_json::json!({ "status": "in_review", "vetted": false })));
+        // in_review but a missing vetted → safe default is "needs a pass".
+        assert!(needs(serde_json::json!({ "status": "in_review" })));
+        // in_review but already vetted → the pass ran + was addressed → skip.
+        assert!(!needs(serde_json::json!({ "status": "in_review", "vetted": true })));
+        // not in_review → no pass regardless of vetted.
+        assert!(!needs(serde_json::json!({ "status": "draft", "vetted": false })));
+        assert!(!needs(serde_json::json!({ "status": "vetted", "vetted": true })));
     }
 
     #[test]
