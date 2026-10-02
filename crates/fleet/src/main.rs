@@ -2737,6 +2737,37 @@ fn spin_up(agent: &str, apply: bool) {
     }
 }
 
+/// Clamp-aware idle-cadence guidance for a monitor whose idle cadence exceeds one hour (task_765 Tier A).
+/// A dynamic `/loop` self-wake (ScheduleWakeup) is hard-clamped to a one-hour maximum, so an at-rest monitor
+/// whose idle cadence is longer than an hour CANNOT honor it by self-re-arming — it idle-polls hourly
+/// regardless of the interval it sets (triple-corroborated on v-compiler-perf / v-hivemind / v-runtime, which
+/// each set a 2-3h cadence yet woke hourly). The only lever that expresses a >1h cadence is a FIXED-INTERVAL
+/// `/loop` cron (CronCreate), which has no such ceiling. Returns the extra kickoff clause for a >1h cadence,
+/// or empty for a cadence a dynamic self-wake can already honor (<=1h, i.e. <=3600s).
+fn long_cadence_cron_clause(interval: &str) -> String {
+    let secs = match parse_interval_secs(interval) {
+        Some(s) if s > 3600 => s,
+        _ => return String::new(),
+    };
+    // A clean whole-hour cadence maps to a concrete cron (`0 */H * * *`); anything else gets the generic form
+    // (cron is minute-granular, so a non-whole-hour cadence over an hour has no tidy expression to suggest).
+    let example = if secs % 3600 == 0 {
+        format!("'0 */{} * * *'", secs / 3600)
+    } else {
+        "a fixed-interval cron matching your cadence".to_string()
+    };
+    format!(
+        " NOTE on your >1h idle cadence: a dynamic /loop self-wake is hard-clamped to a ONE-HOUR maximum, so \
+         once your queue is drained and inbox empty you CANNOT hold a cadence longer than an hour by \
+         self-re-arming — a dynamic next-wake would pin you to hourly ticks no matter what interval you set. \
+         To actually rest at your {interval} cadence, establish a FIXED-INTERVAL /loop cron with CronCreate \
+         ({example}) and then do NOT also self-re-arm the dynamic wake: the cron fires your next tick on \
+         schedule, and a dynamic re-arm alongside it just fights the cron until the one-hour clamp wins. The \
+         event-wake still revives you immediately on a routed message or a new assignment, so the cron sets \
+         only your empty-idle floor, never your revival latency."
+    )
+}
+
 /// Build the SELF-DISCOVERY kickoff prompt for a board-native agent: it fetches its own charter from the
 /// board (nothing is injected) and starts a WORK-CONSERVING loop. Pure so the prompt is unit-tested.
 ///
@@ -2744,7 +2775,10 @@ fn spin_up(agent: &str, apply: bool) {
 /// decision instead of sleeping a fixed period regardless of pending work. Each tick the agent drains its
 /// inbox, does one unit, then gates the next wake on work-present: it keeps looping soon while it holds
 /// open assigned tasks or unread messages, and only falls back to the long `interval` idle cadence once its
-/// assigned queue is drained AND its inbox is empty — so an agent with assigned work never idle-sleeps.
+/// assigned queue is drained AND its inbox is empty — so an agent with assigned work never idle-sleeps. When
+/// that idle cadence exceeds one hour, the dynamic self-wake cannot schedule it (it clamps to a 1h maximum),
+/// so the kickoff adds `long_cadence_cron_clause` guidance to hold the rest cadence off a CronCreate cron
+/// instead of a self-re-arm (task_765 Tier A).
 fn build_kickoff(agent: &str, workdir: &str, interval: &str, operator: Option<&str>, reactive: bool) -> String {
     // The operator-blocked dashboard convention (operator seq-2292, re-pointed task_936) applies only when this
     // deployment names an operator (config.operator_id); a generic fleet with no designated operator omits it.
@@ -2813,6 +2847,9 @@ fn build_kickoff(agent: &str, workdir: &str, interval: &str, operator: Option<&s
              interval, so a long rest cadence never delays revival, it only cuts empty self-directed ticks."
         )
     };
+    // A >1h idle cadence cannot be held by the dynamic self-wake (it clamps to 1h) — append the cron-cadence
+    // escalation so a long-rest monitor rests off a CronCreate cron instead of idle-polling hourly (task_765).
+    let tick = format!("{tick}{}", long_cadence_cron_clause(interval));
     format!(
         "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
          this session. Call register_agent with agent_id '{agent}' once (idempotent) so your board record \
@@ -9282,6 +9319,44 @@ mod tests {
         assert!(k.contains("metadata.interval") && k.contains("update_agent"), "board metadata.interval via update_agent is the board-native cadence lever (task_566)");
         assert!(k.contains("board-only agent with no file-hub registry row"), "the board lever works for a board-only agent, unlike the frozen cargo xtask set-interval");
         assert!(k.contains("does NOT persist"), "explains a raw next-tick reschedule does not stick against the watchdog");
+        // task_765 Tier A: a <=1h cadence (30m here) is schedulable by the dynamic self-wake, so the kickoff
+        // carries NO cron-escalation clause — only a >1h cadence does.
+        assert!(!k.contains("CronCreate"), "a <=1h cadence gets no cron-cadence escalation (task_765)");
+        assert!(!k.contains("hard-clamped to a ONE-HOUR maximum"), "no clamp note for a cadence the self-wake can honor");
+    }
+
+    #[test]
+    fn build_kickoff_above_one_hour_escalates_to_a_fixed_interval_cron() {
+        // task_765 Tier A: the dynamic /loop self-wake clamps to a 1h max, so a monitor whose idle cadence
+        // exceeds an hour (3h here) idle-polls hourly unless it rests off a CronCreate fixed-interval loop.
+        // The kickoff must say so and hand it the concrete cron.
+        let k = build_kickoff("v-mon", "/wt/v-mon", "3h", Some("op-x"), false);
+        assert!(k.contains("hard-clamped to a ONE-HOUR maximum"), "names the dynamic self-wake 1h clamp (the root cause)");
+        assert!(k.contains("CronCreate"), "routes a >1h cadence to a CronCreate fixed-interval loop");
+        assert!(k.contains("'0 */3 * * *'"), "hands a 3h cadence its concrete cron expression");
+        assert!(k.contains("do NOT also self-re-arm"), "warns against a dynamic re-arm fighting the cron (the v-hivemind failure)");
+        assert!(k.contains("never your revival latency"), "clarifies event-wake still revives immediately, so the cron only sets the idle floor");
+        // A reactive responder with a >1h cadence hits the same clamp, so it carries the clause too.
+        let r = build_kickoff("frank", "/wt/frank", "2h", None, true);
+        assert!(r.contains("CronCreate") && r.contains("'0 */2 * * *'"), "a >1h reactive cadence also gets the cron escalation");
+    }
+
+    #[test]
+    fn long_cadence_cron_clause_only_fires_above_one_hour_and_matches_the_cadence() {
+        // <=1h (incl. exactly 1h = 3600s, the clamp ceiling) is schedulable by the dynamic self-wake -> empty.
+        assert!(long_cadence_cron_clause("30m").is_empty(), "30m needs no escalation");
+        assert!(long_cadence_cron_clause("1h").is_empty(), "exactly 1h is at the clamp ceiling, still schedulable");
+        assert!(long_cadence_cron_clause("3600s").is_empty(), "3600s == 1h, no escalation");
+        // Whole-hour cadences over 1h get a concrete `0 */H * * *` cron.
+        assert!(long_cadence_cron_clause("2h").contains("'0 */2 * * *'"));
+        assert!(long_cadence_cron_clause("6h").contains("'0 */6 * * *'"));
+        // A non-whole-hour cadence over 1h (90m) still escalates, but with the generic form (cron is
+        // minute-granular, so there is no tidy `0 */H` to suggest) — never a bogus hourly cron.
+        let c = long_cadence_cron_clause("90m");
+        assert!(c.contains("a fixed-interval cron matching your cadence"), "90m gets the generic cron form");
+        assert!(!c.contains("*/1"), "never suggests an hourly cron for a 90m cadence");
+        // A garbage interval parses to nothing -> no clause (never panics).
+        assert!(long_cadence_cron_clause("nonsense").is_empty());
     }
 
     #[test]
