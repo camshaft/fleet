@@ -3971,7 +3971,7 @@ fn main() {
         ),
         Cmd::ComposeMandates { agent, out, write } => compose_mandates(&fleet, &agent, &out, write),
         Cmd::Notify { port } => {
-            if let Err(e) = notify::serve(port, &board_session()) {
+            if let Err(e) = notify::serve(port, &board_session(), &fleet.root) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }

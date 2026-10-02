@@ -137,10 +137,11 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
     let reactive_unaddressed = reactive && addressed == Some(false);
     // The board's canonical typed id for a document event (task_1147): top-level `ref`, falling back to
     // `data.ref` depending on how the event body is shaped. Rendered verbatim (already `doc_<id>`).
-    let doc_ref = v
-        .get("ref")
-        .and_then(Value::as_str)
-        .or_else(|| v.get("data").and_then(|d| d.get("ref")).and_then(Value::as_str));
+    let doc_ref = v.get("ref").and_then(Value::as_str).or_else(|| {
+        v.get("data")
+            .and_then(|d| d.get("ref"))
+            .and_then(Value::as_str)
+    });
     let prompt = notification_prompt(
         event_type,
         task_id,
@@ -341,7 +342,42 @@ async fn read_request<S: AsyncRead + Unpin>(
 /// via `spawn_blocking` keeps that off this connection's async task so it never delays accepting the board's
 /// next webhook POST or a concurrent liveness probe (the single blocking-accept-loop this replaced could not
 /// overlap those at all).
-async fn handle_connection(mut stream: TcpStream, session: Arc<str>) {
+/// Default escalation threshold N (doc_3410): the drift directive is a graceful nudge for the first N
+/// consecutive flagged ticks, then escalates to a hard stop-and-return.
+const DRIFT_ESCALATE_N: u32 = 2;
+
+/// Best-effort fleet-detected drift directive to PREPEND to a wake prompt (task_1325 Stage-1 slice 2b, the
+/// enforced tier of doc_3410). On each wake it reads the recipient's board presence and actionable open-task
+/// count (sync board.rs, called from inside `spawn_blocking` so it never touches the async executor),
+/// advances the persisted per-agent `DriftState`, and renders the correction directive when the
+/// switch-do-not-idle condition (task_736) flags: a graceful `Directive` for the first N ticks, then a hard
+/// stop-and-return `Escalate`. Any board or store error yields `None` — a drift check must never block or
+/// corrupt the wake itself.
+fn drift_wake_prefix(hub_root: &std::path::Path, agent: &str) -> Option<String> {
+    let board = crate::board::Board::connect().ok()?;
+    let presence = board
+        .get_agent(agent)
+        .ok()?
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let open = board.open_task_count(agent).ok()?;
+    let signal = crate::drift::switch_do_not_idle_signal(&presence, open);
+    let store = crate::drift::DriftStore::new(hub_root);
+    let mut state = store.load(agent);
+    let action = state.observe(signal, DRIFT_ESCALATE_N);
+    if let Err(e) = store.save(agent, &state) {
+        eprintln!("drift: persist {agent} failed: {e}");
+    }
+    crate::drift::directive_text(action)
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    session: Arc<str>,
+    hub_root: Arc<std::path::Path>,
+) {
     let (method, path, body) = match read_request(&mut stream).await {
         Ok(parts) => parts,
         Err(e) => {
@@ -360,6 +396,13 @@ async fn handle_connection(mut stream: TcpStream, session: Arc<str>) {
         Ok(v) => {
             if let Some((recipient, prompt)) = payload_to_wake(&v) {
                 tokio::task::spawn_blocking(move || {
+                    // task_1325 slice 2b: prepend the fleet-detected enforced drift directive, if any. The
+                    // board read + DriftState persist are sync (board.rs ureq) and run here inside
+                    // spawn_blocking, so they stay off the async executor like tmux_inject itself.
+                    let prompt = match drift_wake_prefix(&hub_root, &recipient) {
+                        Some(dir) => format!("{dir}\n\n{prompt}"),
+                        None => prompt,
+                    };
                     match tmux_inject(&session, &recipient, &prompt) {
                         Ok(()) => eprintln!("woke {recipient}: {prompt}"),
                         Err(e) => eprintln!("inject failed for {recipient}: {e}"),
@@ -377,15 +420,15 @@ async fn handle_connection(mut stream: TcpStream, session: Arc<str>) {
 /// board's next webhook POST or a liveness probe arriving concurrently. Best-effort: every request is
 /// answered `200` immediately, and a payload that is unparseable or not actionable is logged and dropped. A
 /// supervisor liveness-probes the daemon with a `GET` to `/health` (see [`classify_request`]).
-pub fn serve(port: u16, session: &str) -> Result<(), String> {
+pub fn serve(port: u16, session: &str, hub_root: &std::path::Path) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("fleet notify: build tokio runtime: {e}"))?;
-    rt.block_on(serve_async(port, session))
+    rt.block_on(serve_async(port, session, hub_root))
 }
 
-async fn serve_async(port: u16, session: &str) -> Result<(), String> {
+async fn serve_async(port: u16, session: &str, hub_root: &std::path::Path) -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| format!("fleet notify: bind 127.0.0.1:{port}: {e}"))?;
@@ -393,12 +436,13 @@ async fn serve_async(port: u16, session: &str) -> Result<(), String> {
         "fleet notify: listening on http://127.0.0.1:{port} — waking session '{session}' on board webhooks (GET /health for liveness)"
     );
     let session: Arc<str> = Arc::from(session);
+    let hub_root: Arc<std::path::Path> = Arc::from(hub_root);
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .map_err(|e| format!("fleet notify: accept: {e}"))?;
-        tokio::spawn(handle_connection(stream, session.clone()));
+        tokio::spawn(handle_connection(stream, session.clone(), hub_root.clone()));
     }
 }
 
@@ -567,16 +611,19 @@ mod tests {
         // wake regardless of the `subscribed` hint (here `false`). A DM in particular has no subscribable
         // target, so it MUST stay type-gated.
         assert_eq!(
-            notification_prompt("task.assigned", Some(42), None, None, false, false, None).as_deref(),
+            notification_prompt("task.assigned", Some(42), None, None, false, false, None)
+                .as_deref(),
             Some("[notification] task #42")
         );
         assert_eq!(
-            notification_prompt("message.direct", None, Some(438), None, false, false, None).as_deref(),
+            notification_prompt("message.direct", None, Some(438), None, false, false, None)
+                .as_deref(),
             Some("[notification] message #438")
         );
         // A post to a channel the agent is a member of (delivery = membership; #171) wakes on type.
         assert_eq!(
-            notification_prompt("channel.post", None, Some(9), Some(7), false, false, None).as_deref(),
+            notification_prompt("channel.post", None, Some(9), Some(7), false, false, None)
+                .as_deref(),
             Some("[notification] channel #7")
         );
         assert_eq!(
@@ -587,7 +634,8 @@ mod tests {
         // A comment on a target the recipient DIRECTLY subscribes to wakes (#384, subscription = notification)
         // — the collaboration case the zero-polling mandate targets.
         assert_eq!(
-            notification_prompt("task.commented", Some(42), Some(9), None, true, false, None).as_deref(),
+            notification_prompt("task.commented", Some(42), Some(9), None, true, false, None)
+                .as_deref(),
             Some("[notification] comment on task #42")
         );
         assert_eq!(
@@ -599,12 +647,28 @@ mod tests {
         // subscription) must not loop-wake a board-wide coordinator on every ticket; a status change never
         // wakes at all.
         assert_eq!(
-            notification_prompt("task.commented", Some(42), Some(9), None, false, false, None),
+            notification_prompt(
+                "task.commented",
+                Some(42),
+                Some(9),
+                None,
+                false,
+                false,
+                None
+            ),
             None,
             "a firehose-only comment accrues for poll, never wakes"
         );
         assert_eq!(
-            notification_prompt("task.status_changed", Some(42), Some(9), None, true, false, None),
+            notification_prompt(
+                "task.status_changed",
+                Some(42),
+                Some(9),
+                None,
+                true,
+                false,
+                None
+            ),
             None,
             "status change never wakes, even when subscribed"
         );
@@ -634,14 +698,23 @@ mod tests {
         // case — board-triage subscribes to the intake projects and must triage a fresh create at once, not wait
         // out its idle poll). Gated on `subscribed` exactly like task.commented.
         assert_eq!(
-            notification_prompt("task.created", Some(1182), Some(9), None, true, false, None).as_deref(),
+            notification_prompt("task.created", Some(1182), Some(9), None, true, false, None)
+                .as_deref(),
             Some("[notification] new task #1182"),
             "a create on a directly-subscribed target wakes the triager"
         );
         // A firehose-only recipient (subscribed=false) does NOT wake on a create — it accrues for poll, so a
         // create never loop-wakes a board-wide coordinator present via the whole-board firehose.
         assert_eq!(
-            notification_prompt("task.created", Some(1182), Some(9), None, false, false, None),
+            notification_prompt(
+                "task.created",
+                Some(1182),
+                Some(9),
+                None,
+                false,
+                false,
+                None
+            ),
             None,
             "a firehose-only create accrues for poll, never wakes"
         );
@@ -660,12 +733,20 @@ mod tests {
         let subbed = serde_json::json!({"recipient":"board-triage","type":"task.created","task_id":1182,"event_seq":9,"subscribed":true});
         assert_eq!(
             payload_to_wake(&subbed),
-            Some(("board-triage".into(), "[notification] new task #1182".into()))
+            Some((
+                "board-triage".into(),
+                "[notification] new task #1182".into()
+            ))
         );
         let firehose = serde_json::json!({"recipient":"board-pm","type":"task.created","task_id":1182,"event_seq":9,"subscribed":false});
-        assert_eq!(payload_to_wake(&firehose), None, "a firehose create does not wake");
+        assert_eq!(
+            payload_to_wake(&firehose),
+            None,
+            "a firehose create does not wake"
+        );
         // A pre-#384 payload with no `subscribed` field defaults false → drops to poll (never a spurious wake).
-        let no_hint = serde_json::json!({"recipient":"x","type":"task.created","task_id":1182,"event_seq":9});
+        let no_hint =
+            serde_json::json!({"recipient":"x","type":"task.created","task_id":1182,"event_seq":9});
         assert_eq!(payload_to_wake(&no_hint), None);
     }
 
@@ -674,18 +755,43 @@ mod tests {
         // task_1269: a reviewer's comment on a doc under review wakes its owner/assignee (the subscribed=true
         // set), keyed on the doc `ref` since document events carry no task_id. Mirrors the task.commented gate.
         assert_eq!(
-            notification_prompt("document.comment", None, Some(9), None, true, false, Some("doc_3394")).as_deref(),
+            notification_prompt(
+                "document.comment",
+                None,
+                Some(9),
+                None,
+                true,
+                false,
+                Some("doc_3394")
+            )
+            .as_deref(),
             Some("[notification] comment on doc_3394"),
             "a comment on a directly-subscribed doc wakes its owner, with the verbatim doc ref"
         );
         // A firehose-only recipient (subscribed=false) accrues for poll — never a per-comment firehose wake.
         assert_eq!(
-            notification_prompt("document.comment", None, Some(9), None, false, false, Some("doc_3394")),
+            notification_prompt(
+                "document.comment",
+                None,
+                Some(9),
+                None,
+                false,
+                false,
+                Some("doc_3394")
+            ),
             None
         );
         // A reactive recipient the comment does not address is suppressed (task_580 gate).
         assert_eq!(
-            notification_prompt("document.comment", None, Some(9), None, true, true, Some("doc_3394")),
+            notification_prompt(
+                "document.comment",
+                None,
+                Some(9),
+                None,
+                true,
+                true,
+                Some("doc_3394")
+            ),
             None
         );
         // No doc ref → no prompt even when subscribed.
@@ -697,7 +803,10 @@ mod tests {
         let subbed = serde_json::json!({"recipient":"v-fleet-tooling","type":"document.comment","event_seq":9,"subscribed":true,"data":{"ref":"doc_3394"}});
         assert_eq!(
             payload_to_wake(&subbed),
-            Some(("v-fleet-tooling".into(), "[notification] comment on doc_3394".into()))
+            Some((
+                "v-fleet-tooling".into(),
+                "[notification] comment on doc_3394".into()
+            ))
         );
     }
 
@@ -708,7 +817,8 @@ mod tests {
         // subscription wakes — and ONLY those — when the recipient is reactive and the event does not address it.
         // channel.post: woken when not gated, SUPPRESSED when reactive_unaddressed.
         assert_eq!(
-            notification_prompt("channel.post", None, Some(9), Some(7), false, false, None).as_deref(),
+            notification_prompt("channel.post", None, Some(9), Some(7), false, false, None)
+                .as_deref(),
             Some("[notification] channel #7"),
             "ungated channel.post still wakes a member"
         );
@@ -719,7 +829,8 @@ mod tests {
         );
         // task.commented: a direct-subscribed comment wakes, but is SUPPRESSED when reactive_unaddressed.
         assert_eq!(
-            notification_prompt("task.commented", Some(42), Some(9), None, true, false, None).as_deref(),
+            notification_prompt("task.commented", Some(42), Some(9), None, true, false, None)
+                .as_deref(),
             Some("[notification] comment on task #42"),
             "ungated subscribed comment still wakes"
         );
@@ -731,12 +842,14 @@ mod tests {
         // The gate NEVER touches the inherently-addressed direct-delivery types: an assignment or a DM to a
         // reactive agent still wakes even when reactive_unaddressed is set (those address it by definition).
         assert_eq!(
-            notification_prompt("task.assigned", Some(42), None, None, false, true, None).as_deref(),
+            notification_prompt("task.assigned", Some(42), None, None, false, true, None)
+                .as_deref(),
             Some("[notification] task #42"),
             "an assignment addresses the recipient — reactive gate must not suppress it"
         );
         assert_eq!(
-            notification_prompt("message.direct", None, Some(438), None, false, true, None).as_deref(),
+            notification_prompt("message.direct", None, Some(438), None, false, true, None)
+                .as_deref(),
             Some("[notification] message #438"),
             "a DM addresses the recipient — reactive gate must not suppress it"
         );
@@ -869,7 +982,10 @@ mod tests {
         );
         // never doubled: the rendered prompt carries exactly one "doc_" and no "doc doc".
         let (_, prompt) = payload_to_wake(&top).unwrap();
-        assert!(!prompt.contains("doc doc"), "ref is rendered verbatim, not re-prefixed");
+        assert!(
+            !prompt.contains("doc doc"),
+            "ref is rendered verbatim, not re-prefixed"
+        );
         // a document.approved with no ref at all cannot be rendered -> no wake (defensive, not a doubled id).
         assert_eq!(
             payload_to_wake(&serde_json::json!({"recipient":"x","type":"document.approved"})),
