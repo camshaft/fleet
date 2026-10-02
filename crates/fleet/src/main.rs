@@ -1764,6 +1764,21 @@ enum Cmd {
         /// A service name, alias, or port (e.g. `edge-proxy` or `:8880`); omit to list all services.
         service: Option<String>,
     },
+    /// Inspect or set the FLEET-QUIESCE maintenance-mode sentinel (task_1032): the local marker that suppresses
+    /// the nudge-stale daemon AND the watchdog's opt-in auto-actions (revive-stranded / hire-signal /
+    /// recover-wedged) during a mass spin-down/cutover, so they do not fight an operator-directed quiesce. With
+    /// no flag it REPORTS status (on / off / expired, plus age and time until the TTL self-expiry). `--on`
+    /// raises it; `--off` clears it. `spin-down-all` / `spin-up-all` manage it automatically — this is the
+    /// explicit operator control for a delicate manual operation that is NOT a full fleet spin-down (e.g. a
+    /// board migration step), and the first-class way to diagnose "why did the nudge daemon go quiet?".
+    Quiesce {
+        /// Raise the sentinel (maintenance mode ON): suppress nudge-stale + the watchdog auto-actions.
+        #[arg(long)]
+        on: bool,
+        /// Clear the sentinel (maintenance mode OFF): the daemons resume.
+        #[arg(long)]
+        off: bool,
+    },
     /// Board-native liveness watchdog: for each board-native agent (metadata.native == true), compare its
     /// heartbeat age to its OWN loop interval and flag re-arm candidates — an agent heartbeats ~once per
     /// interval, so an age beyond several intervals means missed ticks. Report-only (non-destructive).
@@ -2363,6 +2378,7 @@ fn main() {
         Cmd::BounceStale { apply, force } => bounce_stale(&fleet, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
         Cmd::Services { service } => services(service.as_deref()),
+        Cmd::Quiesce { on, off } => quiesce_cmd(on, off),
         Cmd::Watchdog {
             stale_only,
             rearm,
@@ -8849,6 +8865,43 @@ fn clear_fleet_quiesce() {
     }
 }
 
+/// task_1032: the one-line human status of the fleet-quiesce sentinel for `fleet quiesce` (no flag), given its
+/// age (`None` = absent) and the TTL. OFF when absent, ON (with age + time-to-TTL-expiry) when present and
+/// fresh, EXPIRED when present but past the TTL (treated as OFF by [`fleet_is_quiesced`], but still on disk so
+/// it is worth flagging for cleanup). Pure — unit-tested.
+fn quiesce_status_line(sentinel_age_secs: Option<i64>, ttl_secs: i64) -> String {
+    match sentinel_age_secs {
+        None => "fleet-quiesce: OFF (no sentinel) — nudge-stale + watchdog auto-actions run normally".to_string(),
+        Some(age) if age < ttl_secs => format!(
+            "fleet-quiesce: ON — set {} ago, {} until TTL self-expiry; nudge-stale + watchdog auto-actions (revive-stranded / hire-signal / recover-wedged) suppressed",
+            format_hm(age),
+            format_hm(ttl_secs - age)
+        ),
+        Some(age) => format!(
+            "fleet-quiesce: EXPIRED — sentinel is {} old (past the {} TTL) so it is treated as OFF; clear the stale file with `fleet quiesce --off`",
+            format_hm(age),
+            format_hm(ttl_secs)
+        ),
+    }
+}
+
+/// `fleet quiesce [--on|--off]` (task_1032): inspect or set the fleet-quiesce maintenance-mode sentinel. No flag
+/// → report status. `--on` raises it, `--off` clears it; after either, the resulting status is printed so the
+/// mutation is confirmed. Reuses [`set_fleet_quiesce`] / [`clear_fleet_quiesce`] so the manual path writes the
+/// exact same marker `spin-down-all` does and the daemons read.
+fn quiesce_cmd(on: bool, off: bool) {
+    let ttl_secs = (FLEET_QUIESCE_TTL_HOURS * 3600.0).round() as i64;
+    if on && off {
+        eprintln!("fleet quiesce: pass at most one of --on / --off (reporting status only)");
+    } else if on {
+        set_fleet_quiesce();
+    } else if off {
+        clear_fleet_quiesce();
+    }
+    let now = time::OffsetDateTime::now_utc();
+    println!("{}", quiesce_status_line(quiesce_sentinel_age_secs(now), ttl_secs));
+}
+
 /// task_1032: does THIS `spin-up-all` wave COMPLETE the fan-out (no down candidates remain after it), so the
 /// fleet-quiesce sentinel should be cleared and the nudge daemon resume? True when every down-non-excepted
 /// agent is launched this pass — `limit` None (bring everyone up) or the remaining count fits the limit. A
@@ -13310,6 +13363,17 @@ detached
         // Sentinel aged past the TTL → self-expired → NOT quiesced (a crashed cutover must not mute forever).
         assert!(!fleet_is_quiesced(Some(ttl), ttl));
         assert!(!fleet_is_quiesced(Some(ttl + 10_000), ttl));
+    }
+
+    #[test]
+    fn quiesce_status_line_reports_off_on_and_expired() {
+        let ttl = (FLEET_QUIESCE_TTL_HOURS * 3600.0) as i64;
+        assert!(quiesce_status_line(None, ttl).contains("OFF"));
+        // Fresh sentinel → ON, names the TTL-remaining.
+        let on = quiesce_status_line(Some(3600), ttl);
+        assert!(on.contains("ON") && on.contains("until TTL"));
+        // Past the TTL → EXPIRED (still on disk, flagged for cleanup).
+        assert!(quiesce_status_line(Some(ttl + 1), ttl).contains("EXPIRED"));
     }
 
     #[test]
