@@ -114,6 +114,30 @@ impl Store {
         Ok(())
     }
 
+    /// Delete points by id, waiting for the write — the cull path for the wiki-sync connector (task_1089): a
+    /// re-approved document's stale tail (see `wiki_sync::stale_point_ids`) and an archived document's points.
+    /// `POST /collections/{name}/points/delete?wait=true`. Empty ids or a missing collection is a no-op
+    /// (nothing to remove). Carries `allow(dead_code)` because its caller — the wiki-sync worker — lands next,
+    /// the same staging the `wiki_sync` core module uses.
+    #[allow(dead_code)]
+    pub async fn delete_points(&self, name: &str, ids: &[String]) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if !self.collection_exists(name).await? {
+            return Ok(());
+        }
+        let url = format!("{}/collections/{}/points/delete?wait=true", self.base, name);
+        self.http
+            .post(&url)
+            .json(&json!({ "points": ids }))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("qdrant delete from {name} failed: {e}"))?;
+        Ok(())
+    }
+
     /// Vector search; by default only `status == "active"` items (hides outdated/superseded) — the Python
     /// `query_candidates`. `POST /collections/{name}/points/query`. A missing collection yields no hits.
     pub async fn query_candidates(
