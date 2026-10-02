@@ -278,10 +278,14 @@ let
     # crashes/hangs before `observe-record` (or whose self-close is missed) leaks its window; without the reaper
     # in the always-on sweep those obs-* windows accumulate unbounded (157 leaked before this landed). The reaper
     # only kills windows whose spawn stamp is stale/absent, so a healthy in-flight observer is never touched.
+    # --recover-wedged (task_582, cameron ENABLE): auto-recover an agent stuck in a model-safeguard refusal loop
+    # (which keeps last_seen advancing, so the liveness sweep misses it) via a force spin-down + spin-up. Fenced:
+    # fires only on a trailing run of stop_reason=refusal turns, per-agent 3600s cooldown, suppressed during a
+    # fleet-quiesce. Cameron directed the detect-AND-restart capability (task_582) and approved enabling it here.
     // (mkTimer {
       name = "fleet-watchdog";
       description = "Fleet watchdog";
-      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn --reap-stale-observers";
+      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn --reap-stale-observers --recover-wedged";
       intervalSecs = 60;
       onBootSec = 60;
       persistent = true;
