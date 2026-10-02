@@ -419,6 +419,36 @@ impl Board {
         }
     }
 
+    /// The wiki row for an EXACT document path (task_906): `GET /api/wiki?prefix=<path>` returns the doc at
+    /// `path` AND anything under `path/`, so we select the row whose `path` equals `path` exactly. `None` when
+    /// no such doc is filed. Each row carries `id` and `approved_version_id` (null = no operator-approved
+    /// version), so the caller can gate the content fetch without a round-trip. Over get_json.
+    pub fn wiki_row_for_path(&self, path: &str) -> Result<Option<Value>, String> {
+        let rows = match self.get_json(&format!("/wiki?prefix={path}"))? {
+            Value::Array(a) => a,
+            other => {
+                return Err(format!(
+                    "board /wiki?prefix={path}: expected an array, got {other}"
+                ));
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .find(|r| r.get("path").and_then(Value::as_str) == Some(path)))
+    }
+
+    /// The operator-APPROVED version body of a document by numeric id (task_906 / the task_842 approved read):
+    /// `GET /documents/{id}/content?approved=true` returns a JSON envelope whose `content` field is the
+    /// approved markdown body (never a silent draft fallback). Call only when the wiki row's
+    /// `approved_version_id` is non-null (otherwise this 404s).
+    pub fn fetch_approved_content(&self, id: i64) -> Result<String, String> {
+        let v = self.get_json(&format!("/documents/{id}/content?approved=true"))?;
+        v.get("content")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| format!("board /documents/{id}/content: no `content` string in {v}"))
+    }
+
     /// POST a JSON body to a board path and parse the JSON response — the write sibling of [`get_json`], used
     /// by the project-scoped retention sweeps (`archive-done` / `age-out-todos`, task_1249). Retries a
     /// transient 5xx/transport blip like the reads. `Err` on a non-2xx (the board's message is surfaced).
