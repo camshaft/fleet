@@ -2745,10 +2745,21 @@ fn setup_script_env(agent: &str, fleet_root: &str, plan: &WorkspaceKindPlan) -> 
     env
 }
 
+/// Ensure an agent's launch directory exists before anything runs in it (task_1105). A workspace kind whose
+/// setup_script `cd`s into `FLEET_WORKSPACE_CWD` under `set -e` — the membrain kind, which does no
+/// clone/materialize and treats the launch cwd as already present — otherwise aborts with a raw
+/// `cd: No such file or directory` on every fresh mint, and the subsequent launch (which runs in the same
+/// cwd) would fail the same way. Creating the bare dir is a no-op when it already exists (a kind whose script
+/// materializes into it still works) and surfaces a clear, path-named error when the target is a file rather
+/// than leaking a raw errno. Factored out so the pre-flight is unit-tested.
+fn ensure_launch_cwd(cwd: &str) -> Result<(), String> {
+    std::fs::create_dir_all(cwd).map_err(|e| format!("mkdir launch cwd {cwd}: {e}"))
+}
+
 /// Spin up an agent whose workspace is defined by a board workspace-kind resource rather than by `repos`.
-/// Fetches the kind, reports the plan, and on `--apply` runs its setup_script (with `FLEET_AGENT` /
-/// `FLEET_ROOT` and any `config.env` in the environment) to materialize the workspace, pre-trusts the
-/// launch paths, and launches the agent in the kind's `config.cwd`. (#287)
+/// Fetches the kind, reports the plan, and on `--apply` ensures the launch cwd exists, runs its setup_script
+/// (with `FLEET_AGENT` / `FLEET_ROOT` and any `config.env` in the environment) to materialize the workspace,
+/// pre-trusts the launch paths, and launches the agent in the kind's `config.cwd`. (#287)
 #[allow(clippy::too_many_arguments)]
 fn spin_up_workspace_kind(
     board: &board::Board,
@@ -2798,7 +2809,7 @@ fn spin_up_workspace_kind(
             s.lines().count(),
             if plan.env.is_empty() { String::new() } else { format!(" + {} config env var(s)", plan.env.len()) }
         ),
-        None => println!("  setup_script: NONE — the launch cwd is expected to exist already"),
+        None => println!("  setup_script: NONE — no materialization; spin-up creates the launch cwd, then launches in it"),
     }
 
     if !apply {
@@ -2810,9 +2821,18 @@ fn spin_up_workspace_kind(
         std::process::exit(1);
     }
 
+    // Ensure the launch cwd exists before the setup_script `cd`s into it and before the agent launches there
+    // (task_1105). A clone/materialize kind recreates it harmlessly; a pre-existing-dir kind (membrain) now
+    // finds it present instead of aborting on a raw `cd: No such file or directory`.
+    if let Err(e) = ensure_launch_cwd(&plan.cwd) {
+        eprintln!("  setup FAILED: {e}");
+        std::process::exit(1);
+    }
+
     if let Some(script) = &plan.setup_script {
         // Run the setup_script from the fleet root so it has a stable base, with the agent identity and root
-        // in the environment; the script is what materializes the launch cwd (and anything else the kind needs).
+        // in the environment; the script materializes anything else the kind needs (the launch cwd itself is
+        // already created above).
         if let Err(e) = std::fs::create_dir_all(fleet_root) {
             eprintln!("  setup FAILED: mkdir {fleet_root}: {e}");
             std::process::exit(1);
@@ -12670,6 +12690,38 @@ detached
         std::fs::write(dir.join("g.txt"), "b\n").unwrap();
         assert_eq!(old_worktree_risk(dir.to_str().unwrap()), Some((0, true)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_launch_cwd_creates_a_missing_nested_dir_and_is_idempotent() {
+        // task_1105: a fresh membrain-kind mint has no launch dir yet; spin-up must create it before the
+        // setup_script `cd`s in. create a nested path that does not exist, then confirm a second call no-ops.
+        let base =
+            std::env::temp_dir().join(format!("fleet-elc-{}-{}", std::process::id(), line!()));
+        let nested = base.join("a/b/c");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(ensure_launch_cwd(nested.to_str().unwrap()).is_ok());
+        assert!(nested.is_dir());
+        // Idempotent: a kind whose own script also materializes the dir (or a re-provision) is a clean no-op.
+        assert!(ensure_launch_cwd(nested.to_str().unwrap()).is_ok());
+        assert!(nested.is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ensure_launch_cwd_errors_with_the_path_when_target_is_a_file() {
+        // The genuinely-unexpected case (metadata.workspace_cwd points at a file): surface a clear, path-named
+        // error rather than leaking a raw errno or silently proceeding.
+        let base =
+            std::env::temp_dir().join(format!("fleet-elc-file-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let err = ensure_launch_cwd(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("mkdir launch cwd"));
+        assert!(err.contains(file.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
