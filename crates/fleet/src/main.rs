@@ -2478,6 +2478,32 @@ enum Cmd {
         #[arg(long)]
         board_api: Option<String>,
     },
+    /// Cast a CR Ship-It (approval) via the CRUX CriticService ApproveReviewRevision API, OPERATOR-GATED
+    /// (task_913). REQUIRES an operator-authorization comment-ref — a board comment the operator wrote
+    /// explicitly authorizing approval of THIS CR — and validates it (author = the configured operator, body
+    /// names the CR so a stale ref cannot approve the wrong one, body carries an approval token) before
+    /// casting; refuses without a valid ref, so no agent approves on its own read. The vote casts as the
+    /// authenticated human via the host Midway cookie (the CRUX API refuses service principals — only humans
+    /// can ship). The CRUX endpoint + target header are read from untracked local config (public-repo-safe),
+    /// never the committed artifact.
+    ApproveCr {
+        /// The CR to approve, as its "CR-XXXXXXXX" id string.
+        #[arg(long)]
+        cr: String,
+        /// The board task id holding the operator-authorization comment.
+        #[arg(long)]
+        auth_task: i64,
+        /// The id of the operator-authorization comment on that task.
+        #[arg(long)]
+        auth_comment: i64,
+        /// The CR revision serial to approve — must be the CURRENT revision; approving a superseded revision
+        /// is a silent no-op toward merge, so pass the revision that is current at cast time.
+        #[arg(long)]
+        revision: i64,
+        /// Validate the authorization + assemble the request but DO NOT cast (print what it would do).
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() {
@@ -2585,6 +2611,9 @@ fn main() {
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::DedupCheck { agent, kill } => dedup_check(agent.as_deref(), kill),
         Cmd::McpCheck { agent } => mcp_check(&agent),
+        Cmd::ApproveCr { cr, auth_task, auth_comment, revision, dry_run } => {
+            approve_cr(&cr, auth_task, auth_comment, revision, dry_run)
+        }
         Cmd::SafePkill { pattern, dry_run, signal } => safe_pkill(&pattern, dry_run, &signal),
         Cmd::NudgeStale {
             apply,
@@ -10789,6 +10818,228 @@ fn mcp_check(agent: &str) {
     }
 }
 
+/// The CRUX Ship-It endpoint config (task_913), read from untracked local config — public-repo-safe: the
+/// internal CriticService host + Coral target header never enter the committed artifact (the repo ships only
+/// `crux.toml.example`). Same local-config pattern as the host-service registry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct CruxConfig {
+    /// The CriticService SSO front-door URL (Midway / human identity) that casts the vote.
+    endpoint: String,
+    /// The Coral `X-Amz-Target` for ApproveReviewRevision.
+    amz_target: String,
+    /// Path to the Midway cookie the cast authenticates with (default `~/.midway/cookie`).
+    #[serde(default = "default_midway_cookie")]
+    midway_cookie: String,
+}
+
+fn default_midway_cookie() -> String {
+    format!("{}/.midway/cookie", std::env::var("HOME").unwrap_or_default())
+}
+
+/// Pure TOML → `CruxConfig` parse, split out so it is unit-testable against an inline fixture without touching
+/// the filesystem (the real config is a local, uncommitted resource).
+fn parse_crux_config(text: &str) -> Result<CruxConfig, toml::de::Error> {
+    toml::from_str(text)
+}
+
+/// Decide whether a fetched board comment is a valid operator authorization to Ship-It `target_cr` (task_913):
+/// the comment author MUST be the configured operator, the body MUST name the target CR (so a stale/mismatched
+/// ref cannot authorize the wrong CR), and the body MUST carry an explicit approval token. `Ok(())` only when
+/// all three hold; otherwise an `Err` naming the reason the cast is refused. Pure — unit-tested.
+fn validate_auth_comment(author: &str, body: &str, operator_id: &str, target_cr: &str) -> Result<(), String> {
+    if author != operator_id {
+        return Err(format!(
+            "auth comment author is '{author}', not the configured operator '{operator_id}'"
+        ));
+    }
+    if !body.contains(target_cr) {
+        return Err(format!(
+            "auth comment does not name the target CR '{target_cr}' (it must, so a stale ref cannot approve the wrong CR)"
+        ));
+    }
+    let lower = body.to_ascii_lowercase();
+    const TOKENS: [&str; 5] = ["approve", "ship it", "ship-it", "shipit", "lgtm"];
+    if !TOKENS.iter().any(|t| lower.contains(t)) {
+        return Err("auth comment carries no explicit approval token (approve / ship it / lgtm)".to_string());
+    }
+    Ok(())
+}
+
+/// The classified outcome of a CRUX ApproveReviewRevision HTTP response (task_913).
+#[derive(Debug, PartialEq, Eq)]
+enum ApproveOutcome {
+    /// 2xx with an empty body — the Ship-It landed (ApproveReviewRevision returns nothing on success).
+    Success,
+    /// A 401/403 or a Midway login/redirect page served by the SSO front door — the cookie is stale.
+    StaleCookie,
+    /// A CriticService Coral exception (named in the JSON body).
+    CruxError(String),
+    /// Anything else — not a recognizable success or known failure.
+    Unexpected(String),
+}
+
+/// Classify a CRUX approve response purely from its HTTP status + body (task_913). A stale/absent Midway
+/// session shows up as a 401/403 OR as the SSO front door serving an HTML login/SAML/redirect page (NOT a
+/// clean 401), so both are treated as a stale cookie; a Coral exception name in the body is a CRUX error; a
+/// 2xx with an empty body is success. Pure — unit-tested (the response classification is where subtle bugs
+/// hide, so it is the test seam).
+fn classify_approve_response(http_code: &str, body: &str) -> ApproveOutcome {
+    let b = body.trim();
+    let lower = b.to_ascii_lowercase();
+    if http_code == "401"
+        || http_code == "403"
+        || lower.contains("<html")
+        || lower.contains("midway")
+        || lower.contains("saml")
+        || lower.contains("federate")
+    {
+        return ApproveOutcome::StaleCookie;
+    }
+    for exc in [
+        "AccessRefusedException",
+        "InvalidRequestException",
+        "CriticException",
+        "DependencyException",
+    ] {
+        if b.contains(exc) {
+            return ApproveOutcome::CruxError(exc.to_string());
+        }
+    }
+    if (http_code == "200" || http_code == "204") && b.is_empty() {
+        return ApproveOutcome::Success;
+    }
+    ApproveOutcome::Unexpected(format!("HTTP {http_code}, body: {b}"))
+}
+
+/// `fleet approve-cr` (task_913): cast a CR Ship-It, OPERATOR-GATED by a required authorization comment-ref.
+/// Loads the untracked CRUX config + the configured operator id, fetches the named board comment, refuses
+/// unless it is a valid operator authorization for THIS CR ([`validate_auth_comment`]), then casts the vote as
+/// the authenticated human via the host Midway cookie (CRUX refuses service principals). `--dry-run` validates
+/// and prints the assembled request without casting. The HTTP I/O wraps the pure cores; it exits non-zero on
+/// any refusal or failure so a caller/script never mistakes a no-op for a cast.
+fn approve_cr(cr: &str, auth_task: i64, auth_comment: i64, revision: i64, dry_run: bool) {
+    // 1. CRUX endpoint config — untracked, public-repo-safe.
+    let cfg_path = fleet_local_config_dir().join("crux.toml");
+    let cfg = match std::fs::read_to_string(&cfg_path) {
+        Ok(t) => parse_crux_config(&t).unwrap_or_else(|e| {
+            eprintln!("fleet approve-cr: {} failed to parse: {e}", cfg_path.display());
+            std::process::exit(1);
+        }),
+        Err(_) => {
+            eprintln!(
+                "fleet approve-cr: no CRUX config at {} — it is a LOCAL, deploy-injected resource (not in the public repo). Copy crates/fleet/crux.toml.example there and fill in this host's CRUX endpoint + target.",
+                cfg_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // 2. The configured operator — the only principal whose comment can authorize a Ship-It.
+    let Some(operator_id) = config::get().operator_id.clone() else {
+        eprintln!("fleet approve-cr: no config.operator_id set — cannot verify an operator authorization; refusing.");
+        std::process::exit(1);
+    };
+
+    // 3. Fetch the authorization comment (the board client returns a task's comments inline).
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet approve-cr: board connect failed: {e}");
+        std::process::exit(1);
+    });
+    let task = board.get_task(auth_task).unwrap_or_else(|e| {
+        eprintln!("fleet approve-cr: fetch auth task {auth_task} failed: {e}");
+        std::process::exit(1);
+    });
+    let comment = task
+        .get("comments")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .find(|c| c.get("id").and_then(serde_json::Value::as_i64) == Some(auth_comment));
+    let Some(comment) = comment else {
+        eprintln!("fleet approve-cr: no comment id {auth_comment} on task_{auth_task} — cannot authorize; refusing.");
+        std::process::exit(1);
+    };
+    let author = comment.get("author").and_then(serde_json::Value::as_str).unwrap_or("");
+    let body = comment.get("body").and_then(serde_json::Value::as_str).unwrap_or("");
+
+    // 4. Validate the authorization. Refuse (non-zero) on any failure — no agent approves on its own read.
+    if let Err(e) = validate_auth_comment(author, body, &operator_id, cr) {
+        eprintln!("fleet approve-cr: authorization INVALID — {e}; refusing to cast.");
+        std::process::exit(1);
+    }
+    println!(
+        "fleet approve-cr: authorization VALID — operator '{operator_id}' authorized Ship-It of {cr} in comment {auth_comment} on task_{auth_task}."
+    );
+
+    let payload = format!(r#"{{"reviewRevision":{{"cr":"{cr}","revision":{revision}}}}}"#);
+    if dry_run {
+        println!(
+            "  DRY-RUN: would POST {} (X-Amz-Target {}) body {payload} as the host Midway identity; not casting.",
+            cfg.endpoint, cfg.amz_target
+        );
+        return;
+    }
+
+    // 5. Cast as the authenticated human via the Midway cookie (CRUX refuses service principals — human-only).
+    //    `-w '\n%{http_code}'` appends the status as the final line so the pure classifier sees both.
+    println!("  casting Ship-It on {cr} revision {revision} …");
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "-L",
+            "-w",
+            "\n%{http_code}",
+            "-b",
+            &cfg.midway_cookie,
+            "-c",
+            &cfg.midway_cookie,
+            "--anyauth",
+            "--location-trusted",
+            "--negotiate",
+            "-u",
+            ":",
+            "-H",
+            &format!("X-Amz-Target: {}", cfg.amz_target),
+            "-H",
+            "Accept: application/json",
+            "-H",
+            "Content-Type: application/json; charset=UTF-8",
+            "-H",
+            "Content-Encoding: amz-1.0",
+            "-d",
+            &payload,
+            &cfg.endpoint,
+        ])
+        .output();
+    let out = out.unwrap_or_else(|e| {
+        eprintln!("  cast failed to run curl: {e}");
+        std::process::exit(1);
+    });
+    let combined = String::from_utf8_lossy(&out.stdout);
+    let (resp_body, code) = combined.rsplit_once('\n').unwrap_or((combined.as_ref(), ""));
+    match classify_approve_response(code.trim(), resp_body) {
+        ApproveOutcome::Success => {
+            println!("  OK — Ship-It cast on {cr} revision {revision} (CriticService accepted, HTTP {}).", code.trim())
+        }
+        ApproveOutcome::StaleCookie => {
+            eprintln!(
+                "  AUTH FAILED — the Midway cookie at {} is stale/absent (HTTP {}; the SSO front door redirected to login). Run `mwinit -s` to refresh it, then retry. NOTHING was cast.",
+                cfg.midway_cookie,
+                code.trim()
+            );
+            std::process::exit(1);
+        }
+        ApproveOutcome::CruxError(exc) => {
+            eprintln!("  CRUX REFUSED the cast: {exc} (HTTP {}). NOTHING was approved. Response: {resp_body}", code.trim());
+            std::process::exit(1);
+        }
+        ApproveOutcome::Unexpected(what) => {
+            eprintln!("  UNEXPECTED response — not a recognizable success or known failure: {what}. Treating as NOT cast.");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn daemon_pids(daemon: &str) {
     let mut found: Vec<i64> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
@@ -13701,6 +13952,49 @@ detached
         // A static header that is neither ${FLEET_AGENT} nor the agent name, with no helper -> warn.
         let hardcoded = TaskboardIdentityConfig { present: true, static_header: Some("someone-else".to_string()), has_helper: false };
         assert_eq!(mcp_check_decision("a", Some("a"), &["claude".to_string()], &hardcoded).verdict, McpCheckVerdict::Warn);
+    }
+
+    #[test]
+    fn validate_auth_comment_requires_operator_cr_binding_and_approval_token() {
+        // Valid: operator author, names the CR, carries an approval token.
+        assert!(validate_auth_comment("cameron", "approve CR-260966047 please", "cameron", "CR-260966047").is_ok());
+        // Wrong author -> refused (no agent approves on its own read).
+        assert!(validate_auth_comment("v-core-opt", "approve CR-260966047", "cameron", "CR-260966047").is_err());
+        // Does not name the target CR -> refused (a stale ref must not approve the wrong CR).
+        assert!(validate_auth_comment("cameron", "approve CR-999999999", "cameron", "CR-260966047").is_err());
+        // No approval token -> refused.
+        assert!(validate_auth_comment("cameron", "looking at CR-260966047", "cameron", "CR-260966047").is_err());
+        // Token match is case-insensitive and accepts the ship-it variants.
+        assert!(validate_auth_comment("cameron", "LGTM, ship it: CR-260966047", "cameron", "CR-260966047").is_ok());
+    }
+
+    #[test]
+    fn parse_crux_config_reads_endpoint_target_and_defaults_cookie() {
+        let cfg = parse_crux_config("endpoint = \"https://x\"\namz_target = \"com.amazon.critic.CriticService.ApproveReviewRevision\"\n").unwrap();
+        assert_eq!(cfg.endpoint, "https://x");
+        assert_eq!(cfg.amz_target, "com.amazon.critic.CriticService.ApproveReviewRevision");
+        assert!(cfg.midway_cookie.ends_with("/.midway/cookie")); // defaulted
+        // An explicit cookie override is honored.
+        let cfg2 = parse_crux_config("endpoint=\"https://x\"\namz_target=\"t\"\nmidway_cookie=\"/tmp/c\"\n").unwrap();
+        assert_eq!(cfg2.midway_cookie, "/tmp/c");
+    }
+
+    #[test]
+    fn classify_approve_response_distinguishes_success_stale_and_crux_error() {
+        // 2xx + empty body = success (ApproveReviewRevision returns nothing on success).
+        assert_eq!(classify_approve_response("200", ""), ApproveOutcome::Success);
+        assert_eq!(classify_approve_response("204", "  "), ApproveOutcome::Success);
+        // A clean 401/403 is a stale cookie.
+        assert_eq!(classify_approve_response("401", ""), ApproveOutcome::StaleCookie);
+        // The SSO front door serving an HTML/Midway login page (even on a 200) is a stale cookie, NOT success.
+        assert_eq!(classify_approve_response("200", "<html>Midway login</html>"), ApproveOutcome::StaleCookie);
+        // A Coral exception in the body is a CRUX error (never mistaken for success).
+        assert_eq!(
+            classify_approve_response("400", "{\"__type\":\"...#AccessRefusedException\"}"),
+            ApproveOutcome::CruxError("AccessRefusedException".to_string())
+        );
+        // A 2xx with an unexpected non-empty body is Unexpected, never Success.
+        assert!(matches!(classify_approve_response("200", "{\"weird\":1}"), ApproveOutcome::Unexpected(_)));
     }
 
     #[test]
