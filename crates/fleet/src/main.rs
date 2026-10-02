@@ -2018,6 +2018,66 @@ fn write_intake_alert_stamp(fleet: &Fleet, project: i64, task_ref: &str, now: u6
     let _ = std::fs::write(p, now.to_string());
 }
 
+/// task_1217 shape (c): the channel the once-per-sweep intake digest is posted to — a consolidated roll-up of
+/// every task currently violating an inbox invariant. board-triage (to route them out) and concierge (aggregate
+/// visibility + the backstop surface if board-triage itself missed it) subscribe, so one `channel.post` wakes
+/// both with the whole actionable batch rather than N per-task wakes. Resolved by name (create-if-absent) each
+/// sweep, mirroring the accountability digest ([`ACCOUNTABILITY_CHANNEL`]) and the deploys channel.
+const INTAKE_DIGEST_CHANNEL: &str = "fleet-intake-watch";
+/// The author the intake digest is posted as — the dwell+state watchdog pass itself, not a task owner.
+const INTAKE_DIGEST_SENDER: &str = "fleet-intake-watch";
+
+/// task_1217 shape (c): the sweep-level digest cooldown stamp — `<root>/watchdog/intake-digest/<project>.stamp`
+/// (contents = unix secs of the last digest). ONE stamp per project (not per offender), so the consolidated
+/// digest posts at most once per cooldown window however fast the sweep runs — the "cooldown-fenced so no
+/// per-sweep spam" board-pm required (comment_6197), while the per-offender comments keep their own per-offender
+/// fence ([`intake_alert_stamp_path`]).
+fn intake_digest_stamp_path(fleet: &Fleet, project: i64) -> PathBuf {
+    fleet
+        .root
+        .join("watchdog")
+        .join("intake-digest")
+        .join(format!("{project}.stamp"))
+}
+
+/// Read the last intake-digest unix time for a project; `None` on an absent/unparseable stamp (never posted).
+fn read_intake_digest_stamp(fleet: &Fleet, project: i64) -> Option<u64> {
+    std::fs::read_to_string(intake_digest_stamp_path(fleet, project))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record that the digest was just posted at `now` (best-effort — a write failure only risks a re-post next
+/// window, the safe direction for a backstop).
+fn write_intake_digest_stamp(fleet: &Fleet, project: i64, now: u64) {
+    let p = intake_digest_stamp_path(fleet, project);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
+/// task_1217 shape (c), board-pm comment_6197: the once-per-sweep intake digest body — ONE consolidated post
+/// naming every task currently violating an inbox invariant and WHY, tagging board-triage to route them out and
+/// concierge for aggregate visibility + the backstop surface. `offenders` is `(task_ref, reason)` for every
+/// current violator this sweep, in sweep order. Each line uses the typed `task_<id>` ref the board hands back
+/// (never a bare `#<id>`, which board content hard-rejects). Pure — unit-tested; the channel resolve/post/fence
+/// wraps it.
+fn intake_digest_body(offenders: &[(String, String)]) -> String {
+    let mut lines = String::new();
+    for (task_ref, reason) in offenders {
+        lines.push_str(&format!("\n- {task_ref}: {reason}"));
+    }
+    format!(
+        "@board-triage @concierge fleet intake-watch: {} task(s) currently violate an uncategorized-intake \
+         invariant and must be routed out of the intake project (assign an owner or move to a real project). \
+         @board-triage each needs a routing call; @concierge this is the aggregate/backstop view:{lines}",
+        offenders.len()
+    )
+}
+
 /// Sweep the uncategorized intake project and REPORT every task that violates an inbox invariant (task_1217),
 /// and with `alert` also post the active, cooldown-fenced per-offender escalation (shape (a), board-pm
 /// comment_6197). Report-only by default: it prints the offenders (via the pure [`intake_report`]) and exits
@@ -2025,7 +2085,10 @@ fn write_intake_alert_stamp(fleet: &Fleet, project: i64, task_ref: &str, now: u6
 /// per-offender comment tagging board-triage on each violating task, fenced per offender by
 /// `alert_cooldown_secs` so a fast sweep never re-comments. Age is the task's `created_at` to now; a task with
 /// no parseable `created_at` is swept on state only (age 0, so it can still trip the state invariant but never
-/// a phantom dwell). The one fenced digest to board-triage plus concierge (shape (c)) is the follow-on.
+/// a phantom dwell). After the per-offender pass, `--alert` also posts ONE consolidated digest per sweep (shape
+/// (c)) to the [`INTAKE_DIGEST_CHANNEL`] — board-triage gets the actionable batch and concierge the aggregate
+/// backstop — fenced by a single sweep-level cooldown ([`intake_digest_stamp_path`]) so a ~30s sweep never
+/// spams the channel. Best-effort: a channel resolve/post failure is logged but never fails the sweep.
 fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_cooldown_secs: u64) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("intake-watch: {e}");
@@ -2069,10 +2132,15 @@ fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_c
 
     if alert {
         let mut alerted = 0usize;
+        // Every current violator this sweep (ref + reason), for the consolidated digest below. Collected
+        // independent of the per-offender comment cooldown: the digest reflects the CURRENT violation set, while
+        // each per-offender comment keeps its own per-offender fence.
+        let mut offenders: Vec<(String, String)> = Vec::new();
         for (id, task_ref, status, age) in &rich {
             let Some(reason) = intake_violation_reason(status, *age, sla_secs) else {
                 continue;
             };
+            offenders.push((task_ref.clone(), reason.clone()));
             // Fence: at most one alert per offender per cooldown window, so a ~30s sweep does not re-comment.
             if bounce_on_cooldown(
                 read_intake_alert_stamp(fleet, project, task_ref),
@@ -2090,9 +2158,42 @@ fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_c
             }
         }
         eprintln!(
-            "intake-watch: alerted {alerted} offender(s) (per-offender cooldown {alert_cooldown_secs}s); the \
-             (c) digest to board-triage plus concierge is the follow-on"
+            "intake-watch: alerted {alerted} offender(s) (per-offender cooldown {alert_cooldown_secs}s)"
         );
+
+        // task_1217 shape (c): ONE consolidated digest per sweep to board-triage + concierge, fenced by a
+        // single sweep-level cooldown stamp so a fast (~30s) sweep posts at most once per window — the actionable
+        // batch for board-triage to route and the aggregate backstop for concierge. Best-effort: a resolve/post
+        // failure is logged but never fails the sweep (the per-offender comments already landed; the digest is
+        // an additional wake path, not the authoritative record).
+        if !offenders.is_empty()
+            && !bounce_on_cooldown(
+                read_intake_digest_stamp(fleet, project),
+                now,
+                alert_cooldown_secs,
+            )
+        {
+            match board.create_or_get_channel(INTAKE_DIGEST_CHANNEL, INTAKE_DIGEST_SENDER) {
+                Ok(channel_id) => {
+                    let body = intake_digest_body(&offenders);
+                    match board.post_to_channel(channel_id, INTAKE_DIGEST_SENDER, &body) {
+                        Ok(()) => {
+                            write_intake_digest_stamp(fleet, project, now);
+                            eprintln!(
+                                "intake-watch: posted digest ({} offender(s)) to #{INTAKE_DIGEST_CHANNEL} (id {channel_id})",
+                                offenders.len()
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "intake-watch: digest post to #{INTAKE_DIGEST_CHANNEL} failed: {e} (per-offender comments already landed)"
+                        ),
+                    }
+                }
+                Err(e) => eprintln!(
+                    "intake-watch: resolve '{INTAKE_DIGEST_CHANNEL}' channel failed: {e} (per-offender comments already landed; skipping digest)"
+                ),
+            }
+        }
     }
 
     if lines.is_empty() {
@@ -16865,6 +16966,36 @@ detached
         assert!(
             c.to_lowercase().contains("rout"),
             "asks to route it out of the inbox: {c}"
+        );
+    }
+
+    #[test]
+    fn intake_digest_body_tags_both_surfaces_counts_and_lists_each_offender_with_typed_refs() {
+        let offenders = vec![
+            (
+                "task_4001".to_string(),
+                "state=in_progress (never in-inbox)".to_string(),
+            ),
+            ("task_4002".to_string(), "dwell 300s > 120s SLA".to_string()),
+        ];
+        let d = intake_digest_body(&offenders);
+        // Wakes both subscriber surfaces: board-triage (route) + concierge (aggregate/backstop).
+        assert!(d.contains("@board-triage"), "tags board-triage: {d}");
+        assert!(d.contains("@concierge"), "tags concierge: {d}");
+        // Names the count and lists each offender with its reason.
+        assert!(d.contains("2 task(s)"), "names the offender count: {d}");
+        assert!(
+            d.contains("task_4001: state=in_progress (never in-inbox)"),
+            "lists the first offender + reason: {d}"
+        );
+        assert!(
+            d.contains("task_4002: dwell 300s > 120s SLA"),
+            "lists the second offender + reason: {d}"
+        );
+        // Typed task_<id> refs only — a bare `#<id>` is hard-rejected by board content.
+        assert!(
+            !d.contains("#4001") && !d.contains("#4002"),
+            "no bare #<id> refs: {d}"
         );
     }
 
