@@ -2155,6 +2155,19 @@ enum Cmd {
         #[arg(long, default_value_t = 80)]
         tail: usize,
     },
+    /// Authoritative OS-process single-instance check (task_1063): scan /proc for live `claude` agent sessions,
+    /// map each to its agent by its working directory (`…/agents/<agent>[/…]`), and report any agent with MORE
+    /// THAN ONE live instance — the duplicate-instance condition the tmux-window guard (camshaft/fleet#327) can
+    /// miss when a duplicate is detached or launched a different way. This is the process-list-authoritative
+    /// method (not the window heuristic) for any duplicate-instance report. Report-only by default; `--kill`
+    /// SIGTERMs the extra instance(s), keeping the oldest (longest-running) canonical one per agent.
+    DedupCheck {
+        /// Limit the check to one agent (by name); default scans every agent with a live claude session.
+        agent: Option<String>,
+        /// SIGTERM the extra instance(s), keeping the oldest canonical per agent. Without it, report only.
+        #[arg(long)]
+        kill: bool,
+    },
     /// Nudge stale in_progress tasks (board task #478, operator: automate what board-follow-up was missing).
     /// A task in `in_progress` whose latest activity (its `updated_at`, or a later comment) is at least
     /// `--threshold-hours` old gets a comment pinging its assignee for a progress update or ETA. Per-task
@@ -2537,6 +2550,7 @@ fn main() {
         Cmd::SeamCheck { agent, no_fetch } => seam_check(&agent, no_fetch),
         Cmd::MonitorTick { agent, apply, no_fetch } => monitor_tick(&agent, apply, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
+        Cmd::DedupCheck { agent, kill } => dedup_check(agent.as_deref(), kill),
         Cmd::NudgeStale {
             apply,
             threshold_hours,
@@ -10319,6 +10333,108 @@ fn exe_matches_daemon(exe_target: &str, daemon: &str) -> bool {
 /// ` (deleted)` suffix the way `confirm-kill`'s rationale requires), matches the basename in Rust, and confirms
 /// `kill -0` liveness so a half-exited pid is never reported. Prints one matching pid per line, ascending;
 /// exit 0 whether or not any matched — absence is a valid answer the caller (a guard/redeploy) acts on.
+/// Extract the agent name from a board-native agent's working directory: the path segment immediately after an
+/// `agents/` component. The fleet stores each board-native agent's workspace at `<root>/.fleet/agents/<agent>[/…]`
+/// (e.g. `/home/u/.fleet/agents/ticket-ingest/fleet` → `ticket-ingest`), so a process's cwd names its agent even
+/// when a resumed session's argv no longer carries the kickoff — the authoritative identity signal for the
+/// OS-process dedup check (task_1063). None if the path has no `agents/<segment>`. Pure — unit-tested.
+fn agent_from_cwd(cwd: &str) -> Option<&str> {
+    let mut segs = cwd.split('/');
+    while let Some(s) = segs.next() {
+        if s == "agents" {
+            return segs.next().filter(|a| !a.is_empty());
+        }
+    }
+    None
+}
+
+/// Group live agent instances `(pid, agent, start_tick)` by agent and decide the dedup action (task_1063): for
+/// each agent with MORE THAN ONE live instance, keep the OLDEST (smallest start tick = longest-running
+/// canonical) and mark the rest to kill (newest-first). Agents with a single instance are omitted — nothing to
+/// do. Deterministic (agents sorted, kills ordered). Pure — unit-tested; the /proc scan and the actual kill
+/// wrap this.
+fn dedup_decision(instances: &[(u32, String, u64)]) -> Vec<(String, u32, Vec<u32>)> {
+    let mut by_agent: std::collections::BTreeMap<&str, Vec<(u32, u64)>> = std::collections::BTreeMap::new();
+    for (pid, agent, start) in instances {
+        by_agent.entry(agent).or_default().push((*pid, *start));
+    }
+    let mut out = Vec::new();
+    for (agent, mut procs) in by_agent {
+        if procs.len() < 2 {
+            continue;
+        }
+        // Oldest first (smallest start tick); keep[0] is the canonical, the rest are extras to kill.
+        procs.sort_by_key(|(pid, start)| (*start, *pid));
+        let keep = procs[0].0;
+        let kill: Vec<u32> = procs[1..].iter().map(|(pid, _)| *pid).collect();
+        out.push((agent.to_string(), keep, kill));
+    }
+    out
+}
+
+/// The process start time (field 22 of `/proc/<pid>/stat`, in clock ticks since boot) — a smaller value is an
+/// older process. Parses past the `(comm)` field (which may itself contain spaces/parens) by splitting after the
+/// last `)`. None if `/proc/<pid>/stat` is unreadable or malformed.
+fn proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // Fields after comm begin at `state` (overall field 3); starttime is overall field 22 → index 19 here.
+    after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// `fleet dedup-check` (task_1063): the OS-process-authoritative single-instance check. Scans `/proc` for live
+/// `claude` sessions, maps each to its agent by cwd ([`agent_from_cwd`]), and reports any agent running more
+/// than one instance (optionally filtered to `agent`). On `--kill`, SIGTERMs the extra instance(s), keeping the
+/// oldest canonical per agent ([`dedup_decision`]). This is the method to use for a duplicate-instance report —
+/// it sees a detached or differently-launched duplicate that the tmux-window guard (camshaft/fleet#327) misses.
+fn dedup_check(filter: Option<&str>, kill: bool) {
+    let mut instances: Vec<(u32, String, u64)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            // A Claude Code agent session's process comm is exactly `claude`.
+            if std::fs::read_to_string(e.path().join("comm")).unwrap_or_default().trim() != "claude" {
+                continue;
+            }
+            let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else { continue };
+            let Some(agent) = agent_from_cwd(&cwd.to_string_lossy()).map(str::to_string) else { continue };
+            if filter.is_some_and(|f| f != agent) {
+                continue;
+            }
+            instances.push((pid, agent, proc_starttime(pid).unwrap_or(0)));
+        }
+    }
+    let dups = dedup_decision(&instances);
+    println!(
+        "dedup-check: {} live agent process(es){}",
+        instances.len(),
+        filter.map(|f| format!(" (filter: {f})")).unwrap_or_default()
+    );
+    if dups.is_empty() {
+        println!("  OK — every agent has at most one live instance (1:1 process:identity).");
+        return;
+    }
+    for (agent, keep, killset) in &dups {
+        println!(
+            "  DUPLICATE '{agent}': {} live instances — canonical (oldest) pid {keep}, extra(s): {killset:?}",
+            killset.len() + 1
+        );
+        if kill {
+            for pid in killset {
+                let ok = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                println!("    {} pid {pid}", if ok { "SIGTERM ->" } else { "FAILED to kill" });
+            }
+        }
+    }
+    if !kill {
+        println!("  (report-only — re-run with --kill to SIGTERM the extra instance(s), keeping the oldest canonical)");
+    }
+}
+
 fn daemon_pids(daemon: &str) {
     let mut found: Vec<i64> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
@@ -13105,6 +13221,37 @@ detached
                 "v-x",
             ]
         );
+    }
+
+    #[test]
+    fn agent_from_cwd_extracts_the_segment_after_agents() {
+        assert_eq!(agent_from_cwd("/local/home/u/.fleet/agents/ticket-ingest/fleet"), Some("ticket-ingest"));
+        assert_eq!(agent_from_cwd("/home/u/.fleet/agents/membrain-ops"), Some("membrain-ops"));
+        // No `agents/` component (e.g. a worktree-based agent) -> cannot name an agent.
+        assert_eq!(agent_from_cwd("/home/u/.claude/worktrees/some-topic"), None);
+        // `agents` with nothing after it -> None.
+        assert_eq!(agent_from_cwd("/home/u/.fleet/agents"), None);
+    }
+
+    #[test]
+    fn dedup_decision_keeps_oldest_and_kills_the_rest_only_for_duplicated_agents() {
+        // ticket-ingest has two instances (pid 100 start=5 is older, pid 200 start=50) -> keep 100, kill [200].
+        // membrain-ops has one -> omitted (nothing to do).
+        let inst = vec![
+            (200u32, "ticket-ingest".to_string(), 50u64),
+            (100u32, "ticket-ingest".to_string(), 5u64),
+            (300u32, "membrain-ops".to_string(), 7u64),
+        ];
+        assert_eq!(dedup_decision(&inst), vec![("ticket-ingest".to_string(), 100u32, vec![200u32])]);
+        // All-singleton -> empty (clean 1:1).
+        assert!(dedup_decision(&[(1, "a".to_string(), 1), (2, "b".to_string(), 1)]).is_empty());
+        // Three instances of one agent -> keep oldest, kill the other two (newest-first order preserved by start).
+        let three = vec![
+            (9u32, "x".to_string(), 30u64),
+            (7u32, "x".to_string(), 10u64),
+            (8u32, "x".to_string(), 20u64),
+        ];
+        assert_eq!(dedup_decision(&three), vec![("x".to_string(), 7u32, vec![8u32, 9u32])]);
     }
 
     #[test]
