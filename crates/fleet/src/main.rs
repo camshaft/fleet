@@ -3429,7 +3429,9 @@ enum Cmd {
     /// fleet-dream systemd timer invokes. Pulls all repo-scoped memory, groups by repo, and runs the
     /// analyze+publish pass per scope -- refreshing each versioned `dreams/<scope>` review doc and writing a
     /// per-scope report under `<state-dir>/dreams`. Emits a `DREAM-NEW` stdout line per scope with new
-    /// proposals (the notify-on-new signal). Corpus-only first cut (no repo-root -> staleness skips).
+    /// proposals (the notify-on-new signal). When a repo-checkout base is configured (`--repo-root-base` or
+    /// `config.repo_checkout_base`) each scope that resolves to a local checkout also runs the staleness
+    /// detector against it; scopes with no local checkout stay corpus-only.
     DreamRun {
         /// Board REST base for the live-board pull (default the fleet board base).
         #[arg(long)]
@@ -3444,6 +3446,11 @@ enum Cmd {
         /// `dream::DREAM_NOTIFY_CHANNEL`). Created-or-got by name; posted to only when a scope has new>0.
         #[arg(long, default_value = "dream-reports")]
         notify_channel: String,
+        /// Base dir under which local repo checkouts live; each `repos/<org>-<name>` scope maps to
+        /// `<base>/<org>/<name>` (else `<base>/<slug>`) to enable the staleness detector. Overrides
+        /// `config.repo_checkout_base`; absent (and unset in config) → every scope is corpus-only.
+        #[arg(long)]
+        repo_root_base: Option<PathBuf>,
     },
     /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
     /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
@@ -3896,10 +3903,25 @@ fn main() {
             state_dir,
             board_memory,
             notify_channel,
+            repo_root_base,
         } => {
             let api = board_api.unwrap_or_else(board::Board::base_url);
             let state_dir = state_dir.unwrap_or_else(default_state_dir);
-            let code = dream::run_cmd(&api, &state_dir, &board_memory, &notify_channel);
+            // CLI flag wins; else the config-file base (so the scheduled service enables staleness via
+            // config.toml with no flag). Absent in both → every scope stays corpus-only.
+            let repo_root_base = repo_root_base.or_else(|| {
+                config::get()
+                    .repo_checkout_base
+                    .as_deref()
+                    .map(PathBuf::from)
+            });
+            let code = dream::run_cmd(
+                &api,
+                &state_dir,
+                &board_memory,
+                &notify_channel,
+                repo_root_base.as_deref(),
+            );
             if code != 0 {
                 std::process::exit(code);
             }

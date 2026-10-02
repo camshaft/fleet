@@ -17,7 +17,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1957,6 +1957,23 @@ fn scope_report_filename(scope: &str, date: &str) -> String {
     format!("{}-{}.json", scope.replace('/', "-"), date)
 }
 
+/// Candidate local-checkout paths for a repo scope `<slug>` under `base`, most-specific first, so the
+/// all-scopes runner can hand the staleness detector a repo-root per scope (task_1123). A board scope slug is
+/// `<org>-<name>` (e.g. `camshaft-cadenza`) while a checkout lives at `<base>/<org>/<name>`; the slug's FIRST
+/// `-` is the org/name boundary, so `camshaft-s2n-quic` -> `<base>/camshaft/s2n-quic` (only the first `-` is
+/// split). An exact `<base>/<slug>` is the fallback for a slug with no org prefix. The caller picks the first
+/// candidate that exists on disk; if none exist the scope has no local checkout and the staleness detector
+/// skips it (exactly as when no base is configured) — a wrong root would mis-flag refs, so resolution never
+/// guesses past these deterministic candidates. Pure; unit-tested.
+fn repo_checkout_candidates(base: &Path, repo_slug: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some((org, name)) = repo_slug.split_once('-') {
+        candidates.push(base.join(org).join(name));
+    }
+    candidates.push(base.join(repo_slug));
+    candidates
+}
+
 /// Today's UTC date as `YYYY-MM-DD` for the per-scope report filename.
 fn today_utc_date() -> String {
     time::OffsetDateTime::now_utc().date().to_string()
@@ -1986,10 +2003,18 @@ fn format_dream_notify_post(new_by_scope: &[(String, usize)]) -> String {
 /// versioned `dreams/<scope>` review doc and writing a per-scope report under `<state-dir>/dreams/`. Emits a
 /// `DREAM-NEW scope=... new=... ids=...` line to stdout per scope that surfaced new proposals, and posts a
 /// light notify-on-new message to the librarian's `notify_channel` (dedicated `dream-reports` feed) when any
-/// scope is new. FIRST CUT is corpus-only: no `--repo-root`, so the staleness detector skips (the repo-root
-/// mapping is a v-fleet-tooling follow-on). Returns a nonzero exit if any scope (or the notify) failed, so a
-/// failed run is visible to the timer, while still processing the other scopes.
-pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str, notify_channel: &str) -> i32 {
+/// scope is new. When `repo_root_base` is set, each `repos/<org>-<name>` scope is mapped to its local checkout
+/// under the base (see [`repo_checkout_candidates`]) and the verified-dangling staleness detector runs against
+/// it; a scope with no local checkout stays corpus-only, and with no base every scope is corpus-only. Returns
+/// a nonzero exit if any scope (or the notify) failed, so a failed run is visible to the timer, while still
+/// processing the other scopes.
+pub fn run_cmd(
+    board_api: &str,
+    state_dir: &Path,
+    board_memory: &str,
+    notify_channel: &str,
+    repo_root_base: Option<&Path>,
+) -> i32 {
     let date = today_utc_date();
     let recs = match load_corpus_from_board(board_api, "repos") {
         Ok(r) => r,
@@ -2022,7 +2047,28 @@ pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str, notify_cha
     for (repo, group) in &by_repo {
         let scope = format!("repos/{repo}");
         let out = dreams_dir.join(scope_report_filename(&scope, &date));
-        match run_scope_pass(group, Some(&scope), &out, true, board_memory, None) {
+        // Resolve the scope to a local checkout under the configured base, if any; the staleness detector
+        // runs only when the checkout exists on disk (a wrong root would mis-flag refs, so an unresolved
+        // scope stays corpus-only rather than guessing).
+        let repo_root = repo_root_base.and_then(|base| {
+            repo_checkout_candidates(base, repo)
+                .into_iter()
+                .find(|p| p.is_dir())
+        });
+        if let Some(root) = &repo_root {
+            eprintln!(
+                "dream-run: {scope} -- staleness enabled against {}",
+                root.display()
+            );
+        }
+        match run_scope_pass(
+            group,
+            Some(&scope),
+            &out,
+            true,
+            board_memory,
+            repo_root.as_deref(),
+        ) {
             Ok(o) => {
                 eprintln!(
                     "dream-run: {scope} -- {} memories, {} new proposal(s)",
@@ -2571,6 +2617,32 @@ mod tests {
         assert_eq!(
             scope_report_filename("repos/fleet", "2026-01-01"),
             "repos-fleet-2026-01-01.json"
+        );
+    }
+
+    #[test]
+    fn repo_checkout_candidates_splits_org_on_first_dash_then_falls_back_exact() {
+        let base = Path::new("/p");
+        // org-prefixed slug: first `-` is the org/name boundary; only the first `-` splits, so a
+        // multi-dash name (s2n-quic) stays intact under the org dir.
+        assert_eq!(
+            repo_checkout_candidates(base, "camshaft-cadenza"),
+            vec![
+                PathBuf::from("/p/camshaft/cadenza"),
+                PathBuf::from("/p/camshaft-cadenza")
+            ]
+        );
+        assert_eq!(
+            repo_checkout_candidates(base, "camshaft-s2n-quic"),
+            vec![
+                PathBuf::from("/p/camshaft/s2n-quic"),
+                PathBuf::from("/p/camshaft-s2n-quic")
+            ]
+        );
+        // no org prefix: exact `<base>/<slug>` is the only candidate.
+        assert_eq!(
+            repo_checkout_candidates(base, "membrain"),
+            vec![PathBuf::from("/p/membrain")]
         );
     }
 

@@ -54,6 +54,13 @@ pub struct Config {
     /// REASSIGN it to a fresh agent (mint a helper if needed) rather than wait on the silent owner. Defaults to
     /// round 3 at the use site (= N). Takes precedence over the pm-tag round when both apply. Config-tunable.
     pub nudge_reassign_round: Option<usize>,
+    /// task_1123: base directory under which local repo checkouts live, enabling the `dream-run` staleness
+    /// detector per scope. The all-scopes runner maps each `repos/<org>-<name>` scope to `<base>/<org>/<name>`
+    /// (falling back to `<base>/<slug>`); when the checkout exists the verified-dangling staleness detector
+    /// runs against it, otherwise that scope stays corpus-only. Absent → no base, so every scope is corpus-only
+    /// (the first-cut behavior). The checkout root is a deployment-specific path, so it is named here, never
+    /// hard-coded; `dream-run --repo-root-base` overrides it.
+    pub repo_checkout_base: Option<String>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -122,12 +129,17 @@ mod tests {
             operator_id = "operator"
             nudge_pm_tag_round = 2
             nudge_reassign_round = 3
+            repo_checkout_base = "/home/x/Projects"
             "#,
         );
         assert_eq!(cfg.operator_id.as_deref(), Some("operator"));
+        assert_eq!(cfg.repo_checkout_base.as_deref(), Some("/home/x/Projects"));
         assert_eq!(cfg.nudge_pm_tag_round, Some(2));
         assert_eq!(cfg.nudge_reassign_round, Some(3));
-        assert_eq!(cfg.tunnel_health_url.as_deref(), Some("http://127.0.0.1:8898/"));
+        assert_eq!(
+            cfg.tunnel_health_url.as_deref(),
+            Some("http://127.0.0.1:8898/")
+        );
         assert_eq!(cfg.host.as_deref(), Some("host-b"));
         assert_eq!(cfg.session.as_deref(), Some("fleet-main"));
         assert_eq!(cfg.hub.as_deref(), Some("/srv/hub"));
@@ -143,7 +155,10 @@ mod tests {
         assert!(empty.session.is_none() && empty.board_api.is_none());
         let partial = parse(r#"session = "s""#);
         assert_eq!(partial.session.as_deref(), Some("s"));
-        assert!(partial.hub.is_none(), "unset keys stay None → use the built-in default");
+        assert!(
+            partial.hub.is_none(),
+            "unset keys stay None → use the built-in default"
+        );
     }
 
     #[test]
