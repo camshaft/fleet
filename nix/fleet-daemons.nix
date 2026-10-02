@@ -308,10 +308,18 @@ let
     # ephemeral reviewers for every review in_review + not yet vetted. Idempotent via the S2b per-angle claim (a
     # review already covered re-spawns nothing), so running it on the 60s cadence is safe; this is what makes the
     # review engine live without a manual `review-spawn`/`review-sweep` invocation.
+    # --intake-watch (task_1217 enable, v-fleet-tooling comment_7017): run the project_29 dwell+state intake sweep
+    # each pass and ALERT (per-offender comment + one fenced digest to the fleet-intake-watch channel), so an
+    # intake task past the ~2min dwell SLA or stuck in_progress/blocked surfaces rather than piling silently. This
+    # is alert-only (no destructive auto-action), already blessed by cameron's task framing, so it is a deploy not
+    # a fresh operator posture. It reads the intake project from config.intake_project; absent = no-op (zero blast
+    # radius), so this flag only goes live once config.intake_project = 29 is set on this host (co-applied with
+    # v-nix's home-manager host-config migration). Gated like the sibling acts: board-reachable, quiesce-suppressed,
+    # best-effort, logged; its per-offender + per-sweep cooldown stamps make the 60s cadence safe.
     // (mkTimer {
       name = "fleet-watchdog";
       description = "Fleet watchdog";
-      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn --reap-stale-observers --recover-wedged --review-sweep";
+      exec = "${fleetBin} watchdog --rearm --stale-only --observe --spawn --reap-stale-observers --recover-wedged --review-sweep --intake-watch";
       intervalSecs = 60;
       onBootSec = 60;
       persistent = true;
