@@ -2131,13 +2131,13 @@ fn board_hygiene_sweeps(
 ) -> Vec<HygieneSweep> {
     let mut sweeps = vec![HygieneSweep {
         name: "archive-done",
-        path: format!("/api/projects/{project}/archive-done"),
+        path: format!("/projects/{project}/archive-done"),
         older_than_days: archive_done_days,
     }];
     if !skip_age_out {
         sweeps.push(HygieneSweep {
             name: "age-out-todos",
-            path: format!("/api/projects/{project}/age-out-todos"),
+            path: format!("/projects/{project}/age-out-todos"),
             older_than_days: age_out_days,
         });
     }
@@ -2292,6 +2292,121 @@ fn compose_mandate_artifact(sets: &[(String, Option<String>)]) -> Result<Compose
         }
     }
     Ok(ComposedMandate { artifact, skipped })
+}
+
+/// Fetch each mandate set's operator-approved content from the board (task_906): for each ordered path, read
+/// its wiki row and gate on `approved_version_id` - null means no approved version (fail-soft, `None`), else
+/// fetch the approved body. A path with no wiki row at all is also `None`. Returns the ordered
+/// `(path, approved_content)` list [`compose_mandate_artifact`] consumes. The gate-on-id means a missing set
+/// never costs a 404 round-trip. A hard board error on a set is surfaced (not silently skipped).
+fn fetch_mandate_sets(
+    board: &board::Board,
+    paths: &[String],
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let content = match board.wiki_row_for_path(path)? {
+            Some(row) => match row
+                .get("approved_version_id")
+                .and_then(serde_json::Value::as_i64)
+            {
+                Some(id_present) => {
+                    let _ = id_present; // non-null => an approved version exists; fetch the body
+                    let doc_id = row
+                        .get("id")
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| {
+                            format!("compose-mandates: wiki row for {path} has no id")
+                        })?;
+                    Some(board.fetch_approved_content(doc_id)?)
+                }
+                None => None, // filed but no approved version yet -> fail-soft skip
+            },
+            None => None, // not filed -> fail-soft skip
+        };
+        out.push((path.clone(), content));
+    }
+    Ok(out)
+}
+
+/// Whether a freshly-composed mandate artifact DIFFERS from what is already on disk (task_906): the write-gate
+/// that keeps the boot file churn-free - only an actual content change triggers the atomic rewrite. Pure.
+fn artifact_changed(new: &str, existing: Option<&str>) -> bool {
+    existing != Some(new)
+}
+
+/// Compose an agent's role-inherited mandate sets into one boot-local artifact (task_906): read its registry
+/// metadata, select the ordered set paths, fetch each approved version, concatenate under stable headers, and
+/// (with `write`) atomically rewrite the `out` file only when the content changed. DRY-RUN by default (prints
+/// the artifact + the skipped sets, writes nothing). `core` with no approved version is a hard hold+alarm.
+fn compose_mandates(fleet: &Fleet, agent: &str, out: &str, write: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("compose-mandates: {e}");
+        std::process::exit(1);
+    });
+    let _ = fleet;
+    let rec = board.get_agent(agent).unwrap_or_else(|e| {
+        eprintln!("compose-mandates: cannot read agent {agent}: {e}");
+        std::process::exit(1);
+    });
+    let md = rec
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let paths = mandate_set_paths_from_metadata(&md);
+    let sets = fetch_mandate_sets(&board, &paths).unwrap_or_else(|e| {
+        eprintln!("compose-mandates: {e}");
+        std::process::exit(1);
+    });
+    let composed = compose_mandate_artifact(&sets).unwrap_or_else(|e| {
+        // core hard-required: hold + alarm rather than compose a mandate with no universal contract.
+        eprintln!("compose-mandates: {e}");
+        std::process::exit(1);
+    });
+    if !composed.skipped.is_empty() {
+        eprintln!(
+            "compose-mandates: {agent}: {} set(s) skipped (no approved version): {}",
+            composed.skipped.len(),
+            composed.skipped.join(", ")
+        );
+    }
+    if !write {
+        println!(
+            "compose-mandates: DRY-RUN for {agent} ({} set(s), {} skipped). Pass --write to materialize to {out}.\n---\n{}",
+            paths.len(),
+            composed.skipped.len(),
+            composed.artifact
+        );
+        return;
+    }
+    let existing = std::fs::read_to_string(out).ok();
+    if !artifact_changed(&composed.artifact, existing.as_deref()) {
+        println!("compose-mandates: {agent}: {out} already current (no change)");
+        return;
+    }
+    let out_path = std::path::Path::new(out);
+    if let Some(dir) = out_path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("compose-mandates: cannot create {}: {e}", dir.display());
+        std::process::exit(1);
+    }
+    let tmp = format!("{out}.tmp.{}", std::process::id());
+    if let Err(e) = std::fs::write(&tmp, &composed.artifact) {
+        eprintln!("compose-mandates: write {tmp} failed: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        eprintln!("compose-mandates: rename into {out} failed: {e}");
+        let _ = std::fs::remove_file(&tmp);
+        std::process::exit(1);
+    }
+    println!(
+        "compose-mandates: {agent}: wrote {out} ({} bytes, {} set(s), {} skipped)",
+        composed.artifact.len(),
+        paths.len(),
+        composed.skipped.len()
+    );
 }
 
 #[derive(Parser)]
@@ -3395,6 +3510,20 @@ enum Cmd {
         #[arg(long)]
         execute: bool,
     },
+    /// Compose an agent's role-inherited mandate sets into one boot-local artifact (task_906): select the
+    /// ordered set paths from registry metadata, fetch each operator-approved version, concatenate under
+    /// stable headers. DRY-RUN by default (prints it); pass --write to atomically materialize to --out.
+    ComposeMandates {
+        /// The agent whose mandate sets to compose (its board metadata drives the selection).
+        #[arg(long)]
+        agent: String,
+        /// The boot-local artifact path to materialize (with --write).
+        #[arg(long)]
+        out: String,
+        /// Atomically write the artifact to --out (only when the content changed); default is a dry-run.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 fn main() {
@@ -3535,6 +3664,7 @@ fn main() {
             skip_age_out,
             execute,
         ),
+        Cmd::ComposeMandates { agent, out, write } => compose_mandates(&fleet, &agent, &out, write),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
                 eprintln!("{e}");
@@ -16753,20 +16883,33 @@ detached
     }
 
     #[test]
+    fn artifact_changed_is_a_pure_content_gate() {
+        assert!(artifact_changed("A", None), "no existing file -> write");
+        assert!(
+            artifact_changed("A", Some("B")),
+            "differing content -> write"
+        );
+        assert!(
+            !artifact_changed("A", Some("A")),
+            "identical content -> skip (no boot-file churn)"
+        );
+    }
+
+    #[test]
     fn board_hygiene_sweeps_builds_both_rows_and_respects_skip() {
         let both = board_hygiene_sweeps(28, 7, 14, false);
         assert_eq!(both.len(), 2, "archive-done + age-out-todos");
         assert_eq!(both[0].name, "archive-done");
-        assert_eq!(both[0].path, "/api/projects/28/archive-done");
+        assert_eq!(both[0].path, "/projects/28/archive-done");
         assert_eq!(both[0].older_than_days, 7);
         assert_eq!(both[1].name, "age-out-todos");
-        assert_eq!(both[1].path, "/api/projects/28/age-out-todos");
+        assert_eq!(both[1].path, "/projects/28/age-out-todos");
         assert_eq!(both[1].older_than_days, 14);
         // skip_age_out drops the second row, leaving only the confirmed archive-done sweep.
         let only = board_hygiene_sweeps(29, 7, 14, true);
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].name, "archive-done");
-        assert_eq!(only[0].path, "/api/projects/29/archive-done");
+        assert_eq!(only[0].path, "/projects/29/archive-done");
     }
 
     #[test]
