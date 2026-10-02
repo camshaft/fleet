@@ -1706,6 +1706,16 @@ enum Cmd {
         #[arg(long)]
         stale_only: bool,
     },
+    /// Resolve the OWNER + authoritative-definition pointer for a managed host service, so an agent
+    /// asked to touch shared infra can look up "who owns it + where is the authored definition" cheaply
+    /// instead of a message round-trip (task_1027). With no argument, lists every registered service;
+    /// with a name/alias/port (e.g. `edge-proxy`, `:8880`), prints its owner, definition, and whether it
+    /// is a `lifeline` (fleet-wide board/MCP/event-wake dependency — attended-only, never an unattended
+    /// bounce). Backed by the committed `host-services.toml` registry.
+    Services {
+        /// A service name, alias, or port (e.g. `edge-proxy` or `:8880`); omit to list all services.
+        service: Option<String>,
+    },
     /// Board-native liveness watchdog: for each board-native agent (metadata.native == true), compare its
     /// heartbeat age to its OWN loop interval and flag re-arm candidates — an agent heartbeats ~once per
     /// interval, so an age beyond several intervals means missed ticks. Report-only (non-destructive).
@@ -2292,6 +2302,7 @@ fn main() {
         Cmd::BounceSession { agent, apply, force } => bounce_session(&fleet, &agent, apply, force),
         Cmd::BounceStale { apply, force } => bounce_stale(&fleet, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
+        Cmd::Services { service } => services(service.as_deref()),
         Cmd::Watchdog {
             stale_only,
             rearm,
@@ -4212,6 +4223,90 @@ fn status(stale_only: bool) {
     }
     if stale_only && shown == 0 {
         println!("(all {} agents live)", agents.len());
+    }
+}
+
+/// The committed host-service ownership registry (task_1027), embedded so the lookup is a cheap local call
+/// with no runtime file dependency. Edited by PR as services are added or ownership moves.
+const HOST_SERVICES_TOML: &str = include_str!("../host-services.toml");
+
+/// One managed host service's ownership record: who owns it, where its authoritative definition lives, and
+/// whether it is a fleet-wide `lifeline` (board / MCP / event-wake) whose changes are attended-only.
+#[derive(Debug, serde::Deserialize)]
+struct HostService {
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    owner: String,
+    definition: String,
+    #[serde(default)]
+    lifeline: bool,
+    #[serde(default)]
+    note: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HostServiceRegistry {
+    #[serde(default)]
+    service: Vec<HostService>,
+}
+
+/// Parse the embedded registry. The TOML is committed + unit-tested, so a parse failure is a build/test-time
+/// bug, not a runtime condition — surface it loudly rather than silently returning an empty registry.
+fn host_service_registry() -> HostServiceRegistry {
+    toml::from_str(HOST_SERVICES_TOML).expect("host-services.toml is committed + test-parsed; must deserialize")
+}
+
+/// Resolve a query (service name, alias, or port like `:8880`) to a service, case-insensitively. A leading
+/// `:` is kept so a port alias matches as written; matching is exact against the name or any alias. Pure —
+/// unit-tested.
+fn find_host_service<'a>(reg: &'a [HostService], query: &str) -> Option<&'a HostService> {
+    let q = query.trim().to_ascii_lowercase();
+    reg.iter().find(|s| {
+        s.name.to_ascii_lowercase() == q || s.aliases.iter().any(|a| a.to_ascii_lowercase() == q)
+    })
+}
+
+/// `fleet services [<query>]`: the host-service ownership lookup (task_1027). With no query, list every
+/// registered service (name, owner, lifeline marker). With a query, print the owner + authoritative
+/// definition + a LIFELINE warning if applicable — the cheap "who owns this + where is the authored
+/// definition" resolve an agent must do BEFORE touching shared infra it does not own.
+fn services(query: Option<&str>) {
+    let reg = host_service_registry();
+    match query {
+        None => {
+            println!("Host-service ownership registry ({} services) — `fleet services <name>` for detail:", reg.service.len());
+            for s in &reg.service {
+                let flag = if s.lifeline { "  [LIFELINE — attended-only]" } else { "" };
+                println!("  {:<24} owner: {}{flag}", s.name, s.owner);
+            }
+            println!("Before modifying a shared service you do NOT own: resolve its owner + authored definition here first, prefer reusing that definition, and treat a lifeline change as owner-coordinated + operator-attended (never an unattended bounce).");
+        }
+        Some(q) => match find_host_service(&reg.service, q) {
+            Some(s) => {
+                println!("service:    {}", s.name);
+                if !s.aliases.is_empty() {
+                    println!("aliases:    {}", s.aliases.join(", "));
+                }
+                println!("owner:      {}", s.owner);
+                println!("definition: {}", s.definition);
+                if !s.note.is_empty() {
+                    println!("note:       {}", s.note);
+                }
+                if s.lifeline {
+                    println!("LIFELINE:   YES — a fleet-wide board/MCP/event-wake dependency. Changes are OWNER-COORDINATED + OPERATOR-ATTENDED with a tested rollback; NEVER an unattended activation/bounce. Reuse the authored definition above; do not re-author from the live process.");
+                } else {
+                    println!("lifeline:   no");
+                }
+            }
+            None => {
+                eprintln!("fleet services: no service matches '{q}'. Known services:");
+                for s in &reg.service {
+                    eprintln!("  {} ({})", s.name, s.aliases.join(", "));
+                }
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -9998,6 +10093,29 @@ mod tests {
         let none = std::collections::BTreeSet::new();
         assert_eq!(reconstitute_targets(&down, &none, Some(2)), vec!["v-a", "v-b"]);
         assert_eq!(reconstitute_targets(&down, &none, None), vec!["v-a", "v-b", "v-c"]);
+    }
+
+    #[test]
+    fn host_service_registry_parses_and_resolves_by_name_alias_and_port() {
+        // task_1027: the committed registry must deserialize (a parse failure here is a build-time bug, not
+        // a runtime surprise), and the lookup must resolve by name, alias, AND a port alias, case-insensitively.
+        let reg = host_service_registry();
+        assert!(!reg.service.is_empty(), "the seed registry is non-empty");
+        // Resolve the lifeline the near-miss was about, by name, by a word alias, and by its port — all one service.
+        let by_name = find_host_service(&reg.service, "edge-proxy").expect("resolve by name");
+        let by_alias = find_host_service(&reg.service, "green-mcp-proxy").expect("resolve by alias");
+        let by_port = find_host_service(&reg.service, ":8880").expect("resolve by port alias");
+        assert_eq!(by_name.name, "edge-proxy");
+        assert_eq!(by_alias.name, "edge-proxy");
+        assert_eq!(by_port.name, "edge-proxy");
+        // The :8880 board/MCP proxy is a lifeline owned by v-nix — the exact facts an agent must see before touching it.
+        assert!(by_name.lifeline, "edge-proxy is a lifeline");
+        assert_eq!(by_name.owner, "v-nix");
+        // Case-insensitive, and the notifier is also flagged lifeline (event-wake path).
+        assert_eq!(find_host_service(&reg.service, "EDGE-PROXY").map(|s| s.name.as_str()), Some("edge-proxy"));
+        assert!(find_host_service(&reg.service, "fleet-notify").expect("notifier present").lifeline);
+        // An unknown service resolves to None (the command then prints the known list + exits nonzero).
+        assert!(find_host_service(&reg.service, "no-such-service").is_none());
     }
 
     #[test]
