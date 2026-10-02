@@ -3424,6 +3424,11 @@ enum Cmd {
         /// the scope's repo worktree (e.g. `--repo-root .`).
         #[arg(long)]
         repo_root: Option<PathBuf>,
+        /// Opt in to the value_contradiction detector (OFF by default: it was net false-positive in the
+        /// task_1123 co-verify -- a memory VALUE is usually a measurement, not an asserted invariant -- so it
+        /// is kept behind this flag for a future narrower/LLM-assisted redesign).
+        #[arg(long)]
+        value_contradictions: bool,
     },
     /// Run automatic dreaming over EVERY repos/* scope on the board (task_1123): the scheduled RUNNER the
     /// fleet-dream systemd timer invokes. Pulls all repo-scoped memory, groups by repo, and runs the
@@ -3451,6 +3456,10 @@ enum Cmd {
         /// `config.repo_checkout_base`; absent (and unset in config) → every scope is corpus-only.
         #[arg(long)]
         repo_root_base: Option<PathBuf>,
+        /// Opt in to the value_contradiction detector (OFF by default: net false-positive in the task_1123
+        /// co-verify, kept behind this flag for a future redesign). The scheduled timer leaves it off.
+        #[arg(long)]
+        value_contradictions: bool,
     },
     /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
     /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
@@ -3881,6 +3890,7 @@ fn main() {
             publish_board,
             board_memory,
             repo_root,
+            value_contradictions,
         } => {
             let api = board_api.unwrap_or_else(board::Board::base_url);
             let code = dream::analyze_cmd(
@@ -3893,6 +3903,7 @@ fn main() {
                 publish_board,
                 &board_memory,
                 repo_root.as_deref(),
+                value_contradictions,
             );
             if code != 0 {
                 std::process::exit(code);
@@ -3904,6 +3915,7 @@ fn main() {
             board_memory,
             notify_channel,
             repo_root_base,
+            value_contradictions,
         } => {
             let api = board_api.unwrap_or_else(board::Board::base_url);
             let state_dir = state_dir.unwrap_or_else(default_state_dir);
@@ -3921,6 +3933,7 @@ fn main() {
                 &board_memory,
                 &notify_channel,
                 repo_root_base.as_deref(),
+                value_contradictions,
             );
             if code != 0 {
                 std::process::exit(code);
