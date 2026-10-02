@@ -61,6 +61,14 @@ pub struct Config {
     /// API not MCP). The deployed workers reach the board on the deployment host; only the workers use it.
     pub board_url: String,
 
+    /// Interval in seconds for the board-driven workers' periodic catch-up poll — a backstop so a `todo` task
+    /// is still picked up when a board->worker webhook delivery is missed (e.g. the board and the worker are
+    /// not co-resident, so the loopback `webhook_url` the worker registers is unreachable from the board).
+    /// Each poll re-runs the same claim-guarded catch-up as startup, so it never double-dispatches a task the
+    /// webhook already took. 0 DISABLES the poll (pure reactive — the pre-existing behavior). Only the workers
+    /// read it; the always-on server ignores it.
+    pub pipeline_poll_secs: u64,
+
     /// Drop-folder the `kb inbox` worker drains (was `KB_INBOX_DIR`). Each file is ingested + IPFS-pinned
     /// then deleted; the first path component is its collection.
     pub inbox_dir: String,
@@ -126,6 +134,7 @@ impl Default for Config {
             cache_dir: String::new(),
             ipfs_url: "http://127.0.0.1:5001".to_string(),
             board_url: "http://127.0.0.1:8079/api".to_string(),
+            pipeline_poll_secs: 60, // periodic catch-up backstop for missed webhook deliveries; 0 disables
             inbox_dir: "/data/kb-inbox".to_string(),
             inbox_default_collection: "inbox".to_string(),
             // Generic loopback default (NOT the host-specific green-machine.lan), matching the other
@@ -225,6 +234,7 @@ mod tests {
         assert_eq!(c.promoted_collection, "promoted-memory");
         assert_eq!(c.authority_for("unknown"), 0.5);
         assert_eq!(c.pdf_ocr_min_chars, 0); // OCR off by default (task_40)
+        assert_eq!(c.pipeline_poll_secs, 60); // periodic catch-up backstop on by default
         // Host-neutral default (task_727): the public-extraction repo must not hardcode green-machine.lan.
         // Deployments override via the role TOML; a config-less run gets loopback.
         assert_eq!(c.ipfs_gateway, "http://127.0.0.1:8080");
@@ -238,12 +248,14 @@ mod tests {
             embed_gpu_mem_limit = 4294967296
             mcp_port = 8076
             pdf_ocr_min_chars = 12
+            pipeline_poll_secs = 0
             "#,
         );
         assert_eq!(c.embed_device, "gpu");
         assert_eq!(c.embed_gpu_mem_limit, 4294967296);
         assert_eq!(c.mcp_port, 8076);
         assert_eq!(c.pdf_ocr_min_chars, 12); // parses when set (opt-in)
+        assert_eq!(c.pipeline_poll_secs, 0); // parses when set (0 disables the poll)
         // untouched keys keep the Python defaults
         assert_eq!(c.embed_model, "BAAI/bge-large-en-v1.5");
         assert_eq!(c.w_quality, 0.15);
