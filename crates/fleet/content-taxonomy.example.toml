@@ -1,0 +1,30 @@
+# content-taxonomy.example.toml -- EXAMPLE marker taxonomy for `fleet scan-content` (task_782 / doc_104).
+#
+# THIS IS A PLACEHOLDER. The real marker vocabulary is Amazon-internal and lives in a PRIVATE store that the
+# security-specialist co-owner curates (task_1156); it is NEVER committed to this public repo. Point the
+# scanner at the private file with `--taxonomy <path>` or the FLEET_CONTENT_TAXONOMY environment variable.
+#
+# Format: each [[marker]] names a `category` (shown in the report), an optional `severity` (block | warn,
+# default block), and `tokens` -- literal strings matched case-insensitively as substrings of each line.
+#
+# Guidance for the real taxonomy (why literal tokens work): internal markers are high-signal literal tokens
+# and prefixes. An internal package prefix catches a whole identifier family in one token; an internal host
+# suffix catches every host under it. Do NOT use a generic English suffix (e.g. "Exception", "Service") as a
+# token -- it drowns the signal in false positives. The acceptance case is an internal API identifier NAME
+# with no secret in it (the camshaft/fleet#340 leak): a secret scanner misses that class, so the taxonomy
+# must carry specific internal identifiers and prefixes.
+
+[[marker]]
+category = "example-internal-host"
+severity = "block"
+tokens = ["example-internal.invalid", "placeholder.example"]
+
+[[marker]]
+category = "example-package-prefix"
+severity = "block"
+tokens = ["com.example.internal."]
+
+[[marker]]
+category = "example-advisory"
+severity = "warn"
+tokens = ["EXAMPLE-REVIEW-ME"]
