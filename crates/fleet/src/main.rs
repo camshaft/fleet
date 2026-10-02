@@ -1639,6 +1639,27 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Orderly FLEET-WIDE spin-UP (migration reconstitution): the reverse of `spin-down-all`. Brings every
+    /// board-native agent that is currently DOWN (offline / no live window) back up, except a stay-as-is list,
+    /// so a parked fleet is reconstituted in gated WAVES rather than a thundering herd. `--limit N` caps each
+    /// invocation to the first N (sorted) candidates, so a mass revive is run as several bounded `--apply`
+    /// passes with a pause between; omit it to bring up everyone down. An agent already running (a live window)
+    /// is skipped, never relaunched. Reports the candidate roster by default; `--apply` launches this wave.
+    /// Each candidate is spun up as a SUBPROCESS (`fleet spin-up <id> --apply`), so a single agent's launch
+    /// failure is contained in its child and never aborts the wave.
+    SpinUpAll {
+        /// Comma-separated agent ids to LEAVE AS-IS (already-up roles, the operator interface, self) — not
+        /// brought up even if down.
+        #[arg(long)]
+        except: Option<String>,
+        /// Cap this wave to the first N (sorted) down candidates, for a bounded reconstitution wave. Omit to
+        /// bring up every down agent in one pass.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Launch this wave's candidates (default: just report the candidate roster).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Bounce ONE board-native agent's session so its MCP client RECONNECTS and refetches tools/list — the fix
     /// for the stale-cached-tools/list trap (task_752): a long-lived session caches tools/list at connect, so a
     /// tool shipped to the board MCP server AFTER it connected (e.g. `pose_question` after the structured-
@@ -2267,6 +2288,7 @@ fn main() {
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::SpinDown { agent, apply, force } => spin_down(&agent, apply, force),
         Cmd::SpinDownAll { except, apply, force } => spin_down_all(except.as_deref(), apply, force),
+        Cmd::SpinUpAll { except, limit, apply } => spin_up_all(except.as_deref(), limit, apply),
         Cmd::BounceSession { agent, apply, force } => bounce_session(&fleet, &agent, apply, force),
         Cmd::BounceStale { apply, force } => bounce_stale(&fleet, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
@@ -3305,6 +3327,111 @@ fn spin_down_all(except_csv: Option<&str>, apply: bool, force: bool) {
     );
     if !apply && ready > 0 {
         println!("  (dry-run — re-run with --apply to stand down the READY agents)");
+    }
+}
+
+/// Pure selection for `fleet spin-up-all`: the reconstitution candidates. Given the board-native agents that
+/// are currently DOWN (offline / no live window) and a stay-as-is exclude set, return the sorted, deduped,
+/// optionally wave-LIMITED list to bring back up. `limit` caps the batch to the first N (sorted) candidates so
+/// a mass reconstitution runs in bounded waves rather than a thundering herd; `None` brings up everyone down.
+/// Pure — unit-tested, no board/tmux.
+fn reconstitute_targets(
+    down_native: &[String],
+    except: &std::collections::BTreeSet<String>,
+    limit: Option<usize>,
+) -> Vec<String> {
+    let mut out: Vec<String> = down_native.iter().filter(|id| !except.contains(*id)).cloned().collect();
+    out.sort();
+    out.dedup();
+    if let Some(n) = limit {
+        out.truncate(n);
+    }
+    out
+}
+
+/// `fleet spin-up-all --except <csv> [--limit N]`: orderly fleet-wide reconstitution — the reverse of
+/// [`spin_down_all`]. Connects ONCE, lists the board-native roster, and brings up every native agent that is
+/// currently DOWN (no live tmux window) except a stay-as-is list, in a bounded WAVE (`--limit N` caps the
+/// pass). A running agent (live window) is skipped, never relaunched. Reports the candidate roster by default;
+/// `--apply` launches this wave. Each candidate is spun up as a SUBPROCESS (`fleet spin-up <id> --apply`), so a
+/// single agent's launch failure (spin_up signals it via process::exit) is contained in its child and never
+/// aborts the wave — the same isolation the watchdog's revive-stranded path uses (task_818).
+fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, apply: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet spin-up-all: {e}");
+        std::process::exit(1);
+    });
+    let agents = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet spin-up-all: {e}");
+        std::process::exit(1);
+    });
+    let except: std::collections::BTreeSet<String> = except_csv
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let native: Vec<String> = native_agent_ids(&agents).into_iter().collect();
+    let session = board_session();
+    let windows = tmux_window_names(&session);
+    // DOWN = board-native with NO live tmux window (parked / not currently running). Filtering by live window
+    // (not by board status) is robust against status drift and means a running agent is never relaunched.
+    let down_native: Vec<String> =
+        native.iter().filter(|id| !windows.iter().any(|w| w == *id)).cloned().collect();
+    let up = native.len().saturating_sub(down_native.len());
+    let targets = reconstitute_targets(&down_native, &except, limit);
+
+    println!(
+        "spin-up-all ({}): {} board-native, {} already up, {} down, {} left as-is, {} this wave{}",
+        if apply { "APPLY" } else { "dry-run" },
+        native.len(),
+        up,
+        down_native.len(),
+        except.len(),
+        targets.len(),
+        limit.map(|n| format!(" [--limit {n}]")).unwrap_or_default()
+    );
+    if !except.is_empty() {
+        let mut keep: Vec<&String> = except.iter().collect();
+        keep.sort();
+        println!("  leave-as-is: {}", keep.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    }
+
+    let self_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "fleet".to_string());
+    let (mut launched, mut failed) = (0usize, 0usize);
+    for id in &targets {
+        if !apply {
+            println!("  READY    {id} — would spin up");
+            continue;
+        }
+        // Subprocess so a per-agent spin_up failure (process::exit) is contained in the child, not this wave.
+        match std::process::Command::new(&self_bin).args(["spin-up", id, "--apply"]).status() {
+            Ok(s) if s.success() => {
+                launched += 1;
+                println!("  LAUNCHED {id}");
+            }
+            Ok(_) => {
+                failed += 1;
+                eprintln!("  FAILED   {id} — spin-up exited nonzero (left down; re-run to retry)");
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("  ERROR    {id} — could not launch spin-up: {e}");
+            }
+        }
+    }
+    if apply {
+        println!("  summary: {launched} launched, {failed} failed this wave");
+        if let Some(n) = limit
+            && down_native.len().saturating_sub(except.len()) > n
+        {
+            println!("  (more down than this wave's --limit — pause, confirm health, then re-run for the next wave)");
+        }
+    } else if !targets.is_empty() {
+        println!("  (dry-run — re-run with --apply to launch this wave)");
     }
 }
 
@@ -9842,6 +9969,21 @@ mod tests {
         // Empty except = every native is a candidate.
         let none = std::collections::BTreeSet::new();
         assert_eq!(batch_targets(&native, &none).len(), native.len());
+    }
+
+    #[test]
+    fn reconstitute_targets_excludes_up_and_except_sorts_and_waves() {
+        // down_native carries a dup (v-a) and is unsorted — the selector sorts + dedups like batch_targets.
+        let down: Vec<String> = ["v-b", "v-a", "v-c", "v-a"].iter().map(|s| s.to_string()).collect();
+        let except: std::collections::BTreeSet<String> = ["v-c"].iter().map(|s| s.to_string()).collect();
+        // No limit: sorted, deduped, the leave-as-is set removed.
+        assert_eq!(reconstitute_targets(&down, &except, None), vec!["v-a", "v-b"]);
+        // --limit caps the wave to the first N (sorted) candidates — the next wave picks up the rest.
+        assert_eq!(reconstitute_targets(&down, &except, Some(1)), vec!["v-a"]);
+        // Empty except = every DOWN agent is a candidate (deduped), still wave-limited.
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(reconstitute_targets(&down, &none, Some(2)), vec!["v-a", "v-b"]);
+        assert_eq!(reconstitute_targets(&down, &none, None), vec!["v-a", "v-b", "v-c"]);
     }
 
     #[test]
