@@ -366,9 +366,17 @@ impl Board {
     /// Create-or-get a channel by name (`POST /channels`, idempotent — posting an existing name returns it),
     /// returning its numeric `id`. `created_by` attributes the creation. Used to resolve a channel name → id
     /// before posting (the board posts by id, not name).
+    ///
+    /// Creates the channel PUBLIC (`private: false`) explicitly (task_1217): a fleet ops channel (deploys,
+    /// accountability, intake-watch) must be DISCOVERABLE so its intended subscribers can self-serve-join via
+    /// `list_channels` — a channel born private/member-scoped is invisible to a would-be subscriber who was not
+    /// an initial member, which is exactly the digest-delivery gap task_1217 hit. The default is already public
+    /// on this board, so making it explicit is a no-op there and a guarantee if the default ever changes; none
+    /// of these ops channels is sensitive.
     pub fn create_or_get_channel(&self, name: &str, created_by: &str) -> Result<i64, String> {
         let url = format!("{}/channels", self.base);
-        let body = serde_json::json!({ "name": name, "created_by": created_by }).to_string();
+        let body = serde_json::json!({ "name": name, "created_by": created_by, "private": false })
+            .to_string();
         // Idempotent (posting an existing name returns it), so a transient-blip retry is safe.
         let resp = with_transient_retry(|| {
             self.agent

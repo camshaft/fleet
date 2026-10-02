@@ -61,6 +61,12 @@ pub struct Config {
     /// (the first-cut behavior). The checkout root is a deployment-specific path, so it is named here, never
     /// hard-coded; `dream-run --repo-root-base` overrides it.
     pub repo_checkout_base: Option<String>,
+    /// task_1217: the board project id of the uncategorized intake inbox the watchdog's `--intake-watch` act
+    /// sweeps each pass (dwell + state invariants; see `intake_sweep`). A deployment-specific id, so it is named
+    /// here rather than hard-coded. Absent → the `--intake-watch` act is a no-op (zero blast radius on a host
+    /// that has not opted the intake project in), so merely shipping the flag changes nothing until a host sets
+    /// this and adds the flag to its watchdog `ExecStart`.
+    pub intake_project: Option<i64>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -130,10 +136,12 @@ mod tests {
             nudge_pm_tag_round = 2
             nudge_reassign_round = 3
             repo_checkout_base = "/home/x/Projects"
+            intake_project = 29
             "#,
         );
         assert_eq!(cfg.operator_id.as_deref(), Some("operator"));
         assert_eq!(cfg.repo_checkout_base.as_deref(), Some("/home/x/Projects"));
+        assert_eq!(cfg.intake_project, Some(29));
         assert_eq!(cfg.nudge_pm_tag_round, Some(2));
         assert_eq!(cfg.nudge_reassign_round, Some(3));
         assert_eq!(
