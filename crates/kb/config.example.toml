@@ -65,6 +65,12 @@ board_url = "http://127.0.0.1:8079/api"
 # registers is unreachable from the board). The poll shares the startup catch-up's claim guard, so it never
 # double-dispatches a task the webhook already took. 0 disables it (pure reactive). Unused by `kb serve`.
 pipeline_poll_secs = 60
+# Host the workers advertise in the webhook_url they register, so the board can POST task events back. Empty =
+# auto-detect the local IP the OS routes toward the board (needed when the board and the worker are NOT
+# co-resident, e.g. board on one host, kb workers on another); set an explicit host/IP to override. Empty +
+# detection-failure falls back to 127.0.0.1 (fine only when co-resident with the board). Paired with
+# pipeline_poll_secs, which is the backstop if a push is ever missed.
+webhook_advertise_host = ""
 
 # --- MCP server ---
 # Bind address for `kb serve`. (was KB_MCP_HOST / KB_MCP_PORT)

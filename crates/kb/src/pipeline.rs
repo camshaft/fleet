@@ -646,10 +646,54 @@ pub async fn handle_embed(board: &Board, ipfs: &Ipfs, task: &Task) -> Result<(),
 // ---- reactive agent runtime ----
 
 /// The reserved webhook port for each role — the Python `KB_UPLOADER_PORT` / `KB_EMBEDDER_PORT` defaults. The
-/// board POSTs task events to `http://127.0.0.1:<port>/` (loopback: the board and the workers are co-resident
-/// on the deployment host).
+/// board POSTs task events to `http://<advertise_host>:<port>/`, where the advertised host is the routable
+/// address the worker registers (see [`advertise_host`]) — loopback when co-resident with the board, else the
+/// worker's board-routable IP.
 const UPLOADER_PORT: u16 = 8075;
 const EMBEDDER_PORT: u16 = 8074;
+
+/// Reduce a board base URL to a `host:port` suitable for a UDP route-detect connect. Strips the scheme and
+/// any path; defaults to `:80` when the URL carries no port. Pure, so it is unit-tested.
+fn board_connect_target(board_url: &str) -> String {
+    let after = board_url.split("://").nth(1).unwrap_or(board_url);
+    let hostport = after
+        .split('/')
+        .next()
+        .unwrap_or(after)
+        .trim_end_matches('/');
+    if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{hostport}:80")
+    }
+}
+
+/// Detect the local IP the OS would use to reach the board, via a connected UDP socket — `connect` only
+/// selects the route, no packet is sent. Returns `None` if the board host can't be resolved or the chosen
+/// address is loopback/unspecified (i.e. nothing routable to advertise).
+fn detect_routable_ip(board_url: &str) -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect(board_connect_target(board_url)).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
+}
+
+/// The host a worker advertises in its registered `webhook_url` so the board can POST events back. Uses the
+/// configured `webhook_advertise_host` when set; otherwise auto-detects the IP routable toward the board, and
+/// falls back to loopback (correct only for a co-resident board) with a warning when detection fails.
+fn advertise_host(cfg: &config::Config) -> String {
+    if !cfg.webhook_advertise_host.is_empty() {
+        return cfg.webhook_advertise_host.clone();
+    }
+    detect_routable_ip(&cfg.board_url).unwrap_or_else(|| {
+        tracing::warn!(
+            "pipeline: no routable IP detected toward the board ({}); advertising a loopback webhook_url — a \
+             non-co-resident board will not reach this worker. Set webhook_advertise_host to fix.",
+            cfg.board_url
+        );
+        "127.0.0.1".to_string()
+    })
+}
 
 /// Run one pipeline stage-agent reactively — the Python `run()`. Registers `role` (also the board agent id)
 /// with its webhook, catches up on any `todo` task already assigned to it, then serves the webhook forever,
@@ -670,7 +714,7 @@ pub async fn run_role(role: &str) -> Result<(), String> {
     let ipfs = Arc::new(Ipfs::connect());
     let busy = BusySet::new();
 
-    let hook = format!("http://127.0.0.1:{port}/");
+    let hook = format!("http://{}:{port}/", advertise_host(config::get()));
     board
         .register(
             Some(&hook),
@@ -795,6 +839,32 @@ mod tests {
 
     fn meta(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn board_connect_target_strips_scheme_and_path_and_defaults_port() {
+        assert_eq!(
+            board_connect_target("http://192.0.2.10:8081/api"),
+            "192.0.2.10:8081"
+        );
+        assert_eq!(
+            board_connect_target("http://127.0.0.1:8079/api"),
+            "127.0.0.1:8079"
+        );
+        assert_eq!(
+            board_connect_target("https://board.lan/api"),
+            "board.lan:80"
+        ); // no port -> :80
+        assert_eq!(board_connect_target("10.0.0.5:9000"), "10.0.0.5:9000"); // bare host:port
+    }
+
+    #[test]
+    fn advertise_host_prefers_explicit_config_over_detection() {
+        let cfg = config::Config {
+            webhook_advertise_host: "198.51.100.7".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(advertise_host(&cfg), "198.51.100.7"); // explicit value used verbatim, no detection
     }
 
     #[test]
