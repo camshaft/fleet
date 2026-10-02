@@ -3334,6 +3334,13 @@ enum Cmd {
         /// Report findings but exit 0 (advisory).
         #[arg(long)]
         warn_only: bool,
+        /// Path to a findings baseline (JSON): a finding already in it is suppressed, so the gate fires only
+        /// on a new finding. Lets the gate land without a flag-day cleanup of the existing tree.
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write every current finding to the `--baseline` path as the audited baseline, then exit 0.
+        #[arg(long)]
+        write_baseline: bool,
     },
     /// Refresh (or `--check`-verify) the committed emphatics projection from the live board banned-phrases
     /// list, preserving the hand-maintained caps allow-list (task_1319). This reaches the board, so it runs
@@ -4034,11 +4041,15 @@ fn main() {
             files,
             dirs,
             warn_only,
+            baseline,
+            write_baseline,
         } => prose_lint::lint_prose(prose_lint::LintOpts {
             ruleset,
             files,
             dirs,
             warn_only,
+            baseline,
+            write_baseline,
         }),
         Cmd::ProseSync {
             ruleset,
