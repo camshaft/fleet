@@ -1,0 +1,89 @@
+# Host-service ownership registry (task_1027).
+#
+# WHY: an agent asked to flake-manage / relocate / restart a shared host service must be able to
+# resolve "who OWNS it and where is the already-authored DEFINITION" with a cheap local lookup
+# (`fleet services <name>`), NOT a message round-trip it then races ahead of. The near-miss this
+# registry closes: an agent nearly bounced the :8880 board/MCP lifeline from a scratch-authored unit
+# before its own ownership query returned and before finding the authored definition.
+#
+# CONTRACT (pair with the charter rule): before modifying a shared host resource you do not own,
+# resolve the owner + authored definition here FIRST and prefer reusing that definition over
+# re-authoring (especially its secret handling). A service with `lifeline = true` is a fleet-wide
+# dependency (board / MCP / event-wake) every agent -- including you -- needs to reach the board:
+# changes to it are OWNER-COORDINATED and OPERATOR-ATTENDED with a tested rollback, NEVER an
+# unattended activation/bounce.
+#
+# This is a SEED from the 2026-10-02 dev-dsk daemon audit; extend it by PR as services are added or
+# ownership moves. `owner` is a board agent id; `definition` points at the authoritative source.
+
+[[service]]
+name = "edge-proxy"
+aliases = [":8880", "board-proxy", "green-mcp-proxy", "mcp-proxy"]
+owner = "v-nix"
+definition = "membrain-agent-fleet flake: edge-proxy.service (launcher does in-process age-decrypt of the CF-Access token); historical copy-out dotfiles roles/home/green-mcp-proxy.nix (task_624)"
+lifeline = true
+note = "The loopback :8880 board/MCP + outbound lifeline EVERY agent uses to reach the board. Attended cutover only; a bounce drops the whole fleet's board access mid-flight."
+
+[[service]]
+name = "membrain-board"
+aliases = ["board", "/board", ":8081", "task-board"]
+owner = "v-task-board"
+definition = "membrain-agent-fleet flake: membrain-board.service + the `board` app (nix run .#board -- <db> [port]); schema migrated in place on open. Deploy/host wiring co-owned with v-nix."
+lifeline = true
+note = "The board server itself (MCP + REST + UI). Lifeline. Served under /board via edge-proxy."
+
+[[service]]
+name = "fleet-notify"
+aliases = [":8899", "notifier", "push-wake", "notify"]
+owner = "v-fleet-tooling"
+definition = "nix/fleet-daemons.nix (fleet-notify.service); `fleet notify --port 8899`"
+lifeline = true
+note = "Event-wake push notifier -- delivers board push-wakes to agent windows. Co-resident event-wake path (replaced the retired reverse tunnel)."
+
+[[service]]
+name = "tunnel@board"
+aliases = ["aws-tunnel", "board-tunnel"]
+owner = "v-nix"
+definition = "membrain-agent-fleet flake: tunnel@.service template (AWS Tunnels ingress, Midway-gated), instance @board"
+lifeline = false
+note = "EXTERNAL inbound board access over the AWS tunnel. Distinct from the retired fleet-tunnel reverse event-wake tunnel."
+
+[[service]]
+name = "fleet-watchdog"
+aliases = ["watchdog"]
+owner = "v-fleet-tooling"
+definition = "nix/fleet-daemons.nix (fleet-watchdog.service + .timer); `fleet watchdog --rearm --stale-only --observe --spawn`"
+lifeline = false
+note = "Board-native liveness watchdog: re-arm + revive-stranded + observe. Timer-driven."
+
+[[service]]
+name = "fleet-up"
+aliases = ["launcher", "up-board"]
+owner = "v-fleet-tooling"
+definition = "nix/fleet-daemons.nix (fleet-up.service + .timer) PENDING -- currently a v-fleet-tooling hand-install at ~/.config/systemd/user/fleet-up.{service,timer}; `fleet up-board --launch`"
+lifeline = false
+note = "Boot + periodic reconcile of the board-native roster pinned to this host (reboot-survival launcher). Skips staged/stood-down/off-host agents."
+
+[[service]]
+name = "membrain-skynet-bridge"
+aliases = ["slack-bridge", "frank-bridge"]
+owner = "v-slack-bridge"
+definition = "membrain-agent-fleet flake: membrain-skynet-bridge.service (points at %h/.local/bin/membrain-skynet-bridge, deployed by v-slack-bridge). SINGLE-INSTANCE; shipped present-but-DISABLED, flag-day-gated."
+lifeline = false
+note = "Slack <-> board bridge. Two supervisors = double-relay (double-Frank); enable only via the coordinated guard-retirement flag-day."
+
+[[service]]
+name = "fleet-litellm"
+aliases = ["litellm"]
+owner = "v-fleet-tooling"
+definition = "nix/fleet-daemons.nix (fleet-litellm.service)"
+lifeline = false
+note = "LiteLLM proxy daemon (fleet-managed user unit)."
+
+[[service]]
+name = "fleet-timers"
+aliases = ["binary-sweep", "cpu-monitor", "drain-nudge", "materialize", "nudge-stale", "reap-leases", "throttle-unleased-nix"]
+owner = "v-fleet-tooling"
+definition = "nix/fleet-daemons.nix -- the timer-driven maintenance group: fleet-{binary-sweep,cpu-monitor,drain-nudge,materialize,nudge-stale,reap-leases,throttle-unleased-nix}.{service,timer}"
+lifeline = false
+note = "Periodic fleet maintenance oneshots (static services fired by their enabled timers)."
