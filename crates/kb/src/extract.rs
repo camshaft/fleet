@@ -16,6 +16,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use pdfium_render::prelude::*;
 use walkdir::{DirEntry, WalkDir};
@@ -135,14 +136,36 @@ pub fn extract(path: &Path) -> Result<Extracted, String> {
     })
 }
 
-/// Extract a PDF's text per page via PDFium (pdfium-render, greenlit decision #1). Binds libpdfium at
-/// runtime from the system library path (provided by the worker roles' LD_LIBRARY_PATH); a missing library
-/// or an unreadable PDF is an error. A page whose text can't be read contributes an empty page rather than
-/// failing the whole document.
+/// Bind libpdfium ONCE per process and reuse it. pdfium-render's `bind_to_system_library()` initializes a
+/// PROCESS-global and returns `PdfiumLibraryBindingsAlreadyInitialized` if called a second time, so a
+/// long-running worker (the pipeline embedder) that ingests a SECOND PDF would fail at the per-call bind
+/// (observed: task_1275 dry-run bound it, task_1276 re-ingest then failed). Bind once here and keep the single
+/// `Pdfium` behind a `Mutex` — PDFium is not thread-safe, and holding the lock across a load+extract serializes
+/// use correctly. A bind failure means libpdfium is absent from the library path, a static deploy condition, so
+/// caching the error is correct (it will not fix itself at runtime).
+fn pdfium() -> Result<std::sync::MutexGuard<'static, Pdfium>, String> {
+    static PDFIUM: OnceLock<Result<Mutex<Pdfium>, String>> = OnceLock::new();
+    match PDFIUM.get_or_init(|| {
+        Pdfium::bind_to_system_library()
+            .map(Pdfium::new)
+            .map(Mutex::new)
+            .map_err(|e| {
+                format!("extract: pdfium bind failed (is libpdfium on the library path?): {e}")
+            })
+    }) {
+        Ok(m) => m
+            .lock()
+            .map_err(|_| "extract: pdfium lock poisoned".to_string()),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// Extract a PDF's text per page via PDFium (pdfium-render, greenlit decision #1). Uses the process-global
+/// [`pdfium`] binding (bound once from the system library path provided by the worker roles' LD_LIBRARY_PATH);
+/// a missing library or an unreadable PDF is an error. A page whose text can't be read contributes an empty
+/// page rather than failing the whole document.
 fn extract_pdf(path: &Path) -> Result<Vec<String>, String> {
-    let pdfium = Pdfium::new(Pdfium::bind_to_system_library().map_err(|e| {
-        format!("extract: pdfium bind failed (is libpdfium on the library path?): {e}")
-    })?);
+    let pdfium = pdfium()?;
     let doc = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|e| format!("extract: pdf {}: {e}", path.display()))?;
@@ -158,9 +181,7 @@ fn extract_pdf(path: &Path) -> Result<Vec<String>, String> {
 /// pipeline embedder which cats a PDF's bytes back from IPFS (it has no file path). Same PDFium bind, per-page
 /// text, and CRLF->LF normalization. A missing libpdfium or an unreadable byte stream is an error.
 pub fn extract_pdf_bytes(data: &[u8]) -> Result<Vec<String>, String> {
-    let pdfium = Pdfium::new(Pdfium::bind_to_system_library().map_err(|e| {
-        format!("extract: pdfium bind failed (is libpdfium on the library path?): {e}")
-    })?);
+    let pdfium = pdfium()?;
     let doc = pdfium
         .load_pdf_from_byte_slice(data, None)
         .map_err(|e| format!("extract: pdf from bytes ({} bytes): {e}", data.len()))?;
