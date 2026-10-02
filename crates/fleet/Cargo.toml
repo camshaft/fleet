@@ -30,3 +30,5 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 # target). Scoped to notify.rs only — every other `fleet` subcommand is a one-shot CLI invocation and
 # stays sync (ureq); this does not make the whole binary async.
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+# sha256 for the memory-sync per-slug content-hash state + the dream-pass exact-dup body identity.
+sha2 = "0.10"
