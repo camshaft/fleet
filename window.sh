@@ -30,6 +30,14 @@ FLEET_SHARED_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/bin"
 
 AGENT="${1:?usage: window.sh <agent-name>}"
 
+# task_1039: export the agent's identity into the session env so the shared task-board HTTP MCP config can
+# carry it as a per-session header -- headers: {"X-Fleet-Agent": "${FLEET_AGENT}"} -- which the board forces
+# the register_agent principal from, so an agent no longer logs in / registers / passes its own name. Claude
+# Code expands ${VAR} in MCP header values at session start, and each window.sh invocation knows its unique
+# $AGENT, so this yields a distinct per-session header. FLEET_AGENT is a deliberately NON-credential name:
+# Claude Code blanks vars whose name contains TOKEN/SECRET/KEY/AUTH/PASSWORD when expanding a project .mcp.json.
+export FLEET_AGENT="$AGENT"
+
 # `fleet` on PATH is the comms + config binary. Resolve the agent's launch config (KEY=VALUE for eval).
 CONFIG="$(fleet describe "$AGENT")" || {
   echo "window.sh: no such agent '$AGENT' in the registry (or `fleet` not on PATH)" >&2
