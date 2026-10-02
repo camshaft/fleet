@@ -199,8 +199,7 @@ let
     };
 
   fleetBin = "${fleet}/bin/fleet";
-  # fleet-tunnel RETIRED 2026-10-02 (task_937) — its daemon is gone (see below); the `fleetTunnel` arg is now
-  # vestigial (left in the formal set so the caller need not change in lockstep; prune in a follow-up).
+  fleetTunnelBin = "${fleetTunnel}/bin/fleet-tunnel";
 
   # The watchdog spawns Claude sessions via window.sh, which need the full known-good login PATH (dropping an
   # entry is the task_347 broken-PATH failure mode) plus this Bedrock env. PATH is intentionally NOT set here:
@@ -243,12 +242,23 @@ let
       after = [ "default.target" ];
       wants = [ ];
     })
-    # fleet-tunnel RETIRED (task_937 host migration, 2026-10-02): the green-era reverse HTTP-over-websocket
-    # event-wake bridge is SUPERSEDED on the co-resident dev-dsk — board->agent is pure localhost, so the
-    # notifier (fleet-notify :8899) + the board's own push-wake WS (reachable via edge-proxy :8880) deliver
-    # event-wake with no reverse tunnel. v-nix (ingress owner) confirmed edge-proxy fully subsumes it. The unit
-    # is dropped from the managed set here; install-fleet-daemons PRUNES the now-unmanaged fleet-tunnel.service
-    # on its next reconcile (the live unit was already disabled + removed by v-fleet-tooling).
+    # Group A: fleet-tunnel — the ACTIVE event-wake bridge. DO NOT RETIRE: it is NOT subsumed by edge-proxy.
+    # It dials the board WS (ws://127.0.0.1:8880/board/tunnel/ws), receives the board's /wake `req` frames, and
+    # forwards them to the notifier (http://127.0.0.1:8899); the notifier does NOT connect to the board itself,
+    # so this tunnel IS the notifier's board feed. Retiring it (the 2026-10-02 reboot-sweep misstep, briefly in
+    # #315) broke fleet-wide event-wake for ~1h until it was restored — see task_1027 (verify-the-wake-path).
+    // (mkService {
+      name = "fleet-tunnel";
+      description = "Fleet reverse tunnel bridge (board WS -> notifier :8899 event-wake)";
+      exec = "${fleetTunnelBin} --config %h/.config/fleet/tunnel.toml";
+      restart = "always";
+      restartSec = 5;
+      after = [
+        "network-online.target"
+        "fleet-notify.service"
+      ];
+      wants = [ "network-online.target" ];
+    })
     # Group A: fleet-litellm (long-running local litellm proxy; external binary, unit-only migration).
     // (mkService {
       name = "fleet-litellm";
