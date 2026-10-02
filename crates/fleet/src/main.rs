@@ -22,6 +22,7 @@ mod dream;
 mod dream_apply;
 mod memory;
 mod notify;
+mod prose_lint;
 mod scan;
 mod transcripts;
 mod workspace;
@@ -3215,6 +3216,24 @@ enum Cmd {
         #[arg(long)]
         allow_missing_taxonomy: bool,
     },
+    /// Lint comments and the loops markdown for filler emphatics and caps-for-emphasis (task_1319), so the
+    /// house write-literally style cannot regress in code. The emphatics wordlist is a checked-in projection
+    /// of the board banned-phrases list (the one source); the caps rule is structural with an acronym
+    /// allow-list. Exit 1 on a finding (the gate), 2 on a missing or invalid ruleset.
+    LintProse {
+        /// Path to the ruleset TOML (else `$FLEET_PROSE_RULESET`), e.g. crates/fleet/prose-style.toml.
+        #[arg(long)]
+        ruleset: Option<String>,
+        /// A file to lint; repeatable. Classified by extension (`.rs` reads comments, `.md` reads prose).
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// A directory to walk for `.rs` and `.md` sources; repeatable.
+        #[arg(long = "dir")]
+        dirs: Vec<String>,
+        /// Report findings but exit 0 (advisory).
+        #[arg(long)]
+        warn_only: bool,
+    },
     /// Keep a browser-facing tunnel's CLI client CONNECTED, not merely alive (task_1182): probe connectivity
     /// end-to-end THROUGH the tunnel and, when it is down (alive-but-not-forwarding — the failure a plain
     /// process-liveness supervisor misses), shed the stale client by its exact pid and re-run the host-provided
@@ -3892,6 +3911,17 @@ fn main() {
             warn_only,
             redact,
             allow_missing_taxonomy,
+        }),
+        Cmd::LintProse {
+            ruleset,
+            files,
+            dirs,
+            warn_only,
+        } => prose_lint::lint_prose(prose_lint::LintOpts {
+            ruleset,
+            files,
+            dirs,
+            warn_only,
         }),
         Cmd::TunnelGuard {
             name,
