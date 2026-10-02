@@ -340,7 +340,10 @@ let
     # OnCalendar at a quiet-hours slot (staggered off the other 04:xx guards) rather than a 24h interval, so the
     # run never drifts into daytime fleet activity; Persistent catches a missed slot on the next wake. The
     # DREAM-NEW notify to the librarian is self-contained in dream-run (board-native post), so this timer stays
-    # a bare oneshot with no journal plumbing. watchdogEnv supplies the board env + the login PATH.
+    # a bare oneshot with no journal plumbing. watchdogEnv supplies the board env; dream-run also shells out to
+    # the `board-memory` CLI (to publish each dreams/<scope> doc) and the model tooling, so install-fleet-daemons
+    # injects the login PATH + the fleet repo's bin/ (where board-memory lives) into the rendered service — a
+    # machine path, never git-frozen into the flake, same install-time pattern as the watchdog.
     // (mkTimer {
       name = "fleet-dream";
       description = "Fleet scheduled dreaming (dream-run over all repo scopes)";
@@ -601,6 +604,15 @@ let
       if [ -e "$UNIT_DIR/fleet-binary-sweep.service" ]; then
         chmod u+w "$UNIT_DIR/fleet-binary-sweep.service" 2>/dev/null || true
         printf 'Environment=FLEET_REPO=%s\n' "$fleet_repo" >> "$UNIT_DIR/fleet-binary-sweep.service"
+      fi
+      # task_1123: fleet-dream's oneshot shells out to `board-memory` (publishes each dreams/<scope> doc) and the
+      # model tooling, so it needs the login PATH plus the fleet repo's bin/ (where board-memory lives). Inject
+      # both at install time, same machine-path pattern as the watchdog PATH and the FLEET_REPO above — never
+      # git-frozen into the flake. Without this the 04:07 oneshot runs under systemd's bare user PATH and cannot
+      # resolve board-memory, so every scope's publish fails.
+      if [ -e "$UNIT_DIR/fleet-dream.service" ]; then
+        chmod u+w "$UNIT_DIR/fleet-dream.service" 2>/dev/null || true
+        printf 'Environment=PATH=%s\n' "$login_path:$fleet_repo/bin" >> "$UNIT_DIR/fleet-dream.service"
       fi
       systemctl --user daemon-reload
       # Enable + start the timers (each oneshot .service is triggered by its timer, so it picks up a changed
