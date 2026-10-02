@@ -1729,6 +1729,14 @@ enum Cmd {
         /// prevention companion is the task_786 spin-down refuse-to-strand guard.
         #[arg(long)]
         revive_stranded: bool,
+        /// ACT on the task_752 STALE-SESSION signal: after the liveness pass, run the `bounce-stale` sweep in
+        /// apply mode — bounce every running board-native session launched under an OLDER binary than this one
+        /// so it refetches its MCP tools/list (picks up tools shipped since it connected). Each bounce still
+        /// passes the fenced per-agent `bounce-session` path (board-native + not-busy + cooldown), so a healthy
+        /// or mid-turn session is never thrashed. OPT-IN and deliberately NOT baked into the installed watchdog
+        /// timer — a fleet-wide bounce is an owner-triggered act, never an unfenced automatic one.
+        #[arg(long)]
+        bounce_stale: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -2252,7 +2260,8 @@ fn main() {
             reap_stale_observers,
             hire_signal,
             revive_stranded,
-        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal, revive_stranded),
+            bounce_stale,
+        } => watchdog(stale_only, rearm, observe, spawn, dry_run, pinned_only, self_redeploy, reap_stale_observers, hire_signal, revive_stranded, bounce_stale),
         Cmd::ObserveRecord {
             agent,
             session,
@@ -4892,6 +4901,8 @@ fn watchdog(
     reap_stale_observers: bool,
     hire_signal: bool,
     revive_stranded: bool,
+    // Named distinctly from the `bounce_stale` function it gates (a same-name binding would shadow the fn).
+    sweep_stale: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -4926,6 +4937,15 @@ fn watchdog(
         Ok((board, agents)) => {
             let native_ids = native_agent_ids(&agents);
             watchdog_board(&board, &agents, stale_only, rearm, observe, spawn, spawn_dry_run, pinned_only, reap_stale_observers, hire_signal, revive_stranded);
+            // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
+            // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
+            // sweep, and in APPLY mode (passing the flag IS the opt-in, like --revive-stranded). The sweep's own
+            // per-agent fences (busy / cooldown) protect each session; --force is not plumbed here (an automated
+            // sweep must never override the busy fence and reconnect through a live turn).
+            if sweep_stale {
+                println!("-- bounce-stale (--bounce-stale: refreshing stale sessions' tools/list) --");
+                bounce_stale(&Fleet::resolve(), true, false);
+            }
             native_ids
         }
         Err(e) => {
