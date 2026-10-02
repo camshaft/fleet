@@ -85,6 +85,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # workspace lock (transitive), so declaring it here pulls no new tree. Default features include the pure
 # decode path we use (`decode_all`).
 zstd = "0.13"
+# Phase-2 docx text extraction: a .docx is an OOXML ZIP whose `word/document.xml` holds the body. Already in
+# the workspace lock (transitive), so declaring it here pulls no new tree. `deflate` is the compression real
+# Word files use for their entries; default-features off keeps the rest of zip's codec surface out.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

@@ -29,6 +29,7 @@ use crate::{chunk, config, crate_docs, curate, embed, extract};
 /// constants. `rustdoc-json` is set by the docs.rs fetch path; `pdf`/`text` come from [`content_type_for`].
 pub const RUSTDOC_JSON: &str = "rustdoc-json";
 pub const PDF: &str = "pdf";
+pub const DOCX: &str = "docx";
 pub const TEXT: &str = "text";
 /// Source/id namespace for an internal crate's rustdoc docs (doc_101/task_828): rustdoc-json that did NOT
 /// come from docs.rs, so it must not be tagged or cited as a docs.rs page.
@@ -41,7 +42,9 @@ const INTERNAL_CRATE: &str = "internal-crate";
 /// content type and is unaffected.
 fn content_type_override(meta: &Map<String, Value>) -> Option<String> {
     match truthy_str(meta, "content_type") {
-        Some(ct) if ct == RUSTDOC_JSON || ct == PDF || ct == TEXT => Some(ct.to_string()),
+        Some(ct) if ct == RUSTDOC_JSON || ct == PDF || ct == DOCX || ct == TEXT => {
+            Some(ct.to_string())
+        }
         _ => None,
     }
 }
@@ -71,15 +74,19 @@ fn truthy_str<'a>(meta: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Detect PDFs by extension, Content-Type header, or the `%PDF-` magic — the Python `_content_type_for`. A
-/// PDF fetched over a URL must run page-wise text extraction, not be embedded as raw bytes. Everything else
-/// is `text`. (`rustdoc-json` is tagged by the docs.rs fetch path, not here.)
+/// Detect PDFs (by extension, Content-Type header, or the `%PDF-` magic) and .docx (by extension or the
+/// WordprocessingML Content-Type) — extends the Python `_content_type_for`. A PDF/docx fetched over a URL must
+/// run document-aware text extraction, not be embedded as raw bytes. Everything else is `text`. Docx is NOT
+/// sniffed by magic (its PK zip header is shared with every OOXML/zip format), so it is recognized only by the
+/// `.docx` name or an explicit WordprocessingML header. (`rustdoc-json` is tagged by the docs.rs fetch path.)
 pub fn content_type_for(name: &str, header: &str, data: &[u8]) -> &'static str {
-    if name.to_lowercase().ends_with(".pdf")
-        || header.to_lowercase().contains("application/pdf")
-        || data.starts_with(b"%PDF-")
+    let lname = name.to_lowercase();
+    let lheader = header.to_lowercase();
+    if lname.ends_with(".pdf") || lheader.contains("application/pdf") || data.starts_with(b"%PDF-")
     {
         PDF
+    } else if lname.ends_with(".docx") || lheader.contains("wordprocessingml.document") {
+        DOCX
     } else {
         TEXT
     }
@@ -199,6 +206,7 @@ pub fn items_from(
     match content_type {
         RUSTDOC_JSON => items_from_rustdoc(data, meta),
         PDF => items_from_pdf(data, meta),
+        DOCX => items_from_docx(data, meta),
         _ => Ok(items_from_text(data, meta)),
     }
 }
@@ -326,6 +334,30 @@ fn items_from_text(data: &[u8], meta: &Map<String, Value>) -> Vec<Item> {
         extra,
         id_override_parts: None,
     }]
+}
+
+/// docx (OOXML WordprocessingML): a single item, the document's extracted text — bytes-based (the embedder has
+/// no file path) via [`extract::extract_docx_bytes`]. `key = title`, `kind = "doc"` (overridable). A non-docx
+/// or corrupt byte stream surfaces the extractor's error.
+fn items_from_docx(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item>, String> {
+    let title = truthy_str(meta, "filename")
+        .or_else(|| truthy_str(meta, "source"))
+        .unwrap_or("doc")
+        .to_string();
+    let mut extra = Map::new();
+    extra.insert("kind".into(), Value::from(str_or(meta, "kind", "doc")));
+    extra.insert(
+        "source".into(),
+        Value::from(str_or(meta, "source_type", "ipfs")),
+    );
+    extra.insert("path".into(), Value::from(title.clone()));
+    extra.insert("title".into(), Value::from(title.clone()));
+    Ok(vec![Item {
+        key: title,
+        body: extract::extract_docx_bytes(data)?,
+        extra,
+        id_override_parts: None,
+    }])
 }
 
 // ---- uploader stage: source -> bytes -> IPFS ----
@@ -779,6 +811,18 @@ mod tests {
             content_type_for("readme.md", "text/markdown", b"# hi"),
             TEXT
         );
+        // docx by extension or the WordprocessingML header; NOT sniffed by the shared PK zip magic.
+        assert_eq!(content_type_for("guide.docx", "", b"PK\x03\x04"), DOCX);
+        assert_eq!(content_type_for("GUIDE.DOCX", "", b""), DOCX); // case-insensitive
+        assert_eq!(
+            content_type_for(
+                "x",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                b""
+            ),
+            DOCX
+        );
+        assert_eq!(content_type_for("archive.zip", "", b"PK\x03\x04"), TEXT); // a plain zip is not docx
         assert_eq!(content_type_for("", "", b""), TEXT);
     }
 
@@ -929,6 +973,10 @@ mod tests {
             content_type_override(&meta(json!({ "content_type": "text" }))),
             Some(TEXT.to_string())
         );
+        assert_eq!(
+            content_type_override(&meta(json!({ "content_type": "docx" }))),
+            Some(DOCX.to_string())
+        );
         // Unknown or absent -> None, so the uploader falls back to sniffing.
         assert_eq!(
             content_type_override(&meta(json!({ "content_type": "bogus" }))),
@@ -987,6 +1035,32 @@ mod tests {
         assert_eq!(items[0].extra["kind"], "manual"); // meta.kind honored
         assert_eq!(items[0].extra["source"], "url");
         assert_eq!(items[0].extra["title"], "note.md");
+    }
+
+    #[test]
+    fn items_from_docx_yields_single_doc_item() {
+        use std::io::{Cursor, Write};
+        // Build a minimal .docx (ZIP + word/document.xml), Stored so no deflate feature is needed.
+        let xml = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+            <w:p><w:r><w:t>Level 5 expectations</w:t></w:r></w:p></w:body></w:document>";
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("word/document.xml", opts).unwrap();
+            zw.write_all(xml.as_bytes()).unwrap();
+            let _ = zw.finish().unwrap();
+        }
+        let m = meta(json!({ "filename": "glg.docx", "source_type": "ipfs" }));
+        let items = items_from(DOCX, &buf, &m).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "glg.docx");
+        assert_eq!(items[0].body, "Level 5 expectations\n");
+        assert_eq!(items[0].extra["kind"], "doc");
+        assert_eq!(items[0].extra["title"], "glg.docx");
+        // A corrupt docx surfaces an error rather than panicking.
+        assert!(items_from(DOCX, b"not a docx", &m).is_err());
     }
 
     #[test]
