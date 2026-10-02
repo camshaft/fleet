@@ -1799,6 +1799,7 @@ struct ScopeOutcome {
 /// is the shared single-scope core: `analyze_cmd` wraps it for one scope, `run_cmd` loops it over every
 /// board scope. `scope` is required when `publish` is set (it is the `dreams/<scope>` doc path); `repo_root`
 /// enables the verified-dangling staleness detector (skipped when `None`).
+#[allow(clippy::too_many_arguments)]
 fn run_scope_pass(
     recs: &[Rec],
     scope: Option<&str>,
@@ -1806,6 +1807,7 @@ fn run_scope_pass(
     publish: bool,
     board_memory: &str,
     repo_root: Option<&Path>,
+    value_contradictions: bool,
 ) -> Result<ScopeOutcome, String> {
     let mut prot: HashMap<String, Vec<String>> = HashMap::new();
     for r in recs {
@@ -1838,7 +1840,14 @@ fn run_scope_pass(
         &backlinks,
         &catalogued,
     ));
-    proposals.extend(detect_value_contradictions(recs, &prot, &backlinks));
+    // value_contradiction is OFF by default (opt-in): the first scheduled co-verify showed 0 true positives
+    // across ~59 samples even after date-exclusion + same-line proximity + caps -- a numeric VALUE in a memory
+    // is almost always a measurement/snapshot (a %, a size, a count), not an asserted invariant, so a
+    // deterministic detector cannot tell a genuine contradiction from two different measurements. Kept behind
+    // this flag for a future LLM-assisted / much-narrower redesign (task_1123 co-verify, librarian-confirmed).
+    if value_contradictions {
+        proposals.extend(detect_value_contradictions(recs, &prot, &backlinks));
+    }
     // Verified-dangling file refs -- only with a repo worktree to resolve against (never on a corpus-only run).
     if let Some(root) = repo_root {
         proposals.extend(detect_stale_refs(recs, &prot, &backlinks, root));
@@ -1855,8 +1864,10 @@ fn run_scope_pass(
         "orphan_add_links",
         "near_duplicate_minhash",
         "write_later_candidate",
-        "value_contradiction",
     ];
+    if value_contradictions {
+        detectors_run.push("value_contradiction");
+    }
     if repo_root.is_some() {
         detectors_run.push("stale_file_ref");
     }
@@ -1903,6 +1914,7 @@ pub fn analyze_cmd(
     publish_board_doc: bool,
     board_memory: &str,
     repo_root: Option<&Path>,
+    value_contradictions: bool,
 ) -> i32 {
     let recs = if from_board {
         let Some(scope) = scope else {
@@ -1943,6 +1955,7 @@ pub fn analyze_cmd(
         publish_board_doc,
         board_memory,
         repo_root,
+        value_contradictions,
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -2046,12 +2059,14 @@ fn format_dream_notify_post(new_by_scope: &[(String, usize)]) -> String {
 /// it; a scope with no local checkout stays corpus-only, and with no base every scope is corpus-only. Returns
 /// a nonzero exit if any scope (or the notify) failed, so a failed run is visible to the timer, while still
 /// processing the other scopes.
+#[allow(clippy::too_many_arguments)]
 pub fn run_cmd(
     board_api: &str,
     state_dir: &Path,
     board_memory: &str,
     notify_channel: &str,
     repo_root_base: Option<&Path>,
+    value_contradictions: bool,
 ) -> i32 {
     let date = today_utc_date();
     let recs = match load_corpus_from_board(board_api, "repos") {
@@ -2106,6 +2121,7 @@ pub fn run_cmd(
             true,
             board_memory,
             repo_root.as_deref(),
+            value_contradictions,
         ) {
             Ok(o) => {
                 eprintln!(
