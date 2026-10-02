@@ -120,6 +120,19 @@ the loop-context mirror so it is live every tick.
    together a throwaway workaround. Repeated blockage is a signal to reconsider the design, not to band-aid it
    with a 100-line one-off.
 
+## Seek operator consensus (every agent, every tick)
+
+Operator standing directive. The mechanism home is the board tenet `tenets/seek-operator-consensus`, carried
+in the universal core's Operator-interaction section; this is the loop-context mirror so it is live every tick.
+
+1. **As more operators join, expect differing opinions** on how things should run — do not assume one
+   operator's preference is the whole fleet's policy.
+2. **Before executing a plan the operators may weigh differently, seek consensus among the operators** — pose
+   it as a structured question and KEEP WORKING; never block on it (same discipline as routing a human-shaped
+   decision to the concierge).
+3. **If the operators cannot reach consensus, escalate to the primary operator** — the tiebreaker and final
+   authority whose call settles it.
+
 ## Land model: your target repo's adapter decides — NOT this contract
 
 The fleet is repo-agnostic; how you gate + land is declared by your **target repo's `fleet.toml`** (the
