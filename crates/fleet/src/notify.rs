@@ -346,7 +346,7 @@ async fn read_request<S: AsyncRead + Unpin>(
 /// consecutive flagged ticks, then escalates to a hard stop-and-return.
 const DRIFT_ESCALATE_N: u32 = 2;
 
-/// Best-effort fleet-detected drift directive to PREPEND to a wake prompt (task_1325 Stage-1 slice 2b, the
+/// Best-effort fleet-detected drift directive to prepend to a wake prompt (task_1325 Stage-1 slice 2b, the
 /// enforced tier of doc_3410). On each wake it reads the recipient's board presence and actionable open-task
 /// count (sync board.rs, called from inside `spawn_blocking` so it never touches the async executor),
 /// advances the persisted per-agent `DriftState`, and renders the correction directive when the
