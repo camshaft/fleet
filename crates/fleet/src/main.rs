@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 
 mod board;
 mod config;
+mod dream;
+mod dream_apply;
+mod memory;
 mod notify;
 mod transcripts;
 mod workspace;
@@ -2336,6 +2339,79 @@ enum Cmd {
     /// fully-staged ones, and warns (fail-open, never blocks) on any only-partially-staged file it will not
     /// risk auto-restaging.
     FmtHookRun,
+    /// Sync the Claude Code memory directory with the board (task_848 auto-sync, the native-tool fallback).
+    /// `--direction file-to-board` pushes new/changed memory files to the board via `board-memory write`
+    /// (idempotent via a per-slug content-hash state); `--direction board-to-file` refreshes the local dir
+    /// from the board for native recall/offline. Scope is exactly one of `--agent <self>` or `--repo <repo>`
+    /// (an agent syncs only its own scope, so file-to-board is same-writer). v-fleet-tooling wires it from
+    /// SessionEnd/periodic (file-to-board) and SessionStart (board-to-file) hooks.
+    MemorySync {
+        /// Which half of the sync to run.
+        #[arg(long)]
+        direction: memory::SyncDirection,
+        /// Scope: the agent whose own memories to sync (mutually exclusive with --repo).
+        #[arg(long, conflicts_with = "repo")]
+        agent: Option<String>,
+        /// Scope: the repo whose memories to sync (mutually exclusive with --agent).
+        #[arg(long)]
+        repo: Option<String>,
+        /// The Claude Code memory directory for this scope.
+        #[arg(long)]
+        memory_dir: PathBuf,
+        /// Path to the board-memory CLI.
+        #[arg(long, default_value = "board-memory")]
+        board_memory: String,
+        /// Per-slug content-hash state file for file-to-board skip-unchanged (default
+        /// `$XDG_CONFIG_HOME/fleet/memory-sync-state.json`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Report what would sync without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run the dream pass analyzer over a memory corpus (task_827/task_956): a PROPOSE-ONLY pass that reads
+    /// board-backed memory and emits a reviewed worklist (the librarian-blessed `dream-report/v1`); it never
+    /// applies a change. Runs the protected classifier, exact-duplicate (merge / cross-repo twin / orphan
+    /// add-links), MinHash near-duplicate, and write-later detectors.
+    DreamAnalyze {
+        /// JSONL corpus (board-identical bodies) for this analysis run.
+        #[arg(long)]
+        corpus: PathBuf,
+        /// Where to write the dream-report JSON.
+        #[arg(long, default_value = "dream-report.json")]
+        out: PathBuf,
+        /// Print this many proposals to stderr for a quick eyeball (0 = none).
+        #[arg(long, default_value_t = 0)]
+        sample: usize,
+    },
+    /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
+    /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
+    /// lane / KB-side op is EMITTED for the librarian (never script-executed), destructive ops archive
+    /// (restore-reversible), and dry-run (the default) applies nothing. `--execute` performs only a
+    /// standard-lane board-side op that carries a disposition version pin.
+    DreamApply {
+        /// The dream-report JSON (a `dream-analyze` output).
+        #[arg(long)]
+        report: PathBuf,
+        /// The proposal_id to apply.
+        #[arg(long)]
+        proposal: String,
+        /// The disposition decision.
+        #[arg(long, value_parser = ["apply", "decline"])]
+        disposition: String,
+        /// The authenticating principal (must be `librarian` for the protected lane).
+        #[arg(long)]
+        principal: String,
+        /// Perform board-side ops (default: dry-run, applies nothing).
+        #[arg(long)]
+        execute: bool,
+        /// Audit-trace path (default `$XDG_CONFIG_HOME/fleet/dream-apply-audit.jsonl`).
+        #[arg(long)]
+        audit_log: Option<PathBuf>,
+        /// Board REST base for the condition-C version-pin check (default the fleet board base).
+        #[arg(long)]
+        board_api: Option<String>,
+    },
 }
 
 fn main() {
@@ -2481,6 +2557,48 @@ fn main() {
         Cmd::ConfirmKill { pid, term, timeout, sigkill } => confirm_kill(pid, term, timeout, sigkill),
         Cmd::DaemonPids { daemon } => daemon_pids(&daemon),
         Cmd::FmtHookRun => fmt_hook_run(),
+        Cmd::MemorySync {
+            direction,
+            agent,
+            repo,
+            memory_dir,
+            board_memory,
+            state,
+            dry_run,
+        } => {
+            let code = memory::sync_cmd(direction, agent, repo, &memory_dir, &board_memory, state, dry_run);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Cmd::DreamAnalyze { corpus, out, sample } => {
+            let code = dream::analyze_cmd(&corpus, &out, sample);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Cmd::DreamApply {
+            report,
+            proposal,
+            disposition,
+            principal,
+            execute,
+            audit_log,
+            board_api,
+        } => {
+            let code = dream_apply::apply_cmd(
+                &report,
+                &proposal,
+                &disposition,
+                &principal,
+                execute,
+                audit_log,
+                board_api,
+            );
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
 }
 
