@@ -151,6 +151,107 @@ fn launch_metadata_patch(md: Option<&serde_json::Value>) -> Option<serde_json::V
     Some(serde_json::Value::Object(patch))
 }
 
+/// task_1182: find the local tunnel-client pid serving `name` in a `tunnel list --json` payload, or `None`
+/// if no tunnel by that name is registered. Pure — unit-tested apart from the `tunnel` CLI. Used by
+/// [`tunnel_guard`] to shed exactly the stale client (by pid), never a `-f` pattern-kill (the self-match trap).
+fn tunnel_pid_for_name(list_json: &str, name: &str) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_str(list_json).ok()?;
+    v.get("tunnels")?
+        .as_array()?
+        .iter()
+        .find(|t| t.get("tunnelName").and_then(serde_json::Value::as_str) == Some(name))
+        .and_then(|t| t.get("meta")?.get("pid")?.as_u64())
+        .map(|p| p as u32)
+}
+
+/// task_1182: whether a `curl -w %{http_code}` probe of the tunnel's public URL shows the local client is
+/// FORWARDING. A 2xx or 3xx response means the request reached the origin through the client (a public board
+/// root legitimately answers `302`, so a redirect counts as healthy); a tunnel-edge gateway error (`502`/
+/// `503`/`504`) or a curl failure (empty / `000`) means the client is alive-but-not-forwarding. Callers should
+/// therefore point `--probe-url` at a path that returns 2xx/3xx when healthy, not one gated behind a `401`.
+/// Pure — unit-tested.
+fn tunnel_probe_healthy(code_output: &str) -> bool {
+    let c = code_output.trim();
+    c.len() == 3 && (c.starts_with('2') || c.starts_with('3')) && c.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// `fleet tunnel-guard` — keep a browser-facing tunnel's CLI client CONNECTED, not merely alive (task_1182).
+///
+/// The failure this exists for: the toolbox `tunnel create` client can go half-dead — its local process stays
+/// alive while its forwarding connection drops — so a plain process-liveness or systemd `Restart=on-failure`
+/// supervisor never notices, and the operator is silently blocked from the board in-browser until a human
+/// re-runs `tunnel create` (the live incident that filed task_1182). So this probes CONNECTIVITY end-to-end
+/// THROUGH the tunnel (not a local-port check), and on failure sheds the stale client by its exact pid and
+/// re-runs the host-provided recreate command. It is kept GENERIC — the tunnel name, the probe URL, and the
+/// recreate command are all caller-supplied (the host wires the specific board-tunnel values), so the fleet
+/// CLI carries no host-specific tunnel config. The probe is a plain `curl` of the PUBLIC url — a true external
+/// end-to-end check that needs no tunnel binary and exercises the whole edge→client→origin path; only `list`
+/// (to find the stale pid) and `recreate` touch the tunnel CLI, so `tunnel_bin` lets the host point at a
+/// non-`PATH` install (e.g. a toolbox bin). Run it from a systemd timer / oneshot (which does not overlap) so
+/// two fires never race a recreate. `--apply` gates the shed+recreate; without it, it only reports.
+fn tunnel_guard(name: &str, probe_url: &str, recreate: &str, tunnel_bin: &str, apply: bool) {
+    let probe_code = |url: &str| -> String {
+        std::process::Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "15", url])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+
+    let code = probe_code(probe_url);
+    if tunnel_probe_healthy(&code) {
+        println!("tunnel-guard: '{name}' healthy (probe {probe_url} -> {})", code.trim());
+        return;
+    }
+    println!(
+        "tunnel-guard: '{name}' UNHEALTHY (probe {probe_url} -> '{}') — client registered but not forwarding",
+        code.trim()
+    );
+    if !apply {
+        println!("  (dry-run — re-run with --apply to shed the stale client + recreate)");
+        return;
+    }
+
+    // Shed the stale client by its EXACT pid (never `pkill -f tunnel` — that self-matches this process and
+    // would also hit sibling tunnel daemons). A missing pid just means no live client to shed.
+    match std::process::Command::new(tunnel_bin).args(["list", "--json"]).output() {
+        Ok(o) => {
+            if let Some(pid) = tunnel_pid_for_name(&String::from_utf8_lossy(&o.stdout), name) {
+                println!("  shedding stale client pid {pid}");
+                let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            } else {
+                println!("  no live client registered for '{name}' — recreating fresh");
+            }
+        }
+        Err(e) => eprintln!("  WARN: could not list tunnels to shed the stale client ({e}); recreating anyway"),
+    }
+
+    // Recreate detached so the client outlives this guard process (it re-parents to init).
+    println!("  recreating: {recreate}");
+    let spawn = std::process::Command::new("bash")
+        .arg("-lc")
+        .arg(format!("setsid nohup {recreate} >/dev/null 2>&1 </dev/null &"))
+        .status();
+    if let Err(e) = spawn {
+        eprintln!("  tunnel-guard: recreate failed to spawn: {e}");
+        std::process::exit(1);
+    }
+    std::thread::sleep(std::time::Duration::from_secs(6));
+
+    let code2 = probe_code(probe_url);
+    if tunnel_probe_healthy(&code2) {
+        println!("tunnel-guard: '{name}' RECOVERED (reprobe -> {})", code2.trim());
+    } else {
+        eprintln!(
+            "tunnel-guard: '{name}' STILL unhealthy after recreate (reprobe -> '{}') — a human may need to \
+             re-auth (mwinit) or check the tunnel service; raising for attention",
+            code2.trim()
+        );
+        std::process::exit(1);
+    }
+}
+
 /// task_1037: whether an agent's charter is DEFERRED (`metadata.charter_projection == "deferred"`) — a
 /// deliberately-not-yet-active vertical (v-cas-http / v-bach during the migration) a mass reconstitution must
 /// not bring up. Absent → not deferred. Pure — unit-tested.
@@ -2280,6 +2381,30 @@ enum Cmd {
         #[arg(long)]
         allow_missing_taxonomy: bool,
     },
+    /// Keep a browser-facing tunnel's CLI client CONNECTED, not merely alive (task_1182): probe connectivity
+    /// end-to-end THROUGH the tunnel and, when it is down (alive-but-not-forwarding — the failure a plain
+    /// process-liveness supervisor misses), shed the stale client by its exact pid and re-run the host-provided
+    /// recreate command. Generic: the tunnel name, probe URL, and recreate command are all caller-supplied, so
+    /// no host-specific tunnel config lives in this CLI. Run from a non-overlapping systemd timer / oneshot.
+    TunnelGuard {
+        /// The tunnel's registered name (its `tunnel create --name`), used to find + shed exactly its client.
+        #[arg(long)]
+        name: String,
+        /// A URL served THROUGH the tunnel to curl as the connectivity probe (a 2xx response is healthy).
+        #[arg(long)]
+        probe_url: String,
+        /// The command to re-run to recreate the client when the probe fails (the host's canonical
+        /// `tunnel create …` with its flags, preserving `--name` so the URL + link-root persist).
+        #[arg(long)]
+        recreate: String,
+        /// The tunnel CLI binary (used only for `list`, to find the stale pid); default `tunnel`. Point this at
+        /// a non-`PATH` install (e.g. `~/.toolbox/bin/tunnel`) when the guard runs without that bin on PATH.
+        #[arg(long, default_value = "tunnel")]
+        tunnel_bin: String,
+        /// Actually shed the stale client + recreate; without it, only report the probe result (dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Pattern-kill processes WITHOUT the `pkill -f` self-match footgun (task_1068): kill every process whose
     /// full command line contains `pattern`, but NEVER the caller's own process, its ancestor chain (the
     /// invoking shell, the Bash-tool wrapper, the agent's claude session), or its process group. `pkill -f`
@@ -2788,6 +2913,13 @@ fn main() {
             redact,
             allow_missing_taxonomy,
         }),
+        Cmd::TunnelGuard {
+            name,
+            probe_url,
+            recreate,
+            tunnel_bin,
+            apply,
+        } => tunnel_guard(&name, &probe_url, &recreate, &tunnel_bin, apply),
         Cmd::SafePkill {
             pattern,
             dry_run,
@@ -12513,6 +12645,46 @@ mod tests {
             root: base.join(".claude/fleet"),
         };
         (base, fleet)
+    }
+
+    #[test]
+    fn tunnel_pid_for_name_reads_the_meta_pid_of_the_matching_tunnel() {
+        // The real `tunnel list --json` shape: tunnels[].tunnelName with the client pid at tunnels[].meta.pid.
+        let json = r#"{
+            "tunnels": [
+                {"tunnelName": "other-tunnel", "meta": {"localPort": 9000, "pid": 111}},
+                {"tunnelName": "membrain-board", "url": "https://x", "meta": {"localPort": 8880, "pid": 222}}
+            ],
+            "hasMore": false
+        }"#;
+        assert_eq!(tunnel_pid_for_name(json, "membrain-board"), Some(222));
+        assert_eq!(tunnel_pid_for_name(json, "other-tunnel"), Some(111));
+        // A name that is not registered yields None (nothing to shed — the handler then recreates fresh).
+        assert_eq!(tunnel_pid_for_name(json, "absent"), None);
+        // No tunnels at all, and malformed input, both yield None rather than panicking.
+        assert_eq!(tunnel_pid_for_name(r#"{"tunnels": [], "hasMore": false}"#, "membrain-board"), None);
+        assert_eq!(tunnel_pid_for_name("not json", "membrain-board"), None);
+    }
+
+    #[test]
+    fn tunnel_probe_healthy_accepts_a_2xx_or_3xx_three_digit_code() {
+        assert!(tunnel_probe_healthy("200"));
+        assert!(tunnel_probe_healthy(" 204\n"), "trims surrounding whitespace");
+        // A 3xx means the request reached the origin through the client — the live board root 302-redirects,
+        // so a redirect is a FORWARDING-healthy signal, not a failure.
+        assert!(tunnel_probe_healthy("302"));
+        assert!(tunnel_probe_healthy("301"));
+        // A tunnel-edge gateway error means the client is alive-but-not-forwarding — unhealthy.
+        assert!(!tunnel_probe_healthy("502"));
+        assert!(!tunnel_probe_healthy("504"));
+        // Empty output (curl error / timeout — the tunnel is not forwarding at all) is unhealthy.
+        assert!(!tunnel_probe_healthy(""));
+        assert!(!tunnel_probe_healthy("   "));
+        assert!(!tunnel_probe_healthy("000"));
+        // Guard against a stray non-3-digit or non-numeric string being read as a 2xx/3xx.
+        assert!(!tunnel_probe_healthy("2"));
+        assert!(!tunnel_probe_healthy("2000"));
+        assert!(!tunnel_probe_healthy("3xx"));
     }
 
     #[test]
