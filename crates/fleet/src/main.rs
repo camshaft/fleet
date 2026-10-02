@@ -2118,26 +2118,37 @@ fn intake_digest_body(offenders: &[(String, String)]) -> String {
     )
 }
 
-/// Sweep the uncategorized intake project and REPORT every task that violates an inbox invariant (task_1217),
-/// and with `alert` also post the active, cooldown-fenced per-offender escalation (shape (a), board-pm
-/// comment_6197). Report-only by default: it prints the offenders (via the pure [`intake_report`]) and exits
-/// non-zero when any violate, so a supervisor can gate on it. With `--alert` it additionally posts a
-/// per-offender comment tagging board-triage on each violating task, fenced per offender by
-/// `alert_cooldown_secs` so a fast sweep never re-comments. Age is the task's `created_at` to now; a task with
-/// no parseable `created_at` is swept on state only (age 0, so it can still trip the state invariant but never
-/// a phantom dwell). After the per-offender pass, `--alert` also posts ONE consolidated digest per sweep (shape
-/// (c)) to the [`INTAKE_DIGEST_CHANNEL`] — board-triage gets the actionable batch and concierge the aggregate
-/// backstop — fenced by a single sweep-level cooldown ([`intake_digest_stamp_path`]) so a ~30s sweep never
-/// spams the channel. Best-effort: a channel resolve/post failure is logged but never fails the sweep.
-fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_cooldown_secs: u64) {
-    let board = board::Board::connect().unwrap_or_else(|e| {
-        eprintln!("intake-watch: {e}");
-        std::process::exit(1);
-    });
-    let tasks = board.list_tasks_by_project(project).unwrap_or_else(|e| {
-        eprintln!("intake-watch: {e}");
-        std::process::exit(1);
-    });
+/// The outcome of one [`intake_sweep`] pass: enough for the standalone CLI to render its report + supervisor
+/// exit code and for the watchdog act to log a one-line summary, without either re-deriving it. `violation_lines`
+/// are the pure [`intake_report`] offender lines (empty = the inbox is clean); `alerted` is the per-offender
+/// comments posted this pass; `digest_posted` is whether the shape-(c) digest went out.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IntakeSweepOutcome {
+    scanned: usize,
+    violation_lines: Vec<String>,
+    alerted: usize,
+    digest_posted: bool,
+}
+
+/// The non-exiting core of the intake sweep (task_1217): classify every task in `project` against the inbox
+/// invariants and, with `alert`, post the cooldown-fenced per-offender escalation (shape (a), board-pm
+/// comment_6197) plus the one consolidated digest (shape (c)). Takes an already-connected `board` and RETURNS an
+/// [`IntakeSweepOutcome`] rather than printing a final report or exiting, so it is callable both from the
+/// standalone `fleet intake-watch` CLI (a thin wrapper that renders + sets the supervisor exit code) and from the
+/// watchdog's periodic sweep (one act among many — it must never exit the process). Age is the task's
+/// `created_at` to now; a task with no parseable `created_at` is swept on state only (age 0, so it can still trip
+/// the state invariant but never a phantom dwell). Every board write is best-effort: a per-offender comment or
+/// channel failure is logged and the sweep continues. `Err` only on the initial task-list fetch (the one thing a
+/// sweep cannot proceed without); the caller decides whether that is fatal.
+fn intake_sweep(
+    board: &board::Board,
+    fleet: &Fleet,
+    project: i64,
+    sla_secs: u64,
+    alert: bool,
+    alert_cooldown_secs: u64,
+) -> Result<IntakeSweepOutcome, String> {
+    let tasks = board.list_tasks_by_project(project)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2168,10 +2179,14 @@ fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_c
         .iter()
         .map(|(_, r, s, a)| (r.clone(), s.clone(), *a))
         .collect();
-    let lines = intake_report(&entries, sla_secs);
+    let mut outcome = IntakeSweepOutcome {
+        scanned: entries.len(),
+        violation_lines: intake_report(&entries, sla_secs),
+        alerted: 0,
+        digest_posted: false,
+    };
 
     if alert {
-        let mut alerted = 0usize;
         // Every current violator this sweep (ref + reason), for the consolidated digest below. Collected
         // independent of the per-offender comment cooldown: the digest reflects the CURRENT violation set, while
         // each per-offender comment keeps its own per-offender fence.
@@ -2192,13 +2207,14 @@ fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_c
             match board.comment_task(*id, "v-fleet-tooling", &intake_alert_comment(&reason)) {
                 Ok(()) => {
                     write_intake_alert_stamp(fleet, project, task_ref, now);
-                    alerted += 1;
+                    outcome.alerted += 1;
                 }
                 Err(e) => eprintln!("intake-watch: alert comment on {task_ref} failed: {e}"),
             }
         }
         eprintln!(
-            "intake-watch: alerted {alerted} offender(s) (per-offender cooldown {alert_cooldown_secs}s)"
+            "intake-watch: alerted {} offender(s) (per-offender cooldown {alert_cooldown_secs}s)",
+            outcome.alerted
         );
 
         // task_1217 shape (c): ONE consolidated digest per sweep to board-triage + concierge, fenced by a
@@ -2219,6 +2235,7 @@ fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_c
                     match board.post_to_channel(channel_id, INTAKE_DIGEST_SENDER, &body) {
                         Ok(()) => {
                             write_intake_digest_stamp(fleet, project, now);
+                            outcome.digest_posted = true;
                             eprintln!(
                                 "intake-watch: posted digest ({} offender(s)) to #{INTAKE_DIGEST_CHANNEL} (id {channel_id})",
                                 offenders.len()
@@ -2236,20 +2253,96 @@ fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_c
         }
     }
 
-    if lines.is_empty() {
+    Ok(outcome)
+}
+
+/// The standalone `fleet intake-watch` CLI (task_1217): connect, run one [`intake_sweep`], render the report, and
+/// EXIT non-zero when any task violates an inbox invariant so a supervisor can gate on it. Report-only by default;
+/// `--alert` posts the per-offender escalation + the digest (the sweep core does that). This exit-code behavior is
+/// why the sweep core is factored out — the watchdog's periodic pass needs the same work WITHOUT the exit.
+fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_cooldown_secs: u64) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("intake-watch: {e}");
+        std::process::exit(1);
+    });
+    let outcome = intake_sweep(&board, fleet, project, sla_secs, alert, alert_cooldown_secs)
+        .unwrap_or_else(|e| {
+            eprintln!("intake-watch: {e}");
+            std::process::exit(1);
+        });
+    if outcome.violation_lines.is_empty() {
         println!(
             "intake-watch: project {project} clean -- {} task(s), none violating (SLA {sla_secs}s)",
-            entries.len()
+            outcome.scanned
         );
     } else {
         eprintln!(
             "intake-watch: project {project} has {} invariant violation(s) (SLA {sla_secs}s):",
-            lines.len()
+            outcome.violation_lines.len()
         );
-        for l in &lines {
+        for l in &outcome.violation_lines {
             eprintln!("  {l}");
         }
         std::process::exit(1);
+    }
+}
+
+/// task_1217 default dwell SLA for the watchdog's folded-in intake sweep: a task may sit in the uncategorized
+/// inbox this long before the dwell invariant trips. Matches the standalone CLI's 120s default (the operator's
+/// "~2min dwell").
+const WATCHDOG_INTAKE_SLA_SECS: u64 = 120;
+/// task_1217 default per-offender + digest alert cooldown for the watchdog's folded-in intake sweep: at most one
+/// per-offender comment and one digest per this window, so the ~30s sweep never re-spams. Matches the standalone
+/// CLI's 3600s default.
+const WATCHDOG_INTAKE_ALERT_COOLDOWN_SECS: u64 = 3600;
+
+/// task_1217 (c) cadence wiring: the watchdog's intake-sweep act. Folds the dwell+state sweep onto the watchdog
+/// cadence so the (a) per-offender escalation + the (c) digest run automatically every pass, not just on a manual
+/// `fleet intake-watch`. The intake project id is read from config (`intake_project`); when it is unset this is a
+/// no-op, so the act has ZERO blast radius on a host that has not opted its intake project in. Always alert-mode
+/// (the whole point of the cadence is the active escalation); the existing per-offender + digest cooldown stamps
+/// make the every-sweep cadence safe. Best-effort and non-exiting: a connect/list failure is logged and the rest
+/// of the watchdog sweep proceeds (quiesce suppression is applied by the caller, like the sibling acts).
+fn watchdog_intake_watch(fleet: &Fleet) {
+    let Some(project) = config::get().intake_project else {
+        return;
+    };
+    println!("-- intake-watch --");
+    // Quiesce suppression (mirrors the sibling acts): during a fleet-wide spin-down/cutover, a dwelling intake
+    // task is expected, so the escalation stands down this sweep rather than spamming comments/digests. Same
+    // self-expiring sentinel the other acts read.
+    if fleet_is_quiesced(
+        quiesce_sentinel_age_secs(time::OffsetDateTime::now_utc()),
+        (FLEET_QUIESCE_TTL_HOURS * 3600.0).round() as i64,
+    ) {
+        println!(
+            "  intake-watch: fleet quiesced -- standing down the intake escalation this sweep"
+        );
+        return;
+    }
+    let board = match board::Board::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("  intake-watch: board connect failed: {e} (skipping this sweep)");
+            return;
+        }
+    };
+    match intake_sweep(
+        &board,
+        fleet,
+        project,
+        WATCHDOG_INTAKE_SLA_SECS,
+        true,
+        WATCHDOG_INTAKE_ALERT_COOLDOWN_SECS,
+    ) {
+        Ok(o) => println!(
+            "  intake-watch: project {project} scanned {} task(s), {} violating, {} alerted, digest {}",
+            o.scanned,
+            o.violation_lines.len(),
+            o.alerted,
+            if o.digest_posted { "posted" } else { "none" }
+        ),
+        Err(e) => eprintln!("  intake-watch: sweep failed: {e} (skipping this sweep)"),
     }
 }
 
@@ -2888,6 +2981,14 @@ enum Cmd {
         /// watchdog unit's `ExecStart`, like `--observe --spawn`.
         #[arg(long)]
         review_sweep: bool,
+        /// Run the task_1217 intake sweep each pass (board-reachable only): classify every task in the
+        /// uncategorized intake project (config `intake_project`) against the dwell + state inbox invariants and
+        /// post the cooldown-fenced per-offender escalation + the once-per-sweep digest to board-triage +
+        /// concierge (see `intake_sweep`). No-op when `intake_project` is unset, so merely shipping this is zero
+        /// blast radius. OPT-IN: a host turns it on in its watchdog unit's `ExecStart` (the separate
+        /// operator-posture enable), like `--observe --spawn` / `--review-sweep`.
+        #[arg(long)]
+        intake_watch: bool,
     },
     /// CONFIRM an observation (#188): advance the per-agent observer watermark to `<session>:<offset>`. The
     /// ephemeral observer calls this as its LAST step, AFTER emitting its report/proposal(s) — so a crashed
@@ -3780,6 +3881,7 @@ fn main() {
             recover_wedged,
             relaunch_missing,
             review_sweep,
+            intake_watch,
         } => watchdog(
             stale_only,
             rearm,
@@ -3795,6 +3897,7 @@ fn main() {
             recover_wedged,
             relaunch_missing,
             review_sweep,
+            intake_watch,
         ),
         Cmd::ObserveRecord {
             agent,
@@ -7958,6 +8061,8 @@ fn watchdog(
     relaunch_missing: bool,
     // Named distinctly from the `review_sweep` function it gates (a same-name binding would shadow the fn).
     sweep_reviews: bool,
+    // Named distinctly from the `intake_watch` function it gates (a same-name binding would shadow the fn).
+    sweep_intake: bool,
 ) {
     // Self-surface (or self-heal) a stale binary: the watchdog is long-running (a timer/loop re-execs this
     // binary), so if its source checkout advanced past the built rev it would silently run old logic (a merged
@@ -8030,6 +8135,13 @@ fn watchdog(
             if sweep_reviews {
                 println!("-- review-sweep (--review-sweep: adversarial-review spawn cadence) --");
                 review_sweep(&board_session(), !spawn_dry_run);
+            }
+            // task_1217 (c) cadence wiring: with --intake-watch, run the dwell+state intake sweep this pass —
+            // the per-offender escalation + the once-per-sweep digest to board-triage + concierge. No-op unless
+            // config.intake_project is set, quiesce-suppressed, best-effort (never aborts the sweep). The
+            // existing per-offender + digest cooldown stamps make the every-sweep cadence safe.
+            if sweep_intake {
+                watchdog_intake_watch(&Fleet::resolve());
             }
             native_ids
         }
