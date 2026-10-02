@@ -65,6 +65,17 @@ pub fn notification_prompt(
         // board's canonical typed ref verbatim as `[approval] doc_123`. The ref the board sends is ALREADY
         // `doc_<id>`, so NEVER prepend `doc ` — that doubles to `doc doc_123`.
         "document.approved" => doc_ref.map(|r| format!("[notification] [approval] {r}")),
+        // A comment on a document the recipient DIRECTLY subscribes to (task_1269): the human-review case —
+        // a reviewer's comment on a doc under review must wake its owner/assignee, not sit for the next poll.
+        // The board delivers `document.comment` to the doc's subscribers (owner/assignee land in the
+        // `subscribed=true` set), so it is subscription=notification exactly like `task.commented`, only keyed
+        // on the doc `ref` (document events carry `ref`/`doc_<id>`, not a task_id). A firehose-only recipient
+        // stays `subscribed=false` and accrues for poll; a reactive-unaddressed recipient is suppressed as
+        // elsewhere. Without this arm a `document.comment` frame — which the board DOES push — fell through to
+        // `_ => None` and dropped until the next poll (the ~14-min lag cameron reported).
+        "document.comment" if subscribed && !reactive_unaddressed => {
+            doc_ref.map(|r| format!("[notification] comment on {r}"))
+        }
         "message.direct" => event_seq.map(|seq| format!("[notification] message #{seq}")),
         // A reactive relay/responder member of this channel is not addressed by this post (task_580): suppress
         // the wake so ambient channel chatter it would conclude "no action" on does not cost a harness tick. It
@@ -656,6 +667,38 @@ mod tests {
         // A pre-#384 payload with no `subscribed` field defaults false → drops to poll (never a spurious wake).
         let no_hint = serde_json::json!({"recipient":"x","type":"task.created","task_id":1182,"event_seq":9});
         assert_eq!(payload_to_wake(&no_hint), None);
+    }
+
+    #[test]
+    fn document_comment_wakes_a_subscribed_doc_owner_keyed_on_the_doc_ref() {
+        // task_1269: a reviewer's comment on a doc under review wakes its owner/assignee (the subscribed=true
+        // set), keyed on the doc `ref` since document events carry no task_id. Mirrors the task.commented gate.
+        assert_eq!(
+            notification_prompt("document.comment", None, Some(9), None, true, false, Some("doc_3394")).as_deref(),
+            Some("[notification] comment on doc_3394"),
+            "a comment on a directly-subscribed doc wakes its owner, with the verbatim doc ref"
+        );
+        // A firehose-only recipient (subscribed=false) accrues for poll — never a per-comment firehose wake.
+        assert_eq!(
+            notification_prompt("document.comment", None, Some(9), None, false, false, Some("doc_3394")),
+            None
+        );
+        // A reactive recipient the comment does not address is suppressed (task_580 gate).
+        assert_eq!(
+            notification_prompt("document.comment", None, Some(9), None, true, true, Some("doc_3394")),
+            None
+        );
+        // No doc ref → no prompt even when subscribed.
+        assert_eq!(
+            notification_prompt("document.comment", None, Some(9), None, true, false, None),
+            None
+        );
+        // End-to-end through payload_to_wake with the ref under `data.ref` (the board's shape).
+        let subbed = serde_json::json!({"recipient":"v-fleet-tooling","type":"document.comment","event_seq":9,"subscribed":true,"data":{"ref":"doc_3394"}});
+        assert_eq!(
+            payload_to_wake(&subbed),
+            Some(("v-fleet-tooling".into(), "[notification] comment on doc_3394".into()))
+        );
     }
 
     #[test]
