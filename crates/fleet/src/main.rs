@@ -904,6 +904,60 @@ fn recipient_from_subject(subject: &str) -> Option<String> {
 /// Deliver a message: temp+rename into the recipient's inbox so a reader never sees a partial file. The
 /// filename `<delivery-seq>-<pid>-<kind>.json` sorts in send order. A `to == "unknown"` whose subject
 /// names a `fleet/<agent>` is rescued to that agent. Path-traversal-guarded at this single chokepoint.
+/// The outcome of resolving a `fleet send --to <name>` recipient against the known agent roster (task_1251):
+/// the prefix-collision guard for the CLI half. "v-fleet-tooling" is a strict prefix of
+/// "v-fleet-tooling-helper", so a caller that types a non-exact collision-shaped name must not silently
+/// deliver to an unintended inbox. Pure — unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum RecipientResolution {
+    /// `to` is itself a known agent id — deliver as addressed. An exact id wins even when it is also a prefix
+    /// of a longer id, so a real recipient is never refused.
+    Exact,
+    /// `to` is NOT a known id but is a strict prefix of one or more known ids — refuse and list the
+    /// candidates rather than deliver to a literal-but-unintended inbox.
+    Ambiguous(Vec<String>),
+    /// `to` matches no known id by exact or prefix — a first-contact or an unknown recipient; deliver as
+    /// addressed (the file-hub creates the inbox), preserving the pre-guard behavior for a genuinely new name.
+    Unknown,
+}
+
+/// Resolve a recipient name against the known agent ids (task_1251). An exact id delivers; a name that is a
+/// strict prefix of known ids but is not itself one is ambiguous (refuse and disambiguate); anything else is a
+/// first-contact/unknown name that delivers unchanged. Pure.
+fn resolve_recipient(to: &str, known: &[String]) -> RecipientResolution {
+    if known.iter().any(|k| k == to) {
+        return RecipientResolution::Exact;
+    }
+    let mut candidates: Vec<String> = known
+        .iter()
+        .filter(|k| k.len() > to.len() && k.starts_with(to))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        RecipientResolution::Unknown
+    } else {
+        candidates.sort();
+        RecipientResolution::Ambiguous(candidates)
+    }
+}
+
+/// The known agent ids from the board roster, or `None` if the board is unreachable (so the caller can
+/// fail-open). Best-effort — a transient board blip must never block a `fleet send`.
+fn board_agent_ids() -> Option<Vec<String>> {
+    let board = board::Board::connect().ok()?;
+    let agents = board.list_agents().ok()?;
+    Some(
+        agents
+            .iter()
+            .filter_map(|a| {
+                a.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+            })
+            .collect(),
+    )
+}
+
 fn deliver(fleet: &Fleet, msg: &Message) {
     let to: String = if msg.to == "unknown" {
         match recipient_from_subject(&msg.subject) {
@@ -1088,6 +1142,22 @@ fn send(
         eprintln!(
             "fleet send: REFUSING a `{kind}` from an UNRESOLVED sender (the reply would dead-letter). \
              Pass `--from <your-agent-name>` (or set $FLEET_AGENT)."
+        );
+        std::process::exit(1);
+    }
+    // task_1251: force an exact-id match / disambiguate a prefix collision at the CLI boundary. "v-fleet-tooling"
+    // is a strict prefix of "v-fleet-tooling-helper", so a non-exact `--to` that collides with known agent ids
+    // is refused with the candidates rather than delivered to an unintended inbox. Best-effort and fail-open:
+    // an unreachable roster, an exact id, or a genuinely new first-contact name all proceed — only an ambiguous
+    // prefix is refused. This lives in `send` (the CLI entry), not `deliver`, so the mechanism stays hermetic.
+    if let Some(known) = board_agent_ids()
+        && let RecipientResolution::Ambiguous(candidates) = resolve_recipient(to, &known)
+    {
+        eprintln!(
+            "fleet send: REFUSING to deliver to `{to}` — not an exact agent id, but a strict prefix of {} \
+             known agents: {}. Pass the exact id.",
+            candidates.len(),
+            candidates.join(", ")
         );
         std::process::exit(1);
     }
@@ -16187,6 +16257,39 @@ detached
         let four = lines.iter().find(|l| l.starts_with("task_4:")).unwrap();
         assert!(four.contains("state=blocked"), "names the state: {four}");
         assert!(four.contains("dwell 999s"), "names the dwell: {four}");
+    }
+
+    #[test]
+    fn resolve_recipient_forces_exact_id_and_disambiguates_a_prefix_collision() {
+        let known = vec![
+            "v-fleet-tooling".to_string(),
+            "v-fleet-tooling-helper".to_string(),
+            "v-nix".to_string(),
+        ];
+        // An exact id wins even though it is also a strict prefix of the helper — a real recipient is never
+        // refused by the guard.
+        assert_eq!(
+            resolve_recipient("v-fleet-tooling", &known),
+            RecipientResolution::Exact
+        );
+        assert_eq!(
+            resolve_recipient("v-nix", &known),
+            RecipientResolution::Exact
+        );
+        // A non-exact name that is a strict prefix of known ids is ambiguous — refuse + list the candidates,
+        // sorted, never auto-pick.
+        assert_eq!(
+            resolve_recipient("v-fleet", &known),
+            RecipientResolution::Ambiguous(vec![
+                "v-fleet-tooling".to_string(),
+                "v-fleet-tooling-helper".to_string(),
+            ])
+        );
+        // A wholly unknown name is first-contact — delivered unchanged, so the guard never blocks a new agent.
+        assert_eq!(
+            resolve_recipient("v-brand-new", &known),
+            RecipientResolution::Unknown
+        );
     }
 
     #[test]
