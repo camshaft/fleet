@@ -1874,6 +1874,90 @@ fn classify_intake_task(status: &str, age_secs: u64, sla_secs: u64) -> IntakeVer
     }
 }
 
+/// Build the report lines for an intake sweep (task_1217): one line per task that violates an inbox
+/// invariant, naming the task and WHY (its bad state, a past-SLA dwell, or both on one line). `entries` is
+/// `(task_ref, status, age_secs)` for every task currently in the intake project; a clean task yields no
+/// line. Pure — unit-tested; the board fetch + age computation wraps it.
+fn intake_report(entries: &[(String, String, u64)], sla_secs: u64) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|(task_ref, status, age)| {
+            let v = classify_intake_task(status, *age, sla_secs);
+            if !v.is_violation() {
+                return None;
+            }
+            let mut why = Vec::new();
+            if let Some(s) = &v.bad_state {
+                why.push(format!("state={s} (never in-inbox)"));
+            }
+            if let Some(a) = v.dwell_over_secs {
+                why.push(format!("dwell {a}s > {sla_secs}s SLA"));
+            }
+            Some(format!("{task_ref}: {}", why.join(", ")))
+        })
+        .collect()
+}
+
+/// Sweep the uncategorized intake project and REPORT every task that violates an inbox invariant (task_1217).
+/// Report-only: it prints the offenders (via the pure [`intake_report`]) and exits non-zero when any violate,
+/// so a supervisor can gate on it — the cooldown-fenced alert to board-triage is the follow-on. Age is the
+/// task's `created_at` to now; a task with no parseable `created_at` is swept on state only (age 0, so it can
+/// still trip the state invariant but never a phantom dwell).
+fn intake_watch(project: i64, sla_secs: u64) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("intake-watch: {e}");
+        std::process::exit(1);
+    });
+    let tasks = board.list_tasks_by_project(project).unwrap_or_else(|e| {
+        eprintln!("intake-watch: {e}");
+        std::process::exit(1);
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let entries: Vec<(String, String, u64)> = tasks
+        .iter()
+        .map(|t| {
+            let task_ref = t
+                .get("ref")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+                .or_else(|| {
+                    t.get("id")
+                        .and_then(serde_json::Value::as_i64)
+                        .map(|id| format!("task_{id}"))
+                })
+                .unwrap_or_else(|| "task_?".to_string());
+            let status = t
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let age = dream::provenance_unix_secs(t.get("created_at"))
+                .map(|c| (now - c).max(0) as u64)
+                .unwrap_or(0);
+            (task_ref, status, age)
+        })
+        .collect();
+    let lines = intake_report(&entries, sla_secs);
+    if lines.is_empty() {
+        println!(
+            "intake-watch: project {project} clean -- {} task(s), none violating (SLA {sla_secs}s)",
+            entries.len()
+        );
+    } else {
+        eprintln!(
+            "intake-watch: project {project} has {} invariant violation(s) (SLA {sla_secs}s):",
+            lines.len()
+        );
+        for l in &lines {
+            eprintln!("  {l}");
+        }
+        std::process::exit(1);
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "fleet",
@@ -2918,6 +3002,19 @@ enum Cmd {
         #[arg(long)]
         board_api: Option<String>,
     },
+    /// Report every task currently in the uncategorized intake project that violates an inbox invariant
+    /// (task_1217): a task `in_progress`/`blocked` while still in the inbox, or one dwelling past the dwell
+    /// SLA. Report-only — prints the offenders and exits non-zero when any violate; the cooldown-fenced alert
+    /// to board-triage is a follow-on. The dwell+state safety net for the uncategorized project (task_1214).
+    IntakeWatch {
+        /// The uncategorized intake project id to sweep.
+        #[arg(long)]
+        project: i64,
+        /// The dwell SLA in seconds — a non-terminal task older than this while still in the inbox trips the
+        /// dwell invariant (operator: "~2min dwell").
+        #[arg(long, default_value_t = 120)]
+        sla_secs: u64,
+    },
 }
 
 fn main() {
@@ -3039,6 +3136,7 @@ fn main() {
             apply,
         ),
         Cmd::SetInterval { agent, interval } => set_interval(&fleet, &agent, &interval),
+        Cmd::IntakeWatch { project, sla_secs } => intake_watch(project, sla_secs),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
                 eprintln!("{e}");
@@ -16048,6 +16146,47 @@ detached
         assert!(!classify_intake_task("done", 100_000, 120).is_violation());
         assert!(!classify_intake_task("cancelled", 100_000, 120).is_violation());
         assert!(!classify_intake_task("archived", 100_000, 120).is_violation());
+    }
+
+    #[test]
+    fn intake_report_lists_only_offenders_and_names_why() {
+        let entries = vec![
+            // Clean: fresh todo under SLA — no line.
+            ("task_1".to_string(), "todo".to_string(), 30),
+            // Dwell only.
+            ("task_2".to_string(), "todo".to_string(), 300),
+            // Bad state only (fresh in_progress).
+            ("task_3".to_string(), "in_progress".to_string(), 5),
+            // Both at once — one line carrying both reasons.
+            ("task_4".to_string(), "blocked".to_string(), 999),
+            // Terminal and old — never reported.
+            ("task_5".to_string(), "done".to_string(), 100_000),
+        ];
+        let lines = intake_report(&entries, 120);
+        assert_eq!(lines.len(), 3, "only the three live offenders are reported");
+        assert!(lines.iter().all(|l| !l.starts_with("task_1:")));
+        assert!(lines.iter().all(|l| !l.starts_with("task_5:")));
+        // Dwell-only names the dwell, not a state.
+        let two = lines.iter().find(|l| l.starts_with("task_2:")).unwrap();
+        assert!(
+            two.contains("dwell 300s"),
+            "names the over-SLA dwell: {two}"
+        );
+        assert!(!two.contains("state="), "a todo has no bad state: {two}");
+        // Bad-state-only names the state, not a dwell.
+        let three = lines.iter().find(|l| l.starts_with("task_3:")).unwrap();
+        assert!(
+            three.contains("state=in_progress"),
+            "names the bad state: {three}"
+        );
+        assert!(
+            !three.contains("dwell"),
+            "a fresh task has no dwell breach: {three}"
+        );
+        // Both-at-once carries BOTH reasons on one line.
+        let four = lines.iter().find(|l| l.starts_with("task_4:")).unwrap();
+        assert!(four.contains("state=blocked"), "names the state: {four}");
+        assert!(four.contains("dwell 999s"), "names the dwell: {four}");
     }
 
     #[test]
