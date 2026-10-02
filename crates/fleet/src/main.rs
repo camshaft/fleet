@@ -175,21 +175,63 @@ fn tunnel_probe_healthy(code_output: &str) -> bool {
     c.len() == 3 && (c.starts_with('2') || c.starts_with('3')) && c.chars().all(|ch| ch.is_ascii_digit())
 }
 
+/// How `tunnel_guard` recovers an unhealthy tunnel. [`tunnel_recovery_plan`] picks it from the caller's args.
+#[derive(Debug, PartialEq, Eq)]
+enum TunnelRecovery<'a> {
+    /// systemd-managed: a single `systemctl --user restart <unit>` — systemd owns the client's lifecycle, so a
+    /// pid-kill would race its auto-respawn; the restart also re-reads the unit's `EnvironmentFile`.
+    SystemdRestart(&'a str),
+    /// Standalone: shed the client by its exact pid, then re-run the host's `recreate` command detached.
+    ShedAndRecreate,
+}
+
+/// Decide the recovery for an unhealthy tunnel from the caller's args (task_1182): `--systemd-unit` wins (and
+/// `recreate` is then irrelevant); otherwise a non-empty `recreate` selects the shed+recreate path. Neither
+/// given is a misconfiguration (nothing to recover with). Pure — unit-tested — so the arg contract is checked
+/// without touching systemd or the tunnel CLI.
+fn tunnel_recovery_plan<'a>(
+    systemd_unit: Option<&'a str>,
+    recreate: &str,
+) -> Result<TunnelRecovery<'a>, String> {
+    match systemd_unit {
+        Some(unit) if !unit.trim().is_empty() => Ok(TunnelRecovery::SystemdRestart(unit)),
+        _ if !recreate.trim().is_empty() => Ok(TunnelRecovery::ShedAndRecreate),
+        _ => Err("tunnel-guard: need --recreate or --systemd-unit to recover an unhealthy tunnel".to_string()),
+    }
+}
+
 /// `fleet tunnel-guard` — keep a browser-facing tunnel's CLI client CONNECTED, not merely alive (task_1182).
 ///
 /// The failure this exists for: the toolbox `tunnel create` client can go half-dead — its local process stays
 /// alive while its forwarding connection drops — so a plain process-liveness or systemd `Restart=on-failure`
 /// supervisor never notices, and the operator is silently blocked from the board in-browser until a human
 /// re-runs `tunnel create` (the live incident that filed task_1182). So this probes CONNECTIVITY end-to-end
-/// THROUGH the tunnel (not a local-port check), and on failure sheds the stale client by its exact pid and
-/// re-runs the host-provided recreate command. It is kept GENERIC — the tunnel name, the probe URL, and the
-/// recreate command are all caller-supplied (the host wires the specific board-tunnel values), so the fleet
-/// CLI carries no host-specific tunnel config. The probe is a plain `curl` of the PUBLIC url — a true external
-/// end-to-end check that needs no tunnel binary and exercises the whole edge→client→origin path; only `list`
-/// (to find the stale pid) and `recreate` touch the tunnel CLI, so `tunnel_bin` lets the host point at a
-/// non-`PATH` install (e.g. a toolbox bin). Run it from a systemd timer / oneshot (which does not overlap) so
-/// two fires never race a recreate. `--apply` gates the shed+recreate; without it, it only reports.
-fn tunnel_guard(name: &str, probe_url: &str, recreate: &str, tunnel_bin: &str, apply: bool) {
+/// THROUGH the tunnel (not a local-port check), and on failure recovers it. It is kept GENERIC — the tunnel
+/// name, the probe URL, and the recovery inputs are all caller-supplied (the host wires the specific
+/// board-tunnel values), so the fleet CLI carries no host-specific tunnel config. The probe is a plain `curl`
+/// of the PUBLIC url — a true external end-to-end check that needs no tunnel binary and exercises the whole
+/// edge→client→origin path.
+///
+/// Two recovery modes ([`tunnel_recovery_plan`]): with `--systemd-unit` the tunnel is systemd-managed, so the
+/// recovery is a single `systemctl --user restart <unit>` — a pid-kill + detached recreate would be WRONG there
+/// (systemd `Restart=always` respawns the killed pid AND the recreate spawns a second, racing client). Without
+/// it, the standalone path sheds the client by its exact pid (via `tunnel_bin list`) and re-runs `recreate`
+/// detached. Run it from a systemd timer / oneshot (which does not overlap) so two fires never race. `--apply`
+/// gates the recovery; without it, it only reports.
+fn tunnel_guard(
+    name: &str,
+    probe_url: &str,
+    recreate: &str,
+    tunnel_bin: &str,
+    apply: bool,
+    systemd_unit: Option<&str>,
+) {
+    // Fail fast on a misconfigured guard (neither recovery input) BEFORE probing, so a bad unit never silently
+    // reports healthy-then-cannot-recover.
+    let recovery = tunnel_recovery_plan(systemd_unit, recreate).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
     let probe_code = |url: &str| -> String {
         std::process::Command::new("curl")
             .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "15", url])
@@ -208,34 +250,62 @@ fn tunnel_guard(name: &str, probe_url: &str, recreate: &str, tunnel_bin: &str, a
         code.trim()
     );
     if !apply {
-        println!("  (dry-run — re-run with --apply to shed the stale client + recreate)");
+        match recovery {
+            TunnelRecovery::SystemdRestart(unit) => println!(
+                "  (dry-run — re-run with --apply to `systemctl --user restart {unit}`)"
+            ),
+            TunnelRecovery::ShedAndRecreate => {
+                println!("  (dry-run — re-run with --apply to shed the stale client + recreate)")
+            }
+        }
         return;
     }
 
-    // Shed the stale client by its EXACT pid (never `pkill -f tunnel` — that self-matches this process and
-    // would also hit sibling tunnel daemons). A missing pid just means no live client to shed.
-    match std::process::Command::new(tunnel_bin).args(["list", "--json"]).output() {
-        Ok(o) => {
-            if let Some(pid) = tunnel_pid_for_name(&String::from_utf8_lossy(&o.stdout), name) {
-                println!("  shedding stale client pid {pid}");
-                let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            } else {
-                println!("  no live client registered for '{name}' — recreating fresh");
+    match recovery {
+        // systemd-managed: one restart. systemd stops the half-dead client and starts a fresh one, re-reading
+        // the unit's EnvironmentFile — no pid-kill (which systemd would just respawn) and no detached recreate
+        // (which would race that respawn into two clients).
+        TunnelRecovery::SystemdRestart(unit) => {
+            println!("  restarting systemd unit: systemctl --user restart {unit}");
+            let restarted = std::process::Command::new("systemctl")
+                .args(["--user", "restart", unit])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !restarted {
+                eprintln!("  tunnel-guard: `systemctl --user restart {unit}` failed — raising for attention");
+                std::process::exit(1);
             }
         }
-        Err(e) => eprintln!("  WARN: could not list tunnels to shed the stale client ({e}); recreating anyway"),
-    }
-
-    // Recreate detached so the client outlives this guard process (it re-parents to init).
-    println!("  recreating: {recreate}");
-    let spawn = std::process::Command::new("bash")
-        .arg("-lc")
-        .arg(format!("setsid nohup {recreate} >/dev/null 2>&1 </dev/null &"))
-        .status();
-    if let Err(e) = spawn {
-        eprintln!("  tunnel-guard: recreate failed to spawn: {e}");
-        std::process::exit(1);
+        // Standalone: shed the stale client by its EXACT pid (never `pkill -f tunnel` — that self-matches this
+        // process and would also hit sibling tunnel daemons), then recreate detached. A missing pid just means
+        // no live client to shed.
+        TunnelRecovery::ShedAndRecreate => {
+            match std::process::Command::new(tunnel_bin).args(["list", "--json"]).output() {
+                Ok(o) => {
+                    if let Some(pid) = tunnel_pid_for_name(&String::from_utf8_lossy(&o.stdout), name) {
+                        println!("  shedding stale client pid {pid}");
+                        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    } else {
+                        println!("  no live client registered for '{name}' — recreating fresh");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  WARN: could not list tunnels to shed the stale client ({e}); recreating anyway")
+                }
+            }
+            // Recreate detached so the client outlives this guard process (it re-parents to init).
+            println!("  recreating: {recreate}");
+            let spawn = std::process::Command::new("bash")
+                .arg("-lc")
+                .arg(format!("setsid nohup {recreate} >/dev/null 2>&1 </dev/null &"))
+                .status();
+            if let Err(e) = spawn {
+                eprintln!("  tunnel-guard: recreate failed to spawn: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     std::thread::sleep(std::time::Duration::from_secs(6));
 
@@ -244,7 +314,7 @@ fn tunnel_guard(name: &str, probe_url: &str, recreate: &str, tunnel_bin: &str, a
         println!("tunnel-guard: '{name}' RECOVERED (reprobe -> {})", code2.trim());
     } else {
         eprintln!(
-            "tunnel-guard: '{name}' STILL unhealthy after recreate (reprobe -> '{}') — a human may need to \
+            "tunnel-guard: '{name}' STILL unhealthy after recovery (reprobe -> '{}') — a human may need to \
              re-auth (mwinit) or check the tunnel service; raising for attention",
             code2.trim()
         );
@@ -2402,9 +2472,18 @@ enum Cmd {
         #[arg(long)]
         probe_url: String,
         /// The command to re-run to recreate the client when the probe fails (the host's canonical
-        /// `tunnel create …` with its flags, preserving `--name` so the URL + link-root persist).
-        #[arg(long)]
+        /// `tunnel create …` with its flags, preserving `--name` so the URL + link-root persist). Required
+        /// unless `--systemd-unit` is given (which recovers via a service restart instead); ignored in that mode.
+        #[arg(long, default_value = "")]
         recreate: String,
+        /// When the tunnel is systemd-managed, the `--user` UNIT to restart on an unhealthy probe (e.g.
+        /// `tunnel@board.service`). In this mode the recovery is a single `systemctl --user restart <unit>` —
+        /// NOT a pid-kill + detached recreate — because systemd owns the client's lifecycle (`Restart=always`),
+        /// so killing its pid would have systemd respawn it AND the detached recreate spawn a second, racing
+        /// client. The restart also re-reads the unit's `EnvironmentFile`, so an allow-list change in it takes
+        /// effect. `--recreate` is ignored when this is set.
+        #[arg(long)]
+        systemd_unit: Option<String>,
         /// The tunnel CLI binary (used only for `list`, to find the stale pid); default `tunnel`. Point this at
         /// a non-`PATH` install (e.g. `~/.toolbox/bin/tunnel`) when the guard runs without that bin on PATH.
         #[arg(long, default_value = "tunnel")]
@@ -2953,7 +3032,8 @@ fn main() {
             recreate,
             tunnel_bin,
             apply,
-        } => tunnel_guard(&name, &probe_url, &recreate, &tunnel_bin, apply),
+            systemd_unit,
+        } => tunnel_guard(&name, &probe_url, &recreate, &tunnel_bin, apply, systemd_unit.as_deref()),
         Cmd::ReviewSpawn {
             review_id,
             angle,
@@ -12948,6 +13028,33 @@ mod tests {
         assert!(!tunnel_probe_healthy("2"));
         assert!(!tunnel_probe_healthy("2000"));
         assert!(!tunnel_probe_healthy("3xx"));
+    }
+
+    #[test]
+    fn tunnel_recovery_plan_prefers_systemd_then_recreate_then_errors() {
+        // task_1182: --systemd-unit wins (systemd owns the lifecycle), and recreate is then irrelevant.
+        assert_eq!(
+            tunnel_recovery_plan(Some("tunnel@board.service"), ""),
+            Ok(TunnelRecovery::SystemdRestart("tunnel@board.service"))
+        );
+        assert_eq!(
+            tunnel_recovery_plan(Some("tunnel@board.service"), "tunnel create 8880 --name x"),
+            Ok(TunnelRecovery::SystemdRestart("tunnel@board.service")),
+            "systemd-unit takes precedence over a recreate string"
+        );
+        // No unit but a recreate command -> the standalone shed+recreate path.
+        assert_eq!(
+            tunnel_recovery_plan(None, "tunnel create 8880 --name x"),
+            Ok(TunnelRecovery::ShedAndRecreate)
+        );
+        // A blank unit is treated as absent (falls through to recreate).
+        assert_eq!(
+            tunnel_recovery_plan(Some("  "), "tunnel create 8880 --name x"),
+            Ok(TunnelRecovery::ShedAndRecreate)
+        );
+        // Neither given (both blank) is a misconfiguration -> Err, so the guard fails fast.
+        assert!(tunnel_recovery_plan(None, "").is_err());
+        assert!(tunnel_recovery_plan(Some(""), "   ").is_err());
     }
 
     #[test]
