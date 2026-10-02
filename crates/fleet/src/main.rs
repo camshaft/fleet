@@ -5658,6 +5658,12 @@ fn watchdog_board(
     let now = time::OffsetDateTime::now_utc();
     let now_unix = now.unix_timestamp().max(0) as u64; // for the per-agent re-arm cooldown stamps
     let fleet = Fleet::resolve(); // stamp store (<hub>/.claude/fleet/watchdog/); shared with the file-hub scan
+    // task_1032: is a fleet-wide spin-down/cutover in effect? If so, the watchdog's opt-in auto-ACTIONS
+    // (revive-stranded, hire-signal) stand down this sweep — reviving a parked agent would fight the operator's
+    // spin-down and a hire-signal post is a board write during the freeze. The report WARNINGS still print; only
+    // the ACT is gated. Same local sentinel the nudge-stale daemon reads (self-expires via the TTL).
+    let fleet_quiesced =
+        fleet_is_quiesced(quiesce_sentinel_age_secs(now), (FLEET_QUIESCE_TTL_HOURS * 3600.0).round() as i64);
     let session = board_session();
     let host = this_host(); // host-affinity: this box only manages agents pinned here (or unpinned)
     if pinned_only {
@@ -6031,7 +6037,15 @@ fn watchdog_board(
         // SUBPROCESS of this binary: spin_up signals a per-agent failure via process::exit, so shelling it
         // contains that exit in the child and never aborts the sweep. A stranded agent is offline + windowless
         // (stood down), so spin-up finds no existing window and launches cleanly.
-        if revive_stranded {
+        if revive_stranded && fleet_quiesced {
+            // task_1032: a mass spin-down makes EVERY parked agent that still holds work look "stranded";
+            // auto-reviving them would fight the operator's spin-down. Hold them parked — the WARNING above is
+            // the report, and the quiesce lifts (spin-up-all's final wave, or the TTL) before the next sweep acts.
+            println!(
+                "-- revive-stranded SUPPRESSED (task_1032): fleet-quiesce in effect (mass spin-down) — holding {} stranded agent(s) parked rather than reviving into the operator spin-down",
+                stranded_ids.len()
+            );
+        } else if watchdog_action_enabled(revive_stranded, fleet_quiesced) {
             let cooldown = std::env::var("CDZ_REVIVE_STRANDED_COOLDOWN_SECS")
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
@@ -6081,7 +6095,15 @@ fn watchdog_board(
         // cooldown-fenced per agent so one breach is one actionable ping, not a per-sweep stream. The channel is
         // resolved ONCE per sweep; a resolve failure degrades to report-only (the WARNING already landed) rather
         // than failing the watchdog. post_to_channel pushes the PM a notification exactly like a direct message.
-        if hire_signal {
+        if hire_signal && fleet_quiesced {
+            // task_1032: a hire-signal post is a board write; during a fleet-wide freeze that is coordinator
+            // noise at the most delicate moment. Hold it — the WARNING above is the report, and backlog depth is
+            // not actionable while the whole fleet is parked anyway.
+            println!(
+                "-- hire-signal SUPPRESSED (task_1032): fleet-quiesce in effect (mass spin-down) — not posting {} backlog-depth breach(es) during the freeze",
+                backlog_overflow_ids.len()
+            );
+        } else if watchdog_action_enabled(hire_signal, fleet_quiesced) {
             let cooldown = std::env::var("CDZ_HIRE_SIGNAL_COOLDOWN_SECS")
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
@@ -8651,6 +8673,15 @@ fn spin_up_all_completes_fanout(down_non_except: usize, limit: Option<usize>) ->
         None => true,
         Some(n) => down_non_except <= n,
     }
+}
+
+/// task_1032: should the watchdog RUN an opt-in auto-ACTION (revive-stranded / hire-signal) this sweep? The flag
+/// must be set AND the fleet NOT quiesced. During a fleet-wide quiesce (mass spin-down/cutover) the watchdog's
+/// auto-actions must stand down: reviving a "stranded" agent would fight the operator's spin-down (every parked
+/// agent still holding work looks stranded), and a hire-signal post is a board write during the freeze. The
+/// report WARNINGS still print — only the ACT is gated. Pure — unit-tested.
+fn watchdog_action_enabled(flag: bool, fleet_quiesced: bool) -> bool {
+    flag && !fleet_quiesced
 }
 
 fn nudge_stale(apply: bool, threshold_hours: f64, cooldown_hours: f64) {
@@ -13070,6 +13101,18 @@ detached
         // Sentinel aged past the TTL → self-expired → NOT quiesced (a crashed cutover must not mute forever).
         assert!(!fleet_is_quiesced(Some(ttl), ttl));
         assert!(!fleet_is_quiesced(Some(ttl + 10_000), ttl));
+    }
+
+    #[test]
+    fn watchdog_action_gated_by_flag_and_quiesce() {
+        // task_1032: the opt-in auto-action runs only when its flag is set AND the fleet is not quiesced.
+        assert!(watchdog_action_enabled(true, false), "flag set, not quiesced -> act");
+        // Quiesce (mass spin-down) stands the action down even when the flag is set — reviving would fight the
+        // operator spin-down; a hire-signal post is a board write mid-freeze.
+        assert!(!watchdog_action_enabled(true, true), "flag set but quiesced -> suppressed");
+        // The flag unset is a no-op regardless of quiesce.
+        assert!(!watchdog_action_enabled(false, false));
+        assert!(!watchdog_action_enabled(false, true));
     }
 
     #[test]
