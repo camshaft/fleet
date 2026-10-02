@@ -2168,6 +2168,17 @@ enum Cmd {
         #[arg(long)]
         kill: bool,
     },
+    /// Inspect a board-native agent's live Claude Code session to confirm its auto-force-identity MCP wiring
+    /// (task_1039): report whether the running `claude` process carries `FLEET_AGENT=<agent>` in its environment,
+    /// whether its argv passes a `--mcp-config`/`--strict-mcp-config` that could shadow the user-scope config, and
+    /// whether the user-scope `~/.claude.json` `task-board` entry wires the `X-Fleet-Agent` header (static or
+    /// `headersHelper`). Read-only. The friction this bakes out: ruling out the client side of an identity
+    /// mis-attribution otherwise means hand-reading `/proc/<pid>/environ`, `/proc/<pid>/cmdline`, and jq over the
+    /// shared config — exactly the manual sweep task_1039 debugging required.
+    McpCheck {
+        /// The board-native agent whose live claude session to inspect.
+        agent: String,
+    },
     /// Pattern-kill processes WITHOUT the `pkill -f` self-match footgun (task_1068): kill every process whose
     /// full command line contains `pattern`, but NEVER the caller's own process, its ancestor chain (the
     /// invoking shell, the Bash-tool wrapper, the agent's claude session), or its process group. `pkill -f`
@@ -2573,6 +2584,7 @@ fn main() {
         Cmd::MonitorTick { agent, apply, no_fetch } => monitor_tick(&agent, apply, no_fetch),
         Cmd::SafeguardCheck { agent, threshold, tail } => safeguard_check(&agent, threshold, tail),
         Cmd::DedupCheck { agent, kill } => dedup_check(agent.as_deref(), kill),
+        Cmd::McpCheck { agent } => mcp_check(&agent),
         Cmd::SafePkill { pattern, dry_run, signal } => safe_pkill(&pattern, dry_run, &signal),
         Cmd::NudgeStale {
             apply,
@@ -10568,6 +10580,215 @@ fn dedup_check(filter: Option<&str>, kill: bool) {
     }
 }
 
+/// The auto-force-identity wiring the `task-board` MCP server entry carries in a parsed `~/.claude.json`
+/// (task_1039). `present` is whether a `mcpServers.task-board` entry exists at all; `static_header` is the value
+/// of its `headers["X-Fleet-Agent"]` if set (e.g. `${FLEET_AGENT}`); `has_helper` is whether a `headersHelper`
+/// is configured (a command that emits the header fresh at each connection). Extracted purely so the decision is
+/// unit-testable without the real config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskboardIdentityConfig {
+    present: bool,
+    static_header: Option<String>,
+    has_helper: bool,
+}
+
+/// Parse the identity wiring out of a `~/.claude.json` value — the `mcpServers.task-board` entry's
+/// `headers["X-Fleet-Agent"]` and `headersHelper`. Pure — unit-tested.
+fn taskboard_identity_config(config: &serde_json::Value) -> TaskboardIdentityConfig {
+    let Some(entry) = config.get("mcpServers").and_then(|m| m.get("task-board")) else {
+        return TaskboardIdentityConfig { present: false, static_header: None, has_helper: false };
+    };
+    let static_header = entry
+        .get("headers")
+        .and_then(|h| h.get("X-Fleet-Agent"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let has_helper = entry
+        .get("headersHelper")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    TaskboardIdentityConfig { present: true, static_header, has_helper }
+}
+
+/// The verdict of an [`mcp_check_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpCheckVerdict {
+    /// Identity is wired and the process carries the matching `FLEET_AGENT` — the client should force correctly.
+    Pass,
+    /// Wired, but something warrants a look (a `--mcp-config` that may shadow, or a static header value that is
+    /// neither `${FLEET_AGENT}` nor the agent name with no helper to override it).
+    Warn,
+    /// The client cannot force identity as-is (no entry/header wired, or the process has no/wrong `FLEET_AGENT`).
+    Fail,
+}
+
+/// Report produced by [`mcp_check_decision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpCheckReport {
+    fleet_agent_matches: bool,
+    uses_config_override: bool,
+    identity_wired: bool,
+    verdict: McpCheckVerdict,
+    notes: Vec<String>,
+}
+
+/// Decide, purely, whether `agent`'s live claude session is wired to auto-force its board identity (task_1039):
+/// the process environment must carry `FLEET_AGENT=<agent>` (what the `${FLEET_AGENT}` header / `headersHelper`
+/// expands to), the user-scope `task-board` entry must wire the `X-Fleet-Agent` header, and a `--mcp-config` on
+/// the argv is flagged because it may shadow the user-scope entry (which this check reads). Pure — the /proc and
+/// config reads wrap this. Unit-tested.
+fn mcp_check_decision(
+    agent: &str,
+    fleet_agent_env: Option<&str>,
+    claude_argv: &[String],
+    tb: &TaskboardIdentityConfig,
+) -> McpCheckReport {
+    let fleet_agent_matches = fleet_agent_env == Some(agent);
+    let uses_config_override = claude_argv
+        .iter()
+        .any(|a| a == "--mcp-config" || a == "--strict-mcp-config");
+    let identity_wired = tb.present && (tb.has_helper || tb.static_header.is_some());
+    let mut notes = Vec::new();
+
+    match fleet_agent_env {
+        Some(v) if v == agent => notes.push(format!("FLEET_AGENT=\"{v}\" in the process env (matches the agent).")),
+        Some(v) => notes.push(format!(
+            "FLEET_AGENT=\"{v}\" in the process env but the agent is \"{agent}\" — identity would force to the WRONG id."
+        )),
+        None => notes.push(
+            "FLEET_AGENT is NOT set in the process env — the ${FLEET_AGENT} header / helper expands to EMPTY, so no identity is forced."
+                .to_string(),
+        ),
+    }
+    if !tb.present {
+        notes.push("No mcpServers.task-board entry in ~/.claude.json — no X-Fleet-Agent header is configured.".to_string());
+    } else {
+        match &tb.static_header {
+            Some(h) => notes.push(format!("task-board headers[\"X-Fleet-Agent\"] = \"{h}\".")),
+            None => notes.push("task-board has no static headers[\"X-Fleet-Agent\"].".to_string()),
+        }
+        notes.push(if tb.has_helper {
+            "task-board headersHelper is configured (emits the header fresh at each connection).".to_string()
+        } else {
+            "task-board has no headersHelper.".to_string()
+        });
+    }
+    if uses_config_override {
+        notes.push(
+            "The claude argv passes --mcp-config/--strict-mcp-config — that config may SHADOW the user-scope task-board entry this check read; verify the override carries the header."
+                .to_string(),
+        );
+    }
+
+    let verdict = if !identity_wired || fleet_agent_env.is_none() {
+        McpCheckVerdict::Fail
+    } else if !fleet_agent_matches || uses_config_override {
+        McpCheckVerdict::Warn
+    } else {
+        // Header wired and FLEET_AGENT matches. A helper emits the agent's value directly, so it is fine; a
+        // static-only header must be `${FLEET_AGENT}` (expands to the matching env) or the literal agent name.
+        let static_ok = tb.has_helper
+            || tb
+                .static_header
+                .as_deref()
+                .is_some_and(|h| h == "${FLEET_AGENT}" || h == agent);
+        if static_ok { McpCheckVerdict::Pass } else { McpCheckVerdict::Warn }
+    };
+    McpCheckReport { fleet_agent_matches, uses_config_override, identity_wired, verdict, notes }
+}
+
+/// Read a single environment variable `key` from `/proc/<pid>/environ` (NUL-separated `KEY=VALUE`). None if the
+/// file is unreadable (not our process / gone) or the key is absent.
+fn proc_environ_var(pid: u32, key: &str) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{key}=");
+    raw.split(|&b| b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix(&prefix).map(str::to_string))
+}
+
+/// Read a process's argv from `/proc/<pid>/cmdline` (NUL-separated). Empty when unreadable.
+fn proc_cmdline(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| {
+            raw.split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `fleet mcp-check <agent>` (task_1039): inspect a board-native agent's live Claude Code session and report
+/// whether its auto-force-identity MCP wiring is in place. Finds the agent's `claude` process by cwd
+/// ([`agent_from_cwd`], keeping the oldest if duplicated), reads `FLEET_AGENT` from its environment and its argv,
+/// reads the user-scope `~/.claude.json` task-board entry, and prints the [`mcp_check_decision`] verdict.
+/// Read-only — never writes config or signals a process.
+fn mcp_check(agent: &str) {
+    let mut pids: Vec<u32> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            // A Claude Code agent session's process comm is exactly `claude`.
+            if std::fs::read_to_string(e.path().join("comm")).unwrap_or_default().trim() != "claude" {
+                continue;
+            }
+            let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else { continue };
+            if agent_from_cwd(&cwd.to_string_lossy()) == Some(agent) {
+                pids.push(pid);
+            }
+        }
+    }
+    if pids.is_empty() {
+        println!("mcp-check '{agent}': no live claude session found (no /proc entry with comm=claude cwd'd under agents/{agent}).");
+        println!("  (the agent may be down, or launched outside a worktree under .../agents/{agent})");
+        return;
+    }
+    // Keep the oldest (canonical) if duplicated — mirrors dedup-check's canonical choice.
+    pids.sort_by_key(|p| (proc_starttime(*p).unwrap_or(0), *p));
+    let pid = pids[0];
+    if pids.len() > 1 {
+        println!(
+            "mcp-check '{agent}': {} live claude instances {pids:?} — inspecting the oldest canonical pid {pid} (run `fleet dedup-check {agent}` to resolve the duplication).",
+            pids.len()
+        );
+    }
+
+    let fleet_agent_env = proc_environ_var(pid, "FLEET_AGENT");
+    let argv = proc_cmdline(pid);
+    let tb = match std::env::var("HOME")
+        .map_err(|_| "no HOME".to_string())
+        .and_then(|home| std::fs::read_to_string(format!("{home}/.claude.json")).map_err(|e| e.to_string()))
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string()))
+    {
+        Ok(v) => taskboard_identity_config(&v),
+        Err(e) => {
+            println!("mcp-check '{agent}': could not read ~/.claude.json ({e}) — reporting without the task-board entry.");
+            TaskboardIdentityConfig { present: false, static_header: None, has_helper: false }
+        }
+    };
+
+    let report = mcp_check_decision(agent, fleet_agent_env.as_deref(), &argv, &tb);
+    let label = match report.verdict {
+        McpCheckVerdict::Pass => "PASS",
+        McpCheckVerdict::Warn => "WARN",
+        McpCheckVerdict::Fail => "FAIL",
+    };
+    println!("mcp-check '{agent}' (claude pid {pid}): {label}");
+    for note in &report.notes {
+        println!("  - {note}");
+    }
+    match report.verdict {
+        McpCheckVerdict::Pass => println!(
+            "  => client is wired to auto-force identity for '{agent}'. A null attribution is then NOT a client-config problem — look server/transport-side."
+        ),
+        McpCheckVerdict::Warn => println!("  => wired, but review the note(s) above before trusting auto-force for '{agent}'."),
+        McpCheckVerdict::Fail => println!(
+            "  => client will NOT auto-force identity for '{agent}' as configured; fix the note(s) above, then re-bounce (headersHelper is cached per connection, so a config change needs a reconnect)."
+        ),
+    }
+}
+
 fn daemon_pids(daemon: &str) {
     let mut found: Vec<i64> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
@@ -13425,6 +13646,61 @@ detached
             (8u32, "x".to_string(), 20u64),
         ];
         assert_eq!(dedup_decision(&three), vec![("x".to_string(), 7u32, vec![8u32, 9u32])]);
+    }
+
+    #[test]
+    fn taskboard_identity_config_extracts_header_and_helper() {
+        let v = serde_json::json!({
+            "mcpServers": { "task-board": {
+                "headers": {"X-Fleet-Agent": "${FLEET_AGENT}"},
+                "headersHelper": "echo '{}'"
+            }}
+        });
+        let tb = taskboard_identity_config(&v);
+        assert!(tb.present && tb.has_helper);
+        assert_eq!(tb.static_header.as_deref(), Some("${FLEET_AGENT}"));
+        // No task-board entry -> absent.
+        assert!(!taskboard_identity_config(&serde_json::json!({"mcpServers": {}})).present);
+        // Entry with neither header nor helper -> present but unwired.
+        let bare = taskboard_identity_config(&serde_json::json!({"mcpServers": {"task-board": {"url": "http://x"}}}));
+        assert!(bare.present && !bare.has_helper && bare.static_header.is_none());
+    }
+
+    #[test]
+    fn mcp_check_passes_when_fleet_agent_matches_and_header_wired() {
+        let tb = TaskboardIdentityConfig { present: true, static_header: Some("${FLEET_AGENT}".to_string()), has_helper: true };
+        let r = mcp_check_decision("membrain-ops", Some("membrain-ops"), &["claude".to_string()], &tb);
+        assert_eq!(r.verdict, McpCheckVerdict::Pass);
+        assert!(r.fleet_agent_matches && r.identity_wired && !r.uses_config_override);
+    }
+
+    #[test]
+    fn mcp_check_fails_when_fleet_agent_unset_or_unwired() {
+        // FLEET_AGENT absent -> the ${FLEET_AGENT} header expands empty, no identity forced.
+        let wired = TaskboardIdentityConfig { present: true, static_header: Some("${FLEET_AGENT}".to_string()), has_helper: true };
+        assert_eq!(mcp_check_decision("x", None, &[], &wired).verdict, McpCheckVerdict::Fail);
+        // No header and no helper -> nothing to force from.
+        let unwired = TaskboardIdentityConfig { present: true, static_header: None, has_helper: false };
+        let r = mcp_check_decision("x", Some("x"), &[], &unwired);
+        assert_eq!(r.verdict, McpCheckVerdict::Fail);
+        assert!(!r.identity_wired);
+    }
+
+    #[test]
+    fn mcp_check_warns_on_mismatch_or_shadowing_override() {
+        let tb = TaskboardIdentityConfig { present: true, static_header: Some("${FLEET_AGENT}".to_string()), has_helper: false };
+        // FLEET_AGENT set but to the wrong id -> would force the wrong identity.
+        let mismatch = mcp_check_decision("want", Some("other"), &[], &tb);
+        assert_eq!(mismatch.verdict, McpCheckVerdict::Warn);
+        assert!(!mismatch.fleet_agent_matches);
+        // A --mcp-config override may shadow the user-scope entry this check read.
+        let argv = ["claude".to_string(), "--mcp-config".to_string(), "/x.json".to_string()];
+        let shadow = mcp_check_decision("a", Some("a"), &argv, &tb);
+        assert_eq!(shadow.verdict, McpCheckVerdict::Warn);
+        assert!(shadow.uses_config_override);
+        // A static header that is neither ${FLEET_AGENT} nor the agent name, with no helper -> warn.
+        let hardcoded = TaskboardIdentityConfig { present: true, static_header: Some("someone-else".to_string()), has_helper: false };
+        assert_eq!(mcp_check_decision("a", Some("a"), &["claude".to_string()], &hardcoded).verdict, McpCheckVerdict::Warn);
     }
 
     #[test]
