@@ -407,6 +407,45 @@ fn relaunch_missing_candidate(
     !has_window && !is_offline && hold_reason.is_none()
 }
 
+/// task_1248 default: how many times its own loop interval a managed agent's `last_seen` may lag before the
+/// watchdog treats the loop as FROZEN. A healthy loop stamps `last_seen` every tick, so a heartbeat several
+/// intervals stale while the window is alive means the loop stopped though the process did not. 4 to start
+/// (several intervals, matching the staleness-WARNING cadence) — tunable via config at the act pass; the pure
+/// predicate takes it as a parameter.
+const REVIVE_FROZEN_STALE_FACTOR: i64 = 4;
+
+/// task_1248 (task_582 family): whether the ACTIVE watchdog should REVIVE a managed board-native agent whose
+/// LOOP is frozen — its tmux window + process are still ALIVE but its board `last_seen` has not advanced for
+/// well past its loop cadence. This is the window-alive-but-loop-stuck crash class that neither sibling act
+/// catches: [`relaunch_missing_candidate`] needs a GONE window (here the window is present), and `--recover-wedged`
+/// needs a trailing refusal run (here the loop silently hangs, no refusal trail). Gated on: a LIVE window AND
+/// board presence NOT `offline` (an offline agent is intentionally stood down and left down) AND it is a launch
+/// candidate ([`spin_up_hold_reason`] is `None`: not staged / off-host / launch-gated / charter-deferred) AND
+/// `last_seen` is at least `stale_factor` x the agent's `loop_interval_secs` old (the frozen-loop signal). A
+/// `None` last_seen age (absent/unparseable heartbeat) is NOT treated as frozen — a missing heartbeat is the
+/// relaunch-missing/offline domain, not a frozen LIVE loop, so revive stays conservative (a false negative is
+/// safe; a false positive needlessly bounces a live agent). A non-positive `loop_interval_secs` or a
+/// `stale_factor` below 1 yields no bound and so never fires. The per-agent revive COOLDOWN + quiesce
+/// suppression are applied separately by the act pass (mirroring recover-wedged / relaunch-missing). Pure —
+/// unit-tested.
+fn revive_frozen_candidate(
+    has_window: bool,
+    is_offline: bool,
+    hold_reason: Option<&str>,
+    last_seen_age_secs: Option<i64>,
+    loop_interval_secs: i64,
+    stale_factor: i64,
+) -> bool {
+    if !has_window || is_offline || hold_reason.is_some() {
+        return false;
+    }
+    if loop_interval_secs <= 0 || stale_factor < 1 {
+        return false;
+    }
+    let bound = loop_interval_secs.saturating_mul(stale_factor);
+    matches!(last_seen_age_secs, Some(age) if age >= bound)
+}
+
 /// Whether the watchdog should manage an agent on this host. A STAGED agent ([`agent_is_staged`]) is never
 /// managed — it is a reserve helper that is not meant to be running, so re-arming or spawning an observer
 /// against it would be a spurious wake of an intentionally-down agent. Otherwise, under `pinned_only` (a
@@ -19497,6 +19536,99 @@ detached
         ));
         // A window present AND offline AND held -> still nothing (all gates independently block).
         assert!(!relaunch_missing_candidate(true, true, Some("off-host")));
+    }
+
+    #[test]
+    fn revive_frozen_candidate_fires_only_for_a_live_window_online_launchable_agent_with_a_stale_heartbeat()
+     {
+        let n = REVIVE_FROZEN_STALE_FACTOR;
+        let interval = 1800; // 30m loop
+        let bound = interval * n;
+        // The target case: live window, online (not offline), launchable, heartbeat >= N x interval stale ->
+        // the loop is frozen though the process is alive -> revive. This is exactly the gap neither sibling act
+        // catches (window present rules out relaunch-missing; no refusal trail rules out recover-wedged).
+        assert!(revive_frozen_candidate(
+            true,
+            false,
+            None,
+            Some(bound),
+            interval,
+            n
+        ));
+        // Boundary: exactly at the bound fires; one second under does not.
+        assert!(revive_frozen_candidate(
+            true,
+            false,
+            None,
+            Some(bound),
+            interval,
+            n
+        ));
+        assert!(!revive_frozen_candidate(
+            true,
+            false,
+            None,
+            Some(bound - 1),
+            interval,
+            n
+        ));
+        // A fresh heartbeat (loop ticking) -> healthy, never revived.
+        assert!(!revive_frozen_candidate(
+            true,
+            false,
+            None,
+            Some(30),
+            interval,
+            n
+        ));
+        // No live window -> relaunch-missing's domain, not frozen-loop; never revived here.
+        assert!(!revive_frozen_candidate(
+            false,
+            false,
+            None,
+            Some(bound),
+            interval,
+            n
+        ));
+        // Offline (deliberately stood down) -> left down, never revived even if stale.
+        assert!(!revive_frozen_candidate(
+            true,
+            true,
+            None,
+            Some(bound),
+            interval,
+            n
+        ));
+        // Held out of auto-launch (staged / off-host / launch-gated / charter-deferred) -> never revived.
+        assert!(!revive_frozen_candidate(
+            true,
+            false,
+            Some("staged (reserve helper)"),
+            Some(bound),
+            interval,
+            n
+        ));
+        // Absent/unparseable heartbeat -> conservative: a missing heartbeat is not a frozen LIVE loop.
+        assert!(!revive_frozen_candidate(
+            true, false, None, None, interval, n
+        ));
+        // Unknown cadence (non-positive interval) or a sub-1 factor -> no bound, never fires.
+        assert!(!revive_frozen_candidate(
+            true,
+            false,
+            None,
+            Some(bound),
+            0,
+            n
+        ));
+        assert!(!revive_frozen_candidate(
+            true,
+            false,
+            None,
+            Some(bound),
+            interval,
+            0
+        ));
     }
 
     #[test]
