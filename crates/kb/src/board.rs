@@ -1,11 +1,263 @@
-//! `board` — kb's board client: a thin, config-aware shim over the shared `bridge-core` task-client
-//! (task_355). The REST-vs-MCP distinction, the register/webhook route, and the task CRUD surface now live
-//! once in `bridge_core::task_client`, so a future daemon port adopts it directly instead of re-deriving it
-//! the way this crate originally did (the house pattern this module itself used to document in isolation).
+//! `board` — kb's board client. Task CRUD is a thin re-export of the shared `bridge-core` task-client
+//! (task_355). This module adds a small async document client for the wiki-sync connector (task_1089): the
+//! board exposes a document/wiki REST surface the shared task-client does not cover, so kb reads it directly
+//! with async `reqwest` (operator directive #439: no blocking IO on the tokio runtime — unlike the fleet
+//! dreamer, which reads the same routes with blocking `ureq` in a background CLI pass).
+//!
+//! Routes (verified against the live board + the fleet dreamer's reader): `GET /wiki?prefix=<p>` returns the
+//! wiki index as a JSON array of `{id, path, ...}`; `GET /documents/{id}?include_body=true` returns one
+//! document with `path`, `title`, `status`, `approved_version_id`, `metadata`, `current_version`, and (with
+//! `include_body`) the current version's markdown as `body`, fetched server-side from its pinned CID.
 
 pub use bridge_core::task_client::{Board, Task};
 
-/// Build a client for the configured `board_url`, acting as `agent_id`.
+use serde_json::Value;
+
+/// Build a task client for the configured `board_url`, acting as `agent_id`.
 pub fn connect(agent_id: impl Into<String>) -> Board {
     Board::with_base(&crate::config::get().board_url, agent_id)
+}
+
+/// One board wiki-index entry (`GET /wiki`). The index carries enough for the reconcile pass to decide what
+/// to (re)ingest WITHOUT a per-doc fetch: the id, path, approval status, and the current version id (the
+/// cheap change key — a bump means re-ingest). Only a changed/new approved doc then needs a body fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiEntry {
+    pub id: i64,
+    pub path: Option<String>,
+    pub status: Option<String>,
+    pub approved_version_id: Option<i64>,
+    pub current_version_id: Option<i64>,
+}
+
+impl WikiEntry {
+    /// Whether the entry has an approved version — the wiki-sync scope gate (approval admits a doc into the
+    /// KB board-wiki collection). True when `approved_version_id` is set or `status == "approved"`.
+    pub fn has_approved_version(&self) -> bool {
+        self.approved_version_id.is_some() || self.status.as_deref() == Some("approved")
+    }
+}
+
+/// A board document (`GET /documents/{id}`), reduced to what the wiki-sync connector needs: identity + path +
+/// the approval signal for the scope gate, plus the body/CID for ingest when `include_body` was requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Document {
+    pub id: i64,
+    pub path: Option<String>,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    /// Whether the document has an approved version (`approved_version_id` present / `status == "approved"`).
+    /// This is the wiki-sync scope gate — approval is what admits a doc into the KB board-wiki collection.
+    pub has_approved_version: bool,
+    /// The current version id — the change key stamped into each point's payload so a reconcile pass can skip
+    /// a doc whose current version is already ingested (matches the wiki index's `current_version_id`).
+    pub version_id: Option<i64>,
+    /// The current version's markdown, present only when fetched with `include_body=true`.
+    pub body: Option<String>,
+    /// The current version's content id, used to stamp provenance / detect an unchanged re-ingest.
+    pub current_version_cid: Option<String>,
+}
+
+/// Coerce a wiki-index entry id, which the board emits as a number or a numeric string, to i64.
+fn id_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Parse the `GET /wiki` response (a JSON array of entries) into [`WikiEntry`] rows, skipping any entry with
+/// no resolvable id. Pure, so the worker's listing is unit-tested without a live board.
+pub fn parse_wiki_index(v: &Value) -> Vec<WikiEntry> {
+    v.as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    let id = id_as_i64(it.get("id")?)?;
+                    let path = it.get("path").and_then(Value::as_str).map(str::to_string);
+                    let status = it.get("status").and_then(Value::as_str).map(str::to_string);
+                    let approved_version_id = it.get("approved_version_id").and_then(Value::as_i64);
+                    let current_version_id = it.get("current_version_id").and_then(Value::as_i64);
+                    Some(WikiEntry {
+                        id,
+                        path,
+                        status,
+                        approved_version_id,
+                        current_version_id,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a `GET /documents/{id}` response into a [`Document`]. Returns `None` if the id is missing/unparseable.
+/// `has_approved_version` is true when `approved_version_id` is non-null OR `status == "approved"`; `body` and
+/// `current_version_cid` are read when present (body only arrives with `include_body=true`). Pure + tested.
+pub fn parse_document(v: &Value) -> Option<Document> {
+    let id = id_as_i64(v.get("id")?)?;
+    let status = v.get("status").and_then(Value::as_str).map(str::to_string);
+    let approved = v
+        .get("approved_version_id")
+        .map(|a| !a.is_null())
+        .unwrap_or(false)
+        || status.as_deref() == Some("approved");
+    let current_version_cid = v
+        .get("current_version")
+        .and_then(|cv| cv.get("cid"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Prefer the top-level `current_version_id`; fall back to `current_version.id`.
+    let version_id = v
+        .get("current_version_id")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            v.get("current_version")
+                .and_then(|cv| cv.get("id"))
+                .and_then(Value::as_i64)
+        });
+    Some(Document {
+        id,
+        path: v.get("path").and_then(Value::as_str).map(str::to_string),
+        title: v.get("title").and_then(Value::as_str).map(str::to_string),
+        status,
+        has_approved_version: approved,
+        version_id,
+        body: v.get("body").and_then(Value::as_str).map(str::to_string),
+        current_version_cid,
+    })
+}
+
+/// Async reader for the board document/wiki REST surface (stateless — each call is one request), used by the
+/// wiki-sync connector (task_1089). Carries `allow(dead_code)` until the worker (next) calls it, the same
+/// staging the `wiki_sync` core and `Store::delete_points` use.
+#[allow(dead_code)]
+pub struct Documents {
+    base: String,
+    http: reqwest::Client,
+}
+
+#[allow(dead_code)]
+impl Documents {
+    /// Build a reader for the configured `board_url`.
+    pub fn connect() -> Documents {
+        Documents {
+            base: crate::config::get()
+                .board_url
+                .trim_end_matches('/')
+                .to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// List the wiki index, optionally restricted to a path `prefix` — `GET /wiki[?prefix=<p>]`. The reconcile
+    /// pass lists the whole wiki (prefix `None`) and filters to approved docs via [`parse_document`].
+    pub async fn list_wiki(&self, prefix: Option<&str>) -> Result<Vec<WikiEntry>, String> {
+        let url = format!("{}/wiki", self.base);
+        let mut req = self.http.get(&url);
+        if let Some(p) = prefix {
+            req = req.query(&[("prefix", p)]);
+        }
+        let v: Value = req
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("board GET /wiki failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("board GET /wiki: response was not JSON: {e}"))?;
+        Ok(parse_wiki_index(&v))
+    }
+
+    /// Fetch one document — `GET /documents/{id}[?include_body=true]`. With `include_body`, the current
+    /// version's markdown is inlined as `body` (fetched server-side from its pinned CID).
+    pub async fn get_document(&self, id: i64, include_body: bool) -> Result<Document, String> {
+        let mut url = format!("{}/documents/{}", self.base, id);
+        if include_body {
+            url.push_str("?include_body=true");
+        }
+        let v: Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("board GET /documents/{id} failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("board GET /documents/{id}: response was not JSON: {e}"))?;
+        parse_document(&v).ok_or_else(|| format!("board GET /documents/{id}: no id in response"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wiki_index_reads_fields_approval_and_skips_idless() {
+        let v = json!([
+            {"id": 3354, "path": "charters/v-nix", "status": "approved",
+             "approved_version_id": 5172, "current_version_id": 5172},
+            {"id": "3357", "path": "reference/membrain-metrics", "status": "draft",
+             "approved_version_id": null, "current_version_id": 5174}, // numeric string id
+            {"path": "no-id-entry"},                                   // skipped
+        ]);
+        let rows = parse_wiki_index(&v);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 3354);
+        assert_eq!(rows[0].path.as_deref(), Some("charters/v-nix"));
+        assert!(rows[0].has_approved_version()); // approved_version_id set
+        assert_eq!(rows[0].current_version_id, Some(5172));
+        assert_eq!(rows[1].id, 3357);
+        assert!(!rows[1].has_approved_version()); // draft, null approved_version_id
+        assert_eq!(rows[1].current_version_id, Some(5174));
+    }
+
+    #[test]
+    fn wiki_index_non_array_is_empty() {
+        assert!(parse_wiki_index(&json!({"error": "nope"})).is_empty());
+    }
+
+    #[test]
+    fn document_approved_via_approved_version_id() {
+        let v = json!({
+            "id": 3354, "path": "charters/v-nix", "title": "Charter",
+            "status": "in_review", "approved_version_id": 5172, "current_version_id": 5190,
+            "current_version": {"cid": "QmAbc"}
+        });
+        let d = parse_document(&v).unwrap();
+        assert_eq!(d.id, 3354);
+        assert_eq!(d.path.as_deref(), Some("charters/v-nix"));
+        assert!(d.has_approved_version); // approved_version_id present
+        assert_eq!(d.current_version_cid.as_deref(), Some("QmAbc"));
+        assert_eq!(d.version_id, Some(5190)); // top-level current_version_id
+        assert!(d.body.is_none()); // no include_body
+    }
+
+    #[test]
+    fn document_approved_via_status_when_no_version_field() {
+        let v = json!({"id": 1, "status": "approved"});
+        assert!(parse_document(&v).unwrap().has_approved_version);
+    }
+
+    #[test]
+    fn document_draft_is_not_approved_and_reads_body() {
+        let v = json!({
+            "id": 3357, "path": "reference/membrain-metrics", "status": "draft",
+            "approved_version_id": null, "body": "# Metrics\n...", "current_version": {"cid": "QmQr2"}
+        });
+        let d = parse_document(&v).unwrap();
+        assert!(!d.has_approved_version); // draft, null approved_version_id
+        assert_eq!(d.body.as_deref(), Some("# Metrics\n..."));
+        assert_eq!(d.current_version_cid.as_deref(), Some("QmQr2"));
+    }
+
+    #[test]
+    fn document_missing_id_is_none() {
+        assert!(parse_document(&json!({"path": "x"})).is_none());
+    }
 }

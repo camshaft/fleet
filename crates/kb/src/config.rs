@@ -93,6 +93,9 @@ pub struct Config {
     /// Dedicated collection for dream-promoted shared memories (task_823 / doc_102 A5), kept separate from
     /// `memory_collection` so durable cross-agent invariants are curated apart from per-agent memories.
     pub promoted_collection: String,
+    /// Dedicated collection the board-wiki auto-sync connector (task_1089) ingests approved board docs into,
+    /// kept apart from the ingest/memory collections so the curated canon is its own searchable corpus.
+    pub wiki_collection: String,
 
     /// Ranking-blend weights. Relevance dominates; these nudge ordering by curation signals.
     pub w_quality: f64,
@@ -151,6 +154,7 @@ impl Default for Config {
             default_collection: "voron_manuals".to_string(),
             memory_collection: "memory".to_string(),
             promoted_collection: "promoted-memory".to_string(),
+            wiki_collection: "board-wiki".to_string(),
             w_quality: 0.15,
             w_authority: 0.10,
             w_votes: 0.15,
