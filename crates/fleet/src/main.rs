@@ -143,7 +143,10 @@ fn launch_metadata_patch(md: Option<&serde_json::Value>) -> Option<serde_json::V
         return None;
     }
     let mut patch = serde_json::Map::new();
-    patch.insert("comms_norm_ack".to_string(), serde_json::json!(COMMS_NORM_VERSION));
+    patch.insert(
+        "comms_norm_ack".to_string(),
+        serde_json::json!(COMMS_NORM_VERSION),
+    );
     if gate_set {
         patch.insert("launch_gated".to_string(), serde_json::json!(false));
         patch.insert("launch_gated_on".to_string(), serde_json::Value::Null);
@@ -172,7 +175,9 @@ fn tunnel_pid_for_name(list_json: &str, name: &str) -> Option<u32> {
 /// Pure — unit-tested.
 fn tunnel_probe_healthy(code_output: &str) -> bool {
     let c = code_output.trim();
-    c.len() == 3 && (c.starts_with('2') || c.starts_with('3')) && c.chars().all(|ch| ch.is_ascii_digit())
+    c.len() == 3
+        && (c.starts_with('2') || c.starts_with('3'))
+        && c.chars().all(|ch| ch.is_ascii_digit())
 }
 
 /// How `tunnel_guard` recovers an unhealthy tunnel. [`tunnel_recovery_plan`] picks it from the caller's args.
@@ -196,7 +201,10 @@ fn tunnel_recovery_plan<'a>(
     match systemd_unit {
         Some(unit) if !unit.trim().is_empty() => Ok(TunnelRecovery::SystemdRestart(unit)),
         _ if !recreate.trim().is_empty() => Ok(TunnelRecovery::ShedAndRecreate),
-        _ => Err("tunnel-guard: need --recreate or --systemd-unit to recover an unhealthy tunnel".to_string()),
+        _ => Err(
+            "tunnel-guard: need --recreate or --systemd-unit to recover an unhealthy tunnel"
+                .to_string(),
+        ),
     }
 }
 
@@ -234,7 +242,16 @@ fn tunnel_guard(
     });
     let probe_code = |url: &str| -> String {
         std::process::Command::new("curl")
-            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "15", url])
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "15",
+                url,
+            ])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default()
@@ -242,7 +259,10 @@ fn tunnel_guard(
 
     let code = probe_code(probe_url);
     if tunnel_probe_healthy(&code) {
-        println!("tunnel-guard: '{name}' healthy (probe {probe_url} -> {})", code.trim());
+        println!(
+            "tunnel-guard: '{name}' healthy (probe {probe_url} -> {})",
+            code.trim()
+        );
         return;
     }
     println!(
@@ -251,9 +271,9 @@ fn tunnel_guard(
     );
     if !apply {
         match recovery {
-            TunnelRecovery::SystemdRestart(unit) => println!(
-                "  (dry-run — re-run with --apply to `systemctl --user restart {unit}`)"
-            ),
+            TunnelRecovery::SystemdRestart(unit) => {
+                println!("  (dry-run — re-run with --apply to `systemctl --user restart {unit}`)")
+            }
             TunnelRecovery::ShedAndRecreate => {
                 println!("  (dry-run — re-run with --apply to shed the stale client + recreate)")
             }
@@ -273,7 +293,9 @@ fn tunnel_guard(
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !restarted {
-                eprintln!("  tunnel-guard: `systemctl --user restart {unit}` failed — raising for attention");
+                eprintln!(
+                    "  tunnel-guard: `systemctl --user restart {unit}` failed — raising for attention"
+                );
                 std::process::exit(1);
             }
         }
@@ -281,25 +303,36 @@ fn tunnel_guard(
         // process and would also hit sibling tunnel daemons), then recreate detached. A missing pid just means
         // no live client to shed.
         TunnelRecovery::ShedAndRecreate => {
-            match std::process::Command::new(tunnel_bin).args(["list", "--json"]).output() {
+            match std::process::Command::new(tunnel_bin)
+                .args(["list", "--json"])
+                .output()
+            {
                 Ok(o) => {
-                    if let Some(pid) = tunnel_pid_for_name(&String::from_utf8_lossy(&o.stdout), name) {
+                    if let Some(pid) =
+                        tunnel_pid_for_name(&String::from_utf8_lossy(&o.stdout), name)
+                    {
                         println!("  shedding stale client pid {pid}");
-                        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                        let _ = std::process::Command::new("kill")
+                            .arg(pid.to_string())
+                            .status();
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     } else {
                         println!("  no live client registered for '{name}' — recreating fresh");
                     }
                 }
                 Err(e) => {
-                    eprintln!("  WARN: could not list tunnels to shed the stale client ({e}); recreating anyway")
+                    eprintln!(
+                        "  WARN: could not list tunnels to shed the stale client ({e}); recreating anyway"
+                    )
                 }
             }
             // Recreate detached so the client outlives this guard process (it re-parents to init).
             println!("  recreating: {recreate}");
             let spawn = std::process::Command::new("bash")
                 .arg("-lc")
-                .arg(format!("setsid nohup {recreate} >/dev/null 2>&1 </dev/null &"))
+                .arg(format!(
+                    "setsid nohup {recreate} >/dev/null 2>&1 </dev/null &"
+                ))
                 .status();
             if let Err(e) = spawn {
                 eprintln!("  tunnel-guard: recreate failed to spawn: {e}");
@@ -311,7 +344,10 @@ fn tunnel_guard(
 
     let code2 = probe_code(probe_url);
     if tunnel_probe_healthy(&code2) {
-        println!("tunnel-guard: '{name}' RECOVERED (reprobe -> {})", code2.trim());
+        println!(
+            "tunnel-guard: '{name}' RECOVERED (reprobe -> {})",
+            code2.trim()
+        );
     } else {
         eprintln!(
             "tunnel-guard: '{name}' STILL unhealthy after recovery (reprobe -> '{}') — a human may need to \
@@ -362,7 +398,11 @@ fn spin_up_hold_reason(md: Option<&serde_json::Value>, this_host: &str) -> Optio
 /// ([`spin_up_hold_reason`] is `None`: not staged / off-host / launch-gated / charter-deferred). The per-agent
 /// relaunch COOLDOWN is applied separately by the watchdog's act pass (mirroring revive-stranded), so a
 /// crash-looping agent is relaunched a bounded number of times, not every sweep. Pure — unit-tested.
-fn relaunch_missing_candidate(has_window: bool, is_offline: bool, hold_reason: Option<&str>) -> bool {
+fn relaunch_missing_candidate(
+    has_window: bool,
+    is_offline: bool,
+    hold_reason: Option<&str>,
+) -> bool {
     !has_window && !is_offline && hold_reason.is_none()
 }
 
@@ -1794,6 +1834,46 @@ fn should_auto_restart_wedge(ctx_pct: Option<u8>, restarted_recently: bool) -> b
     matches!(ctx_pct, Some(p) if p >= CTX_WEDGE_THRESHOLD) && !restarted_recently
 }
 
+/// A violation of the uncategorized intake project's two invariants (task_1214), carried by a single task
+/// still sitting in the intake inbox. The inbox MUST stay transient: the dwell invariant is that a task sits
+/// under the SLA before being routed out, and the state invariant is that a task is NEVER `in_progress` or
+/// `blocked` while still in it. The dwell+state watchdog classifies every task in the project against both
+/// and raises ONE cooldown-fenced alert per offender — the report/alert safety net (task_1217) that confirms
+/// a low breach rate before a sibling hard-reject flip is safe to land. A task can trip both invariants at
+/// once, so one verdict carries both facts and the sweep emits one alert.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+struct IntakeVerdict {
+    /// Invariant 2: the offending status when the task is `in_progress` or `blocked` while still in the
+    /// intake inbox — it should have been routed out before work began. Fires independent of age.
+    bad_state: Option<String>,
+    /// Invariant 1: the task's age in seconds when it has dwelt in the inbox PAST the SLA without routing.
+    dwell_over_secs: Option<u64>,
+}
+
+impl IntakeVerdict {
+    /// Whether this task breaches either invariant and so warrants an alert. A clean verdict (routed in time,
+    /// still `todo`) breaches neither and is not alerted.
+    fn is_violation(&self) -> bool {
+        self.bad_state.is_some() || self.dwell_over_secs.is_some()
+    }
+}
+
+/// Classify a task that is CURRENTLY in the uncategorized intake project against the inbox invariants
+/// (task_1217). `status` is the board status, `age_secs` how long it has sat in the inbox, and `sla_secs` the
+/// dwell bound (the operator's "~2min dwell", i.e. 120s, passed by the sweep). A TERMINAL task
+/// (`done`/`cancelled`/`archived`) is never a violation — it is no longer awaiting routing, so neither
+/// invariant applies even if it is old. Pure — unit-tested; the board list + cooldown-fenced alert sweep
+/// wraps it.
+fn classify_intake_task(status: &str, age_secs: u64, sla_secs: u64) -> IntakeVerdict {
+    if matches!(status, "done" | "cancelled" | "canceled" | "archived") {
+        return IntakeVerdict::default();
+    }
+    IntakeVerdict {
+        bad_state: matches!(status, "in_progress" | "blocked").then(|| status.to_string()),
+        dwell_over_secs: (age_secs > sla_secs).then_some(age_secs),
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "fleet",
@@ -3033,7 +3113,14 @@ fn main() {
             tunnel_bin,
             apply,
             systemd_unit,
-        } => tunnel_guard(&name, &probe_url, &recreate, &tunnel_bin, apply, systemd_unit.as_deref()),
+        } => tunnel_guard(
+            &name,
+            &probe_url,
+            &recreate,
+            &tunnel_bin,
+            apply,
+            systemd_unit.as_deref(),
+        ),
         Cmd::ReviewSpawn {
             review_id,
             angle,
@@ -3477,7 +3564,15 @@ fn spin_up_workspace_kind(
         }
     }
     match launch_board_agent(
-        agent, &plan.cwd, harness, model, effort, interval, devshell, reactive, proactive_ownership,
+        agent,
+        &plan.cwd,
+        harness,
+        model,
+        effort,
+        interval,
+        devshell,
+        reactive,
+        proactive_ownership,
     ) {
         Ok(win) => {
             println!(
@@ -3492,8 +3587,12 @@ fn spin_up_workspace_kind(
             // stamps the comms-norm acknowledgement (task_1178). Idempotent + non-fatal.
             if let Some(patch) = launch_patch {
                 match board.patch_metadata(agent, patch) {
-                    Ok(()) => println!("  stamped post-launch metadata (bringup gate cleared if set; comms-norm ack recorded)"),
-                    Err(e) => eprintln!("  WARN: launched but could not stamp post-launch metadata: {e}"),
+                    Ok(()) => println!(
+                        "  stamped post-launch metadata (bringup gate cleared if set; comms-norm ack recorded)"
+                    ),
+                    Err(e) => {
+                        eprintln!("  WARN: launched but could not stamp post-launch metadata: {e}")
+                    }
                 }
             }
             // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
@@ -3804,7 +3903,15 @@ fn spin_up(agent: &str, apply: bool) {
         }
     }
     match launch_board_agent(
-        agent, &workdir, &harness, &model, &effort, &interval, devshell, reactive, proactive_ownership,
+        agent,
+        &workdir,
+        &harness,
+        &model,
+        &effort,
+        &interval,
+        devshell,
+        reactive,
+        proactive_ownership,
     ) {
         Ok(win) => {
             let loop_kind = if reactive {
@@ -3829,8 +3936,12 @@ fn spin_up(agent: &str, apply: bool) {
             // stamps the comms-norm acknowledgement (task_1178). Idempotent + non-fatal.
             if let Some(patch) = launch_patch {
                 match board.patch_metadata(agent, patch) {
-                    Ok(()) => println!("  stamped post-launch metadata (bringup gate cleared if set; comms-norm ack recorded)"),
-                    Err(e) => eprintln!("  WARN: launched but could not stamp post-launch metadata: {e}"),
+                    Ok(()) => println!(
+                        "  stamped post-launch metadata (bringup gate cleared if set; comms-norm ack recorded)"
+                    ),
+                    Err(e) => {
+                        eprintln!("  WARN: launched but could not stamp post-launch metadata: {e}")
+                    }
                 }
             }
             // Record the launch rev so the watchdog-driven stale-session sweep can tell this fresh session
@@ -6661,7 +6772,11 @@ fn spawn_reviewer(
     let role_path = exe
         .as_ref()
         .and_then(|p| p.ancestors().nth(3))
-        .map(|repo| repo.join("loops/reviewer.md").to_string_lossy().into_owned())
+        .map(|repo| {
+            repo.join("loops/reviewer.md")
+                .to_string_lossy()
+                .into_owned()
+        })
         .unwrap_or_else(|| "loops/reviewer.md".to_string());
     let kickoff = build_reviewer_kickoff(review_id, angle_key, angle_focus, &role_path, &fleet_bin);
     let window = reviewer_window_name(review_id, angle_key);
@@ -6713,7 +6828,11 @@ fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply:
             if found.is_empty() {
                 eprintln!(
                     "review-spawn: unknown angle '{k}' (known: {})",
-                    REVIEW_ANGLES.iter().map(|(key, _)| *key).collect::<Vec<_>>().join(", ")
+                    REVIEW_ANGLES
+                        .iter()
+                        .map(|(key, _)| *key)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 std::process::exit(2);
             }
@@ -6724,7 +6843,11 @@ fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply:
     println!(
         "review-spawn: review #{review_id}, {} angle(s){}",
         angles.len(),
-        if apply { "" } else { " (dry-run — pass --apply to launch)" }
+        if apply {
+            ""
+        } else {
+            " (dry-run — pass --apply to launch)"
+        }
     );
     // S2b: on --apply, CLAIM each angle on the board FIRST (append an `adversarial_review` log entry carrying
     // the per-angle external_id) and spawn only when the append is NEW (appended:true). A re-sweep's duplicate
@@ -6765,7 +6888,9 @@ fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply:
                     // Already claimed by a prior pass → skip (idempotent re-apply).
                     Ok(false) => println!("  {key}: already-claimed, skip  [claim {claim}]"),
                     // Claim failed → do NOT spawn: launching without a won claim risks a duplicate reviewer.
-                    Err(e) => eprintln!("  {key}: claim FAILED, not spawning ({e})  [claim {claim}]"),
+                    Err(e) => {
+                        eprintln!("  {key}: claim FAILED, not spawning ({e})  [claim {claim}]")
+                    }
                 }
             }
         }
@@ -6779,7 +6904,10 @@ fn review_spawn(board_session: &str, review_id: i64, angle: Option<&str>, apply:
 /// treated as not-yet-vetted (needs a pass), the safe default. Pure — unit-tested.
 fn review_needs_adversarial_pass(review: &serde_json::Value) -> bool {
     review.get("status").and_then(serde_json::Value::as_str) == Some("in_review")
-        && !review.get("vetted").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        && !review
+            .get("vetted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// `fleet review-sweep [--apply]` (task_374 S2c): the fleet-wide automatic trigger. List every review the board
@@ -6805,7 +6933,11 @@ fn review_sweep(board_session: &str, apply: bool) {
     println!(
         "review-sweep: {} review(s) in_review awaiting an adversarial pass{}",
         pending.len(),
-        if apply { "" } else { " (dry-run — pass --apply to claim + launch)" }
+        if apply {
+            ""
+        } else {
+            " (dry-run — pass --apply to claim + launch)"
+        }
     );
     // Per-review: run the full per-angle claim+spawn. review_spawn is idempotent under --apply (the S2b claim),
     // so a review already swept re-claims nothing. Board::connect is sessionless, so re-connecting per review
@@ -6995,51 +7127,52 @@ fn watchdog(
     // Board-native agent ids, so the file-hub scan can SKIP any that still have a stale active file-hub row
     // (heartbeat to the board, not the file → a stale file mtime would false-flag them). Empty when the board
     // is unreachable — the file-hub scan then covers everything as a best-effort outage fallback.
-    let native_ids =
-        match board::Board::connect().and_then(|b| b.list_agents().map(|agents| (b, agents))) {
-            Ok((board, agents)) => {
-                let native_ids = native_agent_ids(&agents);
-                watchdog_board(
-                    &board,
-                    &agents,
-                    stale_only,
-                    rearm,
-                    observe,
-                    spawn,
-                    spawn_dry_run,
-                    pinned_only,
-                    reap_stale_observers,
-                    hire_signal,
-                    revive_stranded,
-                    recover_wedged,
-                    relaunch_missing,
+    let native_ids = match board::Board::connect()
+        .and_then(|b| b.list_agents().map(|agents| (b, agents)))
+    {
+        Ok((board, agents)) => {
+            let native_ids = native_agent_ids(&agents);
+            watchdog_board(
+                &board,
+                &agents,
+                stale_only,
+                rearm,
+                observe,
+                spawn,
+                spawn_dry_run,
+                pinned_only,
+                reap_stale_observers,
+                hire_signal,
+                revive_stranded,
+                recover_wedged,
+                relaunch_missing,
+            );
+            // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
+            // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
+            // sweep, and in APPLY mode (passing the flag IS the opt-in, like --revive-stranded). The sweep's own
+            // per-agent fences (busy / cooldown) protect each session; --force is not plumbed here (an automated
+            // sweep must never override the busy fence and reconnect through a live turn).
+            if sweep_stale {
+                println!(
+                    "-- bounce-stale (--bounce-stale: refreshing stale sessions' tools/list) --"
                 );
-                // task_752: after the liveness pass, optionally refresh stale sessions' MCP tools/list. Gated behind
-                // --bounce-stale (opt-in), run only when the board is reachable so a connect failure never aborts the
-                // sweep, and in APPLY mode (passing the flag IS the opt-in, like --revive-stranded). The sweep's own
-                // per-agent fences (busy / cooldown) protect each session; --force is not plumbed here (an automated
-                // sweep must never override the busy fence and reconnect through a live turn).
-                if sweep_stale {
-                    println!(
-                        "-- bounce-stale (--bounce-stale: refreshing stale sessions' tools/list) --"
-                    );
-                    bounce_stale(&Fleet::resolve(), true, false);
-                }
-                // task_374 S2c: with --review-sweep, run the adversarial-review sweep this pass — spawn the
-                // per-angle reviewers for every in_review + unvetted review. Board-reachable only (we are inside
-                // the connected arm; review_sweep re-connects, which is sessionless/free). Idempotent via the S2b
-                // per-angle claim, so a review already covered re-spawns nothing. Honors --dry-run for a preview.
-                if sweep_reviews {
-                    println!("-- review-sweep (--review-sweep: adversarial-review spawn cadence) --");
-                    review_sweep(&board_session(), !spawn_dry_run);
-                }
-                native_ids
+                bounce_stale(&Fleet::resolve(), true, false);
             }
-            Err(e) => {
-                eprintln!("fleet watchdog: board unavailable ({e}); scanning the file-hub only");
-                std::collections::BTreeSet::new()
+            // task_374 S2c: with --review-sweep, run the adversarial-review sweep this pass — spawn the
+            // per-angle reviewers for every in_review + unvetted review. Board-reachable only (we are inside
+            // the connected arm; review_sweep re-connects, which is sessionless/free). Idempotent via the S2b
+            // per-angle claim, so a review already covered re-spawns nothing. Honors --dry-run for a preview.
+            if sweep_reviews {
+                println!("-- review-sweep (--review-sweep: adversarial-review spawn cadence) --");
+                review_sweep(&board_session(), !spawn_dry_run);
             }
-        };
+            native_ids
+        }
+        Err(e) => {
+            eprintln!("fleet watchdog: board unavailable ({e}); scanning the file-hub only");
+            std::collections::BTreeSet::new()
+        }
+    };
     // FILE-HUB agents are not on the board (no board event delivery), so the event-wake path never reaches
     // them — the poll watchdog is their only liveness. Scan the file-hub registry too (no-op when no hub is
     // configured / no active file-hub agents, i.e. a board-only host). Runs regardless of board health above.
@@ -13005,14 +13138,20 @@ mod tests {
         // A name that is not registered yields None (nothing to shed — the handler then recreates fresh).
         assert_eq!(tunnel_pid_for_name(json, "absent"), None);
         // No tunnels at all, and malformed input, both yield None rather than panicking.
-        assert_eq!(tunnel_pid_for_name(r#"{"tunnels": [], "hasMore": false}"#, "membrain-board"), None);
+        assert_eq!(
+            tunnel_pid_for_name(r#"{"tunnels": [], "hasMore": false}"#, "membrain-board"),
+            None
+        );
         assert_eq!(tunnel_pid_for_name("not json", "membrain-board"), None);
     }
 
     #[test]
     fn tunnel_probe_healthy_accepts_a_2xx_or_3xx_three_digit_code() {
         assert!(tunnel_probe_healthy("200"));
-        assert!(tunnel_probe_healthy(" 204\n"), "trims surrounding whitespace");
+        assert!(
+            tunnel_probe_healthy(" 204\n"),
+            "trims surrounding whitespace"
+        );
         // A 3xx means the request reached the origin through the client — the live board root 302-redirects,
         // so a redirect is a FORWARDING-healthy signal, not a failure.
         assert!(tunnel_probe_healthy("302"));
@@ -13078,7 +13217,10 @@ mod tests {
             "carries the operator-block-needs-a-question clause"
         );
         // task_1107: the pkill/pgrep self-match shell-safety line + the safe-pkill pointer.
-        assert!(k.contains("SHELL SAFETY"), "carries the shell-safety clause");
+        assert!(
+            k.contains("SHELL SAFETY"),
+            "carries the shell-safety clause"
+        );
         assert!(
             k.contains("fleet safe-pkill"),
             "points at the safe-pkill helper instead of raw pkill -f"
@@ -13126,8 +13268,14 @@ mod tests {
         // task_1138: a proactive-ownership agent's kickoff must FORBID idling until a work-accomplished gate,
         // overriding the work-conserving idle-when-no-task default — the loop is the lever, not charter prose.
         let p = build_kickoff("cameron-promo-assist", "/wt/x", "1h", None, false, true);
-        assert!(p.contains("PROACTIVE-OWNERSHIP OVERRIDE"), "carries the override clause");
-        assert!(p.contains("STANDING production unit"), "names the always-actionable standing unit");
+        assert!(
+            p.contains("PROACTIVE-OWNERSHIP OVERRIDE"),
+            "carries the override clause"
+        );
+        assert!(
+            p.contains("STANDING production unit"),
+            "names the always-actionable standing unit"
+        );
         assert!(
             p.contains("do NOT fall back to the idle cadence") && p.contains("never idle-sleep"),
             "forbids idling until the gate"
@@ -13139,7 +13287,10 @@ mod tests {
         // A NON-proactive worker (the default) must NOT carry the override — it keeps the plain work-conserving
         // pacing so a normal vertical is unchanged.
         let n = build_kickoff("v-x", "/wt/x", "1h", None, false, false);
-        assert!(!n.contains("PROACTIVE-OWNERSHIP OVERRIDE"), "default worker is unchanged");
+        assert!(
+            !n.contains("PROACTIVE-OWNERSHIP OVERRIDE"),
+            "default worker is unchanged"
+        );
         // Reactive responders are also unaffected by the proactive flag (mutually exclusive loop stances).
         let r = build_kickoff("frank", "/wt/x", "30m", None, true, false);
         assert!(!r.contains("PROACTIVE-OWNERSHIP OVERRIDE"));
@@ -15862,6 +16013,44 @@ detached
     }
 
     #[test]
+    fn classify_intake_task_flags_dwell_and_bad_state_independently() {
+        // A fresh `todo` under the SLA is clean — the intake inbox is doing its job, no alert.
+        let ok = classify_intake_task("todo", 30, 120);
+        assert!(!ok.is_violation());
+        assert_eq!(ok, IntakeVerdict::default());
+
+        // A `todo` dwelling PAST the SLA trips invariant 1 (age) only, not the state invariant.
+        let dwelt = classify_intake_task("todo", 300, 120);
+        assert_eq!(dwelt.dwell_over_secs, Some(300));
+        assert_eq!(dwelt.bad_state, None);
+        assert!(dwelt.is_violation());
+
+        // `in_progress` while still in the inbox trips invariant 2 REGARDLESS of age — even brand new.
+        let working = classify_intake_task("in_progress", 5, 120);
+        assert_eq!(working.bad_state.as_deref(), Some("in_progress"));
+        assert_eq!(working.dwell_over_secs, None);
+        assert!(working.is_violation());
+
+        // `blocked` in the inbox is likewise an invariant-2 violation on its own.
+        assert_eq!(
+            classify_intake_task("blocked", 10, 120)
+                .bad_state
+                .as_deref(),
+            Some("blocked")
+        );
+
+        // Both at once: a long-dwelling in_progress task carries BOTH facts on one verdict (one alert).
+        let both = classify_intake_task("in_progress", 999, 120);
+        assert_eq!(both.bad_state.as_deref(), Some("in_progress"));
+        assert_eq!(both.dwell_over_secs, Some(999));
+
+        // A TERMINAL task is never a violation — no longer awaiting routing, even if very old.
+        assert!(!classify_intake_task("done", 100_000, 120).is_violation());
+        assert!(!classify_intake_task("cancelled", 100_000, 120).is_violation());
+        assert!(!classify_intake_task("archived", 100_000, 120).is_violation());
+    }
+
+    #[test]
     fn commits_carry_notice_names_the_path_and_the_specific_risk() {
         let ahead_only = commits_carry_notice("/old/path", 3, false);
         assert!(
@@ -17010,14 +17199,22 @@ detached
         // filter, so review-sweep keeps status==in_review AND vetted!=true client-side.
         let needs = |v: serde_json::Value| review_needs_adversarial_pass(&v);
         // in_review + not vetted → needs the pass.
-        assert!(needs(serde_json::json!({ "status": "in_review", "vetted": false })));
+        assert!(needs(
+            serde_json::json!({ "status": "in_review", "vetted": false })
+        ));
         // in_review but a missing vetted → safe default is "needs a pass".
         assert!(needs(serde_json::json!({ "status": "in_review" })));
         // in_review but already vetted → the pass ran + was addressed → skip.
-        assert!(!needs(serde_json::json!({ "status": "in_review", "vetted": true })));
+        assert!(!needs(
+            serde_json::json!({ "status": "in_review", "vetted": true })
+        ));
         // not in_review → no pass regardless of vetted.
-        assert!(!needs(serde_json::json!({ "status": "draft", "vetted": false })));
-        assert!(!needs(serde_json::json!({ "status": "vetted", "vetted": true })));
+        assert!(!needs(
+            serde_json::json!({ "status": "draft", "vetted": false })
+        ));
+        assert!(!needs(
+            serde_json::json!({ "status": "vetted", "vetted": true })
+        ));
     }
 
     #[test]
@@ -17058,12 +17255,24 @@ detached
     fn reviewer_window_name_is_per_review_and_angle_and_window_safe() {
         // task_374 S2a: one window per (review, angle) so angles + reviews don't clash. Angle keys are kebab
         // already; defensively mangle any `/`:`.` to `-` so it stays a single valid tmux window token.
-        assert_eq!(reviewer_window_name(42, "risk-security"), "rev-42-risk-security");
-        assert_eq!(reviewer_window_name(7, "clarity-writing"), "rev-7-clarity-writing");
+        assert_eq!(
+            reviewer_window_name(42, "risk-security"),
+            "rev-42-risk-security"
+        );
+        assert_eq!(
+            reviewer_window_name(7, "clarity-writing"),
+            "rev-7-clarity-writing"
+        );
         assert_eq!(reviewer_window_name(1, "a/b.c:d"), "rev-1-a-b-c-d");
         // distinct review ids and distinct angles both yield distinct windows (no collision).
-        assert_ne!(reviewer_window_name(1, "alternatives"), reviewer_window_name(2, "alternatives"));
-        assert_ne!(reviewer_window_name(1, "alternatives"), reviewer_window_name(1, "risk-security"));
+        assert_ne!(
+            reviewer_window_name(1, "alternatives"),
+            reviewer_window_name(2, "alternatives")
+        );
+        assert_ne!(
+            reviewer_window_name(1, "alternatives"),
+            reviewer_window_name(1, "risk-security")
+        );
     }
 
     #[test]
@@ -17083,7 +17292,11 @@ detached
             .iter()
             .map(|(k, _)| reviewer_claim_external_id(42, k))
             .collect();
-        assert_eq!(ids.len(), REVIEW_ANGLES.len(), "per-angle claim ids are unique");
+        assert_eq!(
+            ids.len(),
+            REVIEW_ANGLES.len(),
+            "per-angle claim ids are unique"
+        );
     }
 
     #[test]
@@ -18207,8 +18420,16 @@ detached
         assert!(!relaunch_missing_candidate(false, true, None));
         // Held out of auto-launch (staged / off-host / launch-gated / charter-deferred) -> never relaunched,
         // even windowless-and-not-offline.
-        assert!(!relaunch_missing_candidate(false, false, Some("staged (reserve helper)")));
-        assert!(!relaunch_missing_candidate(false, false, Some("launch-gated (metadata.launch_gated)")));
+        assert!(!relaunch_missing_candidate(
+            false,
+            false,
+            Some("staged (reserve helper)")
+        ));
+        assert!(!relaunch_missing_candidate(
+            false,
+            false,
+            Some("launch-gated (metadata.launch_gated)")
+        ));
         // A window present AND offline AND held -> still nothing (all gates independently block).
         assert!(!relaunch_missing_candidate(true, true, Some("off-host")));
     }
@@ -18250,13 +18471,19 @@ detached
             let patch = launch_metadata_patch(Some(&set)).expect("a set gate yields a patch");
             assert_eq!(patch["launch_gated"], serde_json::json!(false));
             assert_eq!(patch["launch_gated_on"], serde_json::Value::Null);
-            assert_eq!(patch["comms_norm_ack"], serde_json::json!(COMMS_NORM_VERSION));
+            assert_eq!(
+                patch["comms_norm_ack"],
+                serde_json::json!(COMMS_NORM_VERSION)
+            );
             // Applying the patch (metadata merge) makes the agent read as not-gated.
             let mut merged = set.clone();
             for (k, v) in patch.as_object().unwrap() {
                 merged[k] = v.clone();
             }
-            assert!(!agent_is_launch_gated(Some(&merged)), "cleared gate must read as not-gated");
+            assert!(
+                !agent_is_launch_gated(Some(&merged)),
+                "cleared gate must read as not-gated"
+            );
         }
         // No gate, not yet acked: the patch stamps ONLY the comms ack (no gate keys).
         assert_eq!(
@@ -18271,7 +18498,10 @@ detached
         );
         // Idempotent: already acked at the current version AND no gate set -> no patch (no churn on re-launch).
         assert!(
-            launch_metadata_patch(Some(&serde_json::json!({"comms_norm_ack": COMMS_NORM_VERSION}))).is_none(),
+            launch_metadata_patch(Some(
+                &serde_json::json!({"comms_norm_ack": COMMS_NORM_VERSION})
+            ))
+            .is_none(),
             "a steady-state re-launch of an acked, ungated agent writes nothing"
         );
         // Already acked but a gate is set -> still patches (the gate must clear), keeping the ack.
@@ -18280,7 +18510,10 @@ detached
         })))
         .expect("a set gate yields a patch even when already acked");
         assert_eq!(gated_acked["launch_gated"], serde_json::json!(false));
-        assert_eq!(gated_acked["comms_norm_ack"], serde_json::json!(COMMS_NORM_VERSION));
+        assert_eq!(
+            gated_acked["comms_norm_ack"],
+            serde_json::json!(COMMS_NORM_VERSION)
+        );
     }
 
     #[test]
