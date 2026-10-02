@@ -120,3 +120,47 @@ jobs:
       # and `--features <shipping feature>` satisfies the bin's `required-features` so the daemon code compiles.
       - name: cargo check -p ${{ matrix.crate }} --features ${{ matrix.features }} (isolated, all targets)
         run: cargo check -p ${{ matrix.crate }} --features ${{ matrix.features }} --all-targets
+
+  # task_782 ITEM 1 (commit-content guardrail): the PUBLIC-SAFE always-on layer of doc_104's hybrid design --
+  # a detect-secrets scan on every PR including forks. detect-secrets' default plugins carry no internal
+  # vocabulary, so this is the correct always-on layer on the untrusted (fork) path, where repo secrets are
+  # unavailable; the PRIVATE internal-marker layer (`fleet scan-content` against an Actions-secret taxonomy)
+  # runs only on trusted same-repo runs and is added once the operator provisions the secret (item-3).
+  # REPORTING-ONLY for now: the scan step is `|| true` so it never fails the build, and this job is NOT in the
+  # branch-protection required-check set -- the seed-before-flip rollout (prove it is low-noise against the
+  # current tree, THEN the operator marks it required with a .secrets.baseline allowlist in place). The plugin
+  # set + the allowlist are the content-owner's (librarian) call to tune.
+  content-guardrail:
+    name: content guardrail (reporting)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+
+      - name: detect-secrets scan (public-safe always-on layer, reporting-only)
+        run: |
+          # Scan the tracked tree and SUMMARISE findings. `|| true` keeps this reporting-only: it surfaces the
+          # secret-shaped-finding count so we can judge noise before the operator flips the job to required.
+          detect-secrets scan > detect-secrets.report.json || true
+          python - <<'PY'
+          import json
+          try:
+              data = json.load(open("detect-secrets.report.json"))
+          except Exception as e:
+              print(f"detect-secrets: could not read report ({e}); reporting-only, not failing the build")
+              raise SystemExit(0)
+          results = data.get("results", {})
+          total = sum(len(v) for v in results.values())
+          print(f"detect-secrets: {total} potential secret-shaped finding(s) across {len(results)} file(s)")
+          for path, items in sorted(results.items()):
+              for it in items:
+                  print(f"  {path}:{it.get('line_number','?')} [{it.get('type','?')}]")
+          print("REPORTING-ONLY (task_782 seed phase): this never fails the build yet. The operator flips it "
+                "to a required check once low-noise is confirmed and a .secrets.baseline allowlist is in place.")
+          PY
