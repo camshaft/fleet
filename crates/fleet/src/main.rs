@@ -1619,6 +1619,26 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Orderly FLEET-WIDE spin-down (migration wind-down): run the per-agent `spin-down` decision across EVERY
+    /// board-native agent except a stay-up list, so a whole fleet reaches a clean, RESUMABLE parked state in one
+    /// gated command. Each agent is held to the SAME task_786 guard as single spin-down — an agent still holding
+    /// open actionable assignments, or mid-turn, is REFUSED (not stood down) unless `--force`, so the batch
+    /// self-regulates: cleanly-parked agents stand down, anyone still mid-work is left running. Reports the
+    /// READY/REFUSED roster by default (the live who's-parked checklist); `--apply` stands down the READY ones.
+    /// NEVER pass `--force` for a routine wind-down (it would kill mid-work agents) — it exists only for an
+    /// operator-directed hard stop.
+    SpinDownAll {
+        /// Comma-separated agent ids to KEEP UP (cutover roles, the operator interface, self). Always include
+        /// this binary's own agent — the batch must never stand down the agent orchestrating it.
+        #[arg(long)]
+        except: Option<String>,
+        /// Stand down the READY (cleanly-parked) agents (default: just report the READY/REFUSED roster).
+        #[arg(long)]
+        apply: bool,
+        /// Hard stop: stand down even agents holding open work or mid-turn. Operator-directed override only.
+        #[arg(long)]
+        force: bool,
+    },
     /// Bounce ONE board-native agent's session so its MCP client RECONNECTS and refetches tools/list — the fix
     /// for the stale-cached-tools/list trap (task_752): a long-lived session caches tools/list at connect, so a
     /// tool shipped to the board MCP server AFTER it connected (e.g. `pose_question` after the structured-
@@ -2246,6 +2266,7 @@ fn main() {
         Cmd::UpBoard { launch, pinned_only } => up_board(launch, pinned_only),
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::SpinDown { agent, apply, force } => spin_down(&agent, apply, force),
+        Cmd::SpinDownAll { except, apply, force } => spin_down_all(except.as_deref(), apply, force),
         Cmd::BounceSession { agent, apply, force } => bounce_session(&fleet, &agent, apply, force),
         Cmd::BounceStale { apply, force } => bounce_stale(&fleet, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
@@ -3188,6 +3209,103 @@ fn spin_down(agent: &str, apply: bool, force: bool) {
         }
     }
     println!("  spun down '{agent}' — stood down + resumable.");
+}
+
+/// Pure selection for the fleet-wide spin-down (migration wind-down): of all board-native agent ids, the ones
+/// to CONSIDER standing down — every native agent NOT on the stay-up `except` set, sorted for a stable roster.
+/// The per-agent task_786/busy guard still applies downstream; this is only the except-filter. Pure so the
+/// selection is unit-testable without a live board.
+fn batch_targets(all_native: &[String], except: &std::collections::BTreeSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = all_native.iter().filter(|id| !except.contains(*id)).cloned().collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `fleet spin-down --all --except <csv>`: orderly fleet-wide wind-down. Connects ONCE, lists the board-native
+/// roster, and runs the per-agent `spin_down_action` decision across every native agent except the stay-up
+/// list — reporting a READY/REFUSED roster (the live who's-parked checklist) and, with `--apply`, standing down
+/// the READY ones. Each agent is held to the SAME guard as single spin-down (task_786 holds-assignments + busy
+/// are REFUSED unless `--force`), so a routine wind-down self-regulates: cleanly-parked agents stand down,
+/// anyone still mid-work is left running for the next pass. `--force` is an operator-directed hard stop only.
+fn spin_down_all(except_csv: Option<&str>, apply: bool, force: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("fleet spin-down --all: {e}");
+        std::process::exit(1);
+    });
+    let agents = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("fleet spin-down --all: {e}");
+        std::process::exit(1);
+    });
+    let except: std::collections::BTreeSet<String> = except_csv
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let native: Vec<String> = native_agent_ids(&agents).into_iter().collect();
+    let targets = batch_targets(&native, &except);
+    let session = board_session();
+    let windows = tmux_window_names(&session);
+
+    println!(
+        "spin-down --all ({}): {} board-native agent(s), {} kept up, {} candidate(s){}",
+        if apply { "APPLY" } else { "dry-run" },
+        native.len(),
+        except.len(),
+        targets.len(),
+        if force { " [--force: HARD STOP, overrides the holds-work/busy guard]" } else { "" }
+    );
+    if !except.is_empty() {
+        let mut keep: Vec<&String> = except.iter().collect();
+        keep.sort();
+        println!("  keep-up: {}", keep.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    }
+
+    let (mut ready, mut refused, mut applied) = (0usize, 0usize, 0usize);
+    for id in &targets {
+        let has_window = windows.iter().any(|w| w == id);
+        let is_working = has_window && window_is_working(&session, id);
+        let open = board.open_task_count(id).unwrap_or(0);
+        match spin_down_action(true, has_window, is_working, open, force) {
+            SpinDownAction::RefuseHoldsAssignments { open } => {
+                refused += 1;
+                println!("  REFUSED  {id} — holds {open} open assignment(s) (still mid-work; park them first)");
+            }
+            SpinDownAction::RefuseBusy => {
+                refused += 1;
+                println!("  REFUSED  {id} — turn in flight (pane busy)");
+            }
+            SpinDownAction::NotBoardNative => {} // filtered to native already; unreachable in practice
+            action @ (SpinDownAction::OfflineAndKill | SpinDownAction::OfflineOnly) => {
+                ready += 1;
+                let kind = if matches!(action, SpinDownAction::OfflineAndKill) { "offline+kill window" } else { "offline only (windowless)" };
+                if !apply {
+                    println!("  READY    {id} — would {kind}");
+                    continue;
+                }
+                // Offline FIRST (closes the up-board relaunch race), then kill the window if live.
+                let msg = format!("Spun down via `fleet spin-down --all` (migration wind-down, resumable). `fleet spin-up {id} --apply` revives it.");
+                if let Err(e) = board.set_status(id, "offline", &msg) {
+                    println!("  ERROR    {id} — set offline failed: {e} (left running)");
+                    continue;
+                }
+                if matches!(action, SpinDownAction::OfflineAndKill) {
+                    let target = format!("{session}:{id}");
+                    let _ = std::process::Command::new("tmux").args(["kill-window", "-t", &target]).status();
+                }
+                applied += 1;
+                println!("  PARKED   {id} — {kind} (resumable)");
+            }
+        }
+    }
+    println!(
+        "  summary: {ready} ready, {refused} refused (still mid-work -- re-run after they park){}",
+        if apply { format!(", {applied} parked this pass") } else { String::new() }
+    );
+    if !apply && ready > 0 {
+        println!("  (dry-run — re-run with --apply to stand down the READY agents)");
+    }
 }
 
 /// task_752: the pure selection for `fleet bounce-session`. A bounce RELAUNCHES a board-native agent's session
@@ -9711,6 +9829,19 @@ mod tests {
         // Native + no window → offline ONLY (still mark offline so up-board leaves it stood down); force moot.
         assert_eq!(spin_down_action(true, false, false, 0, false), OfflineOnly);
         assert_eq!(spin_down_action(true, false, true, 0, true), OfflineOnly);
+    }
+
+    #[test]
+    fn batch_targets_excludes_the_stay_up_set_and_sorts() {
+        let native: Vec<String> =
+            ["v-b", "concierge", "v-a", "v-fleet-tooling", "v-nix", "v-c"].iter().map(|s| s.to_string()).collect();
+        let except: std::collections::BTreeSet<String> =
+            ["concierge", "v-nix", "v-fleet-tooling"].iter().map(|s| s.to_string()).collect();
+        // Only non-excepted natives, sorted; the stay-up set (incl. self) is never a target.
+        assert_eq!(batch_targets(&native, &except), vec!["v-a", "v-b", "v-c"]);
+        // Empty except = every native is a candidate.
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(batch_targets(&native, &none).len(), native.len());
     }
 
     #[test]
