@@ -93,6 +93,48 @@ fn agent_is_staged(md: Option<&serde_json::Value>) -> bool {
         .unwrap_or(false)
 }
 
+/// task_1037: whether an agent is launch-GATED — the operator set an explicit gate (`metadata.launch_gated ==
+/// true`, or a non-null `metadata.launch_gated_on` naming what it waits on) so no auto-launch path may bring it
+/// up until the gate clears (e.g. `frank`, gated on daemon mention-wake wiring). Absent → not gated. Pure —
+/// unit-tested.
+fn agent_is_launch_gated(md: Option<&serde_json::Value>) -> bool {
+    md.map(|m| {
+        m.get("launch_gated").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            || m.get("launch_gated_on").is_some_and(|v| !v.is_null())
+    })
+    .unwrap_or(false)
+}
+
+/// task_1037: whether an agent's charter is DEFERRED (`metadata.charter_projection == "deferred"`) — a
+/// deliberately-not-yet-active vertical (v-cas-http / v-bach during the migration) a mass reconstitution must
+/// not bring up. Absent → not deferred. Pure — unit-tested.
+fn agent_charter_deferred(md: Option<&serde_json::Value>) -> bool {
+    md.and_then(|m| m.get("charter_projection")).and_then(serde_json::Value::as_str) == Some("deferred")
+}
+
+/// task_1037: the reason `spin-up-all` must HOLD a down board-native agent OUT of a mass reconstitution (so it
+/// is reported `HELD <reason>`, not launched), or `None` if it is launchable. This closes the launchability gap
+/// the green→dev-dsk migration hit: [`native_agent_ids`] filters only on `metadata.native`, so without this a
+/// STAGED / off-host / launch-gated / charter-deferred agent is a default candidate and gets swept into a wave
+/// (the staged `board-core-helper` was mistakenly launched mid-cutover, task_1037). Reuses the SAME markers the
+/// watchdog + up-board reconcile already honor ([`agent_is_staged`], [`agent_host_matches`]) so the batch can
+/// never disagree with them; the operator escape hatch is `--include-held` or the deliberate per-id `fleet
+/// spin-up <id> --apply`. Order is report-friendliest-first (staged is the common reserve case). Pure —
+/// unit-tested.
+fn spin_up_hold_reason(md: Option<&serde_json::Value>, this_host: &str) -> Option<&'static str> {
+    if agent_is_staged(md) {
+        Some("staged (reserve helper — launch only on board-pm request)")
+    } else if !agent_host_matches(md, this_host) {
+        Some("off-host (metadata.host pins it to another box)")
+    } else if agent_is_launch_gated(md) {
+        Some("launch-gated (metadata.launch_gated — gated on wiring/approval)")
+    } else if agent_charter_deferred(md) {
+        Some("charter deferred (metadata.charter_projection=deferred)")
+    } else {
+        None
+    }
+}
+
 /// Whether the watchdog should manage an agent on this host. A STAGED agent ([`agent_is_staged`]) is never
 /// managed — it is a reserve helper that is not meant to be running, so re-arming or spawning an observer
 /// against it would be a spurious wake of an intentionally-down agent. Otherwise, under `pinned_only` (a
@@ -1656,6 +1698,12 @@ enum Cmd {
         /// bring up every down agent in one pass.
         #[arg(long)]
         limit: Option<usize>,
+        /// Also launch agents normally HELD by the launchability filter (staged / off-host / launch-gated /
+        /// charter-deferred). Default OFF: those are reported `HELD <reason>` and never swept into a wave
+        /// (task_1037). An operator-directed launch of a held agent should normally use `fleet spin-up <id>
+        /// --apply` per id; this flag is the batch escape hatch.
+        #[arg(long)]
+        include_held: bool,
         /// Launch this wave's candidates (default: just report the candidate roster).
         #[arg(long)]
         apply: bool,
@@ -2298,7 +2346,9 @@ fn main() {
         Cmd::SpinUp { agent, apply } => spin_up(&agent, apply),
         Cmd::SpinDown { agent, apply, force } => spin_down(&agent, apply, force),
         Cmd::SpinDownAll { except, apply, force } => spin_down_all(except.as_deref(), apply, force),
-        Cmd::SpinUpAll { except, limit, apply } => spin_up_all(except.as_deref(), limit, apply),
+        Cmd::SpinUpAll { except, limit, include_held, apply } => {
+            spin_up_all(except.as_deref(), limit, include_held, apply)
+        }
         Cmd::BounceSession { agent, apply, force } => bounce_session(&fleet, &agent, apply, force),
         Cmd::BounceStale { apply, force } => bounce_stale(&fleet, apply, force),
         Cmd::Status { stale_only } => status(stale_only),
@@ -3383,7 +3433,7 @@ fn reconstitute_targets(
 /// `--apply` launches this wave. Each candidate is spun up as a SUBPROCESS (`fleet spin-up <id> --apply`), so a
 /// single agent's launch failure (spin_up signals it via process::exit) is contained in its child and never
 /// aborts the wave — the same isolation the watchdog's revive-stranded path uses (task_818).
-fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, apply: bool) {
+fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, include_held: bool, apply: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet spin-up-all: {e}");
         std::process::exit(1);
@@ -3406,22 +3456,60 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, apply: bool) {
     let down_native: Vec<String> =
         native.iter().filter(|id| !windows.iter().any(|w| w == *id)).cloned().collect();
     let up = native.len().saturating_sub(down_native.len());
-    let targets = reconstitute_targets(&down_native, &except, limit);
+    // task_1037: launchability filter. native_agent_ids keys only on metadata.native, so a down candidate can be
+    // a staged / off-host / launch-gated / charter-deferred agent an auto-launch must NOT bring up. Partition the
+    // down set into HELD (reported with a reason, never swept into a wave unless --include-held) and launchable,
+    // reusing the SAME markers the watchdog + up-board reconcile honor (spin_up_hold_reason) so the paths cannot
+    // disagree. The staged board-core-helper was mistakenly launched here before this existed (task_1037).
+    let this_host = this_host();
+    let meta_of = |id: &str| -> Option<serde_json::Value> {
+        agents
+            .iter()
+            .find(|a| a.get("id").and_then(serde_json::Value::as_str) == Some(id))
+            .and_then(|a| a.get("metadata").cloned())
+    };
+    let mut held: Vec<(String, &'static str)> = Vec::new();
+    let launchable_down: Vec<String> = if include_held {
+        down_native.clone()
+    } else {
+        down_native
+            .iter()
+            .filter(|id| match spin_up_hold_reason(meta_of(id).as_ref(), &this_host) {
+                Some(reason) => {
+                    held.push(((*id).clone(), reason));
+                    false
+                }
+                None => true,
+            })
+            .cloned()
+            .collect()
+    };
+    held.sort();
+    let targets = reconstitute_targets(&launchable_down, &except, limit);
 
     println!(
-        "spin-up-all ({}): {} board-native, {} already up, {} down, {} left as-is, {} this wave{}",
+        "spin-up-all ({}): {} board-native, {} already up, {} down ({} launchable, {} held), {} left as-is, {} this wave{}{}",
         if apply { "APPLY" } else { "dry-run" },
         native.len(),
         up,
         down_native.len(),
+        launchable_down.len(),
+        held.len(),
         except.len(),
         targets.len(),
-        limit.map(|n| format!(" [--limit {n}]")).unwrap_or_default()
+        limit.map(|n| format!(" [--limit {n}]")).unwrap_or_default(),
+        if include_held { " [--include-held: holds launched too]" } else { "" }
     );
     if !except.is_empty() {
         let mut keep: Vec<&String> = except.iter().collect();
         keep.sort();
         println!("  leave-as-is: {}", keep.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    if !held.is_empty() {
+        println!("  held (not launchable by default — use `fleet spin-up <id> --apply` or --include-held):");
+        for (id, reason) in &held {
+            println!("    ⊘ HELD {id} — {reason}");
+        }
     }
 
     let self_bin = std::env::current_exe()
@@ -3452,7 +3540,9 @@ fn spin_up_all(except_csv: Option<&str>, limit: Option<usize>, apply: bool) {
     }
     if apply {
         println!("  summary: {launched} launched, {failed} failed this wave");
-        let down_non_except = down_native.len().saturating_sub(except.len());
+        // task_1037: measure remaining-to-reconstitute over the LAUNCHABLE set — a HELD agent (staged/off-host/
+        // gated/deferred) is not a candidate, so it must not keep the fan-out "incomplete" or hold the quiesce.
+        let down_non_except = launchable_down.len().saturating_sub(except.len());
         if let Some(n) = limit
             && down_non_except > n
         {
@@ -13113,6 +13203,50 @@ detached
         // The flag unset is a no-op regardless of quiesce.
         assert!(!watchdog_action_enabled(false, false));
         assert!(!watchdog_action_enabled(false, true));
+    }
+
+    #[test]
+    fn spin_up_hold_reason_holds_unlaunchable_agents_by_default() {
+        let host = "dev-dsk-a";
+        // A plain this-host-pinned native agent (or unpinned) is launchable → no hold.
+        assert_eq!(spin_up_hold_reason(Some(&serde_json::json!({"host": host})), host), None);
+        assert_eq!(spin_up_hold_reason(Some(&serde_json::json!({})), host), None);
+        assert_eq!(spin_up_hold_reason(None, host), None);
+        // Staged reserve helper (board-core-helper) → HELD. This is the task_1037 mistaken-launch case.
+        assert!(spin_up_hold_reason(Some(&serde_json::json!({"staged": true})), host)
+            .is_some_and(|r| r.contains("staged")));
+        // Pinned to another box (green-machine-ops) → HELD off-host.
+        assert!(spin_up_hold_reason(Some(&serde_json::json!({"host": "green"})), host)
+            .is_some_and(|r| r.contains("off-host")));
+        // Launch-gated (frank) → HELD, via either marker shape.
+        assert!(spin_up_hold_reason(Some(&serde_json::json!({"host": host, "launch_gated": true})), host)
+            .is_some_and(|r| r.contains("launch-gated")));
+        assert!(spin_up_hold_reason(
+            Some(&serde_json::json!({"host": host, "launch_gated_on": "daemon mention-wake wiring"})),
+            host
+        )
+        .is_some_and(|r| r.contains("launch-gated")));
+        // Charter-deferred vertical (v-cas-http / v-bach) → HELD.
+        assert!(spin_up_hold_reason(Some(&serde_json::json!({"host": host, "charter_projection": "deferred"})), host)
+            .is_some_and(|r| r.contains("deferred")));
+        // Staged wins the report order even when other markers also apply (common reserve case first).
+        assert!(spin_up_hold_reason(
+            Some(&serde_json::json!({"staged": true, "host": "green"})),
+            host
+        )
+        .is_some_and(|r| r.contains("staged")));
+    }
+
+    #[test]
+    fn launch_gated_and_charter_deferred_markers() {
+        assert!(!agent_is_launch_gated(None));
+        assert!(!agent_is_launch_gated(Some(&serde_json::json!({"launch_gated": false}))));
+        assert!(!agent_is_launch_gated(Some(&serde_json::json!({"launch_gated_on": serde_json::Value::Null}))));
+        assert!(agent_is_launch_gated(Some(&serde_json::json!({"launch_gated": true}))));
+        assert!(agent_is_launch_gated(Some(&serde_json::json!({"launch_gated_on": "x"}))));
+        assert!(!agent_charter_deferred(None));
+        assert!(!agent_charter_deferred(Some(&serde_json::json!({"charter_projection": "active"}))));
+        assert!(agent_charter_deferred(Some(&serde_json::json!({"charter_projection": "deferred"}))));
     }
 
     #[test]
