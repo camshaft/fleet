@@ -1,0 +1,31 @@
+# host-services.toml — EXAMPLE / placeholder shape for the host-service ownership registry (task_1027).
+#
+# This file documents the FORMAT only. The REAL registry is a LOCAL, host-specific resource that is NOT
+# committed to this (public) repo — it names deployment topology (hosts, service layout) that is internal to
+# a given deployment (task_1031 / task_934). The deploy injects the real file at:
+#
+#     $XDG_CONFIG_HOME/fleet/host-services.toml   (fallback: $HOME/.config/fleet/host-services.toml)
+#
+# `fleet services [<name>]` reads it from there; with no file present it prints a hint pointing at that path.
+# Copy this example to that location and fill in your deployment's real services.
+#
+# WHY it is a cheap lookup: before an agent modifies a shared host service it does NOT own, it resolves the
+# owner + authoritative definition here first (and whether the service is a `lifeline`), instead of a message
+# round-trip it then races ahead of. A `lifeline = true` service (board / MCP / event-wake / notifier path)
+# is a fleet-wide dependency: changes are owner-coordinated and operator-attended with a tested rollback,
+# never an unattended bounce.
+
+[[service]]
+# A short, stable service name (how `fleet services <name>` finds it).
+name = "example-proxy"
+# Alternate ways to refer to it: a port (":PORT"), another common name. All match case-insensitively.
+aliases = [":PORT", "another-name"]
+# The board agent id that OWNS this service (the authority on its live unit).
+owner = "<owner-agent-id>"
+# Where the AUTHORITATIVE definition lives — a flake attr, a dotfiles role, a unit file. Reuse this; do not
+# re-author from the live process (especially its secret/credential handling).
+definition = "<pointer to the authored definition, e.g. a flake attr or dotfiles role>"
+# true for a fleet-wide board/MCP/event-wake/notifier dependency (attended-only changes). Omit = false.
+lifeline = false
+# Optional human note.
+note = "<what this service is + any handling caveat>"

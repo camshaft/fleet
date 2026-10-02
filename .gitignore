@@ -2,3 +2,6 @@
 /result
 # fastembed downloads model files here on first run (crates/kb tests/dev); ~1.5GB, never commit.
 /.fastembed_cache
+
+# Host-service ownership registry: a LOCAL, host-specific resource (deploy-injected); never commit it (task_1031/task_934). The committed example is host-services.toml.example.
+crates/fleet/host-services.toml
