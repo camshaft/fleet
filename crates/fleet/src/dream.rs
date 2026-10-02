@@ -1748,6 +1748,109 @@ fn rank_and_section(proposals: &mut [Value]) -> (usize, usize, usize) {
     (count("actionable"), count("cross_repo_twin"), count("fyi"))
 }
 
+/// The per-scope dream-pass outcome: the full report (for the caller to summarize/sample) plus the
+/// notify-on-new signal. Shared by `dream-analyze` (one scope) and `dream-run` (every scope).
+struct ScopeOutcome {
+    report: Value,
+    new_count: usize,
+    new_ids: Vec<String>,
+}
+
+/// Run every detector over `recs`, write the dream-report JSON to `out`, and -- when `publish` is set --
+/// publish the versioned `dreams/<scope>` board doc, returning the report and the notify-on-new signal. This
+/// is the shared single-scope core: `analyze_cmd` wraps it for one scope, `run_cmd` loops it over every
+/// board scope. `scope` is required when `publish` is set (it is the `dreams/<scope>` doc path); `repo_root`
+/// enables the verified-dangling staleness detector (skipped when `None`).
+fn run_scope_pass(
+    recs: &[Rec],
+    scope: Option<&str>,
+    out: &Path,
+    publish: bool,
+    board_memory: &str,
+    repo_root: Option<&Path>,
+) -> Result<ScopeOutcome, String> {
+    let mut prot: HashMap<String, Vec<String>> = HashMap::new();
+    for r in recs {
+        let reasons = protected_reasons(r);
+        if !reasons.is_empty() {
+            prot.insert(r.path().to_string(), reasons);
+        }
+    }
+    let backlinks = build_backlinks(recs);
+
+    // Exact-body sha256 per path — the exact-dup identity, reused by the near-dup detector to skip pairs
+    // that are already exact duplicates.
+    let exact_hashes: HashMap<String, String> = recs
+        .iter()
+        .map(|r| (r.path().to_string(), sha256_hex(&norm_body(r.body()))))
+        .collect();
+
+    let mut proposals = Vec::new();
+    proposals.extend(detect_exact_duplicates(recs, &prot, &backlinks));
+    proposals.extend(detect_near_duplicates(
+        recs,
+        &prot,
+        &backlinks,
+        &exact_hashes,
+    ));
+    let catalogued = load_forward_ref_catalogue(recs);
+    proposals.extend(detect_write_later_candidates(
+        recs,
+        &prot,
+        &backlinks,
+        &catalogued,
+    ));
+    proposals.extend(detect_value_contradictions(recs, &prot, &backlinks));
+    // Verified-dangling file refs -- only with a repo worktree to resolve against (never on a corpus-only run).
+    if let Some(root) = repo_root {
+        proposals.extend(detect_stale_refs(recs, &prot, &backlinks, root));
+    }
+
+    let (sec_actionable, sec_twin, sec_fyi) = rank_and_section(&mut proposals);
+    let standard = proposals.iter().filter(|p| p["lane"] == "standard").count();
+    let protected = proposals
+        .iter()
+        .filter(|p| p["lane"] == "protected")
+        .count();
+    let mut detectors_run = vec![
+        "exact_duplicate",
+        "orphan_add_links",
+        "near_duplicate_minhash",
+        "write_later_candidate",
+        "value_contradiction",
+    ];
+    if repo_root.is_some() {
+        detectors_run.push("stale_file_ref");
+    }
+    let report = json!({
+        "schema": "dream-report/v1 (task_827 comment_3869, librarian-blessed comment_3873)",
+        "generated_by": "v-agent-memory/dream analyze (Rust port, task_956)",
+        "corpus_size": recs.len(),
+        "protected_memories": prot.len(),
+        "detectors_run": detectors_run,
+        "proposal_count": proposals.len(),
+        "by_lane": { "standard": standard, "protected": protected },
+        "by_section": { "actionable": sec_actionable, "cross_repo_twin": sec_twin, "fyi": sec_fyi },
+        "proposals": proposals,
+    });
+
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|e| format!("report serialize failed: {e}"))?;
+    std::fs::write(out, json).map_err(|e| format!("cannot write report {}: {e}", out.display()))?;
+
+    let (new_count, new_ids) = if publish {
+        let scope = scope.ok_or("publish requires a scope (the dreams/<scope> doc path)")?;
+        publish_board(scope, &report, board_memory)?
+    } else {
+        (0, Vec::new())
+    };
+    Ok(ScopeOutcome {
+        report,
+        new_count,
+        new_ids,
+    })
+}
+
 /// Run the dream analyzer and write the dream-report JSON to `out`. The corpus comes from either a `--corpus`
 /// JSONL file or, when `from_board` is set, a live-board pull of `scope` (a wiki path prefix). Returns the
 /// process exit code; `sample` prints that many proposals to stderr for a quick eyeball.
@@ -1791,119 +1894,49 @@ pub fn analyze_cmd(
         }
     };
 
-    let mut prot: HashMap<String, Vec<String>> = HashMap::new();
-    for r in &recs {
-        let reasons = protected_reasons(r);
-        if !reasons.is_empty() {
-            prot.insert(r.path().to_string(), reasons);
-        }
+    if publish_board_doc && scope.is_none() {
+        eprintln!("dream-analyze: --publish-board requires --scope (the dreams/<scope> doc path)");
+        return 2;
     }
-    let backlinks = build_backlinks(&recs);
-
-    // Exact-body sha256 per path — the exact-dup identity, reused by the near-dup detector to skip pairs
-    // that are already exact duplicates.
-    let exact_hashes: HashMap<String, String> = recs
-        .iter()
-        .map(|r| (r.path().to_string(), sha256_hex(&norm_body(r.body()))))
-        .collect();
-
-    let mut proposals = Vec::new();
-    proposals.extend(detect_exact_duplicates(&recs, &prot, &backlinks));
-    proposals.extend(detect_near_duplicates(
+    let outcome = match run_scope_pass(
         &recs,
-        &prot,
-        &backlinks,
-        &exact_hashes,
-    ));
-    let catalogued = load_forward_ref_catalogue(&recs);
-    proposals.extend(detect_write_later_candidates(
-        &recs,
-        &prot,
-        &backlinks,
-        &catalogued,
-    ));
-    proposals.extend(detect_value_contradictions(&recs, &prot, &backlinks));
-    // Verified-dangling file refs -- only with a repo worktree to resolve against (never on a corpus-only run).
-    if let Some(root) = repo_root {
-        proposals.extend(detect_stale_refs(&recs, &prot, &backlinks, root));
-    }
-
-    // Section + rank for the librarian's review surface (actionable first, write-later as FYI).
-    let (sec_actionable, sec_twin, sec_fyi) = rank_and_section(&mut proposals);
-
-    let standard = proposals.iter().filter(|p| p["lane"] == "standard").count();
-    let protected = proposals
-        .iter()
-        .filter(|p| p["lane"] == "protected")
-        .count();
-    let mut detectors_run = vec![
-        "exact_duplicate",
-        "orphan_add_links",
-        "near_duplicate_minhash",
-        "write_later_candidate",
-        "value_contradiction",
-    ];
-    if repo_root.is_some() {
-        detectors_run.push("stale_file_ref");
-    }
-    let report = json!({
-        "schema": "dream-report/v1 (task_827 comment_3869, librarian-blessed comment_3873)",
-        "generated_by": "v-agent-memory/dream analyze (Rust port, task_956)",
-        "corpus_size": recs.len(),
-        "protected_memories": prot.len(),
-        "detectors_run": detectors_run,
-        "proposal_count": proposals.len(),
-        "by_lane": { "standard": standard, "protected": protected },
-        "by_section": { "actionable": sec_actionable, "cross_repo_twin": sec_twin, "fyi": sec_fyi },
-        "proposals": proposals,
-    });
-
-    let json = match serde_json::to_string_pretty(&report) {
-        Ok(s) => s,
+        scope,
+        out,
+        publish_board_doc,
+        board_memory,
+        repo_root,
+    ) {
+        Ok(o) => o,
         Err(e) => {
-            eprintln!("report serialize failed: {e}");
+            eprintln!("{e}");
             return 1;
         }
     };
-    if let Err(e) = std::fs::write(out, json) {
-        eprintln!("cannot write report {}: {e}", out.display());
-        return 1;
-    }
+    let report = &outcome.report;
 
     eprintln!(
         "corpus: {} memories; protected-class: {}",
-        recs.len(),
-        prot.len()
+        report["corpus_size"], report["protected_memories"]
     );
     eprintln!(
-        "proposals: {} (standard {standard}, protected {protected})",
-        report["proposal_count"]
+        "proposals: {} (standard {}, protected {})",
+        report["proposal_count"], report["by_lane"]["standard"], report["by_lane"]["protected"]
     );
     eprintln!("report: {}", out.display());
 
-    // Publish to the versioned board doc dreams/<scope> + emit the notify-on-new signal (automatic dreaming).
     if publish_board_doc {
-        let Some(scope) = scope else {
-            eprintln!(
-                "dream-analyze: --publish-board requires --scope (the dreams/<scope> doc path)"
+        let scope = scope.unwrap_or("");
+        eprintln!(
+            "published: dreams/{scope} ({} new proposal(s))",
+            outcome.new_count
+        );
+        // The scheduler notifies the librarian on this stdout signal, ONLY when new>0.
+        if outcome.new_count > 0 {
+            println!(
+                "DREAM-NEW scope={scope} new={} ids={}",
+                outcome.new_count,
+                outcome.new_ids.join(",")
             );
-            return 2;
-        };
-        match publish_board(scope, &report, board_memory) {
-            Ok((new_count, new_ids)) => {
-                eprintln!("published: dreams/{scope} ({new_count} new proposal(s))");
-                // The scheduler notifies the librarian on this stdout signal, ONLY when new>0.
-                if new_count > 0 {
-                    println!(
-                        "DREAM-NEW scope={scope} new={new_count} ids={}",
-                        new_ids.join(",")
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("publish failed: {e}");
-                return 1;
-            }
         }
     }
 
@@ -1916,6 +1949,89 @@ pub fn analyze_cmd(
         }
     }
     0
+}
+
+/// The per-scope report filename under `<state-dir>/dreams/`: the scope with `/` folded to `-`, then the
+/// date, e.g. `repos-camshaft-cadenza-2026-10-02.json`. Pure.
+fn scope_report_filename(scope: &str, date: &str) -> String {
+    format!("{}-{}.json", scope.replace('/', "-"), date)
+}
+
+/// Today's UTC date as `YYYY-MM-DD` for the per-scope report filename.
+fn today_utc_date() -> String {
+    time::OffsetDateTime::now_utc().date().to_string()
+}
+
+/// `fleet dream-run` (task_1123): the automatic-dreaming RUNNER. Pulls every `repos/*` memory from the live
+/// board in one pass, groups by repo, and runs the analyze+publish pass per repo scope -- refreshing each
+/// versioned `dreams/<scope>` review doc and writing a per-scope report under `<state-dir>/dreams/`. Emits a
+/// consolidated `DREAM-NEW scope=... new=... ids=...` line to stdout per scope that surfaced new proposals
+/// (the librarian-blessed notify-on-new signal); the systemd timer/service wiring (v-fleet-tooling) carries
+/// that signal to the librarian. FIRST CUT is corpus-only: no `--repo-root`, so the staleness detector skips
+/// (the repo-root mapping is a v-fleet-tooling follow-on). Returns a nonzero exit if any scope failed, so a
+/// failed run is visible to the timer, while still processing the other scopes.
+pub fn run_cmd(board_api: &str, state_dir: &Path, board_memory: &str) -> i32 {
+    let date = today_utc_date();
+    let recs = match load_corpus_from_board(board_api, "repos") {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dream-run: cannot pull the repos scope from the board: {e}");
+            return 1;
+        }
+    };
+    // Group by repo namespace (the second path segment, set by load_corpus_from_board). BTreeMap => scopes
+    // run in a deterministic, sorted order.
+    let mut by_repo: std::collections::BTreeMap<String, Vec<Rec>> =
+        std::collections::BTreeMap::new();
+    for r in recs {
+        by_repo.entry(r.repo().to_string()).or_default().push(r);
+    }
+    by_repo.remove("?"); // drop any doc whose path had no namespace segment
+    if by_repo.is_empty() {
+        eprintln!("dream-run: no repo-scoped memories found under repos/");
+        return 0;
+    }
+
+    let dreams_dir = state_dir.join("dreams");
+    if let Err(e) = std::fs::create_dir_all(&dreams_dir) {
+        eprintln!("dream-run: cannot create {}: {e}", dreams_dir.display());
+        return 1;
+    }
+
+    let mut scopes_with_new = 0usize;
+    let mut had_error = false;
+    for (repo, group) in &by_repo {
+        let scope = format!("repos/{repo}");
+        let out = dreams_dir.join(scope_report_filename(&scope, &date));
+        match run_scope_pass(group, Some(&scope), &out, true, board_memory, None) {
+            Ok(o) => {
+                eprintln!(
+                    "dream-run: {scope} -- {} memories, {} new proposal(s)",
+                    group.len(),
+                    o.new_count
+                );
+                // The librarian-blessed notify-on-new signal; the service wiring carries it to the librarian.
+                if o.new_count > 0 {
+                    scopes_with_new += 1;
+                    println!(
+                        "DREAM-NEW scope={scope} new={} ids={}",
+                        o.new_count,
+                        o.new_ids.join(",")
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("dream-run: {scope} FAILED: {e}");
+                had_error = true;
+            }
+        }
+    }
+    eprintln!(
+        "dream-run: {} scope(s) processed, {} with new proposals",
+        by_repo.len(),
+        scopes_with_new
+    );
+    if had_error { 1 } else { 0 }
 }
 
 #[cfg(test)]
@@ -2400,5 +2516,17 @@ mod tests {
         ];
         let bl2 = build_backlinks(&no_subject);
         assert!(detect_value_contradictions(&no_subject, &HashMap::new(), &bl2).is_empty());
+    }
+
+    #[test]
+    fn scope_report_filename_folds_slashes_and_appends_date() {
+        assert_eq!(
+            scope_report_filename("repos/camshaft-cadenza", "2026-10-02"),
+            "repos-camshaft-cadenza-2026-10-02.json"
+        );
+        assert_eq!(
+            scope_report_filename("repos/fleet", "2026-01-01"),
+            "repos-fleet-2026-01-01.json"
+        );
     }
 }
