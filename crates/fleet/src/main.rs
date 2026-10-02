@@ -2440,15 +2440,32 @@ enum Cmd {
     /// applies a change. Runs the protected classifier, exact-duplicate (merge / cross-repo twin / orphan
     /// add-links), MinHash near-duplicate, and write-later detectors.
     DreamAnalyze {
-        /// JSONL corpus (board-identical bodies) for this analysis run.
+        /// JSONL corpus (board-identical bodies) for this analysis run. Omit when using --from-board.
         #[arg(long)]
-        corpus: PathBuf,
+        corpus: Option<PathBuf>,
+        /// Build the corpus from the LIVE board instead of a --corpus file (automatic/scheduled dreaming,
+        /// task_1123). Requires --scope.
+        #[arg(long)]
+        from_board: bool,
+        /// The board wiki path prefix to dream on with --from-board, e.g. `repos/<repo>` or `agents/<agent>`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Board REST base for --from-board (default the fleet board base).
+        #[arg(long)]
+        board_api: Option<String>,
         /// Where to write the dream-report JSON.
         #[arg(long, default_value = "dream-report.json")]
         out: PathBuf,
         /// Print this many proposals to stderr for a quick eyeball (0 = none).
         #[arg(long, default_value_t = 0)]
         sample: usize,
+        /// Also publish the report to the versioned board doc `dreams/<scope>` (the librarian's review
+        /// surface) and print a `DREAM-NEW` signal when a run surfaces new proposals. Requires --scope.
+        #[arg(long)]
+        publish_board: bool,
+        /// Path to the board-memory CLI (used by --publish-board).
+        #[arg(long, default_value = "board-memory")]
+        board_memory: String,
     },
     /// Apply a DISPOSITIONED dream proposal under the lane gate (task_827/task_956): the gated INC 2
     /// apply-workflow. Nothing autonomous -- names the disposition + authenticating principal; a protected
@@ -2642,8 +2659,11 @@ fn main() {
                 std::process::exit(code);
             }
         }
-        Cmd::DreamAnalyze { corpus, out, sample } => {
-            let code = dream::analyze_cmd(&corpus, &out, sample);
+        Cmd::DreamAnalyze { corpus, from_board, scope, board_api, out, sample, publish_board, board_memory } => {
+            let api = board_api.unwrap_or_else(board::Board::base_url);
+            let code = dream::analyze_cmd(
+                corpus.as_deref(), from_board, scope.as_deref(), &api, &out, sample, publish_board, &board_memory,
+            );
             if code != 0 {
                 std::process::exit(code);
             }

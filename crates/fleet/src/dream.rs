@@ -865,14 +865,346 @@ fn load_corpus(path: &Path) -> Result<Vec<Rec>, String> {
     Ok(recs)
 }
 
-/// Run the dream analyzer over `corpus` and write the dream-report JSON to `out`. Returns the process exit
-/// code. `sample` prints that many proposals to stderr for a quick eyeball.
-pub fn analyze_cmd(corpus: &Path, out: &Path, sample: usize) -> i32 {
-    let recs = match load_corpus(corpus) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            return 1;
+/// A browser-like User-Agent for board GETs — the public CF edge 403s a non-browser UA; harmless on loopback.
+const BOARD_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) fleet-dream";
+
+/// Percent-encode a wiki path prefix (the board `/wiki?prefix=` query): keep RFC3986 unreserved bytes, encode
+/// everything else (notably `/`). Mirrors the shim's `jq @uri`. Pure.
+fn encode_prefix(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// One board REST GET returning parsed JSON (transient 5xx are the caller's concern; a background pass
+/// tolerates a slow board). `path` begins with `/` and is appended to `board_api`.
+fn board_get_json(board_api: &str, path: &str) -> Result<Value, String> {
+    let url = format!("{}{}", board_api.trim_end_matches('/'), path);
+    let resp = ureq::get(&url)
+        .set("accept", "application/json")
+        .set("user-agent", BOARD_UA)
+        .call()
+        .map_err(|e| format!("board GET {path} failed: {e}"))?;
+    let raw = resp
+        .into_string()
+        .map_err(|e| format!("board GET {path} read failed: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("board GET {path}: not JSON: {e}"))
+}
+
+/// Build the analyzer corpus from the LIVE board for one scope (a wiki path prefix, e.g. `repos/<repo>` or
+/// `agents/<agent>`): list the scope's memory docs via `/wiki?prefix=`, then fetch each doc's body + metadata
+/// via `/documents/<id>?include_body=true`, assembling the analyzer record. Replaces the --corpus JSONL for
+/// scheduled runs so dreaming reflects current board state. Within-repo link semantics are preserved by
+/// keying `repo` to the scope's namespace segment (the second path segment).
+fn load_corpus_from_board(board_api: &str, scope: &str) -> Result<Vec<Rec>, String> {
+    let index = board_get_json(board_api, &format!("/wiki?prefix={}", encode_prefix(scope)))?;
+    let items = index
+        .as_array()
+        .ok_or_else(|| format!("board /wiki?prefix={scope}: expected an array, got {index}"))?;
+    let mut recs = Vec::with_capacity(items.len());
+    for it in items {
+        let id = it.get("id").ok_or("wiki entry missing id")?;
+        let id_str = match id {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            other => return Err(format!("wiki entry id is neither number nor string: {other}")),
+        };
+        let doc = board_get_json(board_api, &format!("/documents/{id_str}?include_body=true"))?;
+        let path = doc.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        if path.is_empty() {
+            continue; // a doc with no filed path is not a memory in a scope
+        }
+        let slug = path.rsplit('/').next().unwrap_or(&path).to_string();
+        // namespace = the second path segment (repos/<X>/.. or agents/<X>/..), so [[links]] resolve within it.
+        let namespace = path.split('/').nth(1).unwrap_or("?").to_string();
+        let md = doc.get("metadata").cloned().unwrap_or(Value::Null);
+        let provenance: Option<Provenance> = md
+            .get("provenance")
+            .cloned()
+            .and_then(|p| serde_json::from_value(p).ok());
+        recs.push(Rec {
+            slug,
+            repo: Some(namespace),
+            name: doc.get("title").and_then(Value::as_str).map(str::to_string),
+            description: md.get("description").and_then(Value::as_str).map(str::to_string),
+            rtype: md.get("type").and_then(Value::as_str).map(str::to_string),
+            body: doc.get("body").and_then(Value::as_str).map(str::to_string),
+            source: md
+                .get("provenance")
+                .and_then(|p| p.get("source"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            doc_id: Some(id.clone()),
+            provenance,
+            path: Some(path),
+        });
+    }
+    Ok(recs)
+}
+
+/// Normalize text to the board's ASCII-only content rule (the board 400s on any non-ASCII char): apply the
+/// board's suggested substitutions (em/en dash, curly quotes, ellipsis, arrows) then drop any other
+/// non-ASCII. Keeps a published dream doc from being rejected for a stray Unicode char in a memory rationale.
+fn to_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{2014}' | '\u{2013}' => out.push('-'),
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            '\u{201C}' | '\u{201D}' => out.push('"'),
+            '\u{2026}' => out.push_str("..."),
+            '\u{2192}' => out.push_str("->"),
+            '\u{2190}' => out.push_str("<-"),
+            c if c.is_ascii() => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A stable fingerprint of a proposal's SUBSTANCE (its `proposed_change`): the dedup key for "materially
+/// changed". The proposal_id is already content-derived for most kinds, but a write-later advisory keeps its
+/// id (hashed from the memory path) while its slug list can shift -- the fingerprint catches that. Pure.
+fn proposal_fingerprint(p: &Value) -> String {
+    let pc = p.get("proposed_change").cloned().unwrap_or(Value::Null);
+    let s = serde_json::to_string(&pc).unwrap_or_default();
+    sha256_hex(&s)[..16].to_string()
+}
+
+/// Parse the machine-tracked `dream-state` block from a prior published doc body: a map
+/// `proposal_id -> (fingerprint, disposition)`. Absent/garbled block => empty (treated as a first run). Pure.
+fn parse_dream_state(body: &str) -> HashMap<String, (String, String)> {
+    let mut m = HashMap::new();
+    let Some(start) = body.find("<!-- dream-state") else { return m };
+    let after = &body[start..];
+    let Some(nl) = after.find('\n') else { return m };
+    let rest = &after[nl + 1..];
+    let Some(end) = rest.find("-->") else { return m };
+    let json_str = rest[..end].trim();
+    if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(json_str) {
+        for (id, v) in o {
+            let h = v.get("hash").and_then(Value::as_str).unwrap_or("").to_string();
+            let d = v.get("disposition").and_then(Value::as_str).unwrap_or("new").to_string();
+            m.insert(id, (h, d));
+        }
+    }
+    m
+}
+
+/// Render the review-surface markdown for a dream-report (sectioned, each proposal with id / confidence /
+/// evidence / carried disposition) plus the trailing machine-tracked `dream-state` block. `state` is the
+/// per-proposal `(id, fingerprint, disposition)` to record. Pure.
+fn render_dream_doc(scope: &str, report: &Value, state: &[(String, String, String)]) -> String {
+    let disp: HashMap<&str, &str> = state.iter().map(|(id, _, d)| (id.as_str(), d.as_str())).collect();
+    let empty = Vec::new();
+    let proposals = report.get("proposals").and_then(Value::as_array).unwrap_or(&empty);
+    let mut out = String::new();
+    out.push_str(&format!("# dream: {scope}\n\n"));
+    out.push_str(&format!(
+        "Propose-only dream-report (v-agent-memory, automatic pass). Apply via the human-gated dream-apply lane; nothing here is auto-applied. Corpus {} memories, {} proposals.\n",
+        report.get("corpus_size").and_then(Value::as_u64).unwrap_or(0),
+        proposals.len()
+    ));
+    for (sec, title) in [
+        ("actionable", "## Actionable"),
+        ("cross_repo_twin", "## Cross-repo twins"),
+        ("fyi", "## FYI (write-later advisories)"),
+    ] {
+        let in_sec: Vec<&Value> = proposals
+            .iter()
+            .filter(|p| p.get("section").and_then(Value::as_str) == Some(sec))
+            .collect();
+        if in_sec.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{title}\n"));
+        for p in in_sec {
+            let id = p.get("proposal_id").and_then(Value::as_str).unwrap_or("?");
+            let kind = p.get("kind").and_then(Value::as_str).unwrap_or("?");
+            let conf = p.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+            let d = disp.get(id).copied().unwrap_or("new");
+            out.push_str(&format!("\n### {id}  ({kind}, confidence {conf})  [disposition: {d}]\n"));
+            if let Some(r) = p.get("rationale").and_then(Value::as_str) {
+                out.push_str(r);
+                out.push('\n');
+            }
+            let paths: Vec<&str> = p
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|t| t.get("path").and_then(Value::as_str)).collect())
+                .unwrap_or_default();
+            if !paths.is_empty() {
+                out.push_str(&format!("Targets: {}\n", paths.join(", ")));
+            }
+        }
+    }
+    // Machine-tracked state block: set a disposition to accepted|declined|deferred to stop it re-notifying.
+    let state_obj: serde_json::Map<String, Value> = state
+        .iter()
+        .map(|(id, h, d)| (id.clone(), json!({ "hash": h, "disposition": d })))
+        .collect();
+    let state_json = serde_json::to_string(&Value::Object(state_obj)).unwrap_or_else(|_| "{}".into());
+    out.push_str("\n<!-- dream-state v1 (machine-tracked; set a disposition to accepted|declined|deferred to stop a proposal re-notifying)\n");
+    out.push_str(&state_json);
+    out.push_str("\n-->\n");
+    out
+}
+
+/// Run the `board-memory` shim with `args` and an optional stdin body.
+fn run_board_memory(bin: &str, args: &[&str], stdin: Option<&str>) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
+    let mut child = cmd.spawn()?;
+    if let Some(body) = stdin {
+        child.stdin.take().expect("stdin piped").write_all(body.as_bytes())?;
+    }
+    child.wait_with_output()
+}
+
+/// Publish the dream-report to the versioned board doc `dreams/<scope>` (via the board-memory shim),
+/// carrying the librarian's prior dispositions forward by stable id+fingerprint so a declined/deferred
+/// proposal never re-notifies. Returns `(new_count, new_ids)` -- the notify-on-new signal. A proposal is NEW
+/// when its id is unseen OR its fingerprint changed (materially different). Mutating the live board, so it
+/// runs only under `--publish-board`.
+fn publish_board(scope: &str, report: &Value, bin: &str) -> Result<(usize, Vec<String>), String> {
+    let doc_path = format!("dreams/{scope}");
+    // Read the prior doc (if any) to recover dispositions. A missing doc (exit 4) => empty prior.
+    let prior_body = match run_board_memory(bin, &["get", "--path", &doc_path], None) {
+        Ok(o) if o.status.success() => {
+            let v: Value = serde_json::from_slice(&o.stdout).unwrap_or(Value::Null);
+            v.get("body").and_then(Value::as_str).unwrap_or("").to_string()
+        }
+        Ok(_) => String::new(), // no prior doc
+        Err(e) => return Err(format!("board-memory get failed to spawn: {e}")),
+    };
+    let prior = parse_dream_state(&prior_body);
+
+    let empty = Vec::new();
+    let proposals = report.get("proposals").and_then(Value::as_array).unwrap_or(&empty);
+    let mut state: Vec<(String, String, String)> = Vec::with_capacity(proposals.len());
+    let mut new_ids: Vec<String> = Vec::new();
+    for p in proposals {
+        let id = p.get("proposal_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let fp = proposal_fingerprint(p);
+        match prior.get(&id) {
+            Some((prior_fp, disp)) if *prior_fp == fp => state.push((id, fp, disp.clone())),
+            _ => {
+                new_ids.push(id.clone());
+                state.push((id, fp, "new".to_string()));
+            }
+        }
+    }
+
+    let body = to_ascii(&render_dream_doc(scope, report, &state));
+    let name = format!("dream: {scope}");
+    let args = [
+        "write", "--path", &doc_path, "--name", &name, "--type", "reference", "--tags", "dream-report",
+        "--author", "v-agent-memory",
+    ];
+    match run_board_memory(bin, &args, Some(&body)) {
+        Ok(o) if o.status.success() => Ok((new_ids.len(), new_ids)),
+        Ok(o) => Err(format!("board-memory write failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Err(format!("board-memory write failed to spawn: {e}")),
+    }
+}
+
+/// Section + rank the proposals for the librarian's review surface: tag each with a `section` -- `actionable`
+/// (within-repo merges + orphan add-links), `cross_repo_twin` (the distinct cross-cutting twins), or `fyi`
+/// (the low-confidence write-later advisories) -- then order by section (actionable, then twins, then FYI),
+/// confidence descending, then id for stability. Mutates each proposal in place; returns the per-section
+/// counts. "Rank, do not suppress" per the librarian.
+fn rank_and_section(proposals: &mut [Value]) -> (usize, usize, usize) {
+    fn section_of(kind: &str) -> &'static str {
+        match kind {
+            "cross_repo_twin" => "cross_repo_twin",
+            "write_later_candidate" => "fyi",
+            _ => "actionable", // near_duplicate (merges) + cross_link (orphan add-links)
+        }
+    }
+    fn rank(section: &str) -> u8 {
+        match section {
+            "actionable" => 0,
+            "cross_repo_twin" => 1,
+            _ => 2,
+        }
+    }
+    for p in proposals.iter_mut() {
+        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("");
+        let section = section_of(kind);
+        if let Some(obj) = p.as_object_mut() {
+            obj.insert("section".to_string(), json!(section));
+        }
+    }
+    proposals.sort_by(|a, b| {
+        let sa = a.get("section").and_then(Value::as_str).unwrap_or("");
+        let sb = b.get("section").and_then(Value::as_str).unwrap_or("");
+        let ca = a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+        let cb = b.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+        rank(sa)
+            .cmp(&rank(sb))
+            .then(cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                a.get("proposal_id")
+                    .and_then(Value::as_str)
+                    .cmp(&b.get("proposal_id").and_then(Value::as_str))
+            })
+    });
+    let count = |s: &str| {
+        proposals
+            .iter()
+            .filter(|p| p.get("section").and_then(Value::as_str) == Some(s))
+            .count()
+    };
+    (count("actionable"), count("cross_repo_twin"), count("fyi"))
+}
+
+/// Run the dream analyzer and write the dream-report JSON to `out`. The corpus comes from either a `--corpus`
+/// JSONL file or, when `from_board` is set, a live-board pull of `scope` (a wiki path prefix). Returns the
+/// process exit code; `sample` prints that many proposals to stderr for a quick eyeball.
+#[allow(clippy::too_many_arguments)]
+pub fn analyze_cmd(
+    corpus: Option<&Path>,
+    from_board: bool,
+    scope: Option<&str>,
+    board_api: &str,
+    out: &Path,
+    sample: usize,
+    publish_board_doc: bool,
+    board_memory: &str,
+) -> i32 {
+    let recs = if from_board {
+        let Some(scope) = scope else {
+            eprintln!("dream-analyze: --from-board requires --scope <wiki-prefix> (e.g. repos/<repo> or agents/<agent>)");
+            return 2;
+        };
+        match load_corpus_from_board(board_api, scope) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    } else {
+        let Some(corpus) = corpus else {
+            eprintln!("dream-analyze: pass --corpus <jsonl> or --from-board --scope <wiki-prefix>");
+            return 2;
+        };
+        match load_corpus(corpus) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
         }
     };
 
@@ -898,6 +1230,9 @@ pub fn analyze_cmd(corpus: &Path, out: &Path, sample: usize) -> i32 {
     let catalogued = load_forward_ref_catalogue(&recs);
     proposals.extend(detect_write_later_candidates(&recs, &prot, &backlinks, &catalogued));
 
+    // Section + rank for the librarian's review surface (actionable first, write-later as FYI).
+    let (sec_actionable, sec_twin, sec_fyi) = rank_and_section(&mut proposals);
+
     let standard = proposals.iter().filter(|p| p["lane"] == "standard").count();
     let protected = proposals.iter().filter(|p| p["lane"] == "protected").count();
     let report = json!({
@@ -908,6 +1243,7 @@ pub fn analyze_cmd(corpus: &Path, out: &Path, sample: usize) -> i32 {
         "detectors_run": ["exact_duplicate", "orphan_add_links", "near_duplicate_minhash", "write_later_candidate"],
         "proposal_count": proposals.len(),
         "by_lane": { "standard": standard, "protected": protected },
+        "by_section": { "actionable": sec_actionable, "cross_repo_twin": sec_twin, "fyi": sec_fyi },
         "proposals": proposals,
     });
 
@@ -929,6 +1265,28 @@ pub fn analyze_cmd(corpus: &Path, out: &Path, sample: usize) -> i32 {
         report["proposal_count"]
     );
     eprintln!("report: {}", out.display());
+
+    // Publish to the versioned board doc dreams/<scope> + emit the notify-on-new signal (automatic dreaming).
+    if publish_board_doc {
+        let Some(scope) = scope else {
+            eprintln!("dream-analyze: --publish-board requires --scope (the dreams/<scope> doc path)");
+            return 2;
+        };
+        match publish_board(scope, &report, board_memory) {
+            Ok((new_count, new_ids)) => {
+                eprintln!("published: dreams/{scope} ({new_count} new proposal(s))");
+                // The scheduler notifies the librarian on this stdout signal, ONLY when new>0.
+                if new_count > 0 {
+                    println!("DREAM-NEW scope={scope} new={new_count} ids={}", new_ids.join(","));
+                }
+            }
+            Err(e) => {
+                eprintln!("publish failed: {e}");
+                return 1;
+            }
+        }
+    }
+
     if sample > 0 && let Some(arr) = report["proposals"].as_array() {
         for p in arr.iter().take(sample) {
             let s = p.to_string();
@@ -1119,6 +1477,57 @@ mod tests {
             .collect();
         let props = detect_near_duplicates(&recs, &HashMap::new(), &backlinks, &exact);
         assert!(props.is_empty(), "exact-dup pair is skipped by the near-dup detector");
+    }
+
+    #[test]
+    fn dream_state_round_trips_through_render_and_parse() {
+        let report = json!({
+            "corpus_size": 3,
+            "proposals": [
+                {"proposal_id":"dp-x-1","kind":"near_duplicate","confidence":1.0,"section":"actionable",
+                 "rationale":"two memories share a body","targets":[{"path":"repos/r/a"},{"path":"repos/r/b"}]}
+            ]
+        });
+        let state = vec![("dp-x-1".to_string(), "abc123def456".to_string(), "declined".to_string())];
+        let body = render_dream_doc("repos/r", &report, &state);
+        // Rendered doc shows the section + the carried disposition inline.
+        assert!(body.contains("## Actionable"));
+        assert!(body.contains("[disposition: declined]"));
+        assert!(body.contains("Targets: repos/r/a, repos/r/b"));
+        // The machine state block round-trips back to the same (fingerprint, disposition).
+        let parsed = parse_dream_state(&body);
+        assert_eq!(parsed.get("dp-x-1"), Some(&("abc123def456".to_string(), "declined".to_string())));
+        // A body with no state block parses empty (first run).
+        assert!(parse_dream_state("# just a doc, no state").is_empty());
+    }
+
+    #[test]
+    fn proposal_fingerprint_is_stable_and_tracks_substance() {
+        let a = json!({"proposed_change": {"op":"merge","diff":{"survivor_path":"x"}}});
+        let b = json!({"proposed_change": {"op":"merge","diff":{"survivor_path":"y"}}});
+        assert_eq!(proposal_fingerprint(&a), proposal_fingerprint(&a)); // stable
+        assert_ne!(proposal_fingerprint(&a), proposal_fingerprint(&b)); // changes with the diff
+    }
+
+    #[test]
+    fn rank_and_section_orders_actionable_then_twins_then_fyi_by_confidence() {
+        let mut props = vec![
+            json!({"proposal_id": "w1", "kind": "write_later_candidate", "confidence": 0.2}),
+            json!({"proposal_id": "t1", "kind": "cross_repo_twin", "confidence": 0.9}),
+            json!({"proposal_id": "m1", "kind": "near_duplicate", "confidence": 0.85}),
+            json!({"proposal_id": "m2", "kind": "near_duplicate", "confidence": 1.0}),
+            json!({"proposal_id": "o1", "kind": "cross_link", "confidence": 0.6}),
+        ];
+        let (actionable, twins, fyi) = rank_and_section(&mut props);
+        assert_eq!((actionable, twins, fyi), (3, 1, 1)); // m1,m2,o1 | t1 | w1
+        // sections tagged
+        assert_eq!(props[0]["section"], "actionable");
+        // actionable block first, by confidence desc: m2 (1.0), m1 (0.85), o1 (0.6)
+        let ids: Vec<&str> = props.iter().map(|p| p["proposal_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["m2", "m1", "o1", "t1", "w1"]);
+        // the cross-repo twin is its own section, write-later is FYI last.
+        assert_eq!(props[3]["section"], "cross_repo_twin");
+        assert_eq!(props[4]["section"], "fyi");
     }
 
     #[test]
