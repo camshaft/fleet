@@ -4846,7 +4846,11 @@ fn build_kickoff(
          status=blocked with a blocked_on note. A blocked task is NOT actionable pending work, so if it is \
          your only open task you drop to the long/event-woken cadence — the live actionable-event wake \
          re-tickets you the moment a reply, an assignment, or the dep landing arrives, so short-cadence \
-         polling buys nothing.{operator_clause} (If your MCP cannot set a typed blocked_on, ask concierge or board-pm to stamp it.) STATUS \
+         polling buys nothing. SWITCH TO ACTIONABLE (task_736): dropping to that idle cadence is legitimate \
+         ONLY when EVERY task you own is blocked — if you hold ANY OTHER actionable task (status \
+         todo/in_progress, NOT blocked, NOT monitor-exempt) you do NOT idle while this one is blocked, you \
+         SWITCH to that task and keep working; you KEEP the blocked task owner-held meanwhile (never reassign \
+         it) and work your others until its dependency clears.{operator_clause} (If your MCP cannot set a typed blocked_on, ask concierge or board-pm to stamp it.) STATUS \
          HONESTY (task_506): never set your presence offline or away while you still hold a live in_progress \
          assigned task — an in_progress task means actively-worked, so before you stand down you MUST either \
          progress it or re-state it as blocked (with a blocked_on note) or done; standing down on a live \
@@ -14131,6 +14135,18 @@ mod tests {
             k.contains("long/event-woken cadence"),
             "a sole blocked task drops to the long/event-woken cadence, not SOON polling"
         );
+        // Switch-to-actionable (task_736 inc 2): a blocked task is a reason to drop to the idle cadence ONLY
+        // when EVERY owned task is blocked — holding any other actionable task means switch to it, never idle,
+        // and keep the blocked one owner-held meanwhile. Canonized in the kickoff next to the task_506 clause.
+        assert!(
+            k.contains("SWITCH TO ACTIONABLE (task_736)")
+                && k.contains("EVERY task you own is blocked"),
+            "canonizes the switch-to-actionable rule: idle only when all tasks are blocked (task_736)"
+        );
+        assert!(
+            k.contains("you KEEP the blocked task owner-held meanwhile (never reassign"),
+            "the switched-from blocked task stays owner-held, not reassigned (task_736/owner-held model)"
+        );
         // Operator-blocked dashboard convention (operator seq-2292, re-pointed task_936) is preserved as a
         // sub-case, with the operator id INTERPOLATED from config (task_611), not hard-coded: OWNER-HELD +
         // typed blocked_on=operator, never a reassignment to the operator (operator-tenet 10).
@@ -14158,7 +14174,9 @@ mod tests {
             "omits the operator-blocked clause when no operator is configured"
         );
         assert!(
-            k_no_op.contains("buys nothing. (If your MCP cannot set a typed blocked_on"),
+            k_no_op.contains(
+                "until its dependency clears. (If your MCP cannot set a typed blocked_on"
+            ),
             "the surrounding external-dep clause reads cleanly with the operator clause omitted"
         );
         // Status honesty (task_506 Layer 1): never stand down (offline/away) holding a live in_progress task —

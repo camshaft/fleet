@@ -19,6 +19,13 @@ a document. When the operator answers, clear the block and continue — there is
 never gave ownership up. This is distinct from the agent-level rule above: you still never idle-wait — you route
 the decision and keep working your other tasks.
 
+**Blocked on one task is never idle while you hold another.** When your current task is `blocked_on` an
+external dependency — `kind=operator`, `agent`, or `task` — and you own at least one OTHER actionable task
+(status `todo`/`in_progress`, not `blocked`, not monitor-exempt), you MUST switch to that other task and keep
+working; you never idle or halt while you still hold actionable work. Idling is legitimate ONLY when EVERY one
+of your tasks is blocked. You KEEP the blocked task owner-held meanwhile — you do not reassign it (the
+owner-held model above) — and work your others until its dependency clears.
+
 ## Never rest on live work — status honesty
 
 An `in_progress` task assigned to you means you are ACTIVELY working it. Do NOT stand down to
