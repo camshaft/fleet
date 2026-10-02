@@ -364,7 +364,10 @@ fn items_from_docx(data: &[u8], meta: &Map<String, Value>) -> Result<Vec<Item>, 
 
 /// Fetch a ticket's source into `(bytes, content_type, extra_meta)` — the Python `fetch_source`. `docs.rs`
 /// GETs the rustdoc JSON and zstd-decompresses it; `file`/`path` reads the file; `url` GETs (preferring a
-/// `raw_url`) and sniffs the content-type. An unknown `source_type` is an error.
+/// `raw_url`) and sniffs the content-type; `inline` takes the body straight from the ticket's `content`
+/// field (for content a producer already fetched -- e.g. a page the uploader cannot fetch itself, such as
+/// one requiring credentials the worker does not have -- with an optional `source_url` kept as the
+/// citation). An unknown `source_type` is an error.
 async fn fetch_source(
     meta: &Map<String, Value>,
 ) -> Result<(Vec<u8>, String, Map<String, Value>), String> {
@@ -429,6 +432,25 @@ async fn fetch_source(
             extra.insert("url".into(), Value::from(u));
             extra.insert("filename".into(), Value::from(url_filename(u)));
             Ok((bytes.to_vec(), ct, extra))
+        }
+        "inline" => {
+            // Content supplied directly in the ticket by a source-authed producer -- e.g. a producer that
+            // fetched a page the uploader's plain HTTP GET cannot reach (such as one behind credentials the
+            // worker does not have) -- so the uploader does not re-fetch. The body is the ticket's `content`
+            // field; an optional `source_url` is kept as the citation link, and `filename`/`content_type`
+            // steer parsing like the file path.
+            let content = truthy_str(meta, "content").ok_or_else(|| {
+                "pipeline: source_type=inline requires a non-empty \"content\" field".to_string()
+            })?;
+            let name = truthy_str(meta, "filename").unwrap_or("inline.txt");
+            let ct = content_type_override(meta)
+                .unwrap_or_else(|| content_type_for(name, "", content.as_bytes()).to_string());
+            let mut extra = Map::new();
+            extra.insert("filename".into(), Value::from(name));
+            if let Some(u) = truthy_str(meta, "source_url") {
+                extra.insert("url".into(), Value::from(u));
+            }
+            Ok((content.as_bytes().to_vec(), ct, extra))
         }
         other => Err(format!("pipeline: unknown source_type {other:?}")),
     }
@@ -839,6 +861,27 @@ mod tests {
 
     fn meta(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn fetch_source_inline_uses_content_and_keeps_source_url() {
+        let m = meta(json!({
+            "source_type": "inline",
+            "content": "# Role Guidelines\nL4 criteria",
+            "filename": "sde-l4.md",
+            "source_url": "https://example.internal/role-guidelines"
+        }));
+        let (bytes, _ct, extra) = fetch_source(&m).await.unwrap();
+        assert_eq!(bytes, b"# Role Guidelines\nL4 criteria");
+        assert_eq!(extra["filename"], "sde-l4.md");
+        // the producer's source_url is kept as the citation link
+        assert_eq!(extra["url"], "https://example.internal/role-guidelines");
+    }
+
+    #[tokio::test]
+    async fn fetch_source_inline_requires_content() {
+        let m = meta(json!({ "source_type": "inline", "filename": "x.md" }));
+        assert!(fetch_source(&m).await.is_err());
     }
 
     #[test]
