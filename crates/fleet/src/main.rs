@@ -6199,12 +6199,40 @@ fn is_cargo_package_manifest(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn have_cargo() -> bool {
-    std::process::Command::new("cargo")
+fn have_rustfmt() -> bool {
+    std::process::Command::new("rustfmt")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// The Rust edition to pass to `rustfmt` for files owned by a crate: a crate-level `package.edition` string
+/// wins; otherwise (including the common `edition.workspace = true` inheritance, where `package.edition` is a
+/// table not a string) it resolves `workspace.package.edition` from the workspace-root manifest. Defaults to
+/// `"2021"` when neither resolves, so `rustfmt` is never left on its stale 2015 default over modern code.
+/// Pure (takes the two manifest bodies), so it is unit-tested without the filesystem.
+fn rustfmt_edition(crate_manifest: &str, workspace_manifest: &str) -> String {
+    fn get_str(body: &str, path: &[&str]) -> Option<String> {
+        let parsed: toml::Value = body.parse().ok()?;
+        let mut v = &parsed;
+        for key in path {
+            v = v.get(key)?;
+        }
+        v.as_str().map(str::to_string)
+    }
+    get_str(crate_manifest, &["package", "edition"])
+        .or_else(|| get_str(workspace_manifest, &["workspace", "package", "edition"]))
+        .unwrap_or_else(|| "2021".to_string())
+}
+
+/// Read the [`rustfmt_edition`] for files under `crate_manifest`, reading the owning crate manifest and the
+/// workspace-root manifest off disk (missing/unreadable → empty, so the default applies). Side-effecting
+/// wrapper around the pure resolver.
+fn read_rustfmt_edition(repo_root: &Path, crate_manifest: &Path) -> String {
+    let crate_body = std::fs::read_to_string(crate_manifest).unwrap_or_default();
+    let ws_body = std::fs::read_to_string(repo_root.join("Cargo.toml")).unwrap_or_default();
+    rustfmt_edition(&crate_body, &ws_body)
 }
 
 /// Whether `file` (repo-root-relative, as `git diff --cached --name-only` reports it) has NO unstaged
@@ -6224,7 +6252,10 @@ fn is_fully_staged(repo_root: &Path, file: &str) -> bool {
 /// What `fleet fmt-hook-run` (invoked by the installed pre-commit hook — see [`fmt_precommit_hook_body`])
 /// actually does: group the staged `.rs` files by their OWNING crate (never the whole workspace — the
 /// task_617 bug), auto-format + re-stage the ones with no unstaged changes, and warn (fail-open, never
-/// block) on any that are only partially staged, since those cannot be safely auto-restaged.
+/// block) on any that are only partially staged, since those cannot be safely auto-restaged. Formatting runs
+/// `rustfmt` on the EXPLICIT staged file list — NOT `cargo fmt --manifest-path`, which reformats the whole
+/// owning crate regardless of a trailing file list and so silently rewrote unrelated fmt-dirty files in the
+/// crate as unstaged edits the committing agent never made, across every worktree (task_1322).
 fn fmt_hook_run() {
     let Ok(root_out) = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -6252,7 +6283,7 @@ fn fmt_hook_run() {
     else {
         return;
     };
-    if !staged_out.status.success() || !have_cargo() {
+    if !staged_out.status.success() || !have_rustfmt() {
         return;
     }
     let staged: Vec<String> = String::from_utf8_lossy(&staged_out.stdout)
@@ -6282,13 +6313,18 @@ fn fmt_hook_run() {
             .into_iter()
             .partition(|f| is_fully_staged(&repo_root, f));
 
+        // Format with `rustfmt` on an EXPLICIT, absolute file list — never `cargo fmt --manifest-path`, which
+        // reformats the WHOLE owning crate regardless of a trailing file list, so one staged file dragged
+        // every other fmt-dirty file in the crate into the working tree as an unstaged edit the author never
+        // made, fleet-wide (task_1322). The edition is the owning crate's (or the inherited workspace edition)
+        // so rustfmt is not left on its stale 2015 default. Absolute paths so cwd never matters.
+        let edition = read_rustfmt_edition(&repo_root, &manifest);
+
         if !safe.is_empty() {
-            let _ = std::process::Command::new("cargo")
-                .arg("fmt")
-                .arg("--manifest-path")
-                .arg(&manifest)
-                .arg("--")
-                .args(&safe)
+            let _ = std::process::Command::new("rustfmt")
+                .arg("--edition")
+                .arg(&edition)
+                .args(safe.iter().map(|f| repo_root.join(f)))
                 .status();
             let _ = std::process::Command::new("git")
                 .arg("-C")
@@ -6299,14 +6335,12 @@ fn fmt_hook_run() {
         }
 
         if !unsafe_files.is_empty() {
-            // Silence cargo fmt's own --check diff output - only OUR actionable message below should print.
-            let clean = std::process::Command::new("cargo")
-                .arg("fmt")
-                .arg("--manifest-path")
-                .arg(&manifest)
+            // Silence rustfmt's own --check diff output - only OUR actionable message below should print.
+            let clean = std::process::Command::new("rustfmt")
+                .arg("--edition")
+                .arg(&edition)
                 .arg("--check")
-                .arg("--")
-                .args(&unsafe_files)
+                .args(unsafe_files.iter().map(|f| repo_root.join(f)))
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -15299,6 +15333,24 @@ mod tests {
             found,
             PathBuf::from("/repo/Cargo.toml"),
             "stops at repo_root, never checks above it"
+        );
+    }
+
+    #[test]
+    fn rustfmt_edition_prefers_crate_then_workspace_then_default() {
+        // An explicit crate-level edition string wins outright.
+        let crate_explicit = "[package]\nname = \"x\"\nedition = \"2018\"\n";
+        assert_eq!(rustfmt_edition(crate_explicit, ""), "2018");
+        // Inherited edition (`edition.workspace = true` → a table, not a string) resolves the workspace edition.
+        let crate_inherited = "[package]\nname = \"x\"\nedition.workspace = true\n";
+        let ws = "[workspace.package]\nedition = \"2024\"\n";
+        assert_eq!(rustfmt_edition(crate_inherited, ws), "2024");
+        // A crate with no edition at all also falls through to the workspace edition.
+        assert_eq!(rustfmt_edition("[package]\nname = \"x\"\n", ws), "2024");
+        // Nothing resolvable (crate has none, workspace unparseable) → the safe 2021 default, never 2015.
+        assert_eq!(
+            rustfmt_edition("[package]\nname = \"x\"\n", "not valid toml ["),
+            "2021"
         );
     }
 
