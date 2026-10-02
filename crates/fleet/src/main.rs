@@ -1948,32 +1948,84 @@ fn classify_intake_task(status: &str, age_secs: u64, sla_secs: u64) -> IntakeVer
 /// invariant, naming the task and WHY (its bad state, a past-SLA dwell, or both on one line). `entries` is
 /// `(task_ref, status, age_secs)` for every task currently in the intake project; a clean task yields no
 /// line. Pure — unit-tested; the board fetch + age computation wraps it.
+/// The one-line reason a task in the intake project violates an inbox invariant (task_1217), or `None` when
+/// it is clean. Shared by the report ([`intake_report`]) and the per-offender alert body
+/// ([`intake_alert_comment`]) so both name a violation identically. Pure.
+fn intake_violation_reason(status: &str, age_secs: u64, sla_secs: u64) -> Option<String> {
+    let v = classify_intake_task(status, age_secs, sla_secs);
+    if !v.is_violation() {
+        return None;
+    }
+    let mut why = Vec::new();
+    if let Some(s) = &v.bad_state {
+        why.push(format!("state={s} (never in-inbox)"));
+    }
+    if let Some(a) = v.dwell_over_secs {
+        why.push(format!("dwell {a}s > {sla_secs}s SLA"));
+    }
+    Some(why.join(", "))
+}
+
 fn intake_report(entries: &[(String, String, u64)], sla_secs: u64) -> Vec<String> {
     entries
         .iter()
         .filter_map(|(task_ref, status, age)| {
-            let v = classify_intake_task(status, *age, sla_secs);
-            if !v.is_violation() {
-                return None;
-            }
-            let mut why = Vec::new();
-            if let Some(s) = &v.bad_state {
-                why.push(format!("state={s} (never in-inbox)"));
-            }
-            if let Some(a) = v.dwell_over_secs {
-                why.push(format!("dwell {a}s > {sla_secs}s SLA"));
-            }
-            Some(format!("{task_ref}: {}", why.join(", ")))
+            intake_violation_reason(status, *age, sla_secs).map(|why| format!("{task_ref}: {why}"))
         })
         .collect()
 }
 
-/// Sweep the uncategorized intake project and REPORT every task that violates an inbox invariant (task_1217).
-/// Report-only: it prints the offenders (via the pure [`intake_report`]) and exits non-zero when any violate,
-/// so a supervisor can gate on it — the cooldown-fenced alert to board-triage is the follow-on. Age is the
-/// task's `created_at` to now; a task with no parseable `created_at` is swept on state only (age 0, so it can
-/// still trip the state invariant but never a phantom dwell).
-fn intake_watch(project: i64, sla_secs: u64) {
+/// The per-offender alert comment body for a violating intake task (task_1217 shape (a), board-pm
+/// comment_6197): it names the violation and asks board-triage to route the task out of the uncategorized
+/// inbox. The signal sits on the task where its owner and board-triage both see it, with no task mutation.
+/// Pure — unit-tested.
+fn intake_alert_comment(reason: &str) -> String {
+    format!(
+        "@board-triage this task violates an uncategorized-intake invariant: {reason}. It should be routed \
+         out of the intake project (assign it an owner or move it to a real project). Flagged by fleet \
+         intake-watch for task_1217."
+    )
+}
+
+/// The per-offender intake-alert stamp path: `<root>/watchdog/intake-alert/<project>-<ref>.stamp` (contents =
+/// the unix secs of the last alert). Keyed by project and task ref so one offender is alerted at most once per
+/// cooldown window.
+fn intake_alert_stamp_path(fleet: &Fleet, project: i64, task_ref: &str) -> PathBuf {
+    fleet
+        .root
+        .join("watchdog")
+        .join("intake-alert")
+        .join(format!("{project}-{task_ref}.stamp"))
+}
+
+/// Read an offender's last intake-alert unix time; `None` on an absent/unparseable stamp (never alerted).
+fn read_intake_alert_stamp(fleet: &Fleet, project: i64, task_ref: &str) -> Option<u64> {
+    std::fs::read_to_string(intake_alert_stamp_path(fleet, project, task_ref))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record that an offender was just alerted at `now` (best-effort — a write failure only risks a re-alert on
+/// the next sweep, the safe direction for a safety net).
+fn write_intake_alert_stamp(fleet: &Fleet, project: i64, task_ref: &str, now: u64) {
+    let p = intake_alert_stamp_path(fleet, project, task_ref);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
+/// Sweep the uncategorized intake project and REPORT every task that violates an inbox invariant (task_1217),
+/// and with `alert` also post the active, cooldown-fenced per-offender escalation (shape (a), board-pm
+/// comment_6197). Report-only by default: it prints the offenders (via the pure [`intake_report`]) and exits
+/// non-zero when any violate, so a supervisor can gate on it. With `--alert` it additionally posts a
+/// per-offender comment tagging board-triage on each violating task, fenced per offender by
+/// `alert_cooldown_secs` so a fast sweep never re-comments. Age is the task's `created_at` to now; a task with
+/// no parseable `created_at` is swept on state only (age 0, so it can still trip the state invariant but never
+/// a phantom dwell). The one fenced digest to board-triage plus concierge (shape (c)) is the follow-on.
+fn intake_watch(fleet: &Fleet, project: i64, sla_secs: u64, alert: bool, alert_cooldown_secs: u64) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("intake-watch: {e}");
         std::process::exit(1);
@@ -1984,33 +2036,64 @@ fn intake_watch(project: i64, sla_secs: u64) {
     });
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_secs())
         .unwrap_or(0);
-    let entries: Vec<(String, String, u64)> = tasks
+    // (id, ref, status, age) per task: the report needs ref/status/age, and the alert also needs the numeric
+    // id to comment on the task.
+    let rich: Vec<(i64, String, String, u64)> = tasks
         .iter()
         .map(|t| {
+            let id = t.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
             let task_ref = t
                 .get("ref")
                 .and_then(serde_json::Value::as_str)
                 .map(String::from)
-                .or_else(|| {
-                    t.get("id")
-                        .and_then(serde_json::Value::as_i64)
-                        .map(|id| format!("task_{id}"))
-                })
-                .unwrap_or_else(|| "task_?".to_string());
+                .unwrap_or_else(|| format!("task_{id}"));
             let status = t
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
             let age = dream::provenance_unix_secs(t.get("created_at"))
-                .map(|c| (now - c).max(0) as u64)
+                .map(|c| (now as i64 - c).max(0) as u64)
                 .unwrap_or(0);
-            (task_ref, status, age)
+            (id, task_ref, status, age)
         })
         .collect();
+    let entries: Vec<(String, String, u64)> = rich
+        .iter()
+        .map(|(_, r, s, a)| (r.clone(), s.clone(), *a))
+        .collect();
     let lines = intake_report(&entries, sla_secs);
+
+    if alert {
+        let mut alerted = 0usize;
+        for (id, task_ref, status, age) in &rich {
+            let Some(reason) = intake_violation_reason(status, *age, sla_secs) else {
+                continue;
+            };
+            // Fence: at most one alert per offender per cooldown window, so a ~30s sweep does not re-comment.
+            if bounce_on_cooldown(
+                read_intake_alert_stamp(fleet, project, task_ref),
+                now,
+                alert_cooldown_secs,
+            ) {
+                continue;
+            }
+            match board.comment_task(*id, "v-fleet-tooling", &intake_alert_comment(&reason)) {
+                Ok(()) => {
+                    write_intake_alert_stamp(fleet, project, task_ref, now);
+                    alerted += 1;
+                }
+                Err(e) => eprintln!("intake-watch: alert comment on {task_ref} failed: {e}"),
+            }
+        }
+        eprintln!(
+            "intake-watch: alerted {alerted} offender(s) (per-offender cooldown {alert_cooldown_secs}s); the \
+             (c) digest to board-triage plus concierge is the follow-on"
+        );
+    }
+
     if lines.is_empty() {
         println!(
             "intake-watch: project {project} clean -- {} task(s), none violating (SLA {sla_secs}s)",
@@ -3084,6 +3167,14 @@ enum Cmd {
         /// dwell invariant (operator: "~2min dwell").
         #[arg(long, default_value_t = 120)]
         sla_secs: u64,
+        /// Post the active alert (task_1217 shape (a)): a per-offender comment on each violating task tagging
+        /// board-triage, cooldown-fenced per offender. Default off — the sweep is report-only.
+        #[arg(long)]
+        alert: bool,
+        /// Per-offender alert cooldown in seconds — an offender is alerted at most once per window, so a fast
+        /// sweep does not re-comment every pass.
+        #[arg(long, default_value_t = 3600)]
+        alert_cooldown_secs: u64,
     },
 }
 
@@ -3206,7 +3297,12 @@ fn main() {
             apply,
         ),
         Cmd::SetInterval { agent, interval } => set_interval(&fleet, &agent, &interval),
-        Cmd::IntakeWatch { project, sla_secs } => intake_watch(project, sla_secs),
+        Cmd::IntakeWatch {
+            project,
+            sla_secs,
+            alert,
+            alert_cooldown_secs,
+        } => intake_watch(&fleet, project, sla_secs, alert, alert_cooldown_secs),
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session()) {
                 eprintln!("{e}");
@@ -16289,6 +16385,41 @@ detached
         assert_eq!(
             resolve_recipient("v-brand-new", &known),
             RecipientResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn intake_violation_reason_names_state_dwell_or_both_and_is_none_when_clean() {
+        // Clean and terminal both yield no reason.
+        assert_eq!(intake_violation_reason("todo", 30, 120), None);
+        assert_eq!(intake_violation_reason("done", 10_000, 120), None);
+        // Dwell-only, state-only, and both.
+        assert_eq!(
+            intake_violation_reason("todo", 300, 120).as_deref(),
+            Some("dwell 300s > 120s SLA")
+        );
+        assert_eq!(
+            intake_violation_reason("in_progress", 5, 120).as_deref(),
+            Some("state=in_progress (never in-inbox)")
+        );
+        let both = intake_violation_reason("blocked", 999, 120).unwrap();
+        assert!(
+            both.contains("state=blocked") && both.contains("dwell 999s"),
+            "carries both reasons: {both}"
+        );
+    }
+
+    #[test]
+    fn intake_alert_comment_tags_board_triage_and_names_the_reason() {
+        let c = intake_alert_comment("dwell 300s > 120s SLA");
+        assert!(c.contains("board-triage"), "escalates to board-triage: {c}");
+        assert!(
+            c.contains("dwell 300s > 120s SLA"),
+            "names the violation: {c}"
+        );
+        assert!(
+            c.to_lowercase().contains("rout"),
+            "asks to route it out of the inbox: {c}"
         );
     }
 
