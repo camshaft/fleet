@@ -75,7 +75,8 @@ let
       name,
       description,
       exec,
-      intervalSecs,
+      intervalSecs ? null,
+      onCalendar ? null,
       onBootSec ? 60,
       persistent ? true,
       restartSec ? null,
@@ -83,6 +84,24 @@ let
       after ? [ ],
       wants ? [ ],
     }:
+    let
+      # A timer fires EITHER on a monotonic interval (OnBootSec + OnUnitActiveSec -- the herd-avoided cadence
+      # most fleet timers use, offset from boot by activation time) OR at a wall-clock time-of-day (OnCalendar),
+      # for a daily pass whose slot is deliberate (a plain 24h interval anchors to install time and drifts the
+      # run into daytime fleet activity). Exactly one of intervalSecs / onCalendar is set (asserted below).
+      # Persistent=true applies to both: a missed run (box asleep past the slot) fires once on the next wake.
+      cadenceLines =
+        if onCalendar != null then
+          [ "OnCalendar=${onCalendar}" ]
+        else
+          [
+            "OnBootSec=${toString onBootSec}"
+            "OnUnitActiveSec=${toString intervalSecs}"
+          ];
+    in
+    assert lib.assertMsg (
+      (intervalSecs == null) != (onCalendar == null)
+    ) "mkTimer ${name}: set exactly one of intervalSecs or onCalendar";
     {
       "${name}.service" = renderUnit (
         [
@@ -104,19 +123,22 @@ let
           "RestartSec=${toString restartSec}"
         ])
       );
-      "${name}.timer" = renderUnit [
-        marker
-        "[Unit]"
-        "Description=${description} cadence"
-        ""
-        "[Timer]"
-        "OnBootSec=${toString onBootSec}"
-        "OnUnitActiveSec=${toString intervalSecs}"
-        "Persistent=${if persistent then "true" else "false"}"
-        ""
-        "[Install]"
-        "WantedBy=timers.target"
-      ];
+      "${name}.timer" = renderUnit (
+        [
+          marker
+          "[Unit]"
+          "Description=${description} cadence"
+          ""
+          "[Timer]"
+        ]
+        ++ cadenceLines
+        ++ [
+          "Persistent=${if persistent then "true" else "false"}"
+          ""
+          "[Install]"
+          "WantedBy=timers.target"
+        ]
+      );
     };
 
   # Group B cron guard (task_495): a cadenza hub .claude/fleet/<script> run on a timer, migrated from the
@@ -308,6 +330,22 @@ let
       exec = "${fleetBin} up-board --launch";
       intervalSecs = 300;
       onBootSec = 30;
+      persistent = true;
+      after = [ "fleet-notify.service" ];
+      wants = [ "fleet-notify.service" ];
+      environment = watchdogEnv;
+    })
+    # fleet-dream (task_1123): scheduled dreaming — a daily oneshot that runs `fleet dream-run`, which
+    # enumerates every repos/* memory scope from the board and runs the dream-analyze+publish pass per scope.
+    # OnCalendar at a quiet-hours slot (staggered off the other 04:xx guards) rather than a 24h interval, so the
+    # run never drifts into daytime fleet activity; Persistent catches a missed slot on the next wake. The
+    # DREAM-NEW notify to the librarian is self-contained in dream-run (board-native post), so this timer stays
+    # a bare oneshot with no journal plumbing. watchdogEnv supplies the board env + the login PATH.
+    // (mkTimer {
+      name = "fleet-dream";
+      description = "Fleet scheduled dreaming (dream-run over all repo scopes)";
+      exec = "${fleetBin} dream-run";
+      onCalendar = "*-*-* 04:07:00";
       persistent = true;
       after = [ "fleet-notify.service" ];
       wants = [ "fleet-notify.service" ];
