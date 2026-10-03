@@ -15,6 +15,9 @@
   pkgs,
   fleet,
   fleetTunnel,
+  # task_1334: the committed prose-style ruleset as a nix-store path (copied from the flake source), so the
+  # prose-sync-check unit reads an immutable copy current with this build instead of a mutable working checkout.
+  proseRuleset,
   lib ? pkgs.lib,
 }:
 let
@@ -632,12 +635,15 @@ let
         chmod u+w "$UNIT_DIR/fleet-binary-sweep.service" 2>/dev/null || true
         printf 'Environment=FLEET_REPO=%s\n' "$fleet_repo" >> "$UNIT_DIR/fleet-binary-sweep.service"
       fi
-      # task_1334: inject the committed prose-style ruleset path into the prose-sync-check unit (it lives in the
-      # repo, not under $HOME, so install-time injection like FLEET_REPO; `fleet prose-sync --check` reads it via
-      # $FLEET_PROSE_RULESET). The board base auto-resolves to the configured board, so no board env is needed.
+      # task_1334: point the prose-sync-check unit at the committed prose-style ruleset as an immutable nix-store
+      # copy (the proseRuleset arg, baked from the flake source), not a working-checkout path. The old
+      # $fleet_repo/crates/fleet/prose-style.toml resolved to the FLEET_REPO checkout, which tracks the frozen
+      # local main (pr-sync stood down) and so lacks the file -- `fleet prose-sync --check` then errored exit 2
+      # every run. The store copy is current with the deployed binary (refreshed on each rebuild/deploy) and
+      # needs no live checkout. The board base auto-resolves to the configured board, so no board env is needed.
       if [ -e "$UNIT_DIR/fleet-prose-sync-check.service" ]; then
         chmod u+w "$UNIT_DIR/fleet-prose-sync-check.service" 2>/dev/null || true
-        printf 'Environment=FLEET_PROSE_RULESET=%s\n' "$fleet_repo/crates/fleet/prose-style.toml" >> "$UNIT_DIR/fleet-prose-sync-check.service"
+        printf 'Environment=FLEET_PROSE_RULESET=%s\n' "${proseRuleset}" >> "$UNIT_DIR/fleet-prose-sync-check.service"
       fi
       # task_1123: fleet-dream's oneshot shells out to `board-memory` (publishes each dreams/<scope> doc) and the
       # model tooling, so it needs the login PATH plus the fleet repo's bin/ (where board-memory lives). Inject
@@ -716,11 +722,12 @@ let
         chmod u+w "$UNIT_DIR/fleet-binary-sweep.service" 2>/dev/null || true
         printf 'Environment=FLEET_REPO=%s\n' "$fleet_repo" >> "$UNIT_DIR/fleet-binary-sweep.service"
       fi
-      # task_1334: same prose-style ruleset path injection as install-fleet-daemons (the prose-sync-check unit is
-      # in the fleet-binary set, so a binary deploy re-copies it and must re-inject FLEET_PROSE_RULESET).
+      # task_1334: same prose-style ruleset injection as install-fleet-daemons -- the immutable nix-store copy
+      # (the proseRuleset arg), not a working-checkout path (the prose-sync-check unit is in the fleet-binary
+      # set, so a binary deploy re-copies it and must re-inject FLEET_PROSE_RULESET).
       if [ -e "$UNIT_DIR/fleet-prose-sync-check.service" ]; then
         chmod u+w "$UNIT_DIR/fleet-prose-sync-check.service" 2>/dev/null || true
-        printf 'Environment=FLEET_PROSE_RULESET=%s\n' "$fleet_repo/crates/fleet/prose-style.toml" >> "$UNIT_DIR/fleet-prose-sync-check.service"
+        printf 'Environment=FLEET_PROSE_RULESET=%s\n' "${proseRuleset}" >> "$UNIT_DIR/fleet-prose-sync-check.service"
       fi
       systemctl --user daemon-reload
       # Re-arm the binary timers: their oneshot ExecStart now points at the new store binary, so the next fire
