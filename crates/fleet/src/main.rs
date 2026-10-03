@@ -2571,30 +2571,59 @@ fn artifact_changed(new: &str, existing: Option<&str>) -> bool {
     existing != Some(new)
 }
 
-/// Compose an agent's role-inherited mandate sets into one boot-local artifact (task_906): read its registry
-/// metadata, select the ordered set paths, fetch each approved version, concatenate under stable headers, and
-/// (with `write`) atomically rewrite the `out` file only when the content changed. DRY-RUN by default (prints
-/// the artifact + the skipped sets, writes nothing). `core` with no approved version is a hard hold+alarm.
-fn compose_mandates(fleet: &Fleet, agent: &str, out: &str, write: bool) {
-    let board = board::Board::connect().unwrap_or_else(|e| {
-        eprintln!("compose-mandates: {e}");
-        std::process::exit(1);
-    });
-    let _ = fleet;
-    let rec = board.get_agent(agent).unwrap_or_else(|e| {
-        eprintln!("compose-mandates: cannot read agent {agent}: {e}");
-        std::process::exit(1);
-    });
+/// Compose ONE agent's mandate artifact from the board (task_906): read its registry metadata, select the
+/// ordered set paths, fetch each operator-approved version, and concatenate under stable headers. Shared by
+/// the single-agent `compose-mandates` and the all-agent `compose-mandates-sweep`. Returns the composed
+/// artifact plus the count of selected set paths, or an `Err` the caller surfaces (no approved `core` is a
+/// hard hold; a board error is surfaced, never silently skipped).
+fn compose_agent_artifact(
+    board: &board::Board,
+    agent: &str,
+) -> Result<(ComposedMandate, usize), String> {
+    let rec = board
+        .get_agent(agent)
+        .map_err(|e| format!("cannot read agent {agent}: {e}"))?;
     let md = rec
         .get("metadata")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let paths = mandate_set_paths_from_metadata(&md);
-    let sets = fetch_mandate_sets(&board, &paths).unwrap_or_else(|e| {
+    let sets = fetch_mandate_sets(board, &paths)?;
+    let composed = compose_mandate_artifact(&sets)?;
+    Ok((composed, paths.len()))
+}
+
+/// Atomically write `artifact` to `out`, hash-gated so an unchanged artifact is a no-op (churn-free boot file,
+/// task_906): write a sibling temp then rename, creating the parent dir as needed. Returns `Ok(true)` if it
+/// wrote, `Ok(false)` if the on-disk content already matched. Shared by `compose-mandates` and the sweep.
+fn write_artifact_if_changed(out: &std::path::Path, artifact: &str) -> Result<bool, String> {
+    let existing = std::fs::read_to_string(out).ok();
+    if !artifact_changed(artifact, existing.as_deref()) {
+        return Ok(false);
+    }
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let tmp = out.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, artifact).map_err(|e| format!("write {} failed: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename into {} failed: {e}", out.display())
+    })?;
+    Ok(true)
+}
+
+/// Compose an agent's role-inherited mandate sets into one boot-local artifact (task_906): read its registry
+/// metadata, select the ordered set paths, fetch each approved version, concatenate under stable headers, and
+/// (with `write`) atomically rewrite the `out` file only when the content changed. DRY-RUN by default (prints
+/// the artifact + the skipped sets, writes nothing). `core` with no approved version is a hard hold+alarm.
+fn compose_mandates(fleet: &Fleet, agent: &str, out: &str, write: bool) {
+    let _ = fleet;
+    let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("compose-mandates: {e}");
         std::process::exit(1);
     });
-    let composed = compose_mandate_artifact(&sets).unwrap_or_else(|e| {
+    let (composed, npaths) = compose_agent_artifact(&board, agent).unwrap_or_else(|e| {
         // core hard-required: hold + alarm rather than compose a mandate with no universal contract.
         eprintln!("compose-mandates: {e}");
         std::process::exit(1);
@@ -2609,40 +2638,99 @@ fn compose_mandates(fleet: &Fleet, agent: &str, out: &str, write: bool) {
     if !write {
         println!(
             "compose-mandates: DRY-RUN for {agent} ({} set(s), {} skipped). Pass --write to materialize to {out}.\n---\n{}",
-            paths.len(),
+            npaths,
             composed.skipped.len(),
             composed.artifact
         );
         return;
     }
-    let existing = std::fs::read_to_string(out).ok();
-    if !artifact_changed(&composed.artifact, existing.as_deref()) {
-        println!("compose-mandates: {agent}: {out} already current (no change)");
-        return;
+    match write_artifact_if_changed(std::path::Path::new(out), &composed.artifact) {
+        Ok(false) => println!("compose-mandates: {agent}: {out} already current (no change)"),
+        Ok(true) => println!(
+            "compose-mandates: {agent}: wrote {out} ({} bytes, {} set(s), {} skipped)",
+            composed.artifact.len(),
+            npaths,
+            composed.skipped.len()
+        ),
+        Err(e) => {
+            eprintln!("compose-mandates: {e}");
+            std::process::exit(1);
+        }
     }
-    let out_path = std::path::Path::new(out);
-    if let Some(dir) = out_path.parent()
-        && let Err(e) = std::fs::create_dir_all(dir)
-    {
-        eprintln!("compose-mandates: cannot create {}: {e}", dir.display());
+}
+
+/// Sweep every board agent's mandate artifact into a per-agent file under `out_dir` (task_906, the materialize
+/// compose step). A strict boot no-op: it only produces `<out_dir>/<agent>.md`; it touches no boot path, so no
+/// agent reads these yet - the boot-path read-with-fallback rides the window.sh->Rust port (task_1318, Option
+/// 2). DRY-RUN by default (reports what would be written); `--write` materializes (atomic, hash-gated per
+/// agent). Reuses the single-agent compose path; one agent's compose error (e.g. no approved `core`) is logged
+/// and skipped, never aborts the sweep. `out_dir` defaults to `<hub>/.claude/fleet/mandates`.
+fn compose_mandates_sweep(fleet: &Fleet, out_dir: Option<&str>, write: bool) {
+    let board = board::Board::connect().unwrap_or_else(|e| {
+        eprintln!("compose-mandates-sweep: {e}");
         std::process::exit(1);
-    }
-    let tmp = format!("{out}.tmp.{}", std::process::id());
-    if let Err(e) = std::fs::write(&tmp, &composed.artifact) {
-        eprintln!("compose-mandates: write {tmp} failed: {e}");
+    });
+    let dir = out_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fleet.root.join("mandates"));
+    let agents = board.list_agents().unwrap_or_else(|e| {
+        eprintln!("compose-mandates-sweep: cannot list agents: {e}");
         std::process::exit(1);
+    });
+    let (mut wrote, mut unchanged, mut skipped_agents) = (0usize, 0usize, 0usize);
+    for a in &agents {
+        let Some(id) = a.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let (composed, npaths) = match compose_agent_artifact(&board, id) {
+            Ok(c) => c,
+            Err(e) => {
+                skipped_agents += 1;
+                eprintln!("compose-mandates-sweep: {id}: {e} (skipped)");
+                continue;
+            }
+        };
+        let out = dir.join(format!("{id}.md"));
+        if !write {
+            println!(
+                "compose-mandates-sweep: DRY-RUN {id}: {} bytes, {} set(s), {} skipped -> {}",
+                composed.artifact.len(),
+                npaths,
+                composed.skipped.len(),
+                out.display()
+            );
+            continue;
+        }
+        match write_artifact_if_changed(&out, &composed.artifact) {
+            Ok(true) => {
+                wrote += 1;
+                println!(
+                    "compose-mandates-sweep: {id}: wrote {} ({} bytes, {} skipped)",
+                    out.display(),
+                    composed.artifact.len(),
+                    composed.skipped.len()
+                );
+            }
+            Ok(false) => unchanged += 1,
+            Err(e) => {
+                skipped_agents += 1;
+                eprintln!("compose-mandates-sweep: {id}: {e} (skipped)");
+            }
+        }
     }
-    if let Err(e) = std::fs::rename(&tmp, out) {
-        eprintln!("compose-mandates: rename into {out} failed: {e}");
-        let _ = std::fs::remove_file(&tmp);
-        std::process::exit(1);
+    if write {
+        println!(
+            "compose-mandates-sweep: {} agent(s): {wrote} wrote, {unchanged} unchanged, {skipped_agents} skipped -> {}",
+            agents.len(),
+            dir.display()
+        );
+    } else {
+        println!(
+            "compose-mandates-sweep: DRY-RUN over {} agent(s) ({skipped_agents} skipped); pass --write to materialize under {}",
+            agents.len(),
+            dir.display()
+        );
     }
-    println!(
-        "compose-mandates: {agent}: wrote {out} ({} bytes, {} set(s), {} skipped)",
-        composed.artifact.len(),
-        paths.len(),
-        composed.skipped.len()
-    );
 }
 
 #[derive(Parser)]
@@ -3848,6 +3936,19 @@ enum Cmd {
         #[arg(long)]
         write: bool,
     },
+    /// Sweep every board agent's mandate artifact into a per-agent file under --out-dir (task_906, the
+    /// materialize compose step). A strict boot no-op: it produces `<out-dir>/<agent>.md` only and touches no
+    /// boot path, so no agent reads these yet (the boot-path read-with-fallback rides the window.sh->Rust
+    /// port). DRY-RUN by default; --write materializes (atomic, hash-gated per agent). --out-dir defaults to
+    /// `<hub>/.claude/fleet/mandates`.
+    ComposeMandatesSweep {
+        /// Directory for the per-agent artifacts (default `<hub>/.claude/fleet/mandates`).
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Atomically write each agent's artifact (only when changed); default is a dry-run.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 fn main() {
@@ -3993,6 +4094,9 @@ fn main() {
             execute,
         ),
         Cmd::ComposeMandates { agent, out, write } => compose_mandates(&fleet, &agent, &out, write),
+        Cmd::ComposeMandatesSweep { out_dir, write } => {
+            compose_mandates_sweep(&fleet, out_dir.as_deref(), write)
+        }
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session(), &fleet.root) {
                 eprintln!("{e}");
@@ -17654,6 +17758,29 @@ detached
             !artifact_changed("A", Some("A")),
             "identical content -> skip (no boot-file churn)"
         );
+    }
+
+    #[test]
+    fn write_artifact_if_changed_creates_then_gates_on_content() {
+        let dir = std::env::temp_dir().join(format!("fleet-mandate-sweep-{}", std::process::id()));
+        let out = dir.join("sub").join("agent.md");
+        // First write: parent dirs are created and the artifact lands -> wrote=true.
+        assert_eq!(
+            write_artifact_if_changed(&out, "V1"),
+            Ok(true),
+            "first write creates the file + parents"
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "V1");
+        // Same content: hash-gated no-op -> wrote=false, file untouched.
+        assert_eq!(
+            write_artifact_if_changed(&out, "V1"),
+            Ok(false),
+            "identical content is a churn-free no-op"
+        );
+        // Changed content: rewrites atomically -> wrote=true.
+        assert_eq!(write_artifact_if_changed(&out, "V2"), Ok(true), "changed content rewrites");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "V2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
