@@ -9912,7 +9912,7 @@ fn monitor_tick_wakes(verdict: &SeamVerdict) -> bool {
     !matches!(verdict, SeamVerdict::Green { .. })
 }
 
-/// task_579 actionable-delta pre-gate: whether to WAKE the model this tick. This gates the MODEL TURN, not the
+/// task_579 actionable-delta pre-gate: whether to wake the model this tick. This gates the model turn, not the
 /// cron cadence - an explicit operator `/loop <short-interval>` defeats cron-cadence gating (membrain-net-read-tears
 /// ran 80+ no-op ticks after an operator re-set a 10m cron over its own correct at-rest cadence), so the gate must
 /// sit on the turn and collapse the no-op wakes regardless of the cron. Wakes on ANY actionable delta: a non-empty
@@ -9932,7 +9932,7 @@ fn should_wake_model(
 }
 
 /// task_579 case (d): whether a blocked-on-external dependency gated on a once-per-UTC-day rollover - the
-/// membrain-net-read-tears TPCII->VS daily-merge case the observer flagged - is plausibly resolvable THIS tick.
+/// membrain-net-read-tears once-per-UTC-day upstream dependency merge case the observer flagged - is plausibly resolvable this tick.
 /// True when the UTC calendar day has advanced since the dependency was last evaluated, so the model is woken to
 /// re-test the merge exactly once per rollover rather than on every poll in between. `last_check_unix` is when the
 /// dep was last evaluated and `now_unix` is now; a dep never checked (`None`) is due (the first evaluation). Pure
