@@ -2602,7 +2602,8 @@ fn write_artifact_if_changed(out: &std::path::Path, artifact: &str) -> Result<bo
         return Ok(false);
     }
     if let Some(dir) = out.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
     let tmp = out.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, artifact).map_err(|e| format!("write {} failed: {e}", tmp.display()))?;
@@ -10179,13 +10180,53 @@ fn seam_check(agent: &str, no_fetch: bool) {
     }
 }
 
+/// task_579 case (d): the per-agent blocked-rollover stamp — `<root>/watchdog/monitor-tick/<agent>.blocked-check`
+/// (contents = unix secs of the last blocked-rollover wake). `monitor-tick` records here each time it wakes the
+/// model for the once-per-UTC-day blocked-external re-check, so [`blocked_external_rollover_due`] fires at most
+/// once per rollover however fast the tick polls in between.
+fn monitor_blocked_stamp_path(fleet: &Fleet, agent: &str) -> PathBuf {
+    fleet
+        .root
+        .join("watchdog")
+        .join("monitor-tick")
+        .join(format!("{agent}.blocked-check"))
+}
+
+/// Read an agent's last blocked-rollover-wake unix time; `None` on an absent/unparseable stamp (never woken for
+/// a block → the first evaluation is due).
+fn read_monitor_blocked_stamp(fleet: &Fleet, agent: &str) -> Option<u64> {
+    std::fs::read_to_string(monitor_blocked_stamp_path(fleet, agent))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record a blocked-rollover wake at `now` (best-effort — a write failure only risks one extra re-check on the
+/// next poll, the safe direction for a wake gate).
+fn write_monitor_blocked_stamp(fleet: &Fleet, agent: &str, now: u64) {
+    let p = monitor_blocked_stamp_path(fleet, agent);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
 /// `fleet monitor-tick <agent>` (task_579): the committed, OPT-IN gated-wake mechanism for an at-rest MONITOR
-/// vertical. It computes the seam decision ([`seam_decision`]) and, on GREEN, performs the agent's board
-/// HEARTBEAT (refreshing last-seen + a canned status) and exits 0 WITHOUT a model wake — so a deterministic
-/// "nothing changed" tick costs no model turn. On CHANGED (or, fail-safe, a no-seam / error) it prints and
-/// exits 3 so a kickoff wrapper injects a model wake with the changed paths in hand. REPORT-ONLY by default
-/// (prints what it would do, no board write); `--apply` performs the green heartbeat. DARK + OPT-IN: committing
-/// it changes nothing until an agent's loop/kickoff is switched to call it — that activation is operator-gated.
+/// vertical. It computes the two deterministic pre-gate signals — the seam decision ([`seam_decision`], case
+/// (c)) and the blocked-external once-per-UTC-day rollover ([`blocked_external_rollover_due`], case (d)) — and
+/// applies [`should_wake_model`]. When neither fires (seam GREEN, no blocked-rollover due) it performs the
+/// agent's board HEARTBEAT (refreshing last-seen + a canned status) and exits 0 WITHOUT a model wake — so a
+/// deterministic "nothing changed" tick costs no model turn. Otherwise (a seam change, a rollover re-check due,
+/// or, fail-safe, a no-seam / error) it prints and exits 3 so a kickoff wrapper injects a model wake.
+///
+/// Per v-fleet-tooling's task_579 lead decision the pre-gate is purely deterministic: the inbox/notification (a)
+/// and board/inbox sync (b) signals stay on the board event-wake path — an actionable DM or board change wakes
+/// the model on its own path, independent of this cron tick — so they are passed `false` and never gated here.
+///
+/// REPORT-ONLY by default (prints what it would do, no board write, no stamp mutation); `--apply` performs the
+/// held heartbeat and records the blocked-rollover stamp. DARK + OPT-IN: committing it changes nothing until an
+/// agent's loop/kickoff is switched to call it — that activation is operator-gated.
 fn monitor_tick(agent: &str, apply: bool, no_fetch: bool) {
     let board = board::Board::connect().unwrap_or_else(|e| {
         eprintln!("fleet monitor-tick: {e}");
@@ -10201,32 +10242,48 @@ fn monitor_tick(agent: &str, apply: bool, no_fetch: bool) {
         .unwrap_or("online")
         .to_string();
     let verdict = seam_decision(&rec, no_fetch);
+    let seam_wakes = monitor_tick_wakes(&verdict);
+
+    // Case (d): a parked assigned task puts the agent in a blocked-external posture; wake the model once per
+    // UTC-day rollover to re-test whether the block cleared (not on every poll). A blocked-count error is a
+    // fail-safe WAKE (never silently skip a tick we could not fully gate) but is NOT stamped as a real rollover
+    // re-check, so a transient board blip does not consume the day's one re-check.
+    let fleet = Fleet::resolve();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (blocked_dep_due, blocked_rollover_fired) = match board.blocked_task_count(agent) {
+        Ok(0) => (false, false),
+        Ok(_) => {
+            let due = blocked_external_rollover_due(read_monitor_blocked_stamp(&fleet, agent), now);
+            (due, due)
+        }
+        Err(e) => {
+            eprintln!(
+                "monitor-tick '{agent}': blocked-task lookup failed ({e}); waking the model fail-safe"
+            );
+            (true, false)
+        }
+    };
+
+    // The deterministic pre-gate inputs are the seam (c) and the blocked-rollover (d) ONLY; (a)/(b) stay on the
+    // board event-wake path (see the fn doc), so they are deliberately `false` here.
+    let wake = should_wake_model(false, false, seam_wakes, blocked_dep_due);
+
     match &verdict {
         SeamVerdict::Green {
             incoming,
             seams,
             head,
         } => {
-            let msg = format!(
-                "MONITOR: seam green — synced to {head}, {incoming} incoming file(s), none on {seams} seam glob(s); model turn gated (skipped)"
+            println!(
+                "monitor-tick '{agent}': seam GREEN — synced to {head}, {incoming} incoming file(s), none on {seams} seam glob(s)"
             );
-            if apply {
-                if let Err(e) = board.set_status(agent, &status, &msg) {
-                    eprintln!(
-                        "monitor-tick '{agent}': GREEN but heartbeat set_status failed ({e}); waking the model fail-safe"
-                    );
-                    std::process::exit(3);
-                }
-                println!("monitor-tick '{agent}': GREEN — heartbeat set, model NOT woken");
-            } else {
-                println!(
-                    "monitor-tick '{agent}': GREEN (report-only) — would heartbeat + NOT wake the model (re-run --apply to heartbeat): {msg}"
-                );
-            }
         }
         SeamVerdict::Changed(matched) => {
             println!(
-                "monitor-tick '{agent}': CHANGED — {} seam-touching path(s), WAKE the model:",
+                "monitor-tick '{agent}': seam CHANGED — {} seam-touching path(s), WAKE:",
                 matched.len()
             );
             for p in matched {
@@ -10235,14 +10292,45 @@ fn monitor_tick(agent: &str, apply: bool, no_fetch: bool) {
         }
         SeamVerdict::NoSeam => {
             eprintln!(
-                "monitor-tick '{agent}': no metadata.seam declared — cannot gate; WAKE the model (fail-safe). Declare metadata.seam to enable gating."
+                "monitor-tick '{agent}': no metadata.seam declared — cannot gate; WAKE (fail-safe). Declare metadata.seam to enable gating."
             );
         }
         SeamVerdict::Error(e) => {
-            eprintln!("monitor-tick '{agent}': {e} — cannot gate; WAKE the model (fail-safe)");
+            eprintln!("monitor-tick '{agent}': {e} — cannot gate; WAKE (fail-safe)");
         }
     }
-    std::process::exit(if monitor_tick_wakes(&verdict) { 3 } else { 0 });
+    if blocked_rollover_fired {
+        println!(
+            "monitor-tick '{agent}': blocked-external posture — once-per-UTC-day rollover re-check due, WAKE"
+        );
+    }
+
+    if !wake {
+        // Deterministically nothing to do (seam GREEN, no blocked-rollover due): advance last-seen + heartbeat
+        // and do NOT wake the model — the whole point of the pre-gate.
+        let msg = "MONITOR: deterministic pre-gate held — seam green, no blocked-rollover due; model turn gated (skipped)";
+        if apply {
+            if let Err(e) = board.set_status(agent, &status, msg) {
+                eprintln!(
+                    "monitor-tick '{agent}': held but heartbeat set_status failed ({e}); waking the model fail-safe"
+                );
+                std::process::exit(3);
+            }
+            println!("monitor-tick '{agent}': HELD — heartbeat set, model NOT woken");
+        } else {
+            println!(
+                "monitor-tick '{agent}': HELD (report-only) — would heartbeat + NOT wake the model (re-run --apply to heartbeat): {msg}"
+            );
+        }
+        std::process::exit(0);
+    }
+
+    // Waking: record a blocked-rollover re-check so case (d) fires at most once per UTC-day rollover
+    // (best-effort, apply-only — report-only never mutates runtime state).
+    if apply && blocked_rollover_fired {
+        write_monitor_blocked_stamp(&fleet, agent, now);
+    }
+    std::process::exit(3);
 }
 
 /// task_582 watchdog-scan tuning. `*_THRESHOLD` / `*_TAIL` MATCH the `Cmd::SafeguardCheck` defaults (3 / 80)
@@ -17778,7 +17866,11 @@ detached
             "identical content is a churn-free no-op"
         );
         // Changed content: rewrites atomically -> wrote=true.
-        assert_eq!(write_artifact_if_changed(&out, "V2"), Ok(true), "changed content rewrites");
+        assert_eq!(
+            write_artifact_if_changed(&out, "V2"),
+            Ok(true),
+            "changed content rewrites"
+        );
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "V2");
         let _ = std::fs::remove_dir_all(&dir);
     }
