@@ -4637,9 +4637,9 @@ fn repair_cargo_home(cargo_home: &Path) -> Vec<String> {
     repairs
 }
 
-/// Detect and repair the contamination a deleted git worktree leaves in the Membrain SHARED cargo-brazil env
+/// Detect and repair the contamination a deleted git worktree leaves in the Membrain shared cargo-brazil env
 /// (task_1452). A prior session's `.claude/worktrees/<name>` paths linger in the generated `brazil.toml`
-/// manifest/env cache and in the `Config-in-pkg` backlink; every `cargo` / `cargo nextest` in the SHARED env
+/// manifest/env cache and in the `Config-in-pkg` backlink; every `cargo` / `cargo nextest` in the shared env
 /// then fails resolving a `Cargo.toml` under a directory that no longer exists, wedging the whole-tree bootstrap
 /// the setup_script is about to run — and every sibling Membrain agent on the shared env, not just the one that
 /// deleted the worktree. The env lives at `src/<package>/build/private/cargo-home/` (the `build` symlink points
@@ -4768,7 +4768,7 @@ fn spin_up_workspace_kind(
         std::process::exit(1);
     }
 
-    // task_1452: the membrain kind's SHARED cargo-brazil env is contaminated when a prior session deletes a git
+    // task_1452: the membrain kind's shared cargo-brazil env is contaminated when a prior session deletes a git
     // worktree whose paths still linger in the generated brazil.toml cache / Config backlink — every cargo +
     // cargo nextest in that shared env then fails on a Cargo.toml under a directory that no longer exists,
     // wedging the whole-tree bootstrap the setup_script is about to run (and every sibling membrain agent).
@@ -18345,7 +18345,7 @@ value = \"/repo/.claude/worktrees/dead/target\"
         let base = std::env::temp_dir()
             .join(format!("fleet-mbrepair-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&base);
-        // A repo root with a LIVE worktree present on disk and a DEAD one that was deleted.
+        // A repo root with a LIVE worktree present on disk and a dead one that was deleted.
         let repo = base.join("repo");
         let live_wt = repo.join(".claude/worktrees/live");
         std::fs::create_dir_all(&live_wt).unwrap();
@@ -18359,7 +18359,7 @@ value = \"/repo/.claude/worktrees/dead/target\"
             live = live_wt.display(),
         );
         std::fs::write(cargo_home.join("brazil.toml"), &brazil_toml).unwrap();
-        // A Config-in-pkg backlink dangling into the dead worktree, plus (to prove safety) a VALID one would be
+        // A Config-in-pkg backlink dangling into the dead worktree, plus (to prove safety) a valid one would be
         // kept — tested separately below.
         symlink(
             dead_wt.join("Config"),
@@ -18385,7 +18385,7 @@ value = \"/repo/.claude/worktrees/dead/target\"
         // Idempotent: a second pass on the now-clean env makes no further repairs.
         assert!(repair_cargo_home(&cargo_home).is_empty());
 
-        // Safety: a backlink that still RESOLVES (points at a live worktree's Config) is left in place.
+        // Safety: a backlink that still resolves (points at a live worktree's Config) is left in place.
         std::fs::write(live_wt.join("Config"), b"cfg").unwrap();
         symlink(live_wt.join("Config"), cargo_home.join("Config-in-pkg")).unwrap();
         assert!(repair_cargo_home(&cargo_home).is_empty());
