@@ -14,6 +14,11 @@
 //!     "deliberately no", "intentionally not"). The anchors match on word boundaries, not as a raw
 //!     substring, so a plain negation (does not exist, is not null) stays clean. The anchor list is
 //!     hand-maintained in prose-style.toml and preserved by the sync, like the caps allow-list.
+//!   - operator-attribution: a code comment that justifies a design choice by citing the operator rather
+//!     than explaining the design on its own terms. It fires on a "per <operator>" lead-in, or on an
+//!     operator name co-occurring with a board-comment citation (comment_N). A plain typed ref such as a
+//!     task_N on its own stays clean, so the typed-ref norm is respected. The operator-name list is
+//!     hand-maintained in prose-style.toml and preserved by the sync.
 //!
 //! The scope is comments, not code. A listed word inside a string literal or an identifier is out of
 //! scope, so the lint does not fire on a user-facing string. Markdown prose lines are scanned whole,
@@ -34,6 +39,8 @@ pub enum Rule {
     CapsEmphasis,
     /// An anchored phrase that defines a thing by stating what it is not.
     DefineByNegation,
+    /// A comment that justifies a design choice by citing the operator.
+    OperatorAttribution,
 }
 
 impl Rule {
@@ -42,6 +49,7 @@ impl Rule {
             Rule::Emphatic => "emphatic",
             Rule::CapsEmphasis => "caps-for-emphasis",
             Rule::DefineByNegation => "define-by-negation",
+            Rule::OperatorAttribution => "operator-attribution",
         }
     }
 }
@@ -73,6 +81,8 @@ struct RulesetFile {
     caps_allow: Vec<String>,
     #[serde(default)]
     negation_anchors: Vec<String>,
+    #[serde(default)]
+    operator_names: Vec<String>,
 }
 
 /// A compiled ruleset ready to match: emphatics pre-lowercased for a case-insensitive match, the caps
@@ -83,6 +93,7 @@ pub struct Ruleset {
     emphatics_lower: Vec<String>,
     caps_allow: BTreeSet<String>,
     negation_anchors: Vec<Vec<String>>,
+    operator_names: Vec<Vec<String>>,
 }
 
 /// Split text into its lowercase word tokens: maximal runs of ASCII alphanumerics, with every other
@@ -131,10 +142,19 @@ pub fn parse_ruleset(toml_src: &str) -> Result<Ruleset, String> {
         }
         negation_anchors.push(words);
     }
+    let mut operator_names = Vec::new();
+    for n in parsed.operator_names {
+        let words = word_tokens(&n);
+        if words.is_empty() {
+            return Err("ruleset has an empty operator name".to_string());
+        }
+        operator_names.push(words);
+    }
     Ok(Ruleset {
         emphatics_lower,
         caps_allow,
         negation_anchors,
+        operator_names,
     })
 }
 
@@ -192,11 +212,47 @@ pub fn match_negation(text: &str, rs: &Ruleset) -> Vec<String> {
         .collect()
 }
 
+/// The index in `hay` where `needle` first appears as a consecutive run of whole elements, or None.
+fn find_run(hay: &[String], needle: &[String]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
 /// Does `needle` appear as a consecutive run of whole elements in `hay`?
 fn is_consecutive_run(hay: &[String], needle: &[String]) -> bool {
-    !needle.is_empty()
-        && needle.len() <= hay.len()
-        && hay.windows(needle.len()).any(|w| w == needle)
+    find_run(hay, needle).is_some()
+}
+
+/// Does the token run carry a board-comment citation (a `comment` token immediately followed by an
+/// all-digit token, which is how `comment_7875` tokenizes)? This is the justification-by-reference signal:
+/// a code comment pointing at a specific board comment to justify the code.
+fn has_comment_citation(toks: &[String]) -> bool {
+    toks.windows(2)
+        .any(|w| w[0] == "comment" && !w[1].is_empty() && w[1].chars().all(|c| c.is_ascii_digit()))
+}
+
+/// The operator-attribution signals found in one line of prose. For each configured operator name, this
+/// fires on a "per <name>" lead-in, or on the name co-occurring with a board-comment citation (comment_N).
+/// A bare operator name with neither a "per" lead-in nor a comment citation stays clean, so a plain typed
+/// ref such as `task_1427 (cameron)` is not flagged and the typed-ref norm is respected.
+pub fn match_operator_attribution(text: &str, rs: &Ruleset) -> Vec<String> {
+    let toks = word_tokens(text);
+    let cited = has_comment_citation(&toks);
+    let mut out = Vec::new();
+    for name in &rs.operator_names {
+        let Some(pos) = find_run(&toks, name) else {
+            continue;
+        };
+        let joined = name.join(" ");
+        if pos > 0 && toks[pos - 1] == "per" {
+            out.push(format!("per {joined}"));
+        } else if cited {
+            out.push(format!("{joined} + comment-ref"));
+        }
+    }
+    out
 }
 
 /// Run every rule over a set of comment lines from one file, collecting findings.
@@ -225,6 +281,14 @@ pub fn lint_comment_lines(file: &str, lines: &[CommentLine], rs: &Ruleset) -> Ve
                 line: cl.line,
                 rule: Rule::DefineByNegation,
                 token: anchor,
+            });
+        }
+        for signal in match_operator_attribution(&cl.text, rs) {
+            out.push(Finding {
+                file: file.to_string(),
+                line: cl.line,
+                rule: Rule::OperatorAttribution,
+                token: signal,
             });
         }
     }
@@ -587,6 +651,11 @@ const RULESET_HEADER: &str = "\
 # a thing by stating what it is not. Each anchor matches on word boundaries, not as a raw substring, so a
 # plain negation (does not exist, is not null) stays clean. It is hand-maintained here and preserved by the
 # sync, like caps_allow; keep it conservative and seeded from real operator-named forms.
+#
+# `operator_names` is the operator-attribution rule's list of operator names. A comment fires when it uses a
+# \"per <name>\" lead-in or names an operator alongside a board-comment citation (comment_N), the pattern of
+# justifying code by the operator rather than by the design. A bare typed ref (task_N) stays clean. It is
+# hand-maintained here and preserved by the sync.
 ";
 
 /// Quote one string as a TOML double-quoted array entry with a trailing comma, escaping a backslash and a
@@ -603,6 +672,7 @@ pub fn render_ruleset_toml(
     emphatics: &[String],
     caps_allow: &[String],
     negation_anchors: &[String],
+    operator_names: &[String],
 ) -> String {
     let render_list = |name: &str, items: &[String]| {
         let mut v = items.to_vec();
@@ -624,15 +694,17 @@ pub fn render_ruleset_toml(
     s.push_str(&render_list("caps_allow", caps_allow));
     s.push('\n');
     s.push_str(&render_list("negation_anchors", negation_anchors));
+    s.push('\n');
+    s.push_str(&render_list("operator_names", operator_names));
     s
 }
 
-/// The three raw ruleset lists in file order: emphatics, caps_allow, negation_anchors.
-pub type RawLists = (Vec<String>, Vec<String>, Vec<String>);
+/// The four raw ruleset lists in file order: emphatics, caps_allow, negation_anchors, operator_names.
+pub type RawLists = (Vec<String>, Vec<String>, Vec<String>, Vec<String>);
 
-/// The raw (original-case, trimmed) emphatics, caps_allow, and negation_anchors arrays from a ruleset file.
-/// The sync uses this to preserve the hand-maintained caps_allow and negation_anchors while it refreshes
-/// emphatics from the board.
+/// The raw (original-case, trimmed) emphatics, caps_allow, negation_anchors, and operator_names arrays from
+/// a ruleset file. The sync uses this to preserve the hand-maintained lists while it refreshes emphatics
+/// from the board.
 pub fn parse_raw_lists(toml_src: &str) -> Result<RawLists, String> {
     let parsed: RulesetFile =
         toml::from_str(toml_src).map_err(|e| format!("ruleset parse error: {e}"))?;
@@ -641,6 +713,7 @@ pub fn parse_raw_lists(toml_src: &str) -> Result<RawLists, String> {
         trim(parsed.emphatics),
         trim(parsed.caps_allow),
         trim(parsed.negation_anchors),
+        trim(parsed.operator_names),
     ))
 }
 
@@ -727,8 +800,8 @@ pub fn prose_sync(opts: SyncOpts) {
             std::process::exit(2);
         }
     };
-    let (caps_allow, negation_anchors) = match parse_raw_lists(&existing) {
-        Ok((_emph, caps, neg)) => (caps, neg),
+    let (caps_allow, negation_anchors, operator_names) = match parse_raw_lists(&existing) {
+        Ok((_emph, caps, neg, ops)) => (caps, neg, ops),
         Err(e) => {
             eprintln!("prose-sync: {e}");
             std::process::exit(2);
@@ -751,7 +824,7 @@ pub fn prose_sync(opts: SyncOpts) {
             std::process::exit(2);
         }
     };
-    let rendered = render_ruleset_toml(&emphatics, &caps_allow, &negation_anchors);
+    let rendered = render_ruleset_toml(&emphatics, &caps_allow, &negation_anchors, &operator_names);
     if rendered == existing {
         println!("prose-sync: in sync ({} emphatic(s))", emphatics.len());
         return;
@@ -786,6 +859,7 @@ mod tests {
             emphatics = ["load-bearing", "leverage", "it's worth noting"]
             caps_allow = ["CI", "HTTP", "JSON"]
             negation_anchors = ["deliberately no", "deliberately not", "intentionally no", "intentionally not"]
+            operator_names = ["cameron"]
         "#,
         )
         .unwrap()
@@ -913,6 +987,47 @@ mod tests {
     }
 
     #[test]
+    fn attribution_flags_a_per_operator_lead_in() {
+        let hits = match_operator_attribution("skip the retry here per cameron", &rs());
+        assert_eq!(hits, vec!["per cameron"]);
+    }
+
+    #[test]
+    fn attribution_flags_an_operator_name_with_a_board_comment_citation() {
+        // The motivating harness form: an operator name justifying code alongside a comment_N citation.
+        let hits =
+            match_operator_attribution("cameron no-poll hard line, task_1427 comment_7875", &rs());
+        assert_eq!(hits, vec!["cameron + comment-ref"]);
+    }
+
+    #[test]
+    fn attribution_leaves_a_plain_typed_ref_clean() {
+        // A bare task_N typed ref naming the operator, with no `per` lead-in and no comment_N citation, is
+        // the encouraged typed-ref form and must stay clean (the false-positive guard).
+        let hits = match_operator_attribution("switch to actionable (task_1427, cameron)", &rs());
+        assert!(
+            hits.is_empty(),
+            "a plain typed ref is not an attribution: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn attribution_does_not_fire_on_an_operator_name_inside_another_word() {
+        // Word-boundary: `cameron` must be a whole token, so a word that merely contains it is clean.
+        let hits = match_operator_attribution("see the cameroness helper for details", &rs());
+        assert!(
+            hits.is_empty(),
+            "a substring of a larger word is clean: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn attribution_is_case_insensitive() {
+        let hits = match_operator_attribution("Per Cameron, drop the cache", &rs());
+        assert_eq!(hits, vec!["per cameron"]);
+    }
+
+    #[test]
     fn extract_comments_line_comment() {
         let src = "let x = 1; // keep it SIMPLE\n";
         let c = extract_comments_rs(src);
@@ -1026,6 +1141,18 @@ mod tests {
     }
 
     #[test]
+    fn lint_file_reports_an_operator_attribution_finding() {
+        let src = "// drop the retry per cameron\nfn f() {}\n";
+        let found = lint_file("src/x.rs", src, &rs());
+        assert!(
+            found
+                .iter()
+                .any(|f| f.rule == Rule::OperatorAttribution && f.token == "per cameron"),
+            "got: {found:?}"
+        );
+    }
+
+    #[test]
     fn shipped_ruleset_parses_and_carries_the_board_phrases() {
         let shipped = include_str!("../prose-style.toml");
         let r = parse_ruleset(shipped).expect("shipped ruleset parses");
@@ -1046,14 +1173,26 @@ mod tests {
     }
 
     #[test]
+    fn shipped_ruleset_carries_the_operator_names() {
+        let shipped = include_str!("../prose-style.toml");
+        let r = parse_ruleset(shipped).expect("shipped ruleset parses");
+        assert!(
+            r.operator_names
+                .iter()
+                .any(|n| n == &vec!["cameron".to_string()]),
+            "the shipped ruleset seeds the operator-attribution names"
+        );
+    }
+
+    #[test]
     fn shipped_ruleset_is_in_canonical_render_form() {
         // The committed prose-style.toml is the output of `fleet prose-sync`. Guard that it is already in
         // canonical render form, so a later `prose-sync --check` does not report drift on it (modulo the
         // board emphatics refresh, which this does not exercise).
         let shipped = include_str!("../prose-style.toml");
-        let (emph, caps, neg) = parse_raw_lists(shipped).expect("shipped ruleset parses");
+        let (emph, caps, neg, ops) = parse_raw_lists(shipped).expect("shipped ruleset parses");
         assert_eq!(
-            render_ruleset_toml(&emph, &caps, &neg),
+            render_ruleset_toml(&emph, &caps, &neg, &ops),
             shipped,
             "committed prose-style.toml must match the canonical sync render"
         );
@@ -1067,7 +1206,7 @@ mod tests {
             "leverage".to_string(),
         ];
         let caps = vec!["HTTP".to_string(), "CI".to_string()];
-        let out = render_ruleset_toml(&emph, &caps, &[]);
+        let out = render_ruleset_toml(&emph, &caps, &[], &[]);
         // emphatics appear sorted and deduped.
         let i_load = out.find("\"load-bearing\"").unwrap();
         let i_lev = out.find("\"leverage\"").unwrap();
@@ -1084,40 +1223,46 @@ mod tests {
         let emph = vec!["it's worth noting".to_string(), "robust".to_string()];
         let caps = vec!["API".to_string()];
         let neg = vec!["deliberately no".to_string()];
-        let once = render_ruleset_toml(&emph, &caps, &neg);
-        let (e2, c2, n2) = parse_raw_lists(&once).unwrap();
-        let twice = render_ruleset_toml(&e2, &c2, &n2);
+        let once = render_ruleset_toml(&emph, &caps, &neg, &["cameron".to_string()]);
+        let (e2, c2, n2, o2) = parse_raw_lists(&once).unwrap();
+        let twice = render_ruleset_toml(&e2, &c2, &n2, &o2);
         assert_eq!(once, twice, "a render of a parsed render is identical");
     }
 
     #[test]
     fn render_escapes_quotes_and_backslashes() {
-        let out = render_ruleset_toml(&[r#"a "quote" and \slash"#.to_string()], &[], &[]);
+        let out = render_ruleset_toml(&[r#"a "quote" and \slash"#.to_string()], &[], &[], &[]);
         assert!(out.contains(r#""a \"quote\" and \\slash","#), "got: {out}");
         parse_ruleset(&out).expect("escaped render parses");
     }
 
     #[test]
     fn parse_raw_lists_preserves_case_for_caps_allow() {
-        let (emph, caps, neg) = parse_raw_lists(
+        let (emph, caps, neg, ops) = parse_raw_lists(
             r#"
             emphatics = ["Load-Bearing"]
             caps_allow = ["ASCII", "CI"]
             negation_anchors = ["deliberately no"]
+            operator_names = ["cameron"]
         "#,
         )
         .unwrap();
         assert_eq!(emph, vec!["Load-Bearing"]);
         assert_eq!(caps, vec!["ASCII", "CI"]);
         assert_eq!(neg, vec!["deliberately no"]);
+        assert_eq!(ops, vec!["cameron"]);
     }
 
     #[test]
     fn a_changed_board_list_makes_render_differ_so_drift_is_detectable() {
         let caps = vec!["CI".to_string()];
-        let before = render_ruleset_toml(&["robust".to_string()], &caps, &[]);
-        let after =
-            render_ruleset_toml(&["robust".to_string(), "seamless".to_string()], &caps, &[]);
+        let before = render_ruleset_toml(&["robust".to_string()], &caps, &[], &[]);
+        let after = render_ruleset_toml(
+            &["robust".to_string(), "seamless".to_string()],
+            &caps,
+            &[],
+            &[],
+        );
         assert_ne!(
             before, after,
             "an added board phrase changes the render (drift)"

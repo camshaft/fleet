@@ -13,6 +13,11 @@
 # a thing by stating what it is not. Each anchor matches on word boundaries, not as a raw substring, so a
 # plain negation (does not exist, is not null) stays clean. It is hand-maintained here and preserved by the
 # sync, like caps_allow; keep it conservative and seeded from real operator-named forms.
+#
+# `operator_names` is the operator-attribution rule's list of operator names. A comment fires when it uses a
+# "per <name>" lead-in or names an operator alongside a board-comment citation (comment_N), the pattern of
+# justifying code by the operator rather than by the design. A bare typed ref (task_N) stays clean. It is
+# hand-maintained here and preserved by the sync.
 
 emphatics = [
   "a testament to",
@@ -148,4 +153,8 @@ negation_anchors = [
   "deliberately not",
   "intentionally no",
   "intentionally not",
+]
+
+operator_names = [
+  "cameron",
 ]
