@@ -772,11 +772,6 @@
   {
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
-    "token": "AWS"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
     "token": "BACKS"
   },
   {
@@ -963,11 +958,6 @@
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
     "token": "COVERAGE"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
-    "token": "CR"
   },
   {
     "file": "crates/fleet/src/main.rs",
@@ -2752,11 +2742,6 @@
   {
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
-    "token": "TOCTOU"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
     "token": "TTL"
   },
   {
@@ -3023,6 +3008,16 @@
     "file": "crates/fleet/src/main.rs",
     "rule": "emphatic",
     "token": "robust"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "emphatic",
+    "token": "seam"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
+    "rule": "emphatic",
+    "token": "seams"
   },
   {
     "file": "crates/fleet/src/memory.rs",
@@ -3378,6 +3373,11 @@
     "file": "crates/fleet/src/scan.rs",
     "rule": "caps-for-emphasis",
     "token": "VOCABULARY"
+  },
+  {
+    "file": "crates/fleet/src/transcripts.rs",
+    "rule": "emphatic",
+    "token": "seam"
   },
   {
     "file": "crates/fleet/src/workspace.rs",
