@@ -280,6 +280,10 @@
         inherit pkgs;
         fleet = fleetPackage pkgs;
         fleetTunnel = fleetTunnelPackage pkgs;
+        # task_1334: the committed prose-style ruleset, copied into the nix store so install-fleet-daemons can
+        # point FLEET_PROSE_RULESET at an immutable store path (current with this build) rather than a mutable
+        # working checkout -- the FLEET_REPO checkout tracks the frozen local main and lacks the file.
+        proseRuleset = ./crates/fleet/prose-style.toml;
       };
     in
     {
