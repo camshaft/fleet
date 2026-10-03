@@ -158,6 +158,32 @@ fn parse_appended(v: &Value) -> Result<bool, String> {
         .ok_or_else(|| format!("append_review_log: no boolean `appended` in response {v}"))
 }
 
+/// Parse the board `/banned-phrases` response into the deduped, sorted phrase strings. The board
+/// returns the watchable-version envelope `{policy_kind, version, count, phrases:[{phrase,…}]}`
+/// (`list_banned_phrases`, camshaft/task-board#448); a pre-versioning board returned a bare array of
+/// those same records. Both shapes are accepted so the projection sync works across the board upgrade.
+fn parse_banned_phrases(resp: &Value) -> Result<Vec<String>, String> {
+    let arr = match resp {
+        Value::Array(a) => a,
+        Value::Object(o) => o.get("phrases").and_then(Value::as_array).ok_or_else(|| {
+            format!("board /banned-phrases: object without a `phrases` array, got {resp}")
+        })?,
+        other => {
+            return Err(format!(
+                "board /banned-phrases: expected an array or {{phrases:[…]}}, got {other}"
+            ));
+        }
+    };
+    let mut phrases: Vec<String> = arr
+        .iter()
+        .filter_map(|r| r.get("phrase").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    phrases.sort();
+    phrases.dedup();
+    Ok(phrases)
+}
+
 /// A handle to the board's REST API (stateless — each call is one `GET`).
 pub struct Board {
     base: String,
@@ -220,27 +246,14 @@ impl Board {
         self.get_json(&format!("/agents/{agent}"))
     }
 
-    /// The board banned-phrases wordlist (`GET /banned-phrases` -> an array of records, each with a `phrase`
-    /// field), as the deduped, sorted phrase strings. This is the one authoritative source the prose-lint
-    /// projection is synced from (task_1319); public CI cannot reach the board, so a maintenance tick syncs
-    /// it into a checked-in file rather than fetching at gate time.
+    /// The board banned-phrases wordlist (`GET /banned-phrases`), as the deduped, sorted phrase
+    /// strings. The response is the watchable-version envelope `{policy_kind, version, count,
+    /// phrases:[{phrase,…}]}` (camshaft/task-board#448); see [`parse_banned_phrases`], which also
+    /// accepts a bare array for a pre-versioning board. This is the one authoritative source the
+    /// prose-lint projection is synced from (task_1319); public CI cannot reach the board, so a
+    /// maintenance tick syncs it into a checked-in file rather than fetching at gate time.
     pub fn banned_phrases(&self) -> Result<Vec<String>, String> {
-        let arr = match self.get_json("/banned-phrases")? {
-            Value::Array(a) => a,
-            other => {
-                return Err(format!(
-                    "board /banned-phrases: expected an array, got {other}"
-                ));
-            }
-        };
-        let mut phrases: Vec<String> = arr
-            .iter()
-            .filter_map(|r| r.get("phrase").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect();
-        phrases.sort();
-        phrases.dedup();
-        Ok(phrases)
+        parse_banned_phrases(&self.get_json("/banned-phrases")?)
     }
 
     /// The set of agent ids the board currently has a LIVE reverse tunnel for (`GET /tunnels` →
@@ -660,6 +673,45 @@ mod tests {
         // The default is the front-door /board/api proxy, not the board's own unreachable port.
         assert!(DEFAULT_BASE.ends_with("/board/api"));
         assert!(DEFAULT_BASE.starts_with("http://"));
+    }
+
+    #[test]
+    fn banned_phrases_parses_the_watchable_version_envelope() {
+        // The versioned board wraps the list in {policy_kind, version, count, phrases:[…]}
+        // (camshaft/task-board#448). The sync must read `phrases`, sorted + deduped.
+        let resp = serde_json::json!({
+            "policy_kind": "banned_phrases",
+            "version": 3,
+            "count": 2,
+            "phrases": [
+                { "phrase": "spine", "note": "banned" },
+                { "phrase": "seam", "note": "banned" },
+            ],
+        });
+        assert_eq!(
+            parse_banned_phrases(&resp).unwrap(),
+            vec!["seam".to_string(), "spine".to_string()]
+        );
+    }
+
+    #[test]
+    fn banned_phrases_still_parses_a_bare_array() {
+        // A pre-versioning board returned the records as a top-level array; still accepted.
+        let resp = serde_json::json!([
+            { "phrase": "robust" },
+            { "phrase": "leverage" },
+            { "phrase": "robust" },
+        ]);
+        assert_eq!(
+            parse_banned_phrases(&resp).unwrap(),
+            vec!["leverage".to_string(), "robust".to_string()]
+        );
+    }
+
+    #[test]
+    fn banned_phrases_errors_on_an_object_without_a_phrases_array() {
+        let resp = serde_json::json!({ "policy_kind": "banned_phrases", "version": 1 });
+        assert!(parse_banned_phrases(&resp).is_err());
     }
 
     #[test]
