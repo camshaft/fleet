@@ -7335,10 +7335,10 @@ fn write_revive_frozen_stamp(fleet: &Fleet, name: &str, now: u64) {
 
 // ── infra-observer triggers (task_695) ──────────────────────────────────────────────────────────────
 // cameron greenlit widening the observer/self-improve capture scope from agent-session tooling-gaps to also
-// cover INFRA/PROCESS breakdowns (comment_3906). The design (v-fleet-tooling comment_5709): fold deterministic
+// cover infrastructure and process breakdowns (comment_3906). The design (v-fleet-tooling comment_5709): fold deterministic
 // non-session signals into the watchdog sweep rather than a sibling daemon. A non-session breakdown has NO
 // transcript, so its evidence IS the signal (a down unit, a stale cron stamp, a stale/degraded health.json, a
-// wedged tunnel) — detection is deterministic and the pass FILES a project-28 self-improve task directly,
+// wedged tunnel) — detection is deterministic and the pass files a project-28 self-improve task directly,
 // inlining the signal as evidence, instead of spawning an LLM observer to "read" anything. These pure cores are
 // the first increment; the probes (systemctl / stat / http), the config-declared signal lists, and the watchdog
 // wiring + board filing are follow-on increments.
