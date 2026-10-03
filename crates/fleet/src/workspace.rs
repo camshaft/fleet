@@ -1,7 +1,7 @@
 //! `workspace` — per-agent git worktrees off a shared bare-mirror store under the fleet root.
 //!
 //! The generic, repo-agnostic workspace model (../../DESIGN.md): an agent's directory holds one worktree
-//! per repo it works in, and every worktree of a repo shares ONE bare mirror
+//! per repo it works in, and every worktree of a repo shares one bare mirror
 //! (`$FLEET_ROOT/mirrors/<repo>.git` + `$FLEET_ROOT/agents/<agent>/<repo>`), so an agent works across many
 //! repos and N agents share a repo's objects. Upstream branches live under `refs/remotes/origin/*` and
 //! agent worktree branches under `refs/heads/*`, so `fetch --prune` never prunes a peer agent's branch.
@@ -25,7 +25,11 @@ fn git(args: &[&str]) -> Result<String, String> {
 
 /// The repo's basename (drops a trailing `.git` and any owner prefix): `camshaft/task-board` -> `task-board`.
 pub fn repo_name(repo: &str) -> &str {
-    repo.trim_end_matches('/').trim_end_matches(".git").rsplit('/').next().unwrap_or(repo)
+    repo.trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit('/')
+        .next()
+        .unwrap_or(repo)
 }
 
 /// Resolve a `repos` entry into a cloneable URL: an `owner/name` -> GitHub; a URL / path / `git@` passes through.
@@ -57,9 +61,9 @@ pub fn mirror_dir(fleet_root: &str, repo: &str) -> String {
     format!("{fleet_root}/mirrors/{}.git", repo_name(repo))
 }
 
-/// Pre-wire the fork's `upstream` remote on the shared mirror and fetch it WITH TAGS, so a fork-vs-upstream
+/// Pre-wire the fork's `upstream` remote on the shared mirror and fetch it with tags, so a fork-vs-upstream
 /// parity diff (`git diff <upstream-tag> -- …`) is one command from any worktree cut from the mirror — the
-/// version-parity-diff lever for a fork-maintainer vertical (task_875). BEST-EFFORT: a parity-diff
+/// version-parity-diff lever for a fork-maintainer vertical (task_875). Best-effort: a parity-diff
 /// convenience must never fail a spin-up, so every step only warns on failure and the caller continues.
 /// Idempotent: on a re-materialize it updates the URL (`set-url`) rather than erroring on an existing remote,
 /// and `--tags` re-fetch is a cheap no-op when nothing changed.
@@ -69,29 +73,51 @@ fn pre_wire_upstream(mirror: &str, upstream: &str) {
         // Remote already present (a re-materialize) — keep its URL current in case the declared upstream changed.
         let _ = git(&["-C", mirror, "remote", "set-url", "upstream", &url]);
     } else if let Err(e) = git(&["-C", mirror, "remote", "add", "upstream", &url]) {
-        eprintln!("  WARN: could not add upstream remote {url}: {e} (a fork-parity diff will need a manual `git remote add upstream`)");
+        eprintln!(
+            "  WARN: could not add upstream remote {url}: {e} (a fork-parity diff will need a manual `git remote add upstream`)"
+        );
         return;
     }
-    // Fetch WITH TAGS so a release-tag parity diff is one command; this does not touch origin's refs.
-    if let Err(e) = git(&["-C", mirror, "fetch", "upstream", "--tags", "--prune", "--quiet"]) {
-        eprintln!("  WARN: could not fetch upstream {url}: {e} (a fork-parity diff will need a manual `git fetch upstream --tags`)");
+    // Fetch with tags so a release-tag parity diff is one command; this does not touch origin's refs.
+    if let Err(e) = git(&[
+        "-C", mirror, "fetch", "upstream", "--tags", "--prune", "--quiet",
+    ]) {
+        eprintln!(
+            "  WARN: could not fetch upstream {url}: {e} (a fork-parity diff will need a manual `git fetch upstream --tags`)"
+        );
     }
 }
 
-/// The remote-tracking ref a NEW agent branch is cut from (never a local head, so a peer's `fetch --prune`
+/// The remote-tracking ref a new agent branch is cut from (never a local head, so a peer's `fetch --prune`
 /// can't delete it): `origin/HEAD`, else `origin/main`/`origin/master`.
 fn mirror_default_base(mirror: &str) -> Result<String, String> {
-    if let Ok(b) = git(&["-C", mirror, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        && !b.is_empty()
+    if let Ok(b) = git(&[
+        "-C",
+        mirror,
+        "symbolic-ref",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ]) && !b.is_empty()
     {
         return Ok(b);
     }
     for c in ["origin/main", "origin/master"] {
-        if git(&["-C", mirror, "show-ref", "--verify", "--quiet", &format!("refs/remotes/{c}")]).is_ok() {
+        if git(&[
+            "-C",
+            mirror,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{c}"),
+        ])
+        .is_ok()
+        {
             return Ok(c.to_string());
         }
     }
-    Err(format!("no remote-tracking base in {mirror} to branch from"))
+    Err(format!(
+        "no remote-tracking base in {mirror} to branch from"
+    ))
 }
 
 /// Ensure `<agent>`'s worktree of `<repo_spec>` exists off a shared bare mirror; return the workspace dir.
@@ -101,7 +127,7 @@ fn mirror_default_base(mirror: &str) -> Result<String, String> {
 /// as-is.
 ///
 /// `upstream` (optional, e.g. `aws/s2n-quic`): a fork-maintainer vertical's upstream repo. When set, an
-/// `upstream` remote is pre-wired on the shared mirror and fetched WITH TAGS, so every worktree cut from the
+/// `upstream` remote is pre-wired on the shared mirror and fetched with tags, so every worktree cut from the
 /// mirror can diff the fork against an upstream release tag (`git diff v1.88.0 -- …`) in one command, with no
 /// by-hand `git remote add` mid-investigation — the version-parity-diff lever (task_875). It is best-effort:
 /// a parity-diff convenience must never fail a spin-up, so a remote-add/fetch hiccup only warns.
@@ -122,7 +148,14 @@ pub fn ensure(
     } else {
         std::fs::create_dir_all(&mirrors).map_err(|e| format!("mkdir {mirrors}: {e}"))?;
         git(&["init", "--quiet", "--bare", &mirror])?;
-        git(&["-C", &mirror, "remote", "add", "origin", &repo_url(repo_spec)])?;
+        git(&[
+            "-C",
+            &mirror,
+            "remote",
+            "add",
+            "origin",
+            &repo_url(repo_spec),
+        ])?;
         git(&["-C", &mirror, "fetch", "origin", "--prune", "--quiet"])?;
     }
     let _ = git(&["-C", &mirror, "remote", "set-head", "origin", "-a"]); // best-effort default-branch pointer
@@ -133,22 +166,50 @@ pub fn ensure(
     if !Path::new(&workdir).exists() {
         let adir = format!("{fleet_root}/agents/{agent}");
         std::fs::create_dir_all(&adir).map_err(|e| format!("mkdir {adir}: {e}"))?;
-        // Each agent gets its OWN branch (`fleet/<agent>`) so N agents can share ONE repo mirror — git
+        // Each agent gets its own branch (`fleet/<agent>`) so N agents can share one repo mirror — git
         // refuses to check out the same branch (e.g. `main`) in two worktrees, so N agents on a shared
-        // repo cannot all check out the declared branch directly. The declared `branch` is the BASE the
+        // repo cannot all check out the declared branch directly. The declared `branch` is the base the
         // per-agent branch is cut from (its remote-tracking ref), not the checked-out branch itself.
         let agent_branch = format!("fleet/{agent}");
         let agent_head = format!("refs/heads/{agent_branch}");
-        if git(&["-C", &mirror, "show-ref", "--verify", "--quiet", &agent_head]).is_ok() {
-            git(&["-C", &mirror, "worktree", "add", "--quiet", &workdir, &agent_branch])?; // resume
+        if git(&[
+            "-C",
+            &mirror,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &agent_head,
+        ])
+        .is_ok()
+        {
+            git(&[
+                "-C",
+                &mirror,
+                "worktree",
+                "add",
+                "--quiet",
+                &workdir,
+                &agent_branch,
+            ])?; // resume
         } else {
             let declared = format!("refs/remotes/origin/{branch}");
-            let base = if git(&["-C", &mirror, "show-ref", "--verify", "--quiet", &declared]).is_ok() {
-                format!("origin/{branch}")
-            } else {
-                mirror_default_base(&mirror)?
-            };
-            git(&["-C", &mirror, "worktree", "add", "--quiet", "-b", &agent_branch, &workdir, &base])?;
+            let base =
+                if git(&["-C", &mirror, "show-ref", "--verify", "--quiet", &declared]).is_ok() {
+                    format!("origin/{branch}")
+                } else {
+                    mirror_default_base(&mirror)?
+                };
+            git(&[
+                "-C",
+                &mirror,
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                &agent_branch,
+                &workdir,
+                &base,
+            ])?;
         }
     }
     Ok(workdir)
@@ -162,12 +223,18 @@ mod tests {
     fn repo_name_drops_owner_and_dotgit() {
         assert_eq!(repo_name("camshaft/task-board"), "task-board");
         assert_eq!(repo_name("camshaft/task-board.git"), "task-board");
-        assert_eq!(repo_name("https://github.com/camshaft/cadenza.git"), "cadenza");
+        assert_eq!(
+            repo_name("https://github.com/camshaft/cadenza.git"),
+            "cadenza"
+        );
     }
 
     #[test]
     fn repo_url_expands_owner_name_but_passes_urls_and_paths() {
-        assert_eq!(repo_url("camshaft/task-board"), "https://github.com/camshaft/task-board.git");
+        assert_eq!(
+            repo_url("camshaft/task-board"),
+            "https://github.com/camshaft/task-board.git"
+        );
         assert_eq!(repo_url("https://x/y.git"), "https://x/y.git");
         assert_eq!(repo_url("/abs/path/repo"), "/abs/path/repo");
         assert_eq!(repo_url("git@github.com:o/r.git"), "git@github.com:o/r.git");
@@ -194,7 +261,13 @@ mod tests {
         std::fs::create_dir_all(&origin).unwrap();
         let run = |dir: &Path, args: &[&str]| {
             assert!(
-                Command::new("git").current_dir(dir).args(args).output().unwrap().status.success(),
+                Command::new("git")
+                    .current_dir(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
                 "git {args:?} in {dir:?}"
             );
         };
@@ -218,7 +291,8 @@ mod tests {
         let origin_spec = origin.to_str().unwrap();
         let up_spec = up.to_str().unwrap();
 
-        let wd = ensure(fr, "v-fork", origin_spec, "main", Some(up_spec)).expect("ensure with upstream");
+        let wd =
+            ensure(fr, "v-fork", origin_spec, "main", Some(up_spec)).expect("ensure with upstream");
         assert!(Path::new(&wd).is_dir(), "worktree materialized");
 
         let mirror = mirror_dir(fr, origin_spec);
@@ -228,13 +302,15 @@ mod tests {
             repo_url(up_spec)
         );
         // and the upstream's release tag was fetched, so a parity diff against it is one command.
-        git(&["-C", &mirror, "rev-parse", "--verify", "v1.0"]).expect("upstream tag v1.0 fetched into the mirror");
+        git(&["-C", &mirror, "rev-parse", "--verify", "v1.0"])
+            .expect("upstream tag v1.0 fetched into the mirror");
 
         // idempotent: a second materialize with the same upstream is a clean no-op (set-url, re-fetch).
-        let wd2 = ensure(fr, "v-fork", origin_spec, "main", Some(up_spec)).expect("idempotent re-materialize");
+        let wd2 = ensure(fr, "v-fork", origin_spec, "main", Some(up_spec))
+            .expect("idempotent re-materialize");
         assert_eq!(wd, wd2);
 
-        // a DIFFERENT repo with NO upstream declared wires no upstream remote.
+        // a different repo with no upstream declared wires no upstream remote.
         let origin2 = base.join("origin2");
         std::fs::create_dir_all(&origin2).unwrap();
         run(&origin2, &["init", "-q", "-b", "main"]);
@@ -243,9 +319,17 @@ mod tests {
         std::fs::write(origin2.join("f"), "x").unwrap();
         run(&origin2, &["add", "-A"]);
         run(&origin2, &["commit", "-qm", "init"]);
-        let _ = ensure(fr, "v-plain", origin2.to_str().unwrap(), "main", None).expect("ensure without upstream");
+        let _ = ensure(fr, "v-plain", origin2.to_str().unwrap(), "main", None)
+            .expect("ensure without upstream");
         assert!(
-            git(&["-C", &mirror_dir(fr, origin2.to_str().unwrap()), "remote", "get-url", "upstream"]).is_err(),
+            git(&[
+                "-C",
+                &mirror_dir(fr, origin2.to_str().unwrap()),
+                "remote",
+                "get-url",
+                "upstream"
+            ])
+            .is_err(),
             "no upstream remote when none is declared"
         );
 
@@ -254,8 +338,17 @@ mod tests {
 
     #[test]
     fn mirror_dir_and_agent_root_dir() {
-        assert_eq!(mirror_dir("/root/.fleet", "camshaft/task-board"), "/root/.fleet/mirrors/task-board.git");
-        assert_eq!(mirror_dir("/root/.fleet", "camshaft/bolero.git"), "/root/.fleet/mirrors/bolero.git");
-        assert_eq!(agent_root_dir("/root/.fleet", "board-pm"), "/root/.fleet/agents/board-pm");
+        assert_eq!(
+            mirror_dir("/root/.fleet", "camshaft/task-board"),
+            "/root/.fleet/mirrors/task-board.git"
+        );
+        assert_eq!(
+            mirror_dir("/root/.fleet", "camshaft/bolero.git"),
+            "/root/.fleet/mirrors/bolero.git"
+        );
+        assert_eq!(
+            agent_root_dir("/root/.fleet", "board-pm"),
+            "/root/.fleet/agents/board-pm"
+        );
     }
 }
