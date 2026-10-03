@@ -7333,6 +7333,73 @@ fn write_revive_frozen_stamp(fleet: &Fleet, name: &str, now: u64) {
     let _ = std::fs::write(p, now.to_string());
 }
 
+// ── infra-observer triggers (task_695) ──────────────────────────────────────────────────────────────
+// cameron greenlit widening the observer/self-improve capture scope from agent-session tooling-gaps to also
+// cover INFRA/PROCESS breakdowns (comment_3906). The design (v-fleet-tooling comment_5709): fold deterministic
+// non-session signals into the watchdog sweep rather than a sibling daemon. A non-session breakdown has NO
+// transcript, so its evidence IS the signal (a down unit, a stale cron stamp, a stale/degraded health.json, a
+// wedged tunnel) — detection is deterministic and the pass FILES a project-28 self-improve task directly,
+// inlining the signal as evidence, instead of spawning an LLM observer to "read" anything. These pure cores are
+// the first increment; the probes (systemctl / stat / http), the config-declared signal lists, and the watchdog
+// wiring + board filing are follow-on increments.
+
+/// task_695: the class of a non-session infra signal the watchdog samples. Each maps to a deterministic probe
+/// (follow-on increments): a supervised systemd user unit's active-state, a cron/timer last-run stamp's age, a
+/// daemon health.json's freshness/degraded flag, and the fleet-tunnel health probe (promoting the existing
+/// report-only check to file-on-breach).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfraSignalKind {
+    SystemdUnit,
+    CronLiveness,
+    DaemonHealth,
+    TunnelHealth,
+}
+
+impl InfraSignalKind {
+    /// A short human label for the task title / report line.
+    fn label(self) -> &'static str {
+        match self {
+            InfraSignalKind::SystemdUnit => "systemd unit down",
+            InfraSignalKind::CronLiveness => "cron/timer stale",
+            InfraSignalKind::DaemonHealth => "daemon health stale/degraded",
+            InfraSignalKind::TunnelHealth => "tunnel wedged",
+        }
+    }
+}
+
+/// task_695: whether a breached infra signal should FILE a self-improve task THIS sweep. Files iff the signal is
+/// breached AND there is not already an OPEN self-improve task for it (dedup on `metadata.observed_signal`, so a
+/// persistently-down daemon has ONE open task, not a fresh one every ~30s sweep) AND the per-signal cooldown has
+/// elapsed (a belt-and-suspenders fence reusing [`bounce_on_cooldown`], so a just-closed-then-re-breached signal
+/// is not re-filed instantly). A clean signal never files. Pure — unit-tested; the probe + the open-task board
+/// query + the create wrap it.
+fn infra_signal_should_file(
+    breached: bool,
+    open_task_exists: bool,
+    last_file_secs: Option<u64>,
+    now: u64,
+    cooldown_secs: u64,
+) -> bool {
+    breached && !open_task_exists && !bounce_on_cooldown(last_file_secs, now, cooldown_secs)
+}
+
+/// task_695: the title + description of the project-28 self-improve task an infra breakdown files. `signal_id`
+/// is the specific declared signal (unit name / stamp path / health path / probe url) and doubles as the
+/// `metadata.observed_signal` dedup key; `evidence` is the deterministic detail inlined so board-triage can route
+/// it without a transcript to read. The body names it an infra-observer finding (metadata.source=infra-observer
+/// at create time) so board-triage consumes it like a session finding. Pure — unit-tested.
+fn infra_observe_task(kind: InfraSignalKind, signal_id: &str, evidence: &str) -> (String, String) {
+    let title = format!("[self-improve] infra: {} ({signal_id})", kind.label());
+    let description = format!(
+        "Infra/process breakdown caught by the fleet watchdog infra-observer (task_695), not an agent session - \
+         the signal is the evidence (no transcript). board-triage: route this to the owner of the affected \
+         unit/daemon/cron.\n\nSignal class: {}\nSignal id: {signal_id}\nEvidence: {evidence}\n\nFiled once per \
+         signal (deduped on metadata.observed_signal while an open task exists; per-signal cooldown-fenced).",
+        kind.label()
+    );
+    (title, description)
+}
+
 // ── observation triggers (#187, BUILD 2/5) ─────────────────────────────────────────────────────────
 // The watchdog is also the SPAWNER of ephemeral per-agent observer sessions: it tracks each agent's
 // transcript growth against a per-agent watermark and, when the unobserved increment crosses a threshold
@@ -20057,6 +20124,77 @@ detached
             interval,
             0
         ));
+    }
+
+    #[test]
+    fn infra_signal_should_file_requires_breach_no_open_task_and_cooldown_elapsed() {
+        let cooldown = 3600;
+        // The target case: breached, no open task for it, never filed -> file.
+        assert!(infra_signal_should_file(
+            true, false, None, 10_000, cooldown
+        ));
+        // Not breached -> never files, regardless of the other gates.
+        assert!(!infra_signal_should_file(
+            false, false, None, 10_000, cooldown
+        ));
+        // Breached but an open self-improve task already exists for this signal -> deduped, no new task.
+        assert!(!infra_signal_should_file(
+            true, true, None, 10_000, cooldown
+        ));
+        // Breached, no open task, but filed within the cooldown window -> suppressed (belt-and-suspenders).
+        assert!(!infra_signal_should_file(
+            true,
+            false,
+            Some(10_000 - 100),
+            10_000,
+            cooldown
+        ));
+        // Breached, no open task, last file older than the cooldown -> files again (the window elapsed).
+        assert!(infra_signal_should_file(
+            true,
+            false,
+            Some(10_000 - cooldown - 1),
+            10_000,
+            cooldown
+        ));
+    }
+
+    #[test]
+    fn infra_observe_task_names_the_class_signal_and_inlines_the_evidence() {
+        let (title, desc) = infra_observe_task(
+            InfraSignalKind::CronLiveness,
+            "slack-bridge-guard.stamp",
+            "last run 5h12m ago, max-age 10m",
+        );
+        // Title names the class + the signal id (the dedup key).
+        assert!(
+            title.contains("cron/timer stale"),
+            "title names the class: {title}"
+        );
+        assert!(
+            title.contains("slack-bridge-guard.stamp"),
+            "title names the signal id: {title}"
+        );
+        // Description inlines the evidence and routes to board-triage; names it an infra-observer finding.
+        assert!(
+            desc.contains("last run 5h12m ago"),
+            "inlines the evidence: {desc}"
+        );
+        assert!(
+            desc.contains("board-triage"),
+            "routes to board-triage: {desc}"
+        );
+        assert!(
+            desc.contains("slack-bridge-guard.stamp"),
+            "carries the signal id for dedup: {desc}"
+        );
+        // Each kind has a distinct label so a unit-down vs a wedged-tunnel task read differently.
+        assert_eq!(InfraSignalKind::SystemdUnit.label(), "systemd unit down");
+        assert_eq!(InfraSignalKind::TunnelHealth.label(), "tunnel wedged");
+        assert_eq!(
+            InfraSignalKind::DaemonHealth.label(),
+            "daemon health stale/degraded"
+        );
     }
 
     #[test]
