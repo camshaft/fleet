@@ -276,17 +276,27 @@
       # Fleet daemons as flake-managed USER systemd units (task #486/#493): the declarative mirror of the
       # binary's `fleet daemon-unit`/`watchdog-unit` templates + `install-fleet-daemons` (reconcile + enable).
       # Self-contained — ExecStart points at THIS flake's fleet package, no cross-repo input. See nix/fleet-daemons.nix.
-      fleetDaemons = pkgs: import ./nix/fleet-daemons.nix {
-        inherit pkgs;
-        fleet = fleetPackage pkgs;
-        fleetTunnel = fleetTunnelPackage pkgs;
-        # task_1334: the committed prose-style ruleset, copied into the nix store so install-fleet-daemons can
-        # point FLEET_PROSE_RULESET at an immutable store path (current with this build) rather than a mutable
-        # working checkout -- the FLEET_REPO checkout tracks the frozen local main and lacks the file.
-        proseRuleset = ./crates/fleet/prose-style.toml;
-      };
+      fleetDaemons =
+        pkgs:
+        import ./nix/fleet-daemons.nix {
+          inherit pkgs;
+          fleet = fleetPackage pkgs;
+          fleetTunnel = fleetTunnelPackage pkgs;
+          # task_1334: the committed prose-style ruleset, copied into the nix store so install-fleet-daemons can
+          # point FLEET_PROSE_RULESET at an immutable store path (current with this build) rather than a mutable
+          # working checkout -- the FLEET_REPO checkout tracks the frozen local main and lacks the file.
+          proseRuleset = ./crates/fleet/prose-style.toml;
+        };
     in
     {
+      # The fleet user daemon set as a home-manager module: a host that imports it gets the whole set under
+      # one `home-manager switch` (home-manager owns install, enable, and generation reconcile). The host sets
+      # the per-host options (package/tunnelPackage/extraPath/fleetRt/fleetRepo). See nix/fleet-daemons-hm.nix.
+      homeManagerModules = rec {
+        fleet-daemons = import ./nix/fleet-daemons-hm.nix;
+        default = fleet-daemons;
+      };
+
       packages = forAllSystems (pkgs: rec {
         fleet = fleetPackage pkgs;
         slack-bridge = slackBridgePackage pkgs;
