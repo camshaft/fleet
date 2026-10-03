@@ -292,11 +292,6 @@
   {
     "file": "crates/fleet/src/dream.rs",
     "rule": "caps-for-emphasis",
-    "token": "JSONL"
-  },
-  {
-    "file": "crates/fleet/src/dream.rs",
-    "rule": "caps-for-emphasis",
     "token": "KEPT"
   },
   {
@@ -538,11 +533,6 @@
     "file": "crates/fleet/src/drift.rs",
     "rule": "caps-for-emphasis",
     "token": "BEHAVIORAL"
-  },
-  {
-    "file": "crates/fleet/src/drift.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NO"
   },
   {
     "file": "crates/fleet/src/drift.rs",
@@ -1593,11 +1583,6 @@
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
     "token": "ITS"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
-    "token": "JSONL"
   },
   {
     "file": "crates/fleet/src/main.rs",
@@ -3402,11 +3387,6 @@
   {
     "file": "crates/fleet/src/transcripts.rs",
     "rule": "caps-for-emphasis",
-    "token": "AKIA"
-  },
-  {
-    "file": "crates/fleet/src/transcripts.rs",
-    "rule": "caps-for-emphasis",
     "token": "AWARE"
   },
   {
@@ -3423,11 +3403,6 @@
     "file": "crates/fleet/src/transcripts.rs",
     "rule": "caps-for-emphasis",
     "token": "FAITHFUL"
-  },
-  {
-    "file": "crates/fleet/src/transcripts.rs",
-    "rule": "caps-for-emphasis",
-    "token": "JSONL"
   },
   {
     "file": "crates/fleet/src/transcripts.rs",
@@ -3502,57 +3477,7 @@
   {
     "file": "crates/fleet/src/workspace.rs",
     "rule": "caps-for-emphasis",
-    "token": "BASE"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "BEST"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
     "token": "DESIGN"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "DIFFERENT"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "EFFORT"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NEW"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NO"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "ONE"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "OWN"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "TAGS"
-  },
-  {
-    "file": "crates/fleet/src/workspace.rs",
-    "rule": "caps-for-emphasis",
-    "token": "WITH"
   },
   {
     "file": "loops/AGENTS-fleet.md",

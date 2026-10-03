@@ -61,6 +61,7 @@ emphatics = [
 
 caps_allow = [
   "ABI",
+  "AKIA",
   "API",
   "ASCII",
   "AST",
@@ -81,6 +82,7 @@ caps_allow = [
   "ID",
   "IO",
   "JSON",
+  "JSONL",
   "KB",
   "LAN",
   "MB",
