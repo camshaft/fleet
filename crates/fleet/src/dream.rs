@@ -16,7 +16,7 @@
 //! fixed-seed MinHash — deterministic across runs, but validated by clustering behavior, not byte-equality.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -1794,6 +1794,42 @@ struct ScopeOutcome {
     new_ids: Vec<String>,
 }
 
+/// Structural backstops (task_1379). A new or materially-changed propose-only detector is meant to be
+/// dry-run read-only against the real board corpus before ship (the charter discipline), but these caps are
+/// the can't-be-forgotten half: a misbehaving detector (e.g. the combinatorial O(k^2) blowup value_contradiction
+/// hit on its first real run -- a ~958MB report that 502'd the board + a 1656-proposal flood) must never
+/// serialize a giant report or flood the review surface, even if the dry-run was skipped. `MAX_PROPOSALS_PER_SCOPE`
+/// caps total proposals across ALL detectors (overflow dropped lowest-priority, a `capped` diagnostic naming the
+/// over-generator); `MAX_REPORT_BYTES` is the ultimate guard against a pathological per-proposal size -- over it
+/// the proposals are suppressed to a minimal diagnostic so a publish cannot pressure the board. Healthy scopes
+/// sit at 0-50 proposals / a few KB, so these ceilings are generous and only trip on a real malfunction.
+const MAX_PROPOSALS_PER_SCOPE: usize = 500;
+const MAX_REPORT_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
+/// Apply the per-scope proposal-count backstop (task_1379). If `proposals` is within the cap, return
+/// `Value::Null`; otherwise truncate it (callers pass it already ordered actionable-first, so the dropped
+/// overflow is the lowest-priority) and return a `capped` diagnostic naming the over-generating detector via
+/// per-kind counts of the pre-cap set.
+fn cap_proposals(proposals: &mut Vec<Value>) -> Value {
+    let total_before_cap = proposals.len();
+    if total_before_cap <= MAX_PROPOSALS_PER_SCOPE {
+        return Value::Null;
+    }
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    for p in proposals.iter() {
+        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("unknown");
+        *by_kind.entry(kind.to_string()).or_default() += 1;
+    }
+    proposals.truncate(MAX_PROPOSALS_PER_SCOPE);
+    json!({
+        "limit": MAX_PROPOSALS_PER_SCOPE,
+        "total_before_cap": total_before_cap,
+        "suppressed": total_before_cap - MAX_PROPOSALS_PER_SCOPE,
+        "by_kind_before_cap": by_kind,
+        "note": "a detector over-generated for this scope (likely a combinatorial blowup); the lowest-priority overflow was suppressed. Do NOT trust this scope's output until the top by_kind detector is investigated (task_1379).",
+    })
+}
+
 /// Run every detector over `recs`, write the dream-report JSON to `out`, and -- when `publish` is set --
 /// publish the versioned `dreams/<scope>` board doc, returning the report and the notify-on-new signal. This
 /// is the shared single-scope core: `analyze_cmd` wraps it for one scope, `run_cmd` loops it over every
@@ -1853,7 +1889,21 @@ fn run_scope_pass(
         proposals.extend(detect_stale_refs(recs, &prot, &backlinks, root));
     }
 
-    let (sec_actionable, sec_twin, sec_fyi) = rank_and_section(&mut proposals);
+    rank_and_section(&mut proposals); // sorts actionable-first + stamps `section`; counts recomputed post-cap below
+    // Structural backstop (task_1379): cap total proposals/scope (truncates the lowest-priority overflow,
+    // since rank_and_section ordered actionable-first) and name the over-generator in a `capped` diagnostic.
+    let capped = cap_proposals(&mut proposals);
+    let count_section = |s: &str| {
+        proposals
+            .iter()
+            .filter(|p| p.get("section").and_then(Value::as_str) == Some(s))
+            .count()
+    };
+    let (sec_actionable, sec_twin, sec_fyi) = (
+        count_section("actionable"),
+        count_section("cross_repo_twin"),
+        count_section("fyi"),
+    );
     let standard = proposals.iter().filter(|p| p["lane"] == "standard").count();
     let protected = proposals
         .iter()
@@ -1880,12 +1930,39 @@ fn run_scope_pass(
         "proposal_count": proposals.len(),
         "by_lane": { "standard": standard, "protected": protected },
         "by_section": { "actionable": sec_actionable, "cross_repo_twin": sec_twin, "fyi": sec_fyi },
+        "capped": capped,
         "proposals": proposals,
     });
 
-    let json = serde_json::to_string_pretty(&report)
+    let mut json = serde_json::to_string_pretty(&report)
         .map_err(|e| format!("report serialize failed: {e}"))?;
-    std::fs::write(out, json).map_err(|e| format!("cannot write report {}: {e}", out.display()))?;
+    // Final size backstop (task_1379): a count cap cannot bound a pathological per-proposal size, so if the
+    // serialized report still exceeds the byte ceiling, suppress the proposals to a minimal diagnostic -- a
+    // publish must never pressure/502 the board (the value_contradiction first real run serialized to ~958MB).
+    let report = if json.len() > MAX_REPORT_BYTES {
+        let diag = json!({
+            "schema": report["schema"].clone(),
+            "generated_by": report["generated_by"].clone(),
+            "corpus_size": recs.len(),
+            "protected_memories": prot.len(),
+            "detectors_run": report["detectors_run"].clone(),
+            "proposal_count": 0,
+            "by_section": { "actionable": sec_actionable, "cross_repo_twin": sec_twin, "fyi": sec_fyi },
+            "size_suppressed": {
+                "serialized_bytes": json.len(),
+                "limit": MAX_REPORT_BYTES,
+                "note": "the full report exceeded the size ceiling and was suppressed to protect the board; a detector is pathological (task_1379). Proposals omitted -- investigate before trusting this scope.",
+            },
+            "proposals": [],
+        });
+        json = serde_json::to_string_pretty(&diag)
+            .map_err(|e| format!("diag report serialize failed: {e}"))?;
+        diag
+    } else {
+        report
+    };
+    std::fs::write(out, &json)
+        .map_err(|e| format!("cannot write report {}: {e}", out.display()))?;
 
     let (new_count, new_ids) = if publish {
         let scope = scope.ok_or("publish requires a scope (the dreams/<scope> doc path)")?;
@@ -2809,5 +2886,46 @@ mod tests {
         assert!(body.contains("- repos/camshaft-cadenza: 3 new -> dreams/repos/camshaft-cadenza"));
         assert!(body.contains("- repos/fleet: 1 new -> dreams/repos/fleet"));
         assert!(body.contains("will not re-ping")); // the no-noise disposition note
+    }
+
+    #[test]
+    fn cap_proposals_under_limit_is_a_noop() {
+        let mut proposals: Vec<Value> = (0..50)
+            .map(|i| json!({ "proposal_id": format!("p{i}"), "kind": "near_duplicate_minhash" }))
+            .collect();
+        let capped = cap_proposals(&mut proposals);
+        assert_eq!(proposals.len(), 50); // unchanged
+        assert!(capped.is_null()); // no diagnostic when within the cap
+    }
+
+    #[test]
+    fn cap_proposals_over_limit_truncates_and_names_the_over_generator() {
+        // Simulate a combinatorial blowup: one detector floods, a few genuine proposals ride along.
+        let mut proposals: Vec<Value> = Vec::new();
+        for i in 0..550 {
+            proposals
+                .push(json!({ "proposal_id": format!("vc{i}"), "kind": "value_contradiction" }));
+        }
+        for i in 0..50 {
+            proposals
+                .push(json!({ "proposal_id": format!("nd{i}"), "kind": "near_duplicate_minhash" }));
+        }
+        let total = proposals.len(); // 600
+        let capped = cap_proposals(&mut proposals);
+        // Overflow truncated to the ceiling.
+        assert_eq!(proposals.len(), MAX_PROPOSALS_PER_SCOPE);
+        // Diagnostic names the over-generator with PRE-cap counts and the suppressed delta.
+        assert_eq!(capped["total_before_cap"], json!(total));
+        assert_eq!(capped["limit"], json!(MAX_PROPOSALS_PER_SCOPE));
+        assert_eq!(capped["suppressed"], json!(total - MAX_PROPOSALS_PER_SCOPE));
+        assert_eq!(
+            capped["by_kind_before_cap"]["value_contradiction"],
+            json!(550)
+        );
+        assert_eq!(
+            capped["by_kind_before_cap"]["near_duplicate_minhash"],
+            json!(50)
+        );
+        assert!(capped["note"].as_str().unwrap().contains("task_1379"));
     }
 }
