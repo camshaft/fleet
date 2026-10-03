@@ -714,10 +714,20 @@ pub async fn run_role(role: &str) -> Result<(), String> {
     let ipfs = Arc::new(Ipfs::connect());
     let busy = BusySet::new();
 
-    let hook = format!("http://{}:{port}/", advertise_host(config::get()));
+    // A poll-only worker registers no `webhook_url` and relies on the periodic catch-up poll below for wake,
+    // used when the board cannot reach this worker's advertised host — e.g. a board webhook-host guard that
+    // rejects the worker's private/loopback LAN address. A reactive worker registers its advertised hook.
+    let poll_only = config::get().poll_only;
+    if poll_only && config::get().pipeline_poll_secs == 0 {
+        return Err(format!(
+            "pipeline {role}: poll_only is set with pipeline_poll_secs = 0, so the worker would register \
+             no webhook_url and never poll; set pipeline_poll_secs > 0"
+        ));
+    }
+    let hook = (!poll_only).then(|| format!("http://{}:{port}/", advertise_host(config::get())));
     board
         .register(
-            Some(&hook),
+            hook.as_deref(),
             &serde_json::json!({ "kind": "worker", "display_name": role }),
         )
         .await?;
@@ -746,6 +756,16 @@ pub async fn run_role(role: &str) -> Result<(), String> {
         tracing::info!("pipeline {role}: catch-up poll every {poll_secs}s");
     }
 
+    // A poll-only worker has no webhook to serve; the catch-up poll above is its sole wake path, so block
+    // here to keep the worker and its spawned poll task alive.
+    if poll_only {
+        tracing::info!(
+            "pipeline {role}: poll-only, no webhook_url registered; waking via the {poll_secs}s catch-up poll"
+        );
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
     // Serve the webhook; the receiver parses + classifies + dedups and hands (task_id, guard) over the channel.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(i64, webhook::BusyGuard)>(64);
     let receiver = tokio::spawn(webhook::run_receiver(
@@ -754,7 +774,10 @@ pub async fn run_role(role: &str) -> Result<(), String> {
         Arc::clone(&busy),
         tx,
     ));
-    tracing::info!("pipeline {role}: reactive on {hook}");
+    tracing::info!(
+        "pipeline {role}: reactive on {}",
+        hook.as_deref().unwrap_or_default()
+    );
     while let Some((id, guard)) = rx.recv().await {
         spawn_process(&board, &ipfs, role, id, guard);
     }
