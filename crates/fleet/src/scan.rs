@@ -1,23 +1,23 @@
-//! `scan` — the commit-content guardrail's internal-MARKER scanner (task_782, doc_104).
+//! `scan` — the commit-content guardrail's internal-marker scanner (task_782, doc_104).
 //!
-//! Why this exists: camshaft/fleet is a PUBLIC repo, and Amazon-internal identifiers (internal API / service /
-//! operation / exception NAMES, internal hostnames, internal package prefixes) must never land in a public
-//! commit. The fleet DATABASE / board is a fine store for internal detail; the leak surface is COMMITTED
+//! Why this exists: camshaft/fleet is a public repo, and Amazon-internal identifiers (internal API / service /
+//! operation / exception names, internal hostnames, internal package prefixes) must never land in a public
+//! commit. The fleet database / board is a fine store for internal detail; the leak surface is committed
 //! public git. The driving incident is real and in this repo's own history: an internal-action CLI shipped
-//! with internal identifier NAMES in tracked source and was reverted — a leak that carried no secret-shaped
+//! with internal identifier names in tracked source and was reverted — a leak that carried no secret-shaped
 //! string at all, so a secret scanner alone would never have caught it.
 //!
 //! doc_104's hybrid design splits the work: an external secret scanner (detect-secrets) owns secret /
-//! credential detection, and THIS engine owns the internal-MARKER side — the vocabulary a secret scanner
-//! cannot know. The marker VOCABULARY is deliberately NOT baked into this public source: it is loaded at
-//! runtime from an external taxonomy file kept in a PRIVATE store (the security-specialist co-owner curates
+//! credential detection, and this engine owns the internal-marker side — the vocabulary a secret scanner
+//! cannot know. The marker vocabulary is deliberately not baked into this public source: it is loaded at
+//! runtime from an external taxonomy file kept in a private store (the security-specialist co-owner curates
 //! it, task_1156). This engine ships only the mechanism and a placeholder example taxonomy, so the public repo
 //! carries no internal vocabulary of its own.
 //!
 //! Matching is literal, case-insensitive substring. Internal markers are high-signal literal tokens and
 //! prefixes — an internal package prefix catches a whole identifier family, an internal host suffix catches
 //! every host under it — so a literal match is both sufficient and low-false-positive. A generic English
-//! suffix (e.g. `Exception`, `Service`) is intentionally NOT a usable marker: it would drown the signal, so
+//! suffix (e.g. `Exception`, `Service`) is intentionally not a usable marker: it would drown the signal, so
 //! the taxonomy carries specific identifiers and prefixes, not generic words.
 
 use serde::Deserialize;
@@ -79,10 +79,10 @@ pub struct Hit {
     pub token: String,
 }
 
-/// Parse a taxonomy TOML string into compiled markers. PURE (no I/O). Emits one [`Marker`] per (spec, token).
+/// Parse a taxonomy TOML string into compiled markers. Pure (no I/O). Emits one [`Marker`] per (spec, token).
 ///
-/// Rejects an unknown severity and an empty-string token. An empty taxonomy (zero markers) is an ERROR, not a
-/// clean parse: a scan with no markers passes everything, which on the public path is fail-OPEN — the caller
+/// Rejects an unknown severity and an empty-string token. An empty taxonomy (zero markers) is an error, not a
+/// clean parse: a scan with no markers passes everything, which on the public path is fail-open — the caller
 /// wants that to surface as a configuration error, never as a green scan.
 pub fn parse_taxonomy(toml_src: &str) -> Result<Vec<Marker>, String> {
     let parsed: TaxonomyFile =
@@ -114,13 +114,14 @@ pub fn parse_taxonomy(toml_src: &str) -> Result<Vec<Marker>, String> {
     }
     if markers.is_empty() {
         return Err(
-            "taxonomy defines no markers — refusing to scan (a no-marker scan is fail-open)".to_string(),
+            "taxonomy defines no markers — refusing to scan (a no-marker scan is fail-open)"
+                .to_string(),
         );
     }
     Ok(markers)
 }
 
-/// Scan one file's text for marker hits. PURE (no I/O). Case-insensitive substring match, line by line.
+/// Scan one file's text for marker hits. Pure (no I/O). Case-insensitive substring match, line by line.
 pub fn scan_text(file: &str, content: &str, markers: &[Marker]) -> Vec<Hit> {
     let mut hits = Vec::new();
     for (idx, line) in content.lines().enumerate() {
@@ -157,12 +158,12 @@ pub fn load_markers(explicit: Option<&str>) -> Result<Vec<Marker>, String> {
              in a private store, never in this public repo)"
                 .to_string()
         })?;
-    let src =
-        std::fs::read_to_string(&path).map_err(|e| format!("cannot read taxonomy '{path}': {e}"))?;
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read taxonomy '{path}': {e}"))?;
     parse_taxonomy(&src)
 }
 
-/// Non-empty, trimmed file names from a `git diff --name-only` listing. PURE (no I/O) so the parsing is
+/// Non-empty, trimmed file names from a `git diff --name-only` listing. Pure (no I/O) so the parsing is
 /// unit-tested apart from the git invocation. Shared by [`staged_contents`] and [`diff_range_contents`].
 fn changed_names(listing: &str) -> Vec<&str> {
     listing
@@ -205,19 +206,23 @@ fn staged_contents() -> Vec<(String, String)> {
 
 /// The current on-disk content of every added/copied/modified file in a git diff `range` (e.g.
 /// `origin/main...HEAD`), as (path, text) pairs. This is the CI-backstop primitive: in a PR checkout the
-/// working tree IS the head, so reading from disk scans exactly what the PR introduces. Unreadable / non-UTF-8
+/// working tree is the head, so reading from disk scans exactly what the PR introduces. Unreadable / non-UTF-8
 /// files are skipped; a deleted file has no content to scan.
 ///
-/// Returns `Err` when `git diff` itself FAILS (a bad range or not a git repo) so the caller can fail-closed:
+/// Returns `Err` when `git diff` itself fails (a bad range or not a git repo) so the caller can fail-closed:
 /// an empty result then unambiguously means "the range changed no scannable files" (a legitimate pass), never
-/// "the range was misconfigured" (which must NOT pass a CI gate silently).
+/// "the range was misconfigured" (which must not pass a CI gate silently).
 fn diff_range_contents(range: &str) -> Result<Vec<(String, String)>, String> {
     let listing = std::process::Command::new("git")
         .args(["diff", "--name-only", "--diff-filter=ACM", range])
         .output();
     let names = match listing {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => return Err(format!("`git diff {range}` failed (bad range, or not a git repo?)")),
+        _ => {
+            return Err(format!(
+                "`git diff {range}` failed (bad range, or not a git repo?)"
+            ));
+        }
     };
     Ok(changed_names(&names)
         .into_iter()
@@ -259,7 +264,9 @@ pub fn scan_content(opts: ScanOpts) {
         Ok(m) => m,
         Err(e) => {
             if opts.allow_missing_taxonomy && e.starts_with("no taxonomy") {
-                eprintln!("scan-content: {e}; --allow-missing-taxonomy set, skipping (NOT fail-closed)");
+                eprintln!(
+                    "scan-content: {e}; --allow-missing-taxonomy set, skipping (NOT fail-closed)"
+                );
                 return;
             }
             eprintln!("scan-content: {e}");
@@ -300,7 +307,13 @@ pub fn scan_content(opts: ScanOpts) {
 
     for h in &all_hits {
         if opts.redact {
-            eprintln!("{}:{}: {} [{}]", h.file, h.line, h.category, h.severity.as_str());
+            eprintln!(
+                "{}:{}: {} [{}]",
+                h.file,
+                h.line,
+                h.category,
+                h.severity.as_str()
+            );
         } else {
             eprintln!(
                 "{}:{}: {} [{}] matched '{}'",
@@ -376,7 +389,7 @@ mod tests {
 
     #[test]
     fn parse_taxonomy_rejects_a_no_marker_taxonomy_as_fail_open() {
-        // An empty taxonomy would scan nothing and pass everything — fail-OPEN on the public path, so it must
+        // An empty taxonomy would scan nothing and pass everything — fail-open on the public path, so it must
         // be an error, not a clean parse.
         let err = parse_taxonomy("").unwrap_err();
         assert!(err.contains("no markers"), "got: {err}");
@@ -392,7 +405,8 @@ mod tests {
         "#,
         )
         .unwrap();
-        let content = "fn ok() {}\nlet target = \"COM.EXAMPLE.INTERNAL.SomeService\";\nfn also_ok() {}";
+        let content =
+            "fn ok() {}\nlet target = \"COM.EXAMPLE.INTERNAL.SomeService\";\nfn also_ok() {}";
         let hits = scan_text("src/x.rs", content, &markers);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line, 2, "1-based line of the hit");
@@ -436,9 +450,9 @@ mod tests {
 
     #[test]
     fn catches_an_internal_identifier_name_with_no_secret_the_task_1124_acceptance_case() {
-        // task_1124 / camshaft/fleet#340: the real leak was an internal API identifier NAME carrying NO
+        // task_1124 / camshaft/fleet#340: the real leak was an internal API identifier name carrying no
         // secret-shaped string, so a secret scanner would miss it entirely. This proves the internal-marker
-        // engine catches that class. PLACEHOLDER tokens stand in for the real (private) taxonomy vocabulary.
+        // engine catches that class. Placeholder tokens stand in for the real (private) taxonomy vocabulary.
         let markers = parse_taxonomy(
             r#"
             [[marker]]
@@ -450,7 +464,10 @@ mod tests {
         let leak = "const TARGET: &str = \"com.example.internal.ExampleService.ExampleOperation\";";
         let hits = scan_text("src/main.rs", leak, &markers);
         assert_eq!(hits.len(), 1);
-        assert!(has_blocking(&hits), "an internal identifier name is a blocking hit");
+        assert!(
+            has_blocking(&hits),
+            "an internal identifier name is a blocking hit"
+        );
     }
 
     #[test]
@@ -467,7 +484,10 @@ mod tests {
             ]
         );
         assert!(changed_names("").is_empty());
-        assert!(changed_names("\n  \n\t\n").is_empty(), "all-blank listing yields no names");
+        assert!(
+            changed_names("\n  \n\t\n").is_empty(),
+            "all-blank listing yields no names"
+        );
     }
 
     #[test]
