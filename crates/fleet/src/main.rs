@@ -9912,6 +9912,38 @@ fn monitor_tick_wakes(verdict: &SeamVerdict) -> bool {
     !matches!(verdict, SeamVerdict::Green { .. })
 }
 
+/// task_579 actionable-delta pre-gate: whether to WAKE the model this tick. This gates the MODEL TURN, not the
+/// cron cadence - an explicit operator `/loop <short-interval>` defeats cron-cadence gating (membrain-net-read-tears
+/// ran 80+ no-op ticks after an operator re-set a 10m cron over its own correct at-rest cadence), so the gate must
+/// sit on the turn and collapse the no-op wakes regardless of the cron. Wakes on ANY actionable delta: a non-empty
+/// actionable inbox / notification set (a), a sync replay that pulled new commits (b), a declared-seam change OR a
+/// verdict that cannot be gated (c, via [`monitor_tick_wakes`], which already carries the no-seam / error
+/// fail-safe wake), or a blocked_on dependency plausibly resolvable this interval (d, e.g. a daily-merge rollover,
+/// [`blocked_external_rollover_due`]). Otherwise the caller advances last-seen, emits the heartbeat `set_status`,
+/// and does NOT wake the model. Pure - unit-tested; the inbox/sync/seam/blocked signals are gathered by the tick
+/// I/O that wraps it.
+fn should_wake_model(
+    inbox_actionable: bool,
+    sync_replayed: bool,
+    seam_wakes: bool,
+    blocked_dep_due: bool,
+) -> bool {
+    inbox_actionable || sync_replayed || seam_wakes || blocked_dep_due
+}
+
+/// task_579 case (d): whether a blocked-on-external dependency gated on a once-per-UTC-day rollover - the
+/// membrain-net-read-tears TPCII->VS daily-merge case the observer flagged - is plausibly resolvable THIS tick.
+/// True when the UTC calendar day has advanced since the dependency was last evaluated, so the model is woken to
+/// re-test the merge exactly once per rollover rather than on every poll in between. `last_check_unix` is when the
+/// dep was last evaluated and `now_unix` is now; a dep never checked (`None`) is due (the first evaluation). Pure
+/// - unit-tested. The day bucket is `unix / 86400` (UTC midnights), which is what a once-per-UTC-day merge keys on.
+fn blocked_external_rollover_due(last_check_unix: Option<u64>, now_unix: u64) -> bool {
+    match last_check_unix {
+        None => true,
+        Some(last) => (now_unix / 86_400) > (last / 86_400),
+    }
+}
+
 /// Compute the seam-gate decision for an agent from its board record: read `metadata.seam` globs + worktree,
 /// ff-sync (unless `no_fetch`) the worktree to `origin/main`, and classify the incoming diff via the pure
 /// [`seam_touched`]. A RELATIVE `metadata.worktree` is resolved against the configured hub (the fleet stores
@@ -16383,6 +16415,78 @@ mod tests {
             seam_touched(&only_shared, &seams).is_empty(),
             "only-excluded change is GREEN"
         );
+    }
+
+    #[test]
+    fn should_wake_model_wakes_on_any_actionable_delta_and_holds_otherwise() {
+        // No delta on any axis -> HOLD (advance last-seen + heartbeat, no model turn). This is the no-op monitor
+        // tick the pre-gate collapses.
+        assert!(!should_wake_model(false, false, false, false));
+        // Each axis independently wakes: (a) actionable inbox, (b) sync replay, (c) seam change / un-gateable
+        // verdict, (d) a blocked_on dep due this interval.
+        assert!(
+            should_wake_model(true, false, false, false),
+            "actionable inbox wakes"
+        );
+        assert!(
+            should_wake_model(false, true, false, false),
+            "sync replay wakes"
+        );
+        assert!(
+            should_wake_model(false, false, true, false),
+            "seam change / fail-safe wakes"
+        );
+        assert!(
+            should_wake_model(false, false, false, true),
+            "blocked dep due wakes"
+        );
+        // The seam axis carries monitor_tick_wakes, which is already fail-safe (no-seam / error -> wake), so an
+        // un-gateable monitor still wakes through this combiner.
+        assert!(should_wake_model(
+            false,
+            false,
+            monitor_tick_wakes(&SeamVerdict::NoSeam),
+            false
+        ));
+        assert!(should_wake_model(
+            false,
+            false,
+            monitor_tick_wakes(&SeamVerdict::Error("git fetch failed".into())),
+            false
+        ));
+        // A provably-green seam with no other delta -> HOLD.
+        let green = SeamVerdict::Green {
+            incoming: 3,
+            seams: 2,
+            head: "abc123".into(),
+        };
+        assert!(!should_wake_model(
+            false,
+            false,
+            monitor_tick_wakes(&green),
+            false
+        ));
+    }
+
+    #[test]
+    fn blocked_external_rollover_due_fires_once_per_utc_day_rollover() {
+        let day = 86_400u64;
+        // Never checked -> due (first evaluation).
+        assert!(blocked_external_rollover_due(None, 5 * day + 100));
+        // Checked earlier the same UTC day -> not due (the daily merge has not rolled over yet).
+        assert!(!blocked_external_rollover_due(
+            Some(5 * day + 100),
+            5 * day + 50_000
+        ));
+        // Checked yesterday, now today -> due (the UTC day advanced, re-test the merge once).
+        assert!(blocked_external_rollover_due(
+            Some(5 * day + 100),
+            6 * day + 10
+        ));
+        // Boundary: last at 23:59:59 of a day, now at 00:00:00 of the next -> due.
+        assert!(blocked_external_rollover_due(Some(6 * day - 1), 6 * day));
+        // Same instant -> not due.
+        assert!(!blocked_external_rollover_due(Some(6 * day), 6 * day));
     }
 
     #[test]
