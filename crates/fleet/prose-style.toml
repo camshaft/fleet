@@ -113,6 +113,7 @@ caps_allow = [
   "URL",
   "USB",
   "UTC",
+  "UTF",
   "UUID",
   "VPN",
   "WASI",

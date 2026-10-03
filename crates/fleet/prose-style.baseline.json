@@ -3085,11 +3085,6 @@
     "token": "PORT"
   },
   {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "UTF"
-  },
-  {
     "file": "crates/fleet/src/notify.rs",
     "rule": "caps-for-emphasis",
     "token": "ALREADY"
@@ -3288,96 +3283,6 @@
     "file": "crates/fleet/src/notify.rs",
     "rule": "caps-for-emphasis",
     "token": "VERSION"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "COMMITTED"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "DATABASE"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "ERROR"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "FAILS"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "IS"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "MARKER"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NAME"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NAMES"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NO"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NOT"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "OPEN"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "PLACEHOLDER"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "PRIVATE"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "PUBLIC"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "PURE"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "THIS"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "UTF"
-  },
-  {
-    "file": "crates/fleet/src/scan.rs",
-    "rule": "caps-for-emphasis",
-    "token": "VOCABULARY"
   },
   {
     "file": "crates/fleet/src/workspace.rs",
