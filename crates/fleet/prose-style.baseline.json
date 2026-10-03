@@ -387,11 +387,6 @@
   {
     "file": "crates/fleet/src/dream.rs",
     "rule": "caps-for-emphasis",
-    "token": "PATH"
-  },
-  {
-    "file": "crates/fleet/src/dream.rs",
-    "rule": "caps-for-emphasis",
     "token": "PRIME"
   },
   {
@@ -2072,11 +2067,6 @@
   {
     "file": "crates/fleet/src/main.rs",
     "rule": "caps-for-emphasis",
-    "token": "PATH"
-  },
-  {
-    "file": "crates/fleet/src/main.rs",
-    "rule": "caps-for-emphasis",
     "token": "PATROL"
   },
   {
@@ -3025,66 +3015,6 @@
     "token": "robust"
   },
   {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "BASED"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "BYTES"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "CHANGED"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "DOTALL"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "FILE"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "LINE"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NEW"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NOT"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "NOTES"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "OWN"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "PATH"
-  },
-  {
-    "file": "crates/fleet/src/memory.rs",
-    "rule": "caps-for-emphasis",
-    "token": "PORT"
-  },
-  {
     "file": "crates/fleet/src/notify.rs",
     "rule": "caps-for-emphasis",
     "token": "ALREADY"
@@ -3453,11 +3383,6 @@
     "file": "loops/AGENTS-fleet.md",
     "rule": "caps-for-emphasis",
     "token": "OWNER"
-  },
-  {
-    "file": "loops/AGENTS-fleet.md",
-    "rule": "caps-for-emphasis",
-    "token": "PATH"
   },
   {
     "file": "loops/AGENTS-fleet.md",
