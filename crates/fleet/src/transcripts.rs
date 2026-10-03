@@ -1,9 +1,9 @@
-//! `transcripts` — a FAITHFUL, LOSSLESS reader/renderer of an agent's harness session transcript.
+//! `transcripts` — a faithful, lossless reader/renderer of an agent's harness session transcript.
 //!
-//! This is NOT a digest, summarizer, or regex-extractor: it renders every conversational record (each
+//! This is not a digest, summarizer, or regex-extractor: it renders every conversational record (each
 //! user/assistant/system turn, every tool call, tool result, and error) verbatim, with no interpretation, so
 //! a downstream reviewer (board task #176 / #187 observers) reads exactly what happened. Non-conversational
-//! harness bookkeeping (mode/permission/attachment/ai-title/…) is not rendered, but it is COUNTED and the
+//! harness bookkeeping (mode/permission/attachment/ai-title/…) is not rendered, but it is counted and the
 //! omitted types are reported in a footer, so nothing is silently dropped.
 //!
 //! Harness-agnostic by construction: parsing/rendering sits behind the [`Harness`] seam so a second harness
@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-/// A harness renderer seam. Each harness parses its own session record shape and renders ONE record to
+/// A harness renderer seam. Each harness parses its own session record shape and renders one record to
 /// faithful text, or returns `None` for a non-conversational bookkeeping record (which the caller counts).
 pub trait Harness {
     /// A stable id for the harness (e.g. `claude-code`), used in the rendering header.
     fn id(&self) -> &'static str;
     /// Render one parsed transcript record (a JSONL line) to faithful text, or `None` to skip (and count) a
-    /// non-conversational record. The returned string is NOT yet scrubbed — the caller scrubs the whole
+    /// non-conversational record. The returned string is not yet scrubbed — the caller scrubs the whole
     /// rendering once.
     fn render_record(&self, rec: &Value) -> Option<String>;
 }
@@ -105,7 +105,10 @@ impl Harness for Codex {
         let ts = rec.get("timestamp").and_then(Value::as_str).unwrap_or("");
         match pt {
             "message" => {
-                let role = payload.get("role").and_then(Value::as_str).unwrap_or("message");
+                let role = payload
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message");
                 let mut out = if ts.is_empty() {
                     format!("── {role} ──\n")
                 } else {
@@ -153,7 +156,7 @@ impl Harness for Codex {
                     .or_else(|| payload.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or("?");
-                // `arguments` is a JSON STRING on Codex; render it verbatim (pretty-printed if it parses).
+                // `arguments` is a JSON string on Codex; render it verbatim (pretty-printed if it parses).
                 let args = payload
                     .get("arguments")
                     .or_else(|| payload.get("input"))
@@ -162,7 +165,10 @@ impl Harness for Codex {
                 Some(format!("[tool_use {name} (call_id {call_id})]\n{args}\n"))
             }
             "function_call_output" | "custom_tool_call_output" => {
-                let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("?");
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
                 let output = render_codex_output(payload.get("output"));
                 Some(format!("[tool_result for {call_id}]\n{output}\n"))
             }
@@ -184,7 +190,7 @@ fn render_codex_content_block(b: &Value) -> String {
     }
 }
 
-/// Render a Codex tool-call `arguments`/`input`: a JSON STRING is pretty-printed if it parses (else shown
+/// Render a Codex tool-call `arguments`/`input`: a JSON string is pretty-printed if it parses (else shown
 /// as-is), and a JSON value is pretty-printed. Verbatim — no interpretation.
 fn render_codex_args(v: &Value) -> String {
     match v {
@@ -235,12 +241,16 @@ fn render_block(b: &Value) -> String {
         }
         "tool_result" => {
             let id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("?");
-            let is_err = b
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let tag = if is_err { "tool_result ERROR" } else { "tool_result" };
-            format!("[{tag} for {id}]\n{}\n", render_tool_result_content(b.get("content")))
+            let is_err = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            let tag = if is_err {
+                "tool_result ERROR"
+            } else {
+                "tool_result"
+            };
+            format!(
+                "[{tag} for {id}]\n{}\n",
+                render_tool_result_content(b.get("content"))
+            )
         }
         "" => format!("{}\n", b), // no type — dump the raw block
         other => format!("[block {other}]\n{b}\n"),
@@ -280,7 +290,11 @@ pub fn render(records: &[Value], harness: &dyn Harness) -> String {
                 out.push('\n');
             }
             None => {
-                let ty = rec.get("type").and_then(Value::as_str).unwrap_or("?").to_string();
+                let ty = rec
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
                 *omitted.entry(ty).or_insert(0) += 1;
             }
         }
@@ -298,7 +312,7 @@ pub fn render(records: &[Value], harness: &dyn Harness) -> String {
 
 /// Redact obvious credential shapes from rendered text so a transcript can be cited without leaking secrets.
 /// Mirrors the `fleet send` leak scanner's token families: `sk-ant-…`, `AKIA…`, `ghp_…`, `xoxb-…`, and the
-/// VALUE of a `SECRET_NAMED_KEY=value` assignment. Conservative — it redacts the token, not the surrounding
+/// value of a `SECRET_NAMED_KEY=value` assignment. Conservative — it redacts the token, not the surrounding
 /// prose, so the rendering stays legible.
 pub fn scrub(text: &str) -> String {
     const REDACTED: &str = "‹redacted›";
@@ -335,19 +349,29 @@ fn scrub_token<'a>(tok: &'a str, redacted: &str) -> std::borrow::Cow<'a, str> {
     if tok.trim().is_empty() {
         return std::borrow::Cow::Borrowed(tok);
     }
-    // A KEY=VALUE assignment whose key is secret-named → redact just the value.
+    // A key=value assignment whose key is secret-named → redact just the value.
     if let Some(eq) = tok.find('=') {
         let key = &tok[..eq];
         let val = &tok[eq + 1..];
         let key_shaped = !key.is_empty()
-            && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            && key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
         if key_shaped && !val.is_empty() {
             let ku = key.to_ascii_uppercase();
             let secret_named = ku.starts_with("AWS_")
                 || ku.starts_with("ANTHROPIC_")
-                || ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "CREDENTIAL", "ACCESS_KEY"]
-                    .iter()
-                    .any(|p| ku.contains(p));
+                || [
+                    "TOKEN",
+                    "SECRET",
+                    "PASSWORD",
+                    "PASSWD",
+                    "API_KEY",
+                    "CREDENTIAL",
+                    "ACCESS_KEY",
+                ]
+                .iter()
+                .any(|p| ku.contains(p));
             if secret_named {
                 return std::borrow::Cow::Owned(format!("{key}={redacted}"));
             }
@@ -375,7 +399,7 @@ pub fn session_slug(cwd: &str) -> String {
 /// True if a project-dir slug plausibly belongs to `agent` under the `.fleet/agents/<agent>/<repo>` workspace
 /// layout: the slug contains the `-agents-<agent>` segment, ending there or followed by `-` (the repo).
 ///
-/// LIMITATION (inherent to the flat slug): both `/` and the dashes WITHIN a multi-word agent/repo id collapse
+/// Limitation (inherent to the flat slug): both `/` and the dashes within a multi-word agent/repo id collapse
 /// to `-`, so a dash-prefix id (`v-fleet`) is indistinguishable from a longer id (`v-fleet-tooling`) by slug
 /// alone. This is a best-effort filter; for an exact target pass `--session <file>`, and when several agent
 /// ids are dash-prefixes of each other the longest anchoring match should be preferred by the caller. Pure.
@@ -397,8 +421,8 @@ fn projects_root() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".claude/projects"))
 }
 
-/// The agent that OWNS a project-dir slug = the LONGEST `roster` id for which [`slug_is_for_agent`] matches.
-/// With dash-prefix ids (`v-task-board` vs `v-task-board-helper`) the bare match is true for BOTH, so the
+/// The agent that owns a project-dir slug = the longest `roster` id for which [`slug_is_for_agent`] matches.
+/// With dash-prefix ids (`v-task-board` vs `v-task-board-helper`) the bare match is true for both, so the
 /// owner is the most specific (longest) one — which maps each transcript dir to exactly one agent. `None`
 /// when no roster id matches. Pure — unit-tested. (task_846: without this, a shorter-prefix agent's observer
 /// also reads the longer agent's transcript, so the span is observed under two keys and re-fires forever.)
@@ -450,11 +474,11 @@ pub fn locate_sessions(agent: &str) -> Vec<PathBuf> {
     locate_sessions_where(|slug| slug_is_for_agent(slug, agent))
 }
 
-/// Like [`locate_sessions`], but ROSTER-AWARE: a dir counts for `agent` only when `agent` is its OWNER (the
+/// Like [`locate_sessions`], but roster-aware: a dir counts for `agent` only when `agent` is its owner (the
 /// longest `roster` id matching the slug per [`slug_owner`]). This fixes task_846: when ids are dash-prefixes
 /// of each other (`v-task-board` / `v-task-board-helper`), the bare [`slug_is_for_agent`] claims the longer
 /// agent's transcript dir for the shorter id too, so the shorter agent's observer reads the longer agent's
-/// transcript and the SAME span gets observed (and its watermark advanced) under two different agent keys —
+/// transcript and the same span gets observed (and its watermark advanced) under two different agent keys —
 /// re-firing forever. Resolving one owner per dir makes an advanced watermark actually suppress the re-fire.
 /// Falls back to the bare match for a dir no roster id owns (empty roster / unknown agent), so behavior is
 /// unchanged outside the dash-prefix case.
@@ -493,7 +517,8 @@ pub fn session_id_of(path: &Path) -> String {
 /// Parse a JSONL file into records, skipping blank/unparseable lines (a truncated final line never aborts the
 /// read). Returns the records and the total line count (for the next watermark).
 pub fn parse_jsonl(path: &Path) -> Result<(Vec<Value>, usize), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut recs = Vec::new();
     let mut lines = 0usize;
     for line in text.lines() {
@@ -538,7 +563,7 @@ mod tests {
         assert!(out.contains("answering now"));
         assert!(out.contains("[tool_use Bash (id tu1)]") && out.contains("\"cmd\": \"ls\""));
         assert!(out.contains("[tool_result for tu1]") && out.contains("file1\nfile2"));
-        // the two bookkeeping records are omitted but ACCOUNTED for (not silently dropped)
+        // the two bookkeeping records are omitted but accounted for (not silently dropped)
         assert!(out.contains("2 non-conversational records omitted"));
         assert!(out.contains("ai-title×1") && out.contains("mode×1"));
     }
@@ -577,9 +602,13 @@ mod tests {
         // its output renders as a tool_result verbatim.
         assert!(out.contains("[tool_result for c1]") && out.contains("file1\nfile2"));
         // the three non-conversational records (session_meta/event_msg/token_usage_record) are omitted but
-        // ACCOUNTED for in the footer, keyed by their top-level type — nothing silently dropped.
+        // accounted for in the footer, keyed by their top-level type — nothing silently dropped.
         assert!(out.contains("3 non-conversational records omitted"));
-        assert!(out.contains("session_meta×1") && out.contains("event_msg×1") && out.contains("token_usage_record×1"));
+        assert!(
+            out.contains("session_meta×1")
+                && out.contains("event_msg×1")
+                && out.contains("token_usage_record×1")
+        );
     }
 
     #[test]
@@ -594,9 +623,11 @@ mod tests {
 
     #[test]
     fn tool_result_error_is_labeled() {
-        let recs = vec![serde_json::json!({"type":"user","message":{"role":"user","content":[
-            {"type":"tool_result","tool_use_id":"z","is_error":true,"content":"boom"}
-        ]}})];
+        let recs = vec![
+            serde_json::json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"z","is_error":true,"content":"boom"}
+            ]}}),
+        ];
         let out = render(&recs, &ClaudeCode);
         assert!(out.contains("[tool_result ERROR for z]") && out.contains("boom"));
     }
@@ -608,7 +639,10 @@ mod tests {
         assert!(!s.contains("sk-ant-abc123") && !s.contains("ghp_deadbeef"));
         assert!(!s.contains("wJalrXUtnFEMI"));
         assert!(s.contains("AWS_SECRET_ACCESS_KEY=‹redacted›"));
-        assert!(s.contains("here is") && s.contains("and a token") && s.contains("ok"), "prose preserved");
+        assert!(
+            s.contains("here is") && s.contains("and a token") && s.contains("ok"),
+            "prose preserved"
+        );
     }
 
     #[test]
@@ -634,15 +668,18 @@ mod tests {
         assert!(!slug_is_for_agent(slug, "board-pm"));
         // no-repo layout (slug ends at the agent)
         assert!(slug_is_for_agent("-x--fleet-agents-board-pm", "board-pm"));
-        // KNOWN LIMITATION: a dash-prefix id also matches (repo separator == intra-name dash). Documented;
+        // Known limitation: a dash-prefix id also matches (repo separator == intra-name dash). Documented;
         // callers disambiguate with the longest match or `--session`.
-        assert!(slug_is_for_agent(slug, "v-fleet"), "dash-prefix collision is a documented limitation");
+        assert!(
+            slug_is_for_agent(slug, "v-fleet"),
+            "dash-prefix collision is a documented limitation"
+        );
     }
 
     #[test]
     fn slug_owner_prefers_the_longest_matching_roster_id() {
         // task_846: v-task-board and v-task-board-helper are dash-prefixes; the helper's dir slug matches
-        // BOTH via slug_is_for_agent, so the owner must be the longer id so a dir maps to exactly one agent.
+        // both via slug_is_for_agent, so the owner must be the longer id so a dir maps to exactly one agent.
         let roster = [
             "v-task-board".to_string(),
             "v-task-board-helper".to_string(),
@@ -650,10 +687,16 @@ mod tests {
         ];
         let helper_slug = "-x--fleet-agents-v-task-board-helper-cadenza";
         let board_slug = "-x--fleet-agents-v-task-board-cadenza";
-        assert_eq!(slug_owner(helper_slug, &roster), Some("v-task-board-helper"));
+        assert_eq!(
+            slug_owner(helper_slug, &roster),
+            Some("v-task-board-helper")
+        );
         assert_eq!(slug_owner(board_slug, &roster), Some("v-task-board"));
         // A slug no roster id matches has no owner.
-        assert_eq!(slug_owner("-x--fleet-agents-v-cdz-smith-cadenza", &roster), None);
+        assert_eq!(
+            slug_owner("-x--fleet-agents-v-cdz-smith-cadenza", &roster),
+            None
+        );
         // Empty roster → no owner (caller falls back to the bare match, preserving prior behavior).
         assert_eq!(slug_owner(helper_slug, &[]), None);
     }
@@ -663,7 +706,10 @@ mod tests {
         assert_eq!(parse_watermark("abc-123:450"), ("abc-123".to_string(), 450));
         assert_eq!(parse_watermark("abc-123"), ("abc-123".to_string(), 0));
         // a session id itself contains no trailing :digits, so a UUID with dashes is intact
-        assert_eq!(parse_watermark("a951bc3e-bfbc"), ("a951bc3e-bfbc".to_string(), 0));
+        assert_eq!(
+            parse_watermark("a951bc3e-bfbc"),
+            ("a951bc3e-bfbc".to_string(), 0)
+        );
     }
 
     #[test]
