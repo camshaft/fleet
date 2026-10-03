@@ -77,6 +77,14 @@ pub struct Config {
     /// read it.
     pub webhook_advertise_host: String,
 
+    /// When true, the board-driven worker registers with no `webhook_url` and relies entirely on the
+    /// `pipeline_poll_secs` catch-up poll for wake. Set this when the board cannot deliver webhooks to the
+    /// worker's advertised host — for example a board that guards `POST /agents` against private/loopback
+    /// webhook hosts, which every co-resident fleet-LAN worker has. Requires `pipeline_poll_secs` > 0 (the
+    /// default 60 satisfies it). The default here is `false` (reactive webhook registration). Only the
+    /// workers read it.
+    pub poll_only: bool,
+
     /// Drop-folder the `kb inbox` worker drains (was `KB_INBOX_DIR`). Each file is ingested + IPFS-pinned
     /// then deleted; the first path component is its collection.
     pub inbox_dir: String,
@@ -147,6 +155,7 @@ impl Default for Config {
             board_url: "http://127.0.0.1:8079/api".to_string(),
             pipeline_poll_secs: 60, // periodic catch-up backstop for missed webhook deliveries; 0 disables
             webhook_advertise_host: String::new(), // empty = auto-detect routable IP toward the board
+            poll_only: false, // reactive webhook registration by default; true drops the webhook_url and polls
             inbox_dir: "/data/kb-inbox".to_string(),
             inbox_default_collection: "inbox".to_string(),
             // Generic loopback default (NOT the host-specific green-machine.lan), matching the other
@@ -279,5 +288,12 @@ mod tests {
     fn parse_invalid_is_defaults_not_panic() {
         let c = parse("this is = = not toml");
         assert_eq!(c.mcp_port, 8077);
+    }
+
+    #[test]
+    fn poll_only_defaults_false_and_parses_true() {
+        assert!(!Config::default().poll_only); // reactive webhook registration by default
+        let c = parse("poll_only = true\n");
+        assert!(c.poll_only); // opt-in: register without a webhook_url and lean on the catch-up poll
     }
 }
