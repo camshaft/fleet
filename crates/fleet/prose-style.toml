@@ -92,6 +92,7 @@ caps_allow = [
   "NOTE",
   "OK",
   "OS",
+  "PATH",
   "PID",
   "PR",
   "RAM",

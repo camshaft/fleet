@@ -1,19 +1,19 @@
 //! `memory` — the Claude Code memory directory <-> board auto-sync (task_848), the Rust port of
 //! `memory_sync.py` (task_956: fleet tooling is Rust, not Python). It is the native-tool fallback cameron
-//! asked for (task_826 comment_3477): an agent that writes the native Claude Code memory FILE directly
+//! asked for (task_826 comment_3477): an agent that writes the native Claude Code memory file directly
 //! (instead of calling `board-memory`) still gets its memory onto the board.
 //!
 //! Two directions, both shelling the `board-memory` CLI (the thin REST shim stays, per the operator ruling):
 //!   - **file-to-board** (the core ask): scan the memory dir, parse each file's frontmatter, and run
-//!     `board-memory write` for each NEW/CHANGED file. Idempotent via a per-slug content-hash state file —
+//!     `board-memory write` for each new/changed file. Idempotent via a per-slug content-hash state file —
 //!     an unchanged file is skipped; a changed one is versioned in place by the deterministic board path.
 //!   - **board-to-file** (the local read-through cache for native recall/offline): `board-memory recall`
 //!     the slug index, then `board-memory read` each body into `<slug>.md`.
 //!
-//! Single-writer stays intact: an agent syncs only its OWN `--agent <self>` (or a given `--repo`) scope, so
+//! Single-writer stays intact: an agent syncs only its own `--agent <self>` (or a given `--repo`) scope, so
 //! file-to-board is same-writer with no cross-agent conflict.
 //!
-//! PORT NOTES vs the Python: the frontmatter parse is the lenient LINE-BASED parser (the Python's own
+//! Port notes vs the Python: the frontmatter parse is the lenient line-based parser (the Python's own
 //! fallback path), not a full YAML load — the fleet crate carries no YAML dependency, and the memory-file
 //! frontmatter shape (single-line `name`/`description` + an indented `metadata.type`) parses identically.
 //! An exotic multi-line YAML scalar in frontmatter would differ, but memory files do not use them. The
@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
-/// Memory index/readme files that are NOT per-fact memories and must never be pushed as a board memory.
+/// Memory index/readme files that are not per-fact memories and must never be pushed as a board memory.
 const SKIP_NAMES: &[&str] = &["MEMORY.md", "README.md"];
 /// The board's four memory types; anything else is coerced to `project` (with a warning).
 const VALID_TYPES: &[&str] = &["user", "feedback", "project", "reference"];
@@ -74,7 +74,7 @@ pub struct MemoryRecord {
 /// Split a `---\n…\n---\n` YAML frontmatter header off the top of a memory file, returning
 /// `Some((frontmatter_block, body))` when both the opening and closing `---` fences are present, else `None`
 /// (treated as "no frontmatter", body = the whole text). Mirrors the Python `FM_RE`:
-/// `^---\s*\n(.*?)\n---\s*\n?(.*)$` with DOTALL — the body has its leading whitespace stripped (the greedy
+/// `^---\s*\n(.*?)\n---\s*\n?(.*)$` in dotall mode — the body has its leading whitespace stripped (the greedy
 /// `\s*` after the closing fence). Pure.
 fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
     // The opener must be the very first line: `---` plus only trailing whitespace.
@@ -84,7 +84,7 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
         return None;
     }
     let rest = &text[nl0 + 1..];
-    // The closer is the first LINE (preceded by a newline, i.e. not rest's offset 0) that is `---` + ws.
+    // The closer is the first line (preceded by a newline, i.e. not rest's offset 0) that is `---` + ws.
     let mut offset = 0usize;
     for line in rest.split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
@@ -342,7 +342,7 @@ fn file_to_board(
             continue;
         }
         if dry_run {
-            // NOTE: the body content pushed is byte-identical to the Python; this count is in BYTES
+            // NOTE: the body content pushed is byte-identical to the Python; this count is in bytes
             // (`.len()`), where the Python printed Unicode code points (`len(str)`). For a multibyte body
             // the two counts differ by the extra UTF-8 bytes — a cosmetic dry-run label difference only,
             // not a content divergence (verified against the 2927-memory camshaft-cadenza store).
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn split_frontmatter_none_without_both_fences() {
         assert!(split_frontmatter("no fence here\nbody\n").is_none());
-        // An opener with no closer is NOT frontmatter (the whole text is the body).
+        // An opener with no closer is not frontmatter (the whole text is the body).
         assert!(split_frontmatter("---\nname: x\nbody with no closing fence\n").is_none());
         // The closer cannot be the opener's own line (needs a preceding newline).
         assert!(split_frontmatter("---\n").is_none());
