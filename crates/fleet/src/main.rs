@@ -4518,6 +4518,151 @@ fn ensure_launch_cwd(cwd: &str) -> Result<(), String> {
     std::fs::create_dir_all(cwd).map_err(|e| format!("mkdir launch cwd {cwd}: {e}"))
 }
 
+/// The distinct `.claude/worktrees/<name>/` directory-prefix segments referenced inside a generated
+/// cargo-brazil `brazil.toml` cache, each paired with the absolute on-disk worktree directory the segment
+/// names (`<repo>/.claude/worktrees/<name>`). The caller decides which are STALE by testing that directory for
+/// existence — a live sibling worktree's directory is present, so its segment is left untouched. Only a
+/// `/`-terminated reference (`<name>/<sub-path>`) is returned, since a bare `.claude/worktrees/<name>` with no
+/// trailing path has no segment to rebase. Pure, so the scan is unit-tested without a filesystem.
+fn brazil_toml_worktree_refs(content: &str) -> Vec<(String, String)> {
+    const MARKER: &str = ".claude/worktrees/";
+    let mut refs: Vec<(String, String)> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = content[from..].find(MARKER) {
+        let marker = from + rel;
+        let after = marker + MARKER.len();
+        from = after; // advance past this marker regardless of what we do with the reference
+        // The worktree name runs from the marker to the next path separator or string/array delimiter.
+        let name_rel = content[after..].find(['/', '"', '\'', ']', ',', ' ', '\t', '\n', '\r']);
+        let Some(nr) = name_rel else { continue };
+        let name_end = after + nr;
+        // Only a `/`-terminated reference is a directory PREFIX we can rebase; a bare `.claude/worktrees/<name>`
+        // with no trailing path has no `.../ ` segment to strip, so leave it.
+        if content.as_bytes().get(name_end) != Some(&b'/') {
+            continue;
+        }
+        let name = &content[after..name_end];
+        if name.is_empty() {
+            continue;
+        }
+        // The absolute path starts at the delimiter that precedes it in the TOML (a quote, bracket, comma,
+        // `=`, or whitespace); everything from there to the name is the repo root the worktree sits under.
+        let start = content[..marker]
+            .rfind(['"', '\'', '[', ',', '=', ' ', '\t', '\n', '\r'])
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let abs_dir = content[start..name_end].to_string();
+        let segment = format!("{MARKER}{name}/");
+        if !refs.iter().any(|(_, s)| *s == segment) {
+            refs.push((abs_dir, segment));
+        }
+    }
+    refs
+}
+
+/// Strip every `.claude/worktrees/<name>/` segment named in `stale` from a generated cargo-brazil `brazil.toml`
+/// cache so each affected path rebases onto the repo root the dead worktree sat under — the deterministic
+/// repair the Membrain stale-worktree runbook performs with `sed -i 's|.claude/worktrees/<name>/||g'`. Returns
+/// the rewritten text when it changed, else `None` (a clean cache is a no-op). Substring removal (not line
+/// deletion) is deliberate: the same segments appear inside `[env.*] value = …` lines, so dropping whole lines
+/// would corrupt the TOML. Pure.
+fn strip_worktree_segments(content: &str, stale: &[String]) -> Option<String> {
+    let mut out = content.to_string();
+    for seg in stale {
+        out = out.replace(seg.as_str(), "");
+    }
+    if out == content {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Repair one cargo-brazil `cargo-home` directory in place (see `repair_membrain_worktree_env`). Strips every
+/// stale deleted-worktree path from `brazil.toml` and removes a `Config-in-pkg` backlink left dangling into a
+/// dead worktree. Returns one human-readable line per repair made (none when the directory is already clean).
+/// Factored out so the per-directory logic is exercised directly in tests.
+fn repair_cargo_home(cargo_home: &Path) -> Vec<String> {
+    let mut repairs: Vec<String> = Vec::new();
+
+    // 1. brazil.toml — rebase paths into worktrees that no longer exist; a live sibling worktree is left alone.
+    let toml = cargo_home.join("brazil.toml");
+    if let Ok(content) = std::fs::read_to_string(&toml) {
+        let stale: Vec<String> = brazil_toml_worktree_refs(&content)
+            .into_iter()
+            .filter(|(abs_dir, _)| !Path::new(abs_dir).exists())
+            .map(|(_, seg)| seg)
+            .collect();
+        if let Some(fixed) = strip_worktree_segments(&content, &stale) {
+            match std::fs::write(&toml, fixed) {
+                Ok(()) => repairs.push(format!(
+                    "rebased {} stale worktree path(s) in {}",
+                    stale.len(),
+                    toml.display()
+                )),
+                Err(e) => repairs.push(format!("WARN: could not rewrite {}: {e}", toml.display())),
+            }
+        }
+    }
+
+    // 2. Config-in-pkg — a symlink to the dead worktree's `Config`; remove it when it dangles into a worktree
+    //    so the configure phase recreates it (else it fails "write out CARGO_HOME Config backlink / File
+    //    exists"). A symlink that still resolves is a live backlink and is left untouched.
+    let config_link = cargo_home.join("Config-in-pkg");
+    if let Ok(meta) = std::fs::symlink_metadata(&config_link)
+        && meta.file_type().is_symlink()
+        && let Ok(target) = std::fs::read_link(&config_link)
+    {
+        let into_worktree = target.to_string_lossy().contains(".claude/worktrees/");
+        // Resolve a relative target against the cargo-home so the existence check is accurate.
+        let resolved = if target.is_absolute() {
+            target.clone()
+        } else {
+            cargo_home.join(&target)
+        };
+        if into_worktree && !resolved.exists() {
+            match std::fs::remove_file(&config_link) {
+                Ok(()) => repairs.push(format!(
+                    "removed dangling Config backlink {} -> {}",
+                    config_link.display(),
+                    target.display()
+                )),
+                Err(e) => {
+                    repairs.push(format!("WARN: could not remove {}: {e}", config_link.display()))
+                }
+            }
+        }
+    }
+
+    repairs
+}
+
+/// Detect and repair the contamination a deleted git worktree leaves in the Membrain SHARED cargo-brazil env
+/// (task_1452). A prior session's `.claude/worktrees/<name>` paths linger in the generated `brazil.toml`
+/// manifest/env cache and in the `Config-in-pkg` backlink; every `cargo` / `cargo nextest` in the SHARED env
+/// then fails resolving a `Cargo.toml` under a directory that no longer exists, wedging the whole-tree bootstrap
+/// the setup_script is about to run — and every sibling Membrain agent on the shared env, not just the one that
+/// deleted the worktree. The env lives at `src/<package>/build/private/cargo-home/` (the `build` symlink points
+/// at the shared brazil build dir), so this scans each `src/*/` package the setup_script bootstraps. Safe and
+/// idempotent: only segments whose worktree directory is ABSENT are stripped (a live sibling worktree is left
+/// intact), only a dangling backlink is removed, and a clean or not-yet-materialized env is a no-op. Returns one
+/// line per repair made for the spin-up report.
+fn repair_membrain_worktree_env(cwd: &str) -> Vec<String> {
+    let mut repairs: Vec<String> = Vec::new();
+    // The setup_script iterates `src/*/` packages under FLEET_WORKSPACE_CWD; the per-package shared env is
+    // `build/private/cargo-home/`. Absent `src/` (an unexpected layout, or not yet materialized) → nothing to do.
+    let Ok(entries) = std::fs::read_dir(Path::new(cwd).join("src")) else {
+        return repairs;
+    };
+    for entry in entries.flatten() {
+        let cargo_home = entry.path().join("build/private/cargo-home");
+        if cargo_home.is_dir() {
+            repairs.extend(repair_cargo_home(&cargo_home));
+        }
+    }
+    repairs
+}
+
 /// Spin up an agent whose workspace is defined by a board workspace-kind resource rather than by `repos`.
 /// Fetches the kind, reports the plan, and on `--apply` ensures the launch cwd exists, runs its setup_script
 /// (with `FLEET_AGENT` / `FLEET_ROOT` and any `config.env` in the environment) to materialize the workspace,
@@ -4598,6 +4743,11 @@ fn spin_up_workspace_kind(
         ),
         None => println!("  verify: NONE — no post-setup health assertion for this kind"),
     }
+    if kind == "membrain" {
+        println!(
+            "  membrain preflight: on --apply, detect + repair stale deleted-worktree paths in the shared cargo-brazil env before bootstrap"
+        );
+    }
 
     if !apply {
         println!("  (dry-run — re-run with --apply to run the setup_script, verify, + launch)");
@@ -4616,6 +4766,23 @@ fn spin_up_workspace_kind(
     if let Err(e) = ensure_launch_cwd(&plan.cwd) {
         eprintln!("  setup FAILED: {e}");
         std::process::exit(1);
+    }
+
+    // task_1452: the membrain kind's SHARED cargo-brazil env is contaminated when a prior session deletes a git
+    // worktree whose paths still linger in the generated brazil.toml cache / Config backlink — every cargo +
+    // cargo nextest in that shared env then fails on a Cargo.toml under a directory that no longer exists,
+    // wedging the whole-tree bootstrap the setup_script is about to run (and every sibling membrain agent).
+    // Detect + auto-repair it before the setup_script. A clean (or not-yet-materialized) env is a no-op, and a
+    // live sibling worktree is never touched.
+    if kind == "membrain" {
+        let repairs = repair_membrain_worktree_env(&plan.cwd);
+        if repairs.is_empty() {
+            println!("  membrain preflight: shared cargo-brazil env clean (no stale worktree paths)");
+        } else {
+            for r in &repairs {
+                println!("  membrain preflight: {r}");
+            }
+        }
     }
 
     if let Some(script) = &plan.setup_script {
@@ -18107,6 +18274,136 @@ detached
         let err = ensure_launch_cwd(file.to_str().unwrap()).unwrap_err();
         assert!(err.contains("mkdir launch cwd"));
         assert!(err.contains(file.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn brazil_toml_worktree_refs_extracts_distinct_prefix_segments() {
+        // task_1452: the generated cache names worktree paths both in a `manifests = [...]` array and in
+        // `[env.*] value = …` lines; the scan returns each DISTINCT `.claude/worktrees/<name>/` prefix once,
+        // paired with the absolute worktree directory the caller tests for existence.
+        let content = "\
+manifests = [
+    \"/repo/.claude/worktrees/dead/Cargo.toml\",
+    \"/repo/.claude/worktrees/dead/sub/Cargo.toml\",
+    \"/repo/.claude/worktrees/live/Cargo.toml\",
+    \"/repo/Cargo.toml\",
+]
+
+[env.FOO]
+value = \"/repo/.claude/worktrees/dead/target\"
+";
+        let refs = brazil_toml_worktree_refs(content);
+        // `dead` appears three times but is one distinct segment; `live` is the other. Order of first sight.
+        assert_eq!(
+            refs,
+            vec![
+                (
+                    "/repo/.claude/worktrees/dead".to_string(),
+                    ".claude/worktrees/dead/".to_string()
+                ),
+                (
+                    "/repo/.claude/worktrees/live".to_string(),
+                    ".claude/worktrees/live/".to_string()
+                ),
+            ]
+        );
+        // A bare `.claude/worktrees/<name>` with no trailing path has no prefix segment to rebase → skipped.
+        assert!(brazil_toml_worktree_refs("value = \"/repo/.claude/worktrees/bare\"\n").is_empty());
+        // A clean cache (no worktree paths at all) yields nothing.
+        assert!(brazil_toml_worktree_refs("manifests = [\n  \"/repo/Cargo.toml\",\n]\n").is_empty());
+    }
+
+    #[test]
+    fn strip_worktree_segments_rebases_only_named_segments_and_is_a_noop_when_clean() {
+        // Stripping the segment rebases the path onto the repo root WITHOUT dropping the `[env.*] value =` line
+        // (the runbook's warning: `grep -v` would corrupt the TOML). Only the named (stale) segment goes; a
+        // live sibling worktree's segment is preserved verbatim.
+        let content = "\
+manifests = [
+    \"/repo/.claude/worktrees/dead/Cargo.toml\",
+    \"/repo/.claude/worktrees/live/Cargo.toml\",
+]
+
+[env.FOO]
+value = \"/repo/.claude/worktrees/dead/target\"
+";
+        let fixed = strip_worktree_segments(content, &[".claude/worktrees/dead/".to_string()])
+            .expect("stale segment present → rewrite");
+        assert!(fixed.contains("\"/repo/Cargo.toml\","));
+        assert!(fixed.contains("value = \"/repo/target\"")); // env line kept, just rebased
+        assert!(fixed.contains("\"/repo/.claude/worktrees/live/Cargo.toml\",")); // live untouched
+        assert!(!fixed.contains("worktrees/dead"));
+        // No stale segments, or none that match → no rewrite.
+        assert!(strip_worktree_segments(content, &[]).is_none());
+        assert!(strip_worktree_segments(content, &[".claude/worktrees/absent/".to_string()]).is_none());
+    }
+
+    #[test]
+    fn repair_cargo_home_strips_stale_keeps_live_removes_dangling_backlink_and_is_idempotent() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir()
+            .join(format!("fleet-mbrepair-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&base);
+        // A repo root with a LIVE worktree present on disk and a DEAD one that was deleted.
+        let repo = base.join("repo");
+        let live_wt = repo.join(".claude/worktrees/live");
+        std::fs::create_dir_all(&live_wt).unwrap();
+        let dead_wt = repo.join(".claude/worktrees/dead"); // deliberately NOT created
+        let cargo_home = base.join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let repo_s = repo.to_str().unwrap();
+        let brazil_toml = format!(
+            "manifests = [\n  \"{dead}/Cargo.toml\",\n  \"{live}/Cargo.toml\",\n]\n\n[env.FOO]\nvalue = \"{dead}/target\"\n",
+            dead = dead_wt.display(),
+            live = live_wt.display(),
+        );
+        std::fs::write(cargo_home.join("brazil.toml"), &brazil_toml).unwrap();
+        // A Config-in-pkg backlink dangling into the dead worktree, plus (to prove safety) a VALID one would be
+        // kept — tested separately below.
+        symlink(
+            dead_wt.join("Config"),
+            cargo_home.join("Config-in-pkg"),
+        )
+        .unwrap();
+
+        let repairs = repair_cargo_home(&cargo_home);
+        assert_eq!(repairs.len(), 2, "brazil.toml rebase + backlink removal: {repairs:?}");
+        let fixed = std::fs::read_to_string(cargo_home.join("brazil.toml")).unwrap();
+        assert!(fixed.contains(&format!("\"{repo_s}/Cargo.toml\",")), "dead rebased to repo root");
+        assert!(fixed.contains(&format!("value = \"{repo_s}/target\"")), "env line kept + rebased");
+        assert!(
+            fixed.contains(&format!("\"{}/Cargo.toml\",", live_wt.display())),
+            "live worktree path untouched"
+        );
+        assert!(!fixed.contains("worktrees/dead"));
+        assert!(
+            std::fs::symlink_metadata(cargo_home.join("Config-in-pkg")).is_err(),
+            "dangling backlink removed"
+        );
+
+        // Idempotent: a second pass on the now-clean env makes no further repairs.
+        assert!(repair_cargo_home(&cargo_home).is_empty());
+
+        // Safety: a backlink that still RESOLVES (points at a live worktree's Config) is left in place.
+        std::fs::write(live_wt.join("Config"), b"cfg").unwrap();
+        symlink(live_wt.join("Config"), cargo_home.join("Config-in-pkg")).unwrap();
+        assert!(repair_cargo_home(&cargo_home).is_empty());
+        assert!(cargo_home.join("Config-in-pkg").exists(), "live backlink preserved");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn repair_membrain_worktree_env_is_a_noop_without_a_materialized_env() {
+        // A fresh/absent workspace (no `src/` or no `build/private/cargo-home`) must be a clean no-op, never an
+        // error — spin-up proceeds straight to the setup_script bootstrap.
+        let base = std::env::temp_dir()
+            .join(format!("fleet-mbenv-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(repair_membrain_worktree_env(base.to_str().unwrap()).is_empty()); // no dir at all
+        std::fs::create_dir_all(base.join("src/Membrain")).unwrap(); // src pkg but no build env yet
+        assert!(repair_membrain_worktree_env(base.to_str().unwrap()).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
