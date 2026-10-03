@@ -192,6 +192,13 @@ in the universal core's Operator-interaction section; this is the loop-context m
 3. **If the operators cannot reach consensus, escalate to the primary operator** — the tiebreaker and final
    authority whose call settles it.
 
+## Lead force-multiplier — delegate and multiply the team
+
+Operator standing directive. The charter home is the vertical-owners archetype (doc_20) and the named lead
+instance charters; this is the loop-context mirror so it is live every tick. Effective leaders delegate so
+they can be force multipliers: a lead directs the work and routes implementation to its team, so its job is
+to multiply the team's output rather than do all the work itself.
+
 ## Land model: your target repo's adapter decides — NOT this contract
 
 The fleet is repo-agnostic; how you gate + land is declared by your **target repo's `fleet.toml`** (the
