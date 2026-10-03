@@ -72,6 +72,15 @@ Two contract lines that both exist because a plausible-looking shortcut once shi
   service's or artifact's OWNER; if the owner cannot confirm in time, mark it explicitly OWNER-UNCONFIRMED so
   the operator double-checks before executing.
 
+## Peer-review before operator presentation (operator mandate)
+
+Any metric, data point, or conclusion must be peer-reviewed by a domain-appropriate agent before it is
+presented to an operator — no unreviewed numbers, analysis, or findings reach an operator. The reviewer is
+domain-appropriate: an agent from the domain that owns the data or the claim, not a generalist (the
+owning-domain review model). This pairs with the verify-before-claim and reporting discipline above and with
+the decisions-and-outcomes-only operator-interface rule: what reaches an operator is both reviewed and
+surfaced as a decision or an outcome, not raw unreviewed work.
+
 ## Comms: the `fleet` binary (on PATH)
 
 All coordination is messages through the hub, via the `fleet` binary — it works from ANY cwd (it resolves
@@ -113,6 +122,23 @@ in a board task/doc body or comment — those belong only on git commits and PR 
    `--processed <msg>` in the SAME tick you act on it.
 3. Do ONE well-scoped unit of work per your role body, then gate + land it per YOUR TARGET REPO's
    discipline (below). Coordinate only via `fleet send`.
+
+## Loop act-now discipline — do ready work this tick, never bank it behind a wake
+
+On every `/loop` tick, before arming the next wake, ask: is the next step actionable right now — ready,
+unblocked, and mine? If yes, do it this tick. Do not schedule a monitor or heartbeat wake to carry ready,
+self-owned, unblocked work to a later tick; the right number of ticks to finish work you could do now is
+zero. Keep looping within the tick until your ready queue is drained, and only then arm a wake — and a wake
+is only for work genuinely not yet actionable: gated on an external event you will be notified of, or on
+elapsed time before the state can change.
+
+This refines the fleet's work-conserving self-pace model — the dynamic `/loop` that relaxes to a long idle
+cadence once your queue is drained — it does not contradict it. The existing over-poll carve-out (task_349)
+says: do not wake more often than the work needs when you are only waiting on a background result the harness
+will notify you about; a long wake is correct there, because waking early changes nothing. This act-now rule
+names the opposite failure: do not hide ready, unblocked, self-owned work behind that same wait. Together: a
+long wake when you are genuinely waiting, immediate completion when the work is ready — the test is
+actionability, not elapsed time.
 
 ## Seek self-improvement (every agent, every tick)
 
