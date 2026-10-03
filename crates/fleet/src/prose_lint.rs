@@ -2,7 +2,7 @@
 //! caps-for-emphasis in Rust comments and in the loops markdown, so the house write-literally style
 //! (operator directive, 2026-08-07) cannot regress in code.
 //!
-//! Two rules run over one pass:
+//! Three rules run over one pass:
 //!   - emphatics: a case-insensitive substring match of each comment line against a wordlist that is a
 //!     checked-in projection of the live board banned-phrases list. The board stays the one source;
 //!     public CI and a pre-commit hook cannot reach it, so the list is synced into a committed file
@@ -10,6 +10,10 @@
 //!   - caps-for-emphasis: a structural check for an all-caps alphabetic word used in prose, with an
 //!     allow-list of acceptable all-caps tokens (acronyms). A word that carries a digit or an
 //!     underscore is an identifier, not emphasis, so it is never flagged.
+//!   - define-by-negation: an anchored phrase that defines a thing by stating what it is not (e.g.
+//!     "deliberately no", "intentionally not"). The anchors match on word boundaries, not as a raw
+//!     substring, so a plain negation (does not exist, is not null) stays clean. The anchor list is
+//!     hand-maintained in prose-style.toml and preserved by the sync, like the caps allow-list.
 //!
 //! The scope is comments, not code. A listed word inside a string literal or an identifier is out of
 //! scope, so the lint does not fire on a user-facing string. Markdown prose lines are scanned whole,
@@ -28,6 +32,8 @@ pub enum Rule {
     Emphatic,
     /// An all-caps word used for emphasis.
     CapsEmphasis,
+    /// An anchored phrase that defines a thing by stating what it is not.
+    DefineByNegation,
 }
 
 impl Rule {
@@ -35,6 +41,7 @@ impl Rule {
         match self {
             Rule::Emphatic => "emphatic",
             Rule::CapsEmphasis => "caps-for-emphasis",
+            Rule::DefineByNegation => "define-by-negation",
         }
     }
 }
@@ -57,21 +64,44 @@ pub struct CommentLine {
     pub text: String,
 }
 
-/// The ruleset file shape: an emphatics wordlist plus a caps allow-list.
+/// The ruleset file shape: an emphatics wordlist, a caps allow-list, and the define-by-negation anchors.
 #[derive(Debug, Deserialize)]
 struct RulesetFile {
     #[serde(default)]
     emphatics: Vec<String>,
     #[serde(default)]
     caps_allow: Vec<String>,
+    #[serde(default)]
+    negation_anchors: Vec<String>,
 }
 
-/// A compiled ruleset ready to match: emphatics pre-lowercased for a case-insensitive match, and the
-/// caps allow-list upper-cased into a set for a direct membership test.
+/// A compiled ruleset ready to match: emphatics pre-lowercased for a case-insensitive match, the caps
+/// allow-list upper-cased into a set for a direct membership test, and each negation anchor split into
+/// its lowercase word tokens for a word-boundary match.
 #[derive(Debug, Clone)]
 pub struct Ruleset {
     emphatics_lower: Vec<String>,
     caps_allow: BTreeSet<String>,
+    negation_anchors: Vec<Vec<String>>,
+}
+
+/// Split text into its lowercase word tokens: maximal runs of ASCII alphanumerics, with every other
+/// character a separator. A hyphen is a separator, so `non-blocking` tokenizes to `non`, `blocking` and
+/// an anchor word `no` never matches inside `non`.
+fn word_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut w = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            w.push(c.to_ascii_lowercase());
+        } else if !w.is_empty() {
+            out.push(std::mem::take(&mut w));
+        }
+    }
+    if !w.is_empty() {
+        out.push(w);
+    }
+    out
 }
 
 /// Parse a ruleset TOML string into a compiled [`Ruleset`]. Pure (no file access). An empty emphatics
@@ -93,9 +123,18 @@ pub fn parse_ruleset(toml_src: &str) -> Result<Ruleset, String> {
         .map(|t| t.trim().to_uppercase())
         .filter(|t| !t.is_empty())
         .collect();
+    let mut negation_anchors = Vec::new();
+    for a in parsed.negation_anchors {
+        let words = word_tokens(&a);
+        if words.is_empty() {
+            return Err("ruleset has an empty negation anchor".to_string());
+        }
+        negation_anchors.push(words);
+    }
     Ok(Ruleset {
         emphatics_lower,
         caps_allow,
+        negation_anchors,
     })
 }
 
@@ -141,7 +180,26 @@ pub fn caps_emphasis_words(text: &str, rs: &Ruleset) -> Vec<String> {
     out
 }
 
-/// Run both rules over a set of comment lines from one file, collecting findings.
+/// The define-by-negation anchors found in one line of prose, as the matched anchor phrases. Each anchor
+/// matches only when its words appear as a consecutive run of whole word tokens, so a plain negation
+/// (does not exist, is not null) and a word that merely contains an anchor word (non-blocking) stay clean.
+pub fn match_negation(text: &str, rs: &Ruleset) -> Vec<String> {
+    let toks = word_tokens(text);
+    rs.negation_anchors
+        .iter()
+        .filter(|anchor| is_consecutive_run(&toks, anchor))
+        .map(|anchor| anchor.join(" "))
+        .collect()
+}
+
+/// Does `needle` appear as a consecutive run of whole elements in `hay`?
+fn is_consecutive_run(hay: &[String], needle: &[String]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= hay.len()
+        && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Run every rule over a set of comment lines from one file, collecting findings.
 pub fn lint_comment_lines(file: &str, lines: &[CommentLine], rs: &Ruleset) -> Vec<Finding> {
     let mut out = Vec::new();
     for cl in lines {
@@ -159,6 +217,14 @@ pub fn lint_comment_lines(file: &str, lines: &[CommentLine], rs: &Ruleset) -> Ve
                 line: cl.line,
                 rule: Rule::CapsEmphasis,
                 token: word,
+            });
+        }
+        for anchor in match_negation(&cl.text, rs) {
+            out.push(Finding {
+                file: file.to_string(),
+                line: cl.line,
+                rule: Rule::DefineByNegation,
+                token: anchor,
             });
         }
     }
@@ -516,6 +582,11 @@ const RULESET_HEADER: &str = "\
 # `caps_allow` is the structural caps-for-emphasis rule's allow-list of acceptable all-caps tokens. It is
 # hand-maintained here (the sync preserves it) and kept conservative, extended from real false positives. A
 # token carrying a digit or an underscore is an identifier and is never flagged, so it does not belong here.
+#
+# `negation_anchors` is the define-by-negation rule's anchored phrase list: short word sequences that define
+# a thing by stating what it is not. Each anchor matches on word boundaries, not as a raw substring, so a
+# plain negation (does not exist, is not null) stays clean. It is hand-maintained here and preserved by the
+# sync, like caps_allow; keep it conservative and seeded from real operator-named forms.
 ";
 
 /// Quote one string as a TOML double-quoted array entry with a trailing comma, escaping a backslash and a
@@ -528,7 +599,11 @@ fn toml_entry(s: &str) -> String {
 /// Render a ruleset file deterministically from the two lists (each sorted and deduped, one entry per
 /// line). Pure. The committed prose-style.toml is exactly this output, so the drift check is a comparison
 /// of this render against the file on disk.
-pub fn render_ruleset_toml(emphatics: &[String], caps_allow: &[String]) -> String {
+pub fn render_ruleset_toml(
+    emphatics: &[String],
+    caps_allow: &[String],
+    negation_anchors: &[String],
+) -> String {
     let render_list = |name: &str, items: &[String]| {
         let mut v = items.to_vec();
         v.sort();
@@ -547,16 +622,26 @@ pub fn render_ruleset_toml(emphatics: &[String], caps_allow: &[String]) -> Strin
     s.push_str(&render_list("emphatics", emphatics));
     s.push('\n');
     s.push_str(&render_list("caps_allow", caps_allow));
+    s.push('\n');
+    s.push_str(&render_list("negation_anchors", negation_anchors));
     s
 }
 
-/// The raw (original-case, trimmed) emphatics and caps_allow arrays from a ruleset file. The sync uses this
-/// to preserve the hand-maintained caps_allow while it refreshes emphatics from the board.
-pub fn parse_raw_lists(toml_src: &str) -> Result<(Vec<String>, Vec<String>), String> {
+/// The three raw ruleset lists in file order: emphatics, caps_allow, negation_anchors.
+pub type RawLists = (Vec<String>, Vec<String>, Vec<String>);
+
+/// The raw (original-case, trimmed) emphatics, caps_allow, and negation_anchors arrays from a ruleset file.
+/// The sync uses this to preserve the hand-maintained caps_allow and negation_anchors while it refreshes
+/// emphatics from the board.
+pub fn parse_raw_lists(toml_src: &str) -> Result<RawLists, String> {
     let parsed: RulesetFile =
         toml::from_str(toml_src).map_err(|e| format!("ruleset parse error: {e}"))?;
     let trim = |v: Vec<String>| v.into_iter().map(|s| s.trim().to_string()).collect();
-    Ok((trim(parsed.emphatics), trim(parsed.caps_allow)))
+    Ok((
+        trim(parsed.emphatics),
+        trim(parsed.caps_allow),
+        trim(parsed.negation_anchors),
+    ))
 }
 
 /// Options for [`prose_sync`].
@@ -642,8 +727,8 @@ pub fn prose_sync(opts: SyncOpts) {
             std::process::exit(2);
         }
     };
-    let caps_allow = match parse_raw_lists(&existing) {
-        Ok((_emph, caps)) => caps,
+    let (caps_allow, negation_anchors) = match parse_raw_lists(&existing) {
+        Ok((_emph, caps, neg)) => (caps, neg),
         Err(e) => {
             eprintln!("prose-sync: {e}");
             std::process::exit(2);
@@ -666,7 +751,7 @@ pub fn prose_sync(opts: SyncOpts) {
             std::process::exit(2);
         }
     };
-    let rendered = render_ruleset_toml(&emphatics, &caps_allow);
+    let rendered = render_ruleset_toml(&emphatics, &caps_allow, &negation_anchors);
     if rendered == existing {
         println!("prose-sync: in sync ({} emphatic(s))", emphatics.len());
         return;
@@ -700,6 +785,7 @@ mod tests {
             r#"
             emphatics = ["load-bearing", "leverage", "it's worth noting"]
             caps_allow = ["CI", "HTTP", "JSON"]
+            negation_anchors = ["deliberately no", "deliberately not", "intentionally no", "intentionally not"]
         "#,
         )
         .unwrap()
@@ -781,6 +867,48 @@ mod tests {
         assert!(
             words.is_empty(),
             "mixed-case plurals are not all-caps: {words:?}"
+        );
+    }
+
+    #[test]
+    fn negation_flags_an_anchored_define_by_negation_phrase() {
+        let hits = match_negation("there is deliberately no fallback path here", &rs());
+        assert_eq!(hits, vec!["deliberately no"]);
+    }
+
+    #[test]
+    fn negation_is_case_insensitive() {
+        let hits = match_negation("the body boundary is DELIBERATELY NOT a trait", &rs());
+        assert_eq!(hits, vec!["deliberately not"]);
+    }
+
+    #[test]
+    fn negation_matches_on_word_boundaries_not_substrings() {
+        // `intentionally no` must not fire inside `intentionally non-blocking`: `no` is not the token `non`.
+        let hits = match_negation("this path is intentionally non-blocking", &rs());
+        assert!(
+            hits.is_empty(),
+            "a word that merely contains an anchor word is clean: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn negation_leaves_a_plain_negation_clean() {
+        // Legitimate negations with no define-by-negation anchor stay clean (the false-positive guard).
+        let hits = match_negation("the key does not exist and the value is not null", &rs());
+        assert!(
+            hits.is_empty(),
+            "a plain negation is not a define-by-negation: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn negation_requires_adjacent_anchor_words() {
+        // `deliberately not` must appear adjacent; `deliberately do not` has a word between, so it is clean.
+        let hits = match_negation("we deliberately do not cache this", &rs());
+        assert!(
+            hits.is_empty(),
+            "non-adjacent anchor words do not match: {hits:?}"
         );
     }
 
@@ -886,11 +1014,49 @@ mod tests {
     }
 
     #[test]
+    fn lint_file_reports_a_define_by_negation_finding() {
+        let src = "// there is deliberately no retry here\nfn f() {}\n";
+        let found = lint_file("src/x.rs", src, &rs());
+        assert!(
+            found
+                .iter()
+                .any(|f| f.rule == Rule::DefineByNegation && f.token == "deliberately no"),
+            "got: {found:?}"
+        );
+    }
+
+    #[test]
     fn shipped_ruleset_parses_and_carries_the_board_phrases() {
         let shipped = include_str!("../prose-style.toml");
         let r = parse_ruleset(shipped).expect("shipped ruleset parses");
         assert!(r.emphatics_lower.iter().any(|p| p == "load-bearing"));
         assert!(r.caps_allow.contains("HTTP"));
+    }
+
+    #[test]
+    fn shipped_ruleset_carries_the_negation_anchors() {
+        let shipped = include_str!("../prose-style.toml");
+        let r = parse_ruleset(shipped).expect("shipped ruleset parses");
+        assert!(
+            r.negation_anchors
+                .iter()
+                .any(|a| a == &vec!["deliberately".to_string(), "no".to_string()]),
+            "the shipped ruleset seeds the define-by-negation anchors"
+        );
+    }
+
+    #[test]
+    fn shipped_ruleset_is_in_canonical_render_form() {
+        // The committed prose-style.toml is the output of `fleet prose-sync`. Guard that it is already in
+        // canonical render form, so a later `prose-sync --check` does not report drift on it (modulo the
+        // board emphatics refresh, which this does not exercise).
+        let shipped = include_str!("../prose-style.toml");
+        let (emph, caps, neg) = parse_raw_lists(shipped).expect("shipped ruleset parses");
+        assert_eq!(
+            render_ruleset_toml(&emph, &caps, &neg),
+            shipped,
+            "committed prose-style.toml must match the canonical sync render"
+        );
     }
 
     #[test]
@@ -901,7 +1067,7 @@ mod tests {
             "leverage".to_string(),
         ];
         let caps = vec!["HTTP".to_string(), "CI".to_string()];
-        let out = render_ruleset_toml(&emph, &caps);
+        let out = render_ruleset_toml(&emph, &caps, &[]);
         // emphatics appear sorted and deduped.
         let i_load = out.find("\"load-bearing\"").unwrap();
         let i_lev = out.find("\"leverage\"").unwrap();
@@ -917,37 +1083,41 @@ mod tests {
     fn render_is_idempotent() {
         let emph = vec!["it's worth noting".to_string(), "robust".to_string()];
         let caps = vec!["API".to_string()];
-        let once = render_ruleset_toml(&emph, &caps);
-        let (e2, c2) = parse_raw_lists(&once).unwrap();
-        let twice = render_ruleset_toml(&e2, &c2);
+        let neg = vec!["deliberately no".to_string()];
+        let once = render_ruleset_toml(&emph, &caps, &neg);
+        let (e2, c2, n2) = parse_raw_lists(&once).unwrap();
+        let twice = render_ruleset_toml(&e2, &c2, &n2);
         assert_eq!(once, twice, "a render of a parsed render is identical");
     }
 
     #[test]
     fn render_escapes_quotes_and_backslashes() {
-        let out = render_ruleset_toml(&[r#"a "quote" and \slash"#.to_string()], &[]);
+        let out = render_ruleset_toml(&[r#"a "quote" and \slash"#.to_string()], &[], &[]);
         assert!(out.contains(r#""a \"quote\" and \\slash","#), "got: {out}");
         parse_ruleset(&out).expect("escaped render parses");
     }
 
     #[test]
     fn parse_raw_lists_preserves_case_for_caps_allow() {
-        let (emph, caps) = parse_raw_lists(
+        let (emph, caps, neg) = parse_raw_lists(
             r#"
             emphatics = ["Load-Bearing"]
             caps_allow = ["ASCII", "CI"]
+            negation_anchors = ["deliberately no"]
         "#,
         )
         .unwrap();
         assert_eq!(emph, vec!["Load-Bearing"]);
         assert_eq!(caps, vec!["ASCII", "CI"]);
+        assert_eq!(neg, vec!["deliberately no"]);
     }
 
     #[test]
     fn a_changed_board_list_makes_render_differ_so_drift_is_detectable() {
         let caps = vec!["CI".to_string()];
-        let before = render_ruleset_toml(&["robust".to_string()], &caps);
-        let after = render_ruleset_toml(&["robust".to_string(), "seamless".to_string()], &caps);
+        let before = render_ruleset_toml(&["robust".to_string()], &caps, &[]);
+        let after =
+            render_ruleset_toml(&["robust".to_string(), "seamless".to_string()], &caps, &[]);
         assert_ne!(
             before, after,
             "an added board phrase changes the render (drift)"
