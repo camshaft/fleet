@@ -112,6 +112,15 @@ board task or `owner/repo#N` for a GitHub issue/PR. The board hard-rejects a bar
 a bare ref costs you a reword-and-retry every time; a typed ref is also unambiguous about which tracker it
 points at.
 
+**Type every mention, and treat a reject as a resend, not a drop (operator mandate).** The typed-reference
+rule applies to every mention in a board-write body — a comment, a message, task or doc text — not only the
+first: a board task as `task_NNNN`, a GitHub PR or issue as `owner/repo#N` (for example `camshaft/fleet#420`),
+or a plain number with no leading `#` when it is only a count or an ordinal. The recurring trap is the second
+or shorthand mention later in the same body — type every one. A reject means the write did not post, so when a
+board write is rejected for a bare `#N` (or any lint), rework the reference and resend it — never drop the
+handoff, because a skipped resend silently loses the content. The reject is an intentional teaching signal,
+not a wall.
+
 **Pass real content to an MCP write tool — never a `$(cat file)` token — and read back after a write.** When
 you put file content into an MCP tool argument (a comment, a message, a doc/version body), pass the ACTUAL
 content: the MCP call has no shell, so a `$(cat file)` or backtick token is stored VERBATIM and silently
