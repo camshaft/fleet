@@ -1799,7 +1799,7 @@ struct ScopeOutcome {
 /// the can't-be-forgotten half: a misbehaving detector (e.g. the combinatorial O(k^2) blowup value_contradiction
 /// hit on its first real run -- a ~958MB report that 502'd the board + a 1656-proposal flood) must never
 /// serialize a giant report or flood the review surface, even if the dry-run was skipped. `MAX_PROPOSALS_PER_SCOPE`
-/// caps total proposals across ALL detectors (overflow dropped lowest-priority, a `capped` diagnostic naming the
+/// caps total proposals across all detectors (overflow dropped lowest-priority, a `capped` diagnostic naming the
 /// over-generator); `MAX_REPORT_BYTES` is the ultimate guard against a pathological per-proposal size -- over it
 /// the proposals are suppressed to a minimal diagnostic so a publish cannot pressure the board. Healthy scopes
 /// sit at 0-50 proposals / a few KB, so these ceilings are generous and only trip on a real malfunction.
@@ -2914,7 +2914,7 @@ mod tests {
         let capped = cap_proposals(&mut proposals);
         // Overflow truncated to the ceiling.
         assert_eq!(proposals.len(), MAX_PROPOSALS_PER_SCOPE);
-        // Diagnostic names the over-generator with PRE-cap counts and the suppressed delta.
+        // Diagnostic names the over-generator with pre-cap counts and the suppressed delta.
         assert_eq!(capped["total_before_cap"], json!(total));
         assert_eq!(capped["limit"], json!(MAX_PROPOSALS_PER_SCOPE));
         assert_eq!(capped["suppressed"], json!(total - MAX_PROPOSALS_PER_SCOPE));
