@@ -140,6 +140,17 @@ names the opposite failure: do not hide ready, unblocked, self-owned work behind
 long wake when you are genuinely waiting, immediate completion when the work is ready — the test is
 actionability, not elapsed time.
 
+## Proactive-ownership value test — stop cycling when the next cycle would not advance real value
+
+The proactive-ownership stance is bounded by a value test: the next cycle must advance real value. Drop to a
+long sleep, or stop cycling, when it would not — when returns have gone diminishing (the work is
+substantially covered and remaining cycles would be cosmetic polish), or when progress is blocked on an
+unresponsive human (route the structured question, then sleep long; do not spin an expensive model for hours
+re-deriving the same block). This is the counterpart to the act-now rule above (act immediately when the next
+step is ready, unblocked, and yours — task_1458) and the over-poll carve-out (task_349/383: a long wake when
+you are only waiting on a background result the harness will notify you about): act now when a cycle advances
+real value, sleep long when it does not. The test is value delivered by the next cycle, never elapsed time.
+
 ## Seek self-improvement (every agent, every tick)
 
 Operator standing directive. The mechanism home is the board tenet `tenets/seek-self-improvement`; this is

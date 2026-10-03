@@ -5385,7 +5385,12 @@ fn build_kickoff(
              urgent' as the signal to advance the standing unit. You may drop to the passive-monitor cadence \
              ONLY once your charter's work-accomplished gate is satisfied (the charter states the precondition, \
              e.g. a significant corpus examined AND a substantial deliverable built); until then keep cycling \
-             and never idle-sleep. The gate is WORK-ACCOMPLISHED, not elapsed time."
+             and never idle-sleep. The gate is WORK-ACCOMPLISHED, not elapsed time. This override is itself \
+             bounded by a value test: the next cycle must advance real value, so drop to a long sleep when it \
+             would not — when returns have gone diminishing (the standing unit is substantially covered and \
+             remaining cycles would be cosmetic polish), or when you are blocked on an unresponsive human \
+             (route the structured question, then sleep long rather than spin for hours re-deriving the same \
+             block). Advance the standing unit while a cycle delivers real value; sleep long when it does not."
         )
     } else {
         tick
