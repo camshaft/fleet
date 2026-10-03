@@ -95,6 +95,21 @@ fn task_is_actionable(task: &Value) -> bool {
     actionable_status && !blocked && !monitor_exempt
 }
 
+/// Whether a task is PARKED on a blocker — a `todo`/`in_progress` task carrying a non-null `blocked_on` /
+/// `blocked_on_kind` link (the inverse of the blocked branch of [`task_is_actionable`], without the
+/// monitor-exempt carve-out). task_579 case (d): an at-rest monitor agent sitting on such a parked task is in
+/// a blocked-external posture, so `monitor-tick` wakes it once per UTC-day rollover to re-test whether the
+/// block cleared ([`blocked_external_rollover_due`](crate::blocked_external_rollover_due)) rather than on
+/// every poll. A done or cancelled task is never parked work. Pure — unit-tested.
+fn task_is_blocked(task: &Value) -> bool {
+    let status = task.get("status").and_then(Value::as_str).unwrap_or("");
+    let open = status == "todo" || status == "in_progress";
+    let blocked = ["blocked_on_kind", "blocked_on"]
+        .iter()
+        .any(|k| task.get(*k).is_some_and(|v| !v.is_null()));
+    open && blocked
+}
+
 /// The board query path for an OPEN observation task tagged `observes=<target>` in a project — the #290
 /// idempotency check. Both `meta_key` and `meta_value` must be present for the board to filter on metadata
 /// (either alone is inert). Agent ids are kebab-case with no URL-special characters, so no encoding is
@@ -255,6 +270,19 @@ impl Board {
             other => return Err(format!("board /tasks: expected an array, got {other}")),
         };
         Ok(tasks.iter().filter(|t| task_is_actionable(t)).count())
+    }
+
+    /// Count an agent's PARKED assigned tasks — the `/tasks?assignee=<id>` list kept to open tasks blocked on
+    /// a `blocked_on` link (see [`task_is_blocked`]). task_579 case (d): `monitor-tick` uses a non-zero count
+    /// as the "blocked-external posture" signal, waking the model once per UTC-day rollover to re-test the
+    /// block rather than on every poll. Same list projection as [`open_task_count`](Self::open_task_count), so
+    /// one assignee list serves both counts. (Agent ids are kebab-case with no URL-special chars.)
+    pub fn blocked_task_count(&self, assignee: &str) -> Result<usize, String> {
+        let tasks = match self.get_json(&format!("/tasks?assignee={assignee}"))? {
+            Value::Array(a) => a,
+            other => return Err(format!("board /tasks: expected an array, got {other}")),
+        };
+        Ok(tasks.iter().filter(|t| task_is_blocked(t)).count())
     }
 
     /// Fetch a custom workspace-kind resource (`GET /api/workspace-kinds/{kind}`) → `Some(record)`, or `None`
@@ -729,6 +757,33 @@ mod tests {
         assert!(task_is_actionable(
             &serde_json::json!({ "status": "in_progress", "monitor_exempt": false })
         ));
+    }
+
+    #[test]
+    fn task_is_blocked_only_for_parked_open_tasks() {
+        // Open task with a blocker link (either shape) is parked.
+        assert!(task_is_blocked(
+            &serde_json::json!({ "status": "todo", "blocked_on_kind": "operator" })
+        ));
+        assert!(task_is_blocked(
+            &serde_json::json!({ "status": "in_progress", "blocked_on": {"kind": "task"} })
+        ));
+        // Open but unblocked (or null link) is not parked — nothing for the rollover gate to re-test.
+        assert!(!task_is_blocked(&serde_json::json!({ "status": "todo" })));
+        assert!(!task_is_blocked(
+            &serde_json::json!({ "status": "in_progress", "blocked_on": null })
+        ));
+        // A terminal task is never parked work, even if a stale blocker link lingers.
+        assert!(!task_is_blocked(
+            &serde_json::json!({ "status": "done", "blocked_on_kind": "task" })
+        ));
+        assert!(!task_is_blocked(
+            &serde_json::json!({ "status": "cancelled", "blocked_on_kind": "operator" })
+        ));
+        assert!(
+            !task_is_blocked(&serde_json::json!({})),
+            "missing status is not parked work"
+        );
     }
 
     #[test]
