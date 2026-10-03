@@ -2996,6 +2996,11 @@
   },
   {
     "file": "crates/fleet/src/main.rs",
+    "rule": "define-by-negation",
+    "token": "deliberately not"
+  },
+  {
+    "file": "crates/fleet/src/main.rs",
     "rule": "emphatic",
     "token": "floored"
   },
@@ -3285,6 +3290,26 @@
     "token": "VERSION"
   },
   {
+    "file": "crates/fleet/src/prose_lint.rs",
+    "rule": "define-by-negation",
+    "token": "deliberately no"
+  },
+  {
+    "file": "crates/fleet/src/prose_lint.rs",
+    "rule": "define-by-negation",
+    "token": "deliberately not"
+  },
+  {
+    "file": "crates/fleet/src/prose_lint.rs",
+    "rule": "define-by-negation",
+    "token": "intentionally no"
+  },
+  {
+    "file": "crates/fleet/src/prose_lint.rs",
+    "rule": "define-by-negation",
+    "token": "intentionally not"
+  },
+  {
     "file": "crates/fleet/src/scan.rs",
     "rule": "caps-for-emphasis",
     "token": "COMMITTED"
@@ -3373,6 +3398,16 @@
     "file": "crates/fleet/src/scan.rs",
     "rule": "caps-for-emphasis",
     "token": "VOCABULARY"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "define-by-negation",
+    "token": "deliberately not"
+  },
+  {
+    "file": "crates/fleet/src/scan.rs",
+    "rule": "define-by-negation",
+    "token": "intentionally not"
   },
   {
     "file": "crates/fleet/src/transcripts.rs",

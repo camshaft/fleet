@@ -8,6 +8,11 @@
 # `caps_allow` is the structural caps-for-emphasis rule's allow-list of acceptable all-caps tokens. It is
 # hand-maintained here (the sync preserves it) and kept conservative, extended from real false positives. A
 # token carrying a digit or an underscore is an identifier and is never flagged, so it does not belong here.
+#
+# `negation_anchors` is the define-by-negation rule's anchored phrase list: short word sequences that define
+# a thing by stating what it is not. Each anchor matches on word boundaries, not as a raw substring, so a
+# plain negation (does not exist, is not null) stays clean. It is hand-maintained here and preserved by the
+# sync, like caps_allow; keep it conservative and seeded from real operator-named forms.
 
 emphatics = [
   "a testament to",
@@ -136,4 +141,11 @@ caps_allow = [
   "WASI",
   "WIT",
   "YAML",
+]
+
+negation_anchors = [
+  "deliberately no",
+  "deliberately not",
+  "intentionally no",
+  "intentionally not",
 ]
