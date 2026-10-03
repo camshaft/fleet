@@ -7505,6 +7505,37 @@ fn infra_observe_task(kind: InfraSignalKind, signal_id: &str, evidence: &str) ->
     (title, description)
 }
 
+/// task_695 SystemdUnit probe core: classify a `systemctl --user is-active <unit>` output. A unit is healthy
+/// only when its state is exactly `active`; any other state (`inactive` / `failed` / `activating` / `unknown`)
+/// or an empty read is a breach. Returns the evidence line on breach, `None` when healthy. Pure — unit-tested;
+/// the `systemctl` spawn (a follow-on wiring increment) wraps it and passes the trimmed stdout.
+fn systemd_unit_breach(unit: &str, is_active_output: &str) -> Option<String> {
+    let state = is_active_output.trim();
+    if state == "active" {
+        return None;
+    }
+    let shown = if state.is_empty() { "no output" } else { state };
+    Some(format!(
+        "systemctl --user is-active {unit} reported '{shown}' (expected 'active')"
+    ))
+}
+
+/// task_695 CronLiveness probe core: a cron/timer last-run stamp is a breach when it is MISSING (`age_secs`
+/// `None` — never ran, or the stamp was removed) or OLDER than `max_age_secs` (the schedule lapsed). `signal_id`
+/// is the stamp path (also the dedup key). Returns the evidence line on breach, `None` when fresh. Pure —
+/// unit-tested; the mtime read ([`file_mtime_unix`]) and the age subtraction wrap it.
+fn cron_stamp_breach(signal_id: &str, age_secs: Option<u64>, max_age_secs: u64) -> Option<String> {
+    match age_secs {
+        None => Some(format!(
+            "cron/timer stamp {signal_id} is missing (never ran, or the stamp was removed)"
+        )),
+        Some(age) if age > max_age_secs => Some(format!(
+            "cron/timer stamp {signal_id} last ran {age}s ago, over its {max_age_secs}s liveness budget"
+        )),
+        Some(_) => None,
+    }
+}
+
 // ── observation triggers (#187, BUILD 2/5) ─────────────────────────────────────────────────────────
 // The watchdog is also the SPAWNER of ephemeral per-agent observer sessions: it tracks each agent's
 // transcript growth against a per-agent watermark and, when the unobserved increment crosses a threshold
@@ -20518,6 +20549,41 @@ detached
             InfraSignalKind::DaemonHealth.label(),
             "daemon health stale/degraded"
         );
+    }
+
+    #[test]
+    fn systemd_unit_breach_only_on_a_non_active_state() {
+        // Active (even with trailing whitespace from the probe's stdout) is healthy — no finding.
+        assert_eq!(
+            systemd_unit_breach("fleet-watchdog.service", "active\n"),
+            None
+        );
+        // Any other state is a breach, and the evidence names the unit + the observed state.
+        for state in ["inactive", "failed", "activating", "unknown"] {
+            let ev = systemd_unit_breach("fleet-sync.timer", state)
+                .expect("non-active state is a breach");
+            assert!(ev.contains("fleet-sync.timer"), "names the unit: {ev}");
+            assert!(ev.contains(state), "names the observed state: {ev}");
+        }
+        // An empty read (probe produced nothing) is a breach, described as such.
+        let ev = systemd_unit_breach("x.service", "   ").expect("empty read is a breach");
+        assert!(ev.contains("no output"), "empty read described: {ev}");
+    }
+
+    #[test]
+    fn cron_stamp_breach_on_missing_or_over_budget_only() {
+        let id = "/srv/hub/.claude/fleet/watchdog/dream-run.stamp";
+        // Fresh (at or under budget) is healthy — no finding, including the exact-boundary age.
+        assert_eq!(cron_stamp_breach(id, Some(0), 7200), None);
+        assert_eq!(cron_stamp_breach(id, Some(7200), 7200), None);
+        // Over budget is a breach naming the age and the budget.
+        let ev = cron_stamp_breach(id, Some(7201), 7200).expect("over budget is a breach");
+        assert!(ev.contains("7201s"), "names the age: {ev}");
+        assert!(ev.contains("7200s"), "names the budget: {ev}");
+        assert!(ev.contains(id), "names the signal id: {ev}");
+        // A missing stamp (never ran / removed) is a breach, described distinctly from a lapse.
+        let ev = cron_stamp_breach(id, None, 7200).expect("missing stamp is a breach");
+        assert!(ev.contains("missing"), "missing stamp described: {ev}");
     }
 
     #[test]

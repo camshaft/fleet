@@ -67,6 +67,25 @@ pub struct Config {
     /// that has not opted the intake project in), so merely shipping the flag changes nothing until a host sets
     /// this and adds the flag to its watchdog `ExecStart`.
     pub intake_project: Option<i64>,
+    /// task_695: the systemd user units the infra-observer samples (`systemctl --user is-active <unit>`); a unit
+    /// in any non-active state files a project-28 self-improve task. Each unit name doubles as the signal id.
+    /// Absent/empty → the systemd probe is a no-op (opt-in per host — a host declares only the units it owns).
+    pub infra_systemd_units: Option<Vec<String>>,
+    /// task_695: the cron/timer last-run stamps the infra-observer ages — a stamp older than its `max_age_secs`
+    /// (or missing entirely) is a stale-liveness breach. Absent/empty → the cron-liveness probe is a no-op. The
+    /// watched stamps are deployment-specific paths, so they are named here, never hard-coded.
+    pub infra_cron_stamps: Option<Vec<InfraStampSignal>>,
+}
+
+/// task_695: a declared file-liveness signal the infra-observer ages — a cron/timer last-run stamp whose file
+/// mtime must stay fresher than `max_age_secs`. `path` doubles as the signal id (and the `metadata.observed_signal`
+/// dedup key when a breach files a task). A deployment-specific path + budget, so both are config-declared.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InfraStampSignal {
+    /// The stamp file whose mtime is the last-run time (also the signal id).
+    pub path: String,
+    /// The liveness budget in seconds — a mtime older than this (or an absent file) is a breach.
+    pub max_age_secs: u64,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -137,11 +156,32 @@ mod tests {
             nudge_reassign_round = 3
             repo_checkout_base = "/home/x/Projects"
             intake_project = 29
+            infra_systemd_units = ["fleet-watchdog.service", "fleet-sync.timer"]
+
+            [[infra_cron_stamps]]
+            path = "/srv/hub/.claude/fleet/watchdog/dream-run.stamp"
+            max_age_secs = 7200
             "#,
         );
         assert_eq!(cfg.operator_id.as_deref(), Some("operator"));
         assert_eq!(cfg.repo_checkout_base.as_deref(), Some("/home/x/Projects"));
         assert_eq!(cfg.intake_project, Some(29));
+        assert_eq!(
+            cfg.infra_systemd_units.as_deref(),
+            Some(
+                &[
+                    "fleet-watchdog.service".to_string(),
+                    "fleet-sync.timer".to_string()
+                ][..]
+            )
+        );
+        let stamps = cfg.infra_cron_stamps.as_deref().expect("stamps parsed");
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(
+            stamps[0].path,
+            "/srv/hub/.claude/fleet/watchdog/dream-run.stamp"
+        );
+        assert_eq!(stamps[0].max_age_secs, 7200);
         assert_eq!(cfg.nudge_pm_tag_round, Some(2));
         assert_eq!(cfg.nudge_reassign_round, Some(3));
         assert_eq!(
