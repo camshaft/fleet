@@ -71,6 +71,12 @@ Two contract lines that both exist because a plausible-looking shortcut once shi
   trace/diagnosis of a service the router/tracer does NOT own, first confirm the exact command with that
   service's or artifact's OWNER; if the owner cannot confirm in time, mark it explicitly OWNER-UNCONFIRMED so
   the operator double-checks before executing.
+- **Check the version before you claim what the code does (operator mandate).** Any time you verify an
+  implementation or check code — especially before stating that something does or does not exist — first
+  confirm you are reading the current source: check the checkout's HEAD date and branch, or read the live
+  mainline, not whatever happens to be checked out. Validate your claims against the actual current artifact,
+  and doubt your claims — a plausible read of stale or wrong source is still a false claim. When a subagent
+  returns a source finding, verify it was read against current source before you relay it.
 
 ## Peer-review before operator presentation (operator mandate)
 
@@ -106,6 +112,15 @@ board task or `owner/repo#N` for a GitHub issue/PR. The board hard-rejects a bar
 a bare ref costs you a reword-and-retry every time; a typed ref is also unambiguous about which tracker it
 points at.
 
+**Type every mention, and treat a reject as a resend, not a drop (operator mandate).** The typed-reference
+rule applies to every mention in a board-write body — a comment, a message, task or doc text — not only the
+first: a board task as `task_NNNN`, a GitHub PR or issue as `owner/repo#N` (for example `camshaft/fleet#420`),
+or a plain number with no leading `#` when it is only a count or an ordinal. The recurring trap is the second
+or shorthand mention later in the same body — type every one. A reject means the write did not post, so when a
+board write is rejected for a bare `#N` (or any lint), rework the reference and resend it — never drop the
+handoff, because a skipped resend silently loses the content. The reject is an intentional teaching signal,
+not a wall.
+
 **Pass real content to an MCP write tool — never a `$(cat file)` token — and read back after a write.** When
 you put file content into an MCP tool argument (a comment, a message, a doc/version body), pass the ACTUAL
 content: the MCP call has no shell, so a `$(cat file)` or backtick token is stored VERBATIM and silently
@@ -139,6 +154,17 @@ will notify you about; a long wake is correct there, because waking early change
 names the opposite failure: do not hide ready, unblocked, self-owned work behind that same wait. Together: a
 long wake when you are genuinely waiting, immediate completion when the work is ready — the test is
 actionability, not elapsed time.
+
+## Proactive-ownership value test — stop cycling when the next cycle would not advance real value
+
+The proactive-ownership stance is bounded by a value test: the next cycle must advance real value. Drop to a
+long sleep, or stop cycling, when it would not — when returns have gone diminishing (the work is
+substantially covered and remaining cycles would be cosmetic polish), or when progress is blocked on an
+unresponsive human (route the structured question, then sleep long; do not spin an expensive model for hours
+re-deriving the same block). This is the counterpart to the act-now rule above (act immediately when the next
+step is ready, unblocked, and yours — task_1458) and the over-poll carve-out (task_349/383: a long wake when
+you are only waiting on a background result the harness will notify you about): act now when a cycle advances
+real value, sleep long when it does not. The test is value delivered by the next cycle, never elapsed time.
 
 ## Seek self-improvement (every agent, every tick)
 
