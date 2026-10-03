@@ -71,6 +71,12 @@ Two contract lines that both exist because a plausible-looking shortcut once shi
   trace/diagnosis of a service the router/tracer does NOT own, first confirm the exact command with that
   service's or artifact's OWNER; if the owner cannot confirm in time, mark it explicitly OWNER-UNCONFIRMED so
   the operator double-checks before executing.
+- **Check the version before you claim what the code does (operator mandate).** Any time you verify an
+  implementation or check code — especially before stating that something does or does not exist — first
+  confirm you are reading the current source: check the checkout's HEAD date and branch, or read the live
+  mainline, not whatever happens to be checked out. Validate your claims against the actual current artifact,
+  and doubt your claims — a plausible read of stale or wrong source is still a false claim. When a subagent
+  returns a source finding, verify it was read against current source before you relay it.
 
 ## Peer-review before operator presentation (operator mandate)
 
